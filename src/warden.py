@@ -365,7 +365,12 @@ def cmd_logs() -> int:
 
 
 def cmd_logs_prune(days: int = 7, size_mb: int = None) -> int:
-    """Clean old log files."""
+    """Clean old log files.
+
+    Args:
+        days: Delete logs older than N days.
+        size_mb: Target total size in MB. If specified, delete oldest files until under limit.
+    """
     if not LOG_DIR.exists():
         print("No log directory found")
         return 0
@@ -375,37 +380,70 @@ def cmd_logs_prune(days: int = 7, size_mb: int = None) -> int:
     compressed = 0
     bytes_freed = 0
 
-    for log_file in LOG_DIR.glob("*.jsonl"):
-        try:
-            mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
-            file_size = log_file.stat().st_size
+    # Collect all log files with metadata.
+    all_files = []
+    for pattern in ["*.jsonl", "*.jsonl.gz"]:
+        for log_file in LOG_DIR.glob(pattern):
+            try:
+                stat = log_file.stat()
+                all_files.append({
+                    "path": log_file,
+                    "mtime": datetime.fromtimestamp(stat.st_mtime),
+                    "size": stat.st_size,
+                })
+            except (IOError, OSError):
+                pass
 
-            if mtime < cutoff:
-                bytes_freed += file_size
-                log_file.unlink()
+    # Phase 1: Remove files older than cutoff.
+    for f in all_files[:]:
+        if f["mtime"] < cutoff:
+            try:
+                bytes_freed += f["size"]
+                f["path"].unlink()
                 removed += 1
-            elif mtime < datetime.now() - timedelta(days=1):
-                # Compress files older than 1 day.
-                gz_path = log_file.with_suffix(".jsonl.gz")
+                all_files.remove(f)
+            except (IOError, OSError) as e:
+                print(f"WARNING: Failed to remove {f['path']}: {e}", file=sys.stderr)
+
+    # Phase 2: Compress uncompressed files older than 1 day.
+    compress_cutoff = datetime.now() - timedelta(days=1)
+    for f in all_files:
+        if f["path"].suffix == ".jsonl" and f["mtime"] < compress_cutoff:
+            try:
+                gz_path = f["path"].with_suffix(".jsonl.gz")
                 if not gz_path.exists():
-                    with open(log_file, "rb") as f_in:
+                    with open(f["path"], "rb") as f_in:
                         with gzip.open(gz_path, "wb") as f_out:
                             f_out.writelines(f_in)
-                    log_file.unlink()
+                    f["path"].unlink()
                     compressed += 1
-        except (IOError, OSError) as e:
-            print(f"WARNING: Failed to process {log_file}: {e}", file=sys.stderr)
+                    # Update file info for size calculation.
+                    f["path"] = gz_path
+                    f["size"] = gz_path.stat().st_size
+            except (IOError, OSError) as e:
+                print(f"WARNING: Failed to compress {f['path']}: {e}", file=sys.stderr)
 
-    # Also clean old compressed files.
-    for gz_file in LOG_DIR.glob("*.jsonl.gz"):
-        try:
-            mtime = datetime.fromtimestamp(gz_file.stat().st_mtime)
-            if mtime < cutoff:
-                bytes_freed += gz_file.stat().st_size
-                gz_file.unlink()
-                removed += 1
-        except (IOError, OSError):
-            pass
+    # Phase 3: Size-based pruning if specified.
+    if size_mb is not None:
+        target_bytes = size_mb * 1024 * 1024
+        total_size = sum(f["size"] for f in all_files)
+
+        if total_size > target_bytes:
+            # Sort by mtime (oldest first) for deletion.
+            all_files.sort(key=lambda f: f["mtime"])
+
+            for f in all_files:
+                if total_size <= target_bytes:
+                    break
+                try:
+                    bytes_freed += f["size"]
+                    total_size -= f["size"]
+                    f["path"].unlink()
+                    removed += 1
+                except (IOError, OSError) as e:
+                    print(f"WARNING: Failed to remove {f['path']}: {e}", file=sys.stderr)
+
+            print(f"Size pruning: reduced to {total_size / 1024 / 1024:.1f} MB (target: {size_mb} MB)")
 
     print(f"Removed {removed} files, compressed {compressed} files")
     if bytes_freed > 0:
@@ -765,6 +803,284 @@ def _rule_str(rule) -> str:
     return str(rule)
 
 
+def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: str = "hourly",
+                     samples_per_hour: int = 10, archive_path: str = None,
+                     older_than: str = "7d") -> int:
+    """Compact log files using the specified strategy.
+
+    Strategies:
+        delete: Simply delete logs older than retention period.
+        aggregate: Aggregate by (host, path, method, status) per time bucket.
+        sample: Keep N random samples per time bucket.
+        archive: Compress and move to archive location.
+    """
+    from collections import defaultdict
+    import random
+    import shutil
+
+    if not LOG_DIR.exists():
+        print("No log directory found")
+        return 0
+
+    # Parse older_than duration.
+    duration_match = re.match(r"(\d+)([dhm])", older_than)
+    if not duration_match:
+        print(f"ERROR: Invalid duration format: {older_than}", file=sys.stderr)
+        return 1
+
+    duration_val = int(duration_match.group(1))
+    duration_unit = duration_match.group(2)
+    if duration_unit == "d":
+        cutoff = datetime.now() - timedelta(days=duration_val)
+    elif duration_unit == "h":
+        cutoff = datetime.now() - timedelta(hours=duration_val)
+    elif duration_unit == "m":
+        cutoff = datetime.now() - timedelta(minutes=duration_val)
+
+    # Find log files to compact.
+    pattern = f"{cell_name}.jsonl" if cell_name else "*.jsonl"
+    log_files = list(LOG_DIR.glob(pattern))
+    if not log_files:
+        print("No log files to compact")
+        return 0
+
+    compacted = 0
+    entries_processed = 0
+
+    for log_file in log_files:
+        try:
+            mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+            if mtime >= cutoff:
+                continue  # Skip recent files.
+
+            cell = log_file.stem
+            entries = []
+
+            with open(log_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+
+            if not entries:
+                continue
+
+            entries_processed += len(entries)
+
+            if strategy == "delete":
+                log_file.unlink()
+                compacted += 1
+
+            elif strategy == "aggregate":
+                # Aggregate by time bucket.
+                aggregated = defaultdict(lambda: {
+                    "count": 0, "blocked_count": 0, "error_count": 0,
+                    "total_bytes": 0, "total_ms": 0.0, "latencies": []
+                })
+
+                for entry in entries:
+                    ts = entry.get("ts", "")
+                    if bucket == "hourly":
+                        bucket_key = ts[:13] + ":00:00Z"  # YYYY-MM-DDTHH:00:00Z
+                    else:  # daily
+                        bucket_key = ts[:10] + "T00:00:00Z"
+
+                    key = (bucket_key, entry.get("host", ""), entry.get("method", ""),
+                           entry.get("status", 0))
+                    agg = aggregated[key]
+                    agg["count"] += 1
+                    if entry.get("blocked"):
+                        agg["blocked_count"] += 1
+                    if entry.get("status", 200) >= 400 or entry.get("error"):
+                        agg["error_count"] += 1
+                    agg["total_bytes"] += entry.get("bytes", 0) + entry.get("request_bytes", 0)
+                    agg["total_ms"] += entry.get("ms", 0)
+                    agg["latencies"].append(entry.get("ms", 0))
+
+                # Write compact file.
+                compact_file = log_file.with_suffix(".compact.jsonl")
+                with open(compact_file, "w") as f:
+                    for (bucket_ts, host, method, status), agg in aggregated.items():
+                        latencies = sorted(agg["latencies"])
+                        p95_idx = int(len(latencies) * 0.95) if latencies else 0
+                        compact_entry = {
+                            "bucket": bucket_ts,
+                            "host": host,
+                            "method": method,
+                            "status": status,
+                            "count": agg["count"],
+                            "blocked_count": agg["blocked_count"],
+                            "error_count": agg["error_count"],
+                            "total_bytes": agg["total_bytes"],
+                            "avg_ms": round(agg["total_ms"] / agg["count"], 2) if agg["count"] else 0,
+                            "p95_ms": round(latencies[p95_idx], 2) if latencies else 0,
+                        }
+                        f.write(json.dumps(compact_entry) + "\n")
+
+                log_file.unlink()
+                compacted += 1
+
+            elif strategy == "sample":
+                # Keep N random samples per hour bucket.
+                buckets = defaultdict(list)
+                for entry in entries:
+                    ts = entry.get("ts", "")
+                    bucket_key = ts[:13]  # YYYY-MM-DDTHH
+                    buckets[bucket_key].append(entry)
+
+                sample_file = log_file.with_suffix(".sample.jsonl")
+                with open(sample_file, "w") as f:
+                    for bucket_key, bucket_entries in buckets.items():
+                        samples = random.sample(bucket_entries,
+                                                min(samples_per_hour, len(bucket_entries)))
+                        for entry in samples:
+                            f.write(json.dumps(entry) + "\n")
+
+                log_file.unlink()
+                compacted += 1
+
+            elif strategy == "archive":
+                if not archive_path:
+                    print("ERROR: --archive-path required for archive strategy", file=sys.stderr)
+                    return 1
+
+                archive_dir = Path(archive_path)
+                archive_dir.mkdir(parents=True, exist_ok=True)
+
+                # Compress and move.
+                gz_name = f"{log_file.stem}.{datetime.now().strftime('%Y%m%d')}.jsonl.gz"
+                gz_path = archive_dir / gz_name
+
+                with open(log_file, "rb") as f_in:
+                    with gzip.open(gz_path, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+
+                log_file.unlink()
+                compacted += 1
+
+        except (IOError, OSError) as e:
+            print(f"WARNING: Failed to process {log_file}: {e}", file=sys.stderr)
+
+    print(f"Compacted {compacted} files ({entries_processed} entries) using '{strategy}' strategy")
+    return 0
+
+
+def cmd_logs_export(cell_name: str = None, format_type: str = "jsonl",
+                    output_file: str = None, days: int = 7) -> int:
+    """Export log files in various formats.
+
+    Formats:
+        jsonl: Line-delimited JSON (default).
+        csv: Comma-separated values.
+        parquet: Columnar format for big data tools.
+    """
+    if not LOG_DIR.exists():
+        print("No log directory found")
+        return 0
+
+    # Find log files.
+    pattern = f"{cell_name}.jsonl" if cell_name else "*.jsonl"
+    log_files = list(LOG_DIR.glob(pattern))
+    if not log_files:
+        print("No log files to export")
+        return 0
+
+    cutoff = datetime.now() - timedelta(days=days)
+
+    # Collect all entries.
+    all_entries = []
+    for log_file in log_files:
+        try:
+            mtime = datetime.fromtimestamp(log_file.stat().st_mtime)
+            if mtime < cutoff:
+                continue
+
+            with open(log_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            all_entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+        except (IOError, OSError):
+            continue
+
+    if not all_entries:
+        print("No entries to export")
+        return 0
+
+    # Determine output.
+    if output_file:
+        out_path = Path(output_file)
+    else:
+        suffix = {"jsonl": ".jsonl", "csv": ".csv", "parquet": ".parquet"}[format_type]
+        out_path = Path(f"warden-logs-export{suffix}")
+
+    if format_type == "jsonl":
+        with open(out_path, "w") as f:
+            for entry in all_entries:
+                f.write(json.dumps(entry) + "\n")
+
+    elif format_type == "csv":
+        import csv
+
+        # Flatten entries and get all unique keys.
+        flat_entries = []
+        all_keys = set()
+        for entry in all_entries:
+            flat = {}
+            for k, v in entry.items():
+                if isinstance(v, (dict, list)):
+                    flat[k] = json.dumps(v)
+                else:
+                    flat[k] = v
+                all_keys.add(k)
+            flat_entries.append(flat)
+
+        # Standard columns first, then extras alphabetically.
+        standard_cols = ["ts", "cell", "method", "host", "path", "status", "bytes", "ms", "blocked"]
+        columns = [c for c in standard_cols if c in all_keys]
+        columns.extend(sorted(all_keys - set(columns)))
+
+        with open(out_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(flat_entries)
+
+    elif format_type == "parquet":
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            print("ERROR: pyarrow required for parquet export. Install with: pip install pyarrow",
+                  file=sys.stderr)
+            return 1
+
+        # Convert to columnar format.
+        columns = {}
+        for entry in all_entries:
+            for k, v in entry.items():
+                if k not in columns:
+                    columns[k] = []
+
+        for entry in all_entries:
+            for k in columns:
+                val = entry.get(k)
+                if isinstance(val, (dict, list)):
+                    val = json.dumps(val)
+                columns[k].append(val)
+
+        table = pa.table(columns)
+        pq.write_table(table, out_path)
+
+    print(f"Exported {len(all_entries)} entries to {out_path}")
+    return 0
+
+
 def cmd_tor_start() -> int:
     """Start Tor container."""
     if tor_running():
@@ -903,7 +1219,26 @@ def main():
     logs_sub = p_logs.add_subparsers(dest="logs_command")
     p_logs_prune = logs_sub.add_parser("prune", help="Clean old log files")
     p_logs_prune.add_argument("--days", type=int, default=7, help="Delete logs older than N days")
-    p_logs_prune.add_argument("--size", type=int, help="Target size in MB (not yet implemented)")
+    p_logs_prune.add_argument("--size", type=int, help="Target total size in MB (delete oldest files until under limit)")
+
+    p_logs_compact = logs_sub.add_parser("compact", help="Compact log files")
+    p_logs_compact.add_argument("cell_name", nargs="?", help="Specific cell (optional)")
+    p_logs_compact.add_argument("--strategy", choices=["delete", "aggregate", "sample", "archive"],
+                                default="delete", help="Compaction strategy")
+    p_logs_compact.add_argument("--bucket", choices=["hourly", "daily"], default="hourly",
+                                help="Time bucket for aggregate strategy")
+    p_logs_compact.add_argument("--samples-per-hour", type=int, default=10,
+                                help="Samples to keep per hour for sample strategy")
+    p_logs_compact.add_argument("--archive-path", help="Archive directory for archive strategy")
+    p_logs_compact.add_argument("--older-than", default="7d",
+                                help="Only compact files older than this (e.g., 7d, 24h)")
+
+    p_logs_export = logs_sub.add_parser("export", help="Export logs to file")
+    p_logs_export.add_argument("cell_name", nargs="?", help="Specific cell (optional)")
+    p_logs_export.add_argument("--format", dest="format_type", choices=["jsonl", "csv", "parquet"],
+                               default="jsonl", help="Export format")
+    p_logs_export.add_argument("--output", "-o", help="Output file path")
+    p_logs_export.add_argument("--days", type=int, default=7, help="Export logs from last N days")
 
     # Network commands.
     p_join = subparsers.add_parser("join", help="Connect to cell network")
@@ -954,6 +1289,15 @@ def main():
     elif args.command == "logs":
         if args.logs_command == "prune":
             sys.exit(cmd_logs_prune(args.days, args.size))
+        elif args.logs_command == "compact":
+            sys.exit(cmd_logs_compact(
+                args.cell_name, args.strategy, args.bucket,
+                args.samples_per_hour, args.archive_path, args.older_than
+            ))
+        elif args.logs_command == "export":
+            sys.exit(cmd_logs_export(
+                args.cell_name, args.format_type, args.output, args.days
+            ))
         else:
             sys.exit(cmd_logs())
     elif args.command == "join":

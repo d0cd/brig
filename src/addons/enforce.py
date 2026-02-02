@@ -77,7 +77,10 @@ BLOCKED_NETWORKS = [
 
 
 class PolicyRule:
-    """A parsed policy rule supporting domain, path, and method matching."""
+    """A parsed policy rule supporting domain, path, and method matching.
+
+    Path patterns are precompiled to regex for faster matching.
+    """
 
     def __init__(self, rule):
         """Parse a rule from string or dict format."""
@@ -97,29 +100,39 @@ class PolicyRule:
         # Pre-compile domain pattern.
         self.is_wildcard = self.domain.startswith("*.")
         if self.is_wildcard:
-            self.suffix = self.domain[1:]  # Keep the dot for suffix matching.
+            self.suffix = self.domain[1:].lower()  # Keep the dot for suffix matching.
+            self.domain_exact = self.domain[2:].lower()  # For exact match of base domain.
         else:
             self.suffix = None
+            self.domain_exact = self.domain.lower()
+
+        # Pre-compile path patterns to regex for faster matching.
+        self._path_patterns = None
+        if self.paths:
+            self._path_patterns = []
+            for p in self.paths:
+                # Convert fnmatch pattern to regex.
+                regex_pattern = fnmatch.translate(p)
+                self._path_patterns.append(re.compile(regex_pattern))
 
     def matches_domain(self, host: str) -> bool:
         """Check if host matches this rule's domain pattern."""
         host = host.lower()
-        domain = self.domain.lower()
 
         if self.is_wildcard:
             # Wildcard: *.example.com matches sub.example.com and example.com.
-            return host.endswith(self.suffix) or host == domain[2:]
+            return host.endswith(self.suffix) or host == self.domain_exact
         else:
             # Exact match.
-            return host == domain
+            return host == self.domain_exact
 
     def matches_path(self, path: str) -> bool:
         """Check if path matches this rule's path patterns."""
-        if self.paths is None:
+        if self._path_patterns is None:
             return True  # No path restriction.
 
-        for pattern in self.paths:
-            if fnmatch.fnmatch(path, pattern):
+        for pattern in self._path_patterns:
+            if pattern.match(path):
                 return True
         return False
 
@@ -138,6 +151,16 @@ class PolicyRule:
         )
 
 
+class PolicyTraceConfig:
+    """Configuration for policy evaluation tracing."""
+
+    def __init__(self, config: dict = None):
+        config = config or {}
+        self.enabled = config.get("enabled", True)
+        self.include_rule_details = config.get("include_rule_details", True)
+        self.include_timing = config.get("include_timing", False)
+
+
 class Policy:
     """Parsed policy with allow/deny rules."""
 
@@ -145,23 +168,65 @@ class Policy:
         self.allow_rules = [PolicyRule(r) for r in (allow or [])]
         self.deny_rules = [PolicyRule(r) for r in (deny or [])]
 
-    def is_allowed(self, host: str, path: str, method: str) -> tuple[bool, str]:
+    def is_allowed(self, host: str, path: str, method: str, trace_config: PolicyTraceConfig = None) -> tuple[bool, str, dict]:
         """Check if request is allowed.
 
-        Returns (allowed, reason) tuple.
+        Returns (allowed, reason, trace) tuple.
+        Trace contains evaluation details when tracing is enabled.
         """
+        trace = {}
+        decision_path = []
+
+        if trace_config and trace_config.enabled:
+            if trace_config.include_timing:
+                import time
+                start_time = time.time()
+
         # Check denylist first (deny takes precedence).
-        for rule in self.deny_rules:
+        decision_path.append("check_deny")
+        deny_rules_checked = 0
+        for i, rule in enumerate(self.deny_rules):
+            deny_rules_checked += 1
             if rule.matches(host, path, method):
-                return False, f"denied by rule: {rule.domain}"
+                decision_path.append("denied")
+                if trace_config and trace_config.enabled:
+                    trace["deny_rules_checked"] = deny_rules_checked
+                    trace["allow_rules_checked"] = 0
+                    trace["matched_rule"] = rule.domain
+                    trace["matched_index"] = i
+                    trace["decision_path"] = decision_path
+                    if trace_config.include_timing:
+                        trace["evaluation_ms"] = round((time.time() - start_time) * 1000, 3)
+                return False, f"denied by rule: {rule.domain}", trace
 
         # Check allowlist.
-        for rule in self.allow_rules:
+        decision_path.append("check_allow")
+        allow_rules_checked = 0
+        for i, rule in enumerate(self.allow_rules):
+            allow_rules_checked += 1
             if rule.matches(host, path, method):
-                return True, f"allowed by rule: {rule.domain}"
+                decision_path.append("allowed")
+                if trace_config and trace_config.enabled:
+                    trace["deny_rules_checked"] = deny_rules_checked
+                    trace["allow_rules_checked"] = allow_rules_checked
+                    trace["matched_rule"] = rule.domain
+                    trace["matched_index"] = i
+                    trace["decision_path"] = decision_path
+                    if trace_config.include_timing:
+                        trace["evaluation_ms"] = round((time.time() - start_time) * 1000, 3)
+                return True, f"allowed by rule: {rule.domain}", trace
 
         # Default deny.
-        return False, "not in allowlist"
+        decision_path.append("default_deny")
+        if trace_config and trace_config.enabled:
+            trace["deny_rules_checked"] = deny_rules_checked
+            trace["allow_rules_checked"] = allow_rules_checked
+            trace["matched_rule"] = None
+            trace["matched_index"] = -1
+            trace["decision_path"] = decision_path
+            if trace_config.include_timing:
+                trace["evaluation_ms"] = round((time.time() - start_time) * 1000, 3)
+        return False, "not in allowlist", trace
 
 
 class PolicyEnforcer:
@@ -174,6 +239,7 @@ class PolicyEnforcer:
         self.policy_mtime = 0.0
         self.subnet_map_mtime = 0.0
         self.cell_policy_mtimes: dict[str, float] = {}
+        self.trace_config = PolicyTraceConfig()
 
     def load(self, loader):
         """Called when addon is loaded."""
@@ -201,6 +267,11 @@ class PolicyEnforcer:
                 allow=data.get("allow", []),
                 deny=data.get("deny", [])
             )
+
+            # Load policy trace configuration.
+            trace_config = data.get("policy_trace", {})
+            self.trace_config = PolicyTraceConfig(trace_config)
+
             self.policy_mtime = mtime
 
             ctx.log.info(
@@ -208,6 +279,8 @@ class PolicyEnforcer:
                 f"{len(self.global_policy.allow_rules)} allow, "
                 f"{len(self.global_policy.deny_rules)} deny rules"
             )
+            if self.trace_config.enabled:
+                ctx.log.info("PolicyEnforcer: Policy tracing enabled")
 
         except (json.JSONDecodeError, IOError, OSError) as e:
             ctx.log.error(f"PolicyEnforcer: Failed to load policy: {e}")
@@ -334,7 +407,9 @@ class PolicyEnforcer:
         # Check 4: Per-cell policy (if exists).
         if cell_name and cell_name in self.cell_policies:
             cell_policy = self.cell_policies[cell_name]
-            allowed, reason = cell_policy.is_allowed(host, path, method)
+            allowed, reason, trace = cell_policy.is_allowed(host, path, method, self.trace_config)
+            if trace and self.trace_config.enabled:
+                flow.metadata["policy_trace"] = trace
             if allowed:
                 flow.metadata["policy_reason"] = f"cell:{reason}"
                 return
@@ -344,7 +419,9 @@ class PolicyEnforcer:
                 return
 
         # Check 5: Global policy.
-        allowed, reason = self.global_policy.is_allowed(host, path, method)
+        allowed, reason, trace = self.global_policy.is_allowed(host, path, method, self.trace_config)
+        if trace and self.trace_config.enabled:
+            flow.metadata["policy_trace"] = trace
         if allowed:
             flow.metadata["policy_reason"] = f"global:{reason}"
             return

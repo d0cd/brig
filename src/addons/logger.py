@@ -33,13 +33,20 @@ Usage:
 import fcntl
 import fnmatch
 import json
+import queue
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from mitmproxy import http, ctx, connection
+
+# Async logging configuration.
+ASYNC_QUEUE_SIZE = 10000
+ASYNC_FLUSH_INTERVAL_MS = 100
+ASYNC_FLUSH_BATCH_SIZE = 100
 
 # Log directory.
 LOG_DIR = Path("/logs")
@@ -54,6 +61,140 @@ POLICY_FILE = Path("/policy.json")
 UNKNOWN_LOG_FILE = LOG_DIR / "unknown.jsonl"
 
 
+class AsyncLogWriter:
+    """Asynchronous log writer with batched writes.
+
+    Uses a queue and background thread to avoid blocking on file I/O.
+    Hybrid flush: writes batch when either time or count threshold is reached.
+    """
+
+    def __init__(self, queue_size: int = ASYNC_QUEUE_SIZE,
+                 flush_interval_ms: int = ASYNC_FLUSH_INTERVAL_MS,
+                 batch_size: int = ASYNC_FLUSH_BATCH_SIZE):
+        self.queue = queue.Queue(maxsize=queue_size)
+        self.flush_interval = flush_interval_ms / 1000.0  # Convert to seconds.
+        self.batch_size = batch_size
+        self.running = False
+        self.worker = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        """Start the background worker thread."""
+        if self.running:
+            return
+        self.running = True
+        self.worker = threading.Thread(target=self._flush_worker, daemon=True)
+        self.worker.start()
+
+    def stop(self) -> None:
+        """Stop the background worker and flush remaining entries."""
+        self.running = False
+        if self.worker:
+            self.worker.join(timeout=1.0)
+            self.worker = None
+        # Flush any remaining entries.
+        self._flush_all()
+
+    def log(self, entry: dict, log_file: Path) -> None:
+        """Queue a log entry for async writing."""
+        try:
+            self.queue.put_nowait((entry, log_file))
+        except queue.Full:
+            # Queue full - fall back to sync write.
+            self._write_sync(entry, log_file)
+
+    def _flush_worker(self) -> None:
+        """Background worker that flushes batches to disk."""
+        batch = []
+        last_flush = time.time()
+
+        while self.running:
+            try:
+                # Non-blocking get with timeout.
+                item = self.queue.get(timeout=0.01)
+                batch.append(item)
+
+                # Check flush conditions: batch size or time interval.
+                now = time.time()
+                should_flush = (
+                    len(batch) >= self.batch_size or
+                    (now - last_flush) >= self.flush_interval
+                )
+
+                if should_flush:
+                    self._flush_batch(batch)
+                    batch = []
+                    last_flush = now
+
+            except queue.Empty:
+                # Timeout - check if we should flush due to time.
+                now = time.time()
+                if batch and (now - last_flush) >= self.flush_interval:
+                    self._flush_batch(batch)
+                    batch = []
+                    last_flush = now
+
+        # Final flush on shutdown.
+        if batch:
+            self._flush_batch(batch)
+
+    def _flush_batch(self, batch: list) -> None:
+        """Write a batch of entries to their respective files."""
+        if not batch:
+            return
+
+        # Group entries by log file.
+        by_file = {}
+        for entry, log_file in batch:
+            if log_file not in by_file:
+                by_file[log_file] = []
+            by_file[log_file].append(entry)
+
+        # Write each file's entries.
+        for log_file, entries in by_file.items():
+            self._write_batch(entries, log_file)
+
+    def _write_batch(self, entries: list, log_file: Path) -> None:
+        """Write multiple entries to a file with locking."""
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    for entry in entries:
+                        f.write(json.dumps(entry) + "\n")
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except (IOError, OSError) as e:
+            # Log errors go to mitmproxy log, not recursively.
+            pass
+
+    def _write_sync(self, entry: dict, log_file: Path) -> None:
+        """Synchronous write fallback when queue is full."""
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(json.dumps(entry) + "\n")
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except (IOError, OSError):
+            pass
+
+    def _flush_all(self) -> None:
+        """Flush all remaining entries in queue."""
+        batch = []
+        while True:
+            try:
+                item = self.queue.get_nowait()
+                batch.append(item)
+            except queue.Empty:
+                break
+        if batch:
+            self._flush_batch(batch)
+
+
 class LogFilter:
     """Log filtering configuration."""
 
@@ -63,8 +204,15 @@ class LogFilter:
         self.exclude_paths = config.get("exclude_paths", [])
         self.min_status = config.get("min_status", 0)
         self.sample_rate = config.get("sample_rate", 1.0)
+        # Enhanced filtering options.
+        self.only_blocked = config.get("only_blocked", False)
+        self.only_errors = config.get("only_errors", False)
+        self.min_latency_ms = config.get("min_latency_ms", 0)
+        self.max_body_size = config.get("max_body_size", 0)  # 0 = no limit
 
-    def should_log(self, host: str, path: str, status: int) -> bool:
+    def should_log(self, host: str, path: str, status: int,
+                   blocked: bool = False, latency_ms: float = 0,
+                   body_size: int = 0) -> bool:
         """Check if request should be logged based on filter rules."""
         # Check host exclusions.
         for pattern in self.exclude_hosts:
@@ -78,6 +226,22 @@ class LogFilter:
 
         # Check minimum status.
         if status < self.min_status:
+            return False
+
+        # Check only_blocked filter.
+        if self.only_blocked and not blocked:
+            return False
+
+        # Check only_errors filter (status >= 400 or status == 0 for connection errors).
+        if self.only_errors and not (status >= 400 or status == 0):
+            return False
+
+        # Check minimum latency.
+        if self.min_latency_ms > 0 and latency_ms < self.min_latency_ms:
+            return False
+
+        # Check maximum body size.
+        if self.max_body_size > 0 and body_size > self.max_body_size:
             return False
 
         # Check sample rate.
@@ -95,12 +259,20 @@ class RequestLogger:
         self.subnet_map_mtime = 0.0
         self.log_filter = LogFilter()
         self.policy_mtime = 0.0
+        self.async_writer = AsyncLogWriter()
 
     def load(self, loader):
         """Called when addon is loaded."""
         ctx.log.info("RequestLogger: Loading...")
         self._reload_subnet_map()
         self._reload_log_filter()
+        self.async_writer.start()
+        ctx.log.info("RequestLogger: Async logging enabled")
+
+    def done(self):
+        """Called when addon is unloaded."""
+        ctx.log.info("RequestLogger: Shutting down async writer...")
+        self.async_writer.stop()
 
     def _reload_subnet_map(self) -> None:
         """Load subnet-to-cell mapping."""
@@ -214,24 +386,13 @@ class RequestLogger:
         return cert_info
 
     def _write_log(self, cell_name: str, entry: dict) -> None:
-        """Write log entry to cell's log file with locking."""
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-
+        """Queue log entry for async writing."""
         if cell_name:
             log_file = LOG_DIR / f"{cell_name}.jsonl"
         else:
             log_file = UNKNOWN_LOG_FILE
 
-        try:
-            with open(log_file, "a") as f:
-                # Acquire exclusive lock for concurrent-safe writes.
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    f.write(json.dumps(entry) + "\n")
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except (IOError, OSError) as e:
-            ctx.log.error(f"RequestLogger: Failed to write log: {e}")
+        self.async_writer.log(entry, log_file)
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Record request start time."""
@@ -260,8 +421,12 @@ class RequestLogger:
         # Get status code.
         status = flow.response.status_code
 
-        # Check log filter.
-        if not self.log_filter.should_log(flow.request.host, flow.request.path, status):
+        # Check log filter with enhanced parameters.
+        blocked = flow.metadata.get("blocked", False)
+        if not self.log_filter.should_log(
+            flow.request.host, flow.request.path, status,
+            blocked=blocked, latency_ms=duration_ms, body_size=response_bytes
+        ):
             return
 
         # Build log entry.
@@ -283,16 +448,73 @@ class RequestLogger:
         if entry["blocked"]:
             entry["block_reason"] = flow.metadata.get("block_reason", "unknown")
 
+        # Add rate limit event if rate limited.
+        rate_limit_event = flow.metadata.get("rate_limit_event")
+        if rate_limit_event:
+            entry["rate_limit"] = rate_limit_event
+
         # Add TLS certificate info for HTTPS.
         if flow.request.scheme == "https":
             cert_info = self._get_cert_info(flow)
             entry.update(cert_info)
 
+        # Add policy trace if available.
+        policy_trace = flow.metadata.get("policy_trace")
+        if policy_trace:
+            entry["policy_trace"] = policy_trace
+
         # Write log.
         self._write_log(cell_name, entry)
 
+    def _extract_error_details(self, flow: http.HTTPFlow) -> dict:
+        """Extract detailed error information from flow."""
+        import errno
+        import re
+
+        details = {}
+        error_str = str(flow.error) if flow.error else ""
+
+        # Map common error patterns to error codes.
+        error_patterns = {
+            r"Connection refused": "ECONNREFUSED",
+            r"Connection reset": "ECONNRESET",
+            r"Connection timed out": "ETIMEDOUT",
+            r"No route to host": "EHOSTUNREACH",
+            r"Network is unreachable": "ENETUNREACH",
+            r"Name or service not known": "NXDOMAIN",
+            r"getaddrinfo failed": "NXDOMAIN",
+            r"Temporary failure in name resolution": "EAGAIN",
+            r"nodename nor servname provided": "NXDOMAIN",
+            r"SSL": "SSL_ERROR",
+            r"certificate": "CERT_ERROR",
+            r"EOF": "EOF",
+            r"closed": "CLOSED",
+        }
+
+        details["error_code"] = "UNKNOWN"
+        for pattern, code in error_patterns.items():
+            if re.search(pattern, error_str, re.IGNORECASE):
+                details["error_code"] = code
+                break
+
+        # DNS resolution status.
+        details["dns_resolved"] = details["error_code"] not in ("NXDOMAIN", "EAGAIN")
+
+        # Destination IP if available.
+        try:
+            if flow.server_conn and flow.server_conn.peername:
+                details["destination_ip"] = flow.server_conn.peername[0]
+                details["destination_port"] = flow.server_conn.peername[1]
+            elif flow.server_conn and flow.server_conn.address:
+                # Address is (host, port) tuple.
+                details["destination_port"] = flow.server_conn.address[1]
+        except (AttributeError, TypeError, IndexError):
+            pass
+
+        return details
+
     def error(self, flow: http.HTTPFlow) -> None:
-        """Log request errors."""
+        """Log request errors with enhanced details."""
         # Get cell name.
         cell_name = flow.metadata.get("cell")
         if not cell_name or cell_name == "unknown":
@@ -318,6 +540,10 @@ class RequestLogger:
             "blocked": flow.metadata.get("blocked", False),
             "error": str(flow.error) if flow.error else "unknown error",
         }
+
+        # Add enhanced error details.
+        error_details = self._extract_error_details(flow)
+        entry.update(error_details)
 
         # Write log.
         self._write_log(cell_name, entry)

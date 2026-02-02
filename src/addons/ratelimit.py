@@ -175,6 +175,16 @@ class RateLimiter:
         # Try to consume a token.
         if not bucket.consume():
             flow.metadata["rate_limited"] = True
+
+            # Store rate limit event details for logger.
+            flow.metadata["rate_limit_event"] = {
+                "event": "rate_limited",
+                "cell": cell_name,
+                "limit": bucket.rate,
+                "burst": bucket.burst,
+                "bucket_tokens": round(bucket.tokens, 2),
+            }
+
             flow.response = http.Response.make(
                 429,
                 "Rate limit exceeded",

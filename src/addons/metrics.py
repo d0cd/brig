@@ -14,7 +14,6 @@ Usage:
     mitmdump -s metrics.py
 """
 
-import bisect
 import json
 import os
 import socket
@@ -33,6 +32,48 @@ METRICS_SOCKET = Path("/var/run/cells/metrics.sock")
 MAX_LATENCIES = 10000
 
 
+class CircularLatencyBuffer:
+    """O(1) circular buffer for latency tracking.
+
+    Provides efficient insertion while maintaining ability to calculate percentiles.
+    """
+
+    def __init__(self, size: int = MAX_LATENCIES):
+        self.buffer = [0.0] * size
+        self.size = size
+        self.index = 0
+        self.count = 0
+        self._sorted_cache = None
+        self._cache_valid = False
+
+    def add(self, latency: float) -> None:
+        """Add a latency value in O(1) time."""
+        self.buffer[self.index] = latency
+        self.index = (self.index + 1) % self.size
+        self.count = min(self.count + 1, self.size)
+        self._cache_valid = False  # Invalidate cache.
+
+    def percentile(self, p: float) -> float:
+        """Get latency percentile (0-100).
+
+        Sorts on read (cached) for accuracy.
+        """
+        if self.count == 0:
+            return 0.0
+
+        # Use cached sorted data if available.
+        if not self._cache_valid:
+            self._sorted_cache = sorted(self.buffer[:self.count])
+            self._cache_valid = True
+
+        idx = int(len(self._sorted_cache) * p / 100)
+        idx = min(idx, len(self._sorted_cache) - 1)
+        return self._sorted_cache[idx]
+
+    def __len__(self) -> int:
+        return self.count
+
+
 @dataclass
 class CellMetrics:
     """Metrics for a single cell."""
@@ -42,8 +83,8 @@ class CellMetrics:
     error_requests: int = 0
     bytes_sent: int = 0
     bytes_received: int = 0
-    latencies_ms: list = field(default_factory=list)
     last_request_ts: float = 0.0
+    _latency_buffer: CircularLatencyBuffer = field(default_factory=CircularLatencyBuffer)
 
     def record_request(
         self,
@@ -68,20 +109,12 @@ class CellMetrics:
         self.bytes_sent += request_bytes
         self.bytes_received += response_bytes
 
-        # Keep sorted list of latencies for percentile calculation.
-        if len(self.latencies_ms) >= MAX_LATENCIES:
-            # Remove oldest entries by sampling.
-            self.latencies_ms = self.latencies_ms[::2]
-
-        bisect.insort(self.latencies_ms, latency_ms)
+        # O(1) latency recording.
+        self._latency_buffer.add(latency_ms)
 
     def get_percentile(self, p: float) -> float:
         """Get latency percentile (0-100)."""
-        if not self.latencies_ms:
-            return 0.0
-        idx = int(len(self.latencies_ms) * p / 100)
-        idx = min(idx, len(self.latencies_ms) - 1)
-        return self.latencies_ms[idx]
+        return self._latency_buffer.percentile(p)
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
