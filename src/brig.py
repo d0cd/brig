@@ -67,19 +67,34 @@ RUNTIME = "runsc"
 # Warden proxy container name.
 PROXY_NAME = "warden"
 
-# State directory.
+# State directory (inside VM).
 STATE_DIR = Path("/state")
 
-# Per-cell policy directory.
+# Per-cell policy directory (inside VM).
 POLICY_DIR = Path("/var/run/brig/policies")
+
+# Brig home directory (macOS side, for init command).
+BRIG_HOME = Path.home() / ".brig"
 
 # History log file.
 HISTORY_FILE = STATE_DIR / "system" / "history.jsonl"
+
+# Operations log file (comprehensive command logging).
+OPERATIONS_FILE = STATE_DIR / "system" / "operations.jsonl"
+
+# Brig config file.
+CONFIG_FILE = Path("/cells/config.json")
 
 # Rate limiting configuration.
 RATE_LIMIT_FILE = STATE_DIR / "system" / "rate_limit.json"
 RATE_LIMIT_MAX = 10  # Max cells created per window.
 RATE_LIMIT_WINDOW = 60  # Window in seconds.
+
+# Mutation commands (for operation logging level filtering).
+MUTATION_COMMANDS = {"run", "stop", "kill", "rm", "start", "pause", "unpause", "cp", "policy"}
+
+# Sensitive argument patterns for redaction.
+SENSITIVE_PATTERNS = {"password", "secret", "key", "token", "credential", "auth"}
 
 # Cache TTL in seconds.
 CACHE_TTL = 2.0
@@ -275,6 +290,177 @@ def log_lifecycle(event: str, cell_name: str, details: dict = None) -> None:
             f.write(json.dumps(entry) + "\n")
     except (IOError, OSError) as e:
         debug(f"Failed to log lifecycle event: {e}")
+
+
+# Operation logging configuration cache.
+_operation_config: dict = None
+_operation_config_mtime: float = 0.0
+
+
+def _load_operation_config() -> dict:
+    """Load operation logging configuration from config file."""
+    global _operation_config, _operation_config_mtime
+
+    default_config = {
+        "operation_logging": {
+            "enabled": True,
+            "level": "all",  # "all", "mutations", "none"
+            "redact_secrets": True,
+            "redact_env_values": True,
+        }
+    }
+
+    try:
+        if not CONFIG_FILE.exists():
+            return default_config
+
+        mtime = CONFIG_FILE.stat().st_mtime
+        if _operation_config is not None and mtime == _operation_config_mtime:
+            return _operation_config
+
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+
+        _operation_config = {**default_config, **config}
+        _operation_config_mtime = mtime
+        return _operation_config
+
+    except (json.JSONDecodeError, IOError, OSError):
+        return default_config
+
+
+def _redact_sensitive_value(key: str, value: str, config: dict) -> str:
+    """Redact sensitive values based on key patterns."""
+    if not config.get("operation_logging", {}).get("redact_env_values", True):
+        return value
+
+    key_lower = key.lower()
+    for pattern in SENSITIVE_PATTERNS:
+        if pattern in key_lower:
+            return "[REDACTED]"
+    return value
+
+
+def _redact_args(args, config: dict) -> dict:
+    """Redact sensitive information from command arguments."""
+    redacted = {}
+    redact_secrets = config.get("operation_logging", {}).get("redact_secrets", True)
+    redact_env = config.get("operation_logging", {}).get("redact_env_values", True)
+
+    for key, value in vars(args).items():
+        # Skip internal/private attributes.
+        if key.startswith("_"):
+            continue
+
+        # Handle secrets - log names only, never values.
+        if key == "secret" and value and redact_secrets:
+            redacted[key] = value  # Just the names, which is safe.
+            continue
+
+        # Handle environment variables - redact values.
+        if key == "env" and value and redact_env:
+            redacted_env = []
+            for env_str in value:
+                if "=" in env_str:
+                    env_key, env_val = env_str.split("=", 1)
+                    redacted_val = _redact_sensitive_value(env_key, env_val, config)
+                    redacted_env.append(f"{env_key}={redacted_val}")
+                else:
+                    redacted_env.append(env_str)
+            redacted[key] = redacted_env
+            continue
+
+        # Handle other potentially sensitive arguments.
+        if isinstance(value, str):
+            key_lower = key.lower()
+            is_sensitive = any(p in key_lower for p in SENSITIVE_PATTERNS)
+            if is_sensitive and redact_env:
+                redacted[key] = "[REDACTED]"
+            else:
+                redacted[key] = value
+        elif isinstance(value, (list, tuple)):
+            redacted[key] = list(value)
+        elif isinstance(value, (int, float, bool, type(None))):
+            redacted[key] = value
+        # Skip complex objects.
+
+    return redacted
+
+
+def _extract_cell_name(args) -> str:
+    """Extract cell name from args if present."""
+    # Try common attribute names for cell name.
+    for attr in ["name", "cell_name", "cell"]:
+        if hasattr(args, attr):
+            val = getattr(args, attr)
+            if val:
+                return val
+    return None
+
+
+def log_operation_start(command: str, args) -> dict:
+    """Log the start of an operation. Returns context for log_operation_end."""
+    config = _load_operation_config()
+    op_config = config.get("operation_logging", {})
+
+    # Check if logging is enabled.
+    if not op_config.get("enabled", True):
+        return {"enabled": False}
+
+    # Check logging level.
+    level = op_config.get("level", "all")
+    if level == "none":
+        return {"enabled": False}
+    if level == "mutations" and command not in MUTATION_COMMANDS:
+        return {"enabled": False}
+
+    return {
+        "enabled": True,
+        "start_time": time.time(),
+        "command": command,
+        "args": args,
+        "config": config,
+    }
+
+
+def log_operation_end(context: dict, exit_code: int = 0, error: str = None) -> None:
+    """Log the end of an operation with timing and result."""
+    if not context.get("enabled", False):
+        return
+
+    config = context.get("config", {})
+    start_time = context.get("start_time", time.time())
+    duration_ms = int((time.time() - start_time) * 1000)
+
+    try:
+        OPERATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "command": context.get("command"),
+            "duration_ms": duration_ms,
+            "exit_code": exit_code,
+        }
+
+        # Add cell name if present.
+        cell_name = _extract_cell_name(context.get("args"))
+        if cell_name:
+            entry["cell"] = cell_name
+
+        # Add redacted args.
+        args = context.get("args")
+        if args:
+            entry["args"] = _redact_args(args, config)
+
+        # Add error if present.
+        if error:
+            entry["error"] = error
+
+        with open(OPERATIONS_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    except (IOError, OSError) as e:
+        debug(f"Failed to log operation: {e}")
 
 
 def check_rate_limit() -> bool:
@@ -714,6 +900,534 @@ def validate_cell_definition(cell_def: dict, file_path: str = "") -> list[str]:
             errors.append(f"'detach' must be a boolean{context}")
 
     return errors
+
+
+# Default network policy for new installations.
+DEFAULT_NETWORK_POLICY = {
+    "allow": [
+        "pypi.org",
+        "*.pythonhosted.org",
+        "files.pythonhosted.org",
+        "github.com",
+        "api.github.com",
+        "*.githubusercontent.com",
+        "registry.npmjs.org",
+    ],
+    "deny": [],
+    "rate_limits": {
+        "default": {
+            "rate": 100,
+            "burst": 500
+        }
+    },
+    "log_filter": {
+        "exclude_hosts": [],
+        "exclude_paths": ["/health", "/ping"],
+        "sample_rate": 1.0
+    },
+    "policy_trace": {
+        "enabled": True,
+        "include_rule_details": True,
+        "include_timing": False
+    }
+}
+
+
+# Default Lima VM configuration.
+DEFAULT_LIMA_YAML = """# Brig Lima VM Configuration
+# See: https://lima-vm.io/docs/reference/
+
+# VM name
+# lima create --name=brig ~/.brig/lima.yaml
+
+# Base image - Ubuntu 22.04 LTS
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+# CPU and memory
+cpus: 4
+memory: "8GiB"
+disk: "50GiB"
+
+# Mount brig directories into the VM
+mounts:
+  - location: "~/.brig/cells"
+    mountPoint: "/cells"
+    writable: false
+  - location: "~/.brig/secrets"
+    mountPoint: "/secrets"
+    writable: false
+  - location: "~/.brig/state"
+    mountPoint: "/state"
+    writable: true
+
+# Provision script - installs Podman, gVisor, creates directories
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+
+      # Install Podman
+      apt-get update
+      apt-get install -y podman uidmap slirp4netns fuse-overlayfs
+
+      # Install gVisor (runsc)
+      ARCH=$(uname -m)
+      if [ "$ARCH" = "x86_64" ]; then
+        GVISOR_ARCH="amd64"
+      else
+        GVISOR_ARCH="arm64"
+      fi
+      curl -fsSL https://storage.googleapis.com/gvisor/releases/release/latest/${GVISOR_ARCH}/runsc -o /usr/local/bin/runsc
+      chmod +x /usr/local/bin/runsc
+
+      # Configure Podman to use gVisor
+      mkdir -p /etc/containers
+      cat > /etc/containers/containers.conf << 'EOF'
+      [engine]
+      runtime = "runsc"
+
+      [engine.runtimes]
+      runsc = ["/usr/local/bin/runsc"]
+      crun = ["/usr/bin/crun"]
+      EOF
+
+      # Create required directories
+      mkdir -p /var/log/brig/network
+      mkdir -p /var/run/brig/policies
+      mkdir -p /state/system
+
+      # Create proxy-external network
+      podman network create --internal=false proxy-external || true
+
+      echo "Brig VM provisioning complete"
+
+# Networking
+networks:
+  - lima: shared
+
+# Port forwarding (optional - for debugging)
+# portForwards:
+#   - guestPort: 8080
+#     hostPort: 8080
+
+# Message shown after VM starts
+message: |
+  Brig VM is ready.
+
+  To start the warden proxy:
+    limactl shell brig warden start
+
+  To run a cell:
+    brig run --name test --image alpine -- echo "Hello from cell"
+"""
+
+
+def cmd_init(args) -> int:
+    """Initialize the brig directory structure."""
+    import platform
+
+    # Check we're on macOS.
+    if platform.system() != "Darwin":
+        print("WARNING: Brig is designed for macOS. Some features may not work.", file=sys.stderr)
+
+    force = getattr(args, "force", False)
+    quiet = getattr(args, "quiet", False)
+
+    def log_msg(msg: str) -> None:
+        if not quiet:
+            print(msg)
+
+    # Check if already initialized.
+    if BRIG_HOME.exists() and not force:
+        if (BRIG_HOME / "lima.yaml").exists():
+            print(f"Brig is already initialized at {BRIG_HOME}")
+            print("Use --force to reinitialize (preserves existing files)")
+            return 0
+
+    log_msg(f"Initializing brig at {BRIG_HOME}...")
+
+    # Create directory structure.
+    directories = [
+        BRIG_HOME,
+        BRIG_HOME / "cells",
+        BRIG_HOME / "secrets",
+        BRIG_HOME / "state",
+        BRIG_HOME / "state" / "system",
+    ]
+
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+        log_msg(f"  Created {directory}")
+
+    # Set restrictive permissions on secrets directory.
+    secrets_dir = BRIG_HOME / "secrets"
+    secrets_dir.chmod(0o700)
+    log_msg(f"  Set permissions 700 on {secrets_dir}")
+
+    # Create default network policy if not exists.
+    policy_file = BRIG_HOME / "cells" / "network-policy.json"
+    if not policy_file.exists() or force:
+        with open(policy_file, "w") as f:
+            json.dump(DEFAULT_NETWORK_POLICY, f, indent=2)
+        log_msg(f"  Created {policy_file}")
+    else:
+        log_msg(f"  Skipped {policy_file} (already exists)")
+
+    # Create Lima config if not exists.
+    lima_file = BRIG_HOME / "lima.yaml"
+    if not lima_file.exists() or force:
+        with open(lima_file, "w") as f:
+            f.write(DEFAULT_LIMA_YAML)
+        log_msg(f"  Created {lima_file}")
+    else:
+        log_msg(f"  Skipped {lima_file} (already exists)")
+
+    # Create example cell definition.
+    example_cell = BRIG_HOME / "cells" / "example.yaml"
+    if not example_cell.exists():
+        example_content = """# Example cell definition
+# Run with: brig run -f ~/.brig/cells/example.yaml
+
+name: example
+image: python:3.11-slim
+
+# Environment variables (non-sensitive)
+env:
+  PYTHONUNBUFFERED: "1"
+
+# Secrets to mount (create files in ~/.brig/secrets/)
+# secrets:
+#   - my-api-key
+
+# Resource limits
+memory: 2g
+cpus: 2
+pids_limit: 512
+
+# Run in background
+detach: true
+
+# Command to run
+command: ["python", "-c", "print('Hello from brig cell!')"]
+"""
+        with open(example_cell, "w") as f:
+            f.write(example_content)
+        log_msg(f"  Created {example_cell}")
+
+    # Create brig config file.
+    config_file = BRIG_HOME / "cells" / "config.json"
+    if not config_file.exists():
+        default_config = {
+            "operation_logging": {
+                "enabled": True,
+                "level": "all",
+                "redact_secrets": True,
+                "redact_env_values": True
+            }
+        }
+        with open(config_file, "w") as f:
+            json.dump(default_config, f, indent=2)
+        log_msg(f"  Created {config_file}")
+
+    log_msg("")
+    log_msg("Brig initialized successfully!")
+    log_msg("")
+    log_msg("Next steps:")
+    log_msg("  1. Install Lima if not already installed:")
+    log_msg("       brew install lima")
+    log_msg("")
+    log_msg("  2. Create the brig VM:")
+    log_msg(f"       limactl create --name=brig {lima_file}")
+    log_msg("")
+    log_msg("  3. Start the VM:")
+    log_msg("       limactl start brig")
+    log_msg("")
+    log_msg("  4. Start the warden proxy:")
+    log_msg("       limactl shell brig -- warden start")
+    log_msg("")
+    log_msg("  5. Run your first cell:")
+    log_msg("       brig run --name test --image alpine -- echo 'Hello!'")
+    log_msg("")
+    log_msg(f"Edit {policy_file} to configure allowed domains.")
+
+    return 0
+
+
+# -----------------------------------------------------------------------------
+# VM Management Commands
+# -----------------------------------------------------------------------------
+
+VM_NAME = "brig"
+
+
+def _lima_installed() -> bool:
+    """Check if lima is installed."""
+    result = subprocess.run(["which", "limactl"], capture_output=True)
+    return result.returncode == 0
+
+
+def _vm_status() -> dict:
+    """Get VM status. Returns dict with 'status' and 'ssh' keys."""
+    if not _lima_installed():
+        return {"status": "lima_not_installed", "ssh": None}
+
+    result = subprocess.run(
+        ["limactl", "list", "--format", "json"],
+        capture_output=True,
+        text=True
+    )
+    if result.returncode != 0:
+        return {"status": "error", "ssh": None}
+
+    try:
+        # Lima outputs JSON Lines (one JSON object per line).
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            vm = json.loads(line)
+            if vm.get("name") == VM_NAME:
+                return {
+                    "status": vm.get("status", "unknown"),
+                    "ssh": vm.get("sshLocalPort"),
+                    "cpus": vm.get("cpus"),
+                    "memory": vm.get("memory"),
+                    "disk": vm.get("disk"),
+                }
+        return {"status": "not_created", "ssh": None}
+    except json.JSONDecodeError:
+        return {"status": "error", "ssh": None}
+
+
+def cmd_vm_create(args) -> int:
+    """Create the brig VM."""
+    if not _lima_installed():
+        print("ERROR: Lima is not installed.", file=sys.stderr)
+        print("Install with: brew install lima", file=sys.stderr)
+        return 1
+
+    status = _vm_status()
+    if status["status"] not in ("not_created", "lima_not_installed"):
+        print(f"VM '{VM_NAME}' already exists (status: {status['status']})")
+        print("Use 'brig vm delete' to remove it first, or 'brig vm start' to start it.")
+        return 0
+
+    lima_yaml = BRIG_HOME / "lima.yaml"
+    if not lima_yaml.exists():
+        print(f"ERROR: Lima configuration not found at {lima_yaml}", file=sys.stderr)
+        print("Run 'brig init' first to create the configuration.", file=sys.stderr)
+        return 1
+
+    print(f"Creating VM '{VM_NAME}' from {lima_yaml}...")
+    cmd = ["limactl", "create", "--name", VM_NAME, str(lima_yaml)]
+
+    if getattr(args, "tty", True) and sys.stdin.isatty():
+        # Interactive mode - let user see progress.
+        result = subprocess.run(cmd)
+    else:
+        # Non-interactive.
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)
+
+    if result.returncode == 0:
+        print(f"VM '{VM_NAME}' created successfully.")
+        print("Start it with: brig vm start")
+    return result.returncode
+
+
+def cmd_vm_start(args) -> int:
+    """Start the brig VM."""
+    if not _lima_installed():
+        print("ERROR: Lima is not installed.", file=sys.stderr)
+        print("Install with: brew install lima", file=sys.stderr)
+        return 1
+
+    status = _vm_status()
+    if status["status"] == "not_created":
+        print(f"VM '{VM_NAME}' does not exist.", file=sys.stderr)
+        print("Create it with: brig vm create", file=sys.stderr)
+        return 1
+
+    if status["status"] == "Running":
+        print(f"VM '{VM_NAME}' is already running.")
+        return 0
+
+    print(f"Starting VM '{VM_NAME}'...")
+    cmd = ["limactl", "start", VM_NAME]
+
+    if getattr(args, "tty", True) and sys.stdin.isatty():
+        result = subprocess.run(cmd)
+    else:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stderr, file=sys.stderr)
+
+    if result.returncode == 0:
+        print(f"VM '{VM_NAME}' started successfully.")
+        print("Start warden with: brig vm shell -- warden start")
+    return result.returncode
+
+
+def cmd_vm_stop(args) -> int:
+    """Stop the brig VM."""
+    if not _lima_installed():
+        print("ERROR: Lima is not installed.", file=sys.stderr)
+        return 1
+
+    status = _vm_status()
+    if status["status"] == "not_created":
+        print(f"VM '{VM_NAME}' does not exist.", file=sys.stderr)
+        return 1
+
+    if status["status"] != "Running":
+        print(f"VM '{VM_NAME}' is not running (status: {status['status']})")
+        return 0
+
+    force = getattr(args, "force", False)
+    print(f"Stopping VM '{VM_NAME}'...")
+
+    cmd = ["limactl", "stop", VM_NAME]
+    if force:
+        cmd.append("--force")
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print(f"VM '{VM_NAME}' stopped.")
+    else:
+        print(result.stderr, file=sys.stderr)
+    return result.returncode
+
+
+def cmd_vm_status(args) -> int:
+    """Show VM status."""
+    if not _lima_installed():
+        print("Lima is not installed.")
+        print("Install with: brew install lima")
+        return 1
+
+    status = _vm_status()
+
+    if getattr(args, "json", False):
+        print(json.dumps(status, indent=2))
+        return 0
+
+    if status["status"] == "not_created":
+        print(f"VM '{VM_NAME}' is not created.")
+        print("Create it with: brig vm create")
+        return 0
+
+    # Colorize status.
+    status_str = status["status"]
+    if status_str == "Running":
+        status_str = colorize(status_str, "green")
+    elif status_str == "Stopped":
+        status_str = colorize(status_str, "yellow")
+    else:
+        status_str = colorize(status_str, "red")
+
+    print(f"VM:     {VM_NAME}")
+    print(f"Status: {status_str}")
+    if status.get("cpus"):
+        print(f"CPUs:   {status['cpus']}")
+    if status.get("memory"):
+        mem_gb = status["memory"] / (1024 ** 3)
+        print(f"Memory: {mem_gb:.1f} GB")
+    if status.get("disk"):
+        disk_gb = status["disk"] / (1024 ** 3)
+        print(f"Disk:   {disk_gb:.1f} GB")
+    if status.get("ssh"):
+        print(f"SSH:    localhost:{status['ssh']}")
+
+    return 0
+
+
+def cmd_vm_shell(args) -> int:
+    """Open a shell in the VM or run a command."""
+    if not _lima_installed():
+        print("ERROR: Lima is not installed.", file=sys.stderr)
+        return 1
+
+    status = _vm_status()
+    if status["status"] != "Running":
+        print(f"ERROR: VM '{VM_NAME}' is not running (status: {status['status']})", file=sys.stderr)
+        print("Start it with: brig vm start", file=sys.stderr)
+        return 1
+
+    cmd = ["limactl", "shell", VM_NAME]
+
+    # If command provided, run it.
+    shell_cmd = getattr(args, "shell_cmd", None)
+    if shell_cmd:
+        cmd.append("--")
+        cmd.extend(shell_cmd)
+
+    # Run interactively.
+    result = subprocess.run(cmd)
+    return result.returncode
+
+
+def cmd_vm_delete(args) -> int:
+    """Delete the brig VM."""
+    if not _lima_installed():
+        print("ERROR: Lima is not installed.", file=sys.stderr)
+        return 1
+
+    status = _vm_status()
+    if status["status"] == "not_created":
+        print(f"VM '{VM_NAME}' does not exist.")
+        return 0
+
+    force = getattr(args, "force", False)
+
+    # Require confirmation unless force.
+    if not force:
+        print(f"WARNING: This will delete VM '{VM_NAME}' and all data inside it.")
+        try:
+            response = input("Are you sure? [y/N] ")
+            if response.lower() not in ("y", "yes"):
+                print("Aborted.")
+                return 1
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return 1
+
+    # Stop if running.
+    if status["status"] == "Running":
+        print("Stopping VM...")
+        subprocess.run(["limactl", "stop", VM_NAME], capture_output=True)
+
+    print(f"Deleting VM '{VM_NAME}'...")
+    result = subprocess.run(["limactl", "delete", VM_NAME], capture_output=True, text=True)
+
+    if result.returncode == 0:
+        print(f"VM '{VM_NAME}' deleted.")
+    else:
+        print(result.stderr, file=sys.stderr)
+    return result.returncode
+
+
+def cmd_vm(args) -> int:
+    """VM management dispatcher."""
+    vm_commands = {
+        "create": cmd_vm_create,
+        "start": cmd_vm_start,
+        "stop": cmd_vm_stop,
+        "status": cmd_vm_status,
+        "shell": cmd_vm_shell,
+        "delete": cmd_vm_delete,
+    }
+
+    vm_cmd = getattr(args, "vm_command", None)
+    if not vm_cmd or vm_cmd not in vm_commands:
+        print("ERROR: Unknown vm command", file=sys.stderr)
+        return 1
+
+    return vm_commands[vm_cmd](args)
 
 
 def cmd_run(args) -> int:
@@ -1947,19 +2661,42 @@ def cmd_health(args) -> int:
     return 0 if all_healthy else 1
 
 
-def cmd_metrics(args) -> int:
-    """Output metrics in Prometheus format."""
-    metrics = []
+def _fetch_warden_metrics() -> dict:
+    """Fetch metrics from warden via Unix socket."""
+    import socket
+    metrics_socket = Path("/var/run/cells/metrics.sock")
+    if not metrics_socket.exists():
+        return {}
 
-    # Helper to add metric.
-    def add_metric(name: str, value: float, help_text: str, labels: dict = None):
-        metrics.append(f"# HELP {name} {help_text}")
-        metrics.append(f"# TYPE {name} gauge")
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(str(metrics_socket))
+        sock.settimeout(5.0)
+        sock.send(b"all")
+        response = sock.recv(65536).decode("utf-8")
+        sock.close()
+        return json.loads(response)
+    except Exception:
+        return {}
+
+
+def _generate_metrics() -> list:
+    """Generate all Prometheus metrics."""
+    lines = []
+    seen_help = set()
+
+    def add_metric(name: str, value: float, help_text: str, metric_type: str = "gauge",
+                   labels: dict = None):
+        # Only add HELP and TYPE once per metric name.
+        if name not in seen_help:
+            lines.append(f"# HELP {name} {help_text}")
+            lines.append(f"# TYPE {name} {metric_type}")
+            seen_help.add(name)
         if labels:
             label_str = ",".join(f'{k}="{v}"' for k, v in labels.items())
-            metrics.append(f"{name}{{{label_str}}} {value}")
+            lines.append(f"{name}{{{label_str}}} {value}")
         else:
-            metrics.append(f"{name} {value}")
+            lines.append(f"{name} {value}")
 
     # Proxy status.
     proxy_up = 1 if proxy_running() else 0
@@ -1992,9 +2729,8 @@ def cmd_metrics(args) -> int:
     add_metric("brig_cells_total", total_cells, "Total number of cells")
 
     for state, count in state_counts.items():
-        metrics.append(f"# HELP brig_cells_by_state Number of cells by state")
-        metrics.append(f"# TYPE brig_cells_by_state gauge")
-        metrics.append(f'brig_cells_by_state{{state="{state}"}} {count}')
+        add_metric("brig_cells_by_state", count, "Number of cells by state",
+                   labels={"state": state})
 
     # Network count.
     result = run(
@@ -2007,6 +2743,79 @@ def cmd_metrics(args) -> int:
     ])
     add_metric("brig_networks_total", cell_networks, "Number of cell networks")
 
+    # Warden metrics (per-cell request stats).
+    warden_metrics = _fetch_warden_metrics()
+    cells_data = warden_metrics.get("cells", {})
+
+    total_requests = 0
+    total_blocked = 0
+    total_rate_limited = 0
+    total_errors = 0
+    total_bytes_sent = 0
+    total_bytes_received = 0
+
+    for cell_name, cell_metrics in cells_data.items():
+        labels = {"cell": cell_name}
+
+        # Request counters.
+        requests = cell_metrics.get("total_requests", 0)
+        total_requests += requests
+        add_metric("brig_cell_requests_total", requests,
+                   "Total requests from cell", "counter", labels)
+
+        blocked = cell_metrics.get("blocked_requests", 0)
+        total_blocked += blocked
+        add_metric("brig_cell_requests_blocked_total", blocked,
+                   "Blocked requests from cell", "counter", labels)
+
+        rate_limited = cell_metrics.get("rate_limited_requests", 0)
+        total_rate_limited += rate_limited
+        add_metric("brig_cell_requests_rate_limited_total", rate_limited,
+                   "Rate-limited requests from cell", "counter", labels)
+
+        errors = cell_metrics.get("error_requests", 0)
+        total_errors += errors
+        add_metric("brig_cell_requests_errors_total", errors,
+                   "Error requests from cell", "counter", labels)
+
+        # Bytes counters.
+        bytes_sent = cell_metrics.get("bytes_sent", 0)
+        total_bytes_sent += bytes_sent
+        add_metric("brig_cell_bytes_sent_total", bytes_sent,
+                   "Bytes sent by cell", "counter", labels)
+
+        bytes_recv = cell_metrics.get("bytes_received", 0)
+        total_bytes_received += bytes_recv
+        add_metric("brig_cell_bytes_received_total", bytes_recv,
+                   "Bytes received by cell", "counter", labels)
+
+        # Latency gauges.
+        p50 = cell_metrics.get("latency_p50_ms", 0)
+        add_metric("brig_cell_latency_p50_ms", p50,
+                   "50th percentile request latency", "gauge", labels)
+
+        p95 = cell_metrics.get("latency_p95_ms", 0)
+        add_metric("brig_cell_latency_p95_ms", p95,
+                   "95th percentile request latency", "gauge", labels)
+
+        p99 = cell_metrics.get("latency_p99_ms", 0)
+        add_metric("brig_cell_latency_p99_ms", p99,
+                   "99th percentile request latency", "gauge", labels)
+
+    # Aggregate totals.
+    add_metric("brig_requests_total", total_requests,
+               "Total requests across all cells", "counter")
+    add_metric("brig_requests_blocked_total", total_blocked,
+               "Total blocked requests", "counter")
+    add_metric("brig_requests_rate_limited_total", total_rate_limited,
+               "Total rate-limited requests", "counter")
+    add_metric("brig_requests_errors_total", total_errors,
+               "Total error requests", "counter")
+    add_metric("brig_bytes_sent_total", total_bytes_sent,
+               "Total bytes sent", "counter")
+    add_metric("brig_bytes_received_total", total_bytes_received,
+               "Total bytes received", "counter")
+
     # History operations (last hour).
     ops_last_hour = 0
     if HISTORY_FILE.exists():
@@ -2016,7 +2825,6 @@ def cmd_metrics(args) -> int:
                 for line in f:
                     try:
                         entry = json.loads(line.strip())
-                        # Parse timestamp.
                         ts_str = entry.get("timestamp", "")
                         if ts_str:
                             import datetime
@@ -2033,8 +2841,46 @@ def cmd_metrics(args) -> int:
     add_metric("brig_operations_last_hour", ops_last_hour,
                "Number of operations in the last hour")
 
-    # Output all metrics.
-    for line in metrics:
+    return lines
+
+
+def cmd_metrics(args) -> int:
+    """Output metrics in Prometheus format."""
+    import http.server
+    import socketserver
+
+    # If --serve specified, start HTTP server.
+    if getattr(args, "serve", False):
+        port = getattr(args, "port", 9090)
+
+        class MetricsHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def do_GET(self):
+                if self.path == "/metrics" or self.path == "/":
+                    metrics_lines = _generate_metrics()
+                    content = "\n".join(metrics_lines) + "\n"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(content.encode("utf-8"))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        print(f"Serving metrics on http://0.0.0.0:{port}/metrics")
+        print("Press Ctrl+C to stop")
+        try:
+            with socketserver.TCPServer(("0.0.0.0", port), MetricsHandler) as server:
+                server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nStopped")
+        return 0
+
+    # Otherwise, output metrics once.
+    metrics_lines = _generate_metrics()
+    for line in metrics_lines:
         print(line)
 
     return 0
@@ -2539,6 +3385,31 @@ def main():
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # init
+    p_init = subparsers.add_parser("init", help="Initialize brig directory structure")
+    p_init.add_argument("--force", action="store_true", help="Overwrite existing config files")
+    p_init.add_argument("--quiet", "-q", action="store_true", help="Suppress output")
+
+    # vm
+    p_vm = subparsers.add_parser("vm", help="Manage the brig Lima VM")
+    vm_sub = p_vm.add_subparsers(dest="vm_command", required=True)
+
+    vm_sub.add_parser("create", help="Create the brig VM")
+
+    vm_sub.add_parser("start", help="Start the brig VM")
+
+    p_vm_stop = vm_sub.add_parser("stop", help="Stop the brig VM")
+    p_vm_stop.add_argument("-f", "--force", action="store_true", help="Force stop")
+
+    p_vm_status = vm_sub.add_parser("status", help="Show VM status")
+    p_vm_status.add_argument("--json", action="store_true", help="Output as JSON")
+
+    p_vm_shell = vm_sub.add_parser("shell", help="Open shell in VM or run command")
+    p_vm_shell.add_argument("shell_cmd", nargs="*", help="Command to run (omit for interactive shell)")
+
+    p_vm_delete = vm_sub.add_parser("delete", help="Delete the brig VM")
+    p_vm_delete.add_argument("-f", "--force", action="store_true", help="Skip confirmation")
+
     # run
     p_run = subparsers.add_parser("run", help="Run a new cell")
     p_run.add_argument("--name", "-n", help="Cell name (required unless in definition file)")
@@ -2664,7 +3535,9 @@ def main():
     p_health.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
 
     # metrics
-    subparsers.add_parser("metrics", help="Output Prometheus metrics")
+    p_metrics = subparsers.add_parser("metrics", help="Output Prometheus metrics")
+    p_metrics.add_argument("--serve", action="store_true", help="Serve metrics via HTTP (for Prometheus scraping)")
+    p_metrics.add_argument("--port", type=int, default=9090, help="Port for HTTP server (default: 9090)")
 
     # verify
     p_verify = subparsers.add_parser("verify", help="Verify security invariants")
@@ -2712,65 +3585,78 @@ def main():
     if args.no_color:
         COLOR_ENABLED = False
 
-    if args.command == "run":
-        sys.exit(cmd_run(args))
-    elif args.command == "stop":
-        sys.exit(cmd_stop(args))
-    elif args.command == "kill":
-        sys.exit(cmd_kill(args))
-    elif args.command == "rm":
-        sys.exit(cmd_rm(args))
-    elif args.command == "start":
-        sys.exit(cmd_start(args))
-    elif args.command == "list":
-        sys.exit(cmd_list(args))
-    elif args.command == "logs":
-        sys.exit(cmd_logs(args))
-    elif args.command == "exec":
-        sys.exit(cmd_exec(args))
-    elif args.command == "attach":
-        sys.exit(cmd_attach(args))
-    elif args.command == "top":
-        sys.exit(cmd_top(args))
-    elif args.command == "diff":
-        sys.exit(cmd_diff(args))
-    elif args.command == "stats":
-        sys.exit(cmd_stats(args))
-    elif args.command == "pause":
-        sys.exit(cmd_pause(args))
-    elif args.command == "unpause":
-        sys.exit(cmd_unpause(args))
-    elif args.command == "files":
-        sys.exit(cmd_files(args))
-    elif args.command == "cat":
-        sys.exit(cmd_cat(args))
-    elif args.command == "cp":
-        sys.exit(cmd_cp(args))
-    elif args.command == "inspect":
-        sys.exit(cmd_inspect(args))
-    elif args.command == "export":
-        sys.exit(cmd_export(args))
-    elif args.command == "network":
-        sys.exit(cmd_network(args))
-    elif args.command == "diagnose":
-        sys.exit(cmd_diagnose(args))
-    elif args.command == "health":
-        sys.exit(cmd_health(args))
-    elif args.command == "metrics":
-        sys.exit(cmd_metrics(args))
-    elif args.command == "verify":
-        sys.exit(cmd_verify(args))
-    elif args.command == "history":
-        sys.exit(cmd_history(args))
-    elif args.command == "policy":
-        if args.policy_command == "show":
-            sys.exit(cmd_policy_show(args))
-        elif args.policy_command == "set":
-            sys.exit(cmd_policy_set(args))
-        elif args.policy_command == "validate":
-            sys.exit(cmd_policy_validate(args))
-        elif args.policy_command == "test":
-            sys.exit(cmd_policy_test(args))
+    # Command dispatch table.
+    commands = {
+        "init": cmd_init,
+        "vm": cmd_vm,
+        "run": cmd_run,
+        "stop": cmd_stop,
+        "kill": cmd_kill,
+        "rm": cmd_rm,
+        "start": cmd_start,
+        "list": cmd_list,
+        "logs": cmd_logs,
+        "exec": cmd_exec,
+        "attach": cmd_attach,
+        "top": cmd_top,
+        "diff": cmd_diff,
+        "stats": cmd_stats,
+        "pause": cmd_pause,
+        "unpause": cmd_unpause,
+        "files": cmd_files,
+        "cat": cmd_cat,
+        "cp": cmd_cp,
+        "inspect": cmd_inspect,
+        "export": cmd_export,
+        "network": cmd_network,
+        "diagnose": cmd_diagnose,
+        "health": cmd_health,
+        "metrics": cmd_metrics,
+        "verify": cmd_verify,
+        "history": cmd_history,
+    }
+
+    # Policy subcommands.
+    policy_commands = {
+        "show": cmd_policy_show,
+        "set": cmd_policy_set,
+        "validate": cmd_policy_validate,
+        "test": cmd_policy_test,
+    }
+
+    # Determine command name for logging.
+    if args.command == "policy":
+        cmd_name = f"policy.{args.policy_command}"
+        cmd_func = policy_commands.get(args.policy_command)
+    elif args.command == "vm":
+        cmd_name = f"vm.{args.vm_command}"
+        cmd_func = commands.get("vm")
+    else:
+        cmd_name = args.command
+        cmd_func = commands.get(args.command)
+
+    if not cmd_func:
+        print(f"ERROR: Unknown command: {args.command}", file=sys.stderr)
+        sys.exit(1)
+
+    # Execute command with operation logging.
+    op_context = log_operation_start(cmd_name, args)
+    exit_code = 0
+    error_msg = None
+
+    try:
+        exit_code = cmd_func(args)
+    except SystemExit as e:
+        exit_code = e.code if isinstance(e.code, int) else 1
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        exit_code = 1
+        raise
+    finally:
+        log_operation_end(op_context, exit_code, error_msg)
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -225,6 +225,7 @@ def cmd_start() -> int:
     optional_addons = [
         "/cells/addons/ratelimit.py",
         "/cells/addons/metrics.py",
+        "/cells/addons/health.py",
         "/cells/addons/notifier.py",
     ]
 
@@ -246,7 +247,12 @@ def cmd_start() -> int:
         # Security hardening.
         "--entrypoint", "mitmdump",
         "--cap-drop", "ALL",
+        # Note: NET_BIND_SERVICE not needed since 8080 is unprivileged.
         "--security-opt", "no-new-privileges",
+        "--read-only",                     # Read-only root filesystem.
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",  # Writable /tmp.
+        "--tmpfs", "/home/mitmproxy/.mitmproxy:rw,noexec,nosuid,size=32m",  # mitmproxy state.
+        "--user", "mitmproxy",             # Run as non-root user.
 
         # Resource limits.
         "--memory", MEMORY_LIMIT,
@@ -530,6 +536,21 @@ def cmd_health(format_json: bool = False) -> int:
     # Check 5: Metrics socket available.
     checks["metrics_available"] = METRICS_SOCKET.exists()
 
+    # Check 6: Health endpoint responsive (if health addon loaded).
+    checks["health_endpoint"] = False
+    if checks["container_running"]:
+        try:
+            proxy_ip = get_proxy_ip(NETWORK)
+            if proxy_ip:
+                import urllib.request
+                req = urllib.request.Request(f"http://{proxy_ip}:8089/health")
+                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                    if resp.status == 200:
+                        checks["health_endpoint"] = True
+        except Exception:
+            # Health endpoint is optional.
+            pass
+
     # Overall health.
     critical_checks = ["container_running", "mitmproxy_responsive", "policy_loaded"]
     healthy = all(checks.get(c, False) for c in critical_checks)
@@ -596,12 +617,13 @@ def cmd_stats(cell_name: str = None, format_json: bool = False) -> int:
 
 def _print_metrics(metrics: dict) -> None:
     """Print metrics in human-readable format."""
-    print(f"  Requests: {metrics.get('total_requests', 0)}")
-    print(f"  Blocked:  {metrics.get('blocked_requests', 0)}")
-    print(f"  Errors:   {metrics.get('error_requests', 0)}")
-    print(f"  Bytes In: {metrics.get('bytes_sent', 0) / 1024:.1f} KB")
-    print(f"  Bytes Out:{metrics.get('bytes_received', 0) / 1024:.1f} KB")
-    print(f"  Latency:  p50={metrics.get('latency_p50_ms', 0):.1f}ms "
+    print(f"  Requests:     {metrics.get('total_requests', 0)}")
+    print(f"  Blocked:      {metrics.get('blocked_requests', 0)}")
+    print(f"  Rate Limited: {metrics.get('rate_limited_requests', 0)}")
+    print(f"  Errors:       {metrics.get('error_requests', 0)}")
+    print(f"  Bytes In:     {metrics.get('bytes_sent', 0) / 1024:.1f} KB")
+    print(f"  Bytes Out:    {metrics.get('bytes_received', 0) / 1024:.1f} KB")
+    print(f"  Latency:      p50={metrics.get('latency_p50_ms', 0):.1f}ms "
           f"p95={metrics.get('latency_p95_ms', 0):.1f}ms "
           f"p99={metrics.get('latency_p99_ms', 0):.1f}ms")
 
@@ -689,6 +711,16 @@ def cmd_policy_validate(file_path: str = None) -> int:
         return 1
     else:
         print(f"Validation OK: {len(allow_rules)} allow rules, {len(deny_rules)} deny rules")
+        # Show rate limit config summary.
+        rate_limits = policy.get("rate_limits", {})
+        if rate_limits:
+            default = rate_limits.get("default", {})
+            default_rate = default.get("rate", 100)
+            default_burst = default.get("burst", 500)
+            print(f"  Rate limits: {default_rate}/s (burst: {default_burst})")
+            cells = rate_limits.get("cells", {})
+            if cells:
+                print(f"  Cell overrides: {len(cells)}")
         for warning in warnings:
             print(f"  WARNING: {warning}")
         return 0
