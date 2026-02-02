@@ -1,0 +1,59 @@
+{
+  "allow": [
+    "example.com",
+    "*.example.com",
+    "api.github.com",
+    "*.githubusercontent.com",
+    {
+      "domain": "api.openai.com",
+      "paths": ["/v1/*"],
+      "methods": ["POST"]
+    },
+    {
+      "domain": "registry.npmjs.org",
+      "paths": ["/*"],
+      "methods": ["GET"]
+    }
+  ],
+  "deny": [
+    "evil.com",
+    "*.malware.com"
+  ],
+  "cells": {
+    "trusted-cell": {
+      "allow": ["internal.corp.com"],
+      "deny": []
+    }
+  },
+  "rate_limits": {
+    "default": {
+      "rate": 100,
+      "burst": 500
+    },
+    "cells": {
+      "heavy-user": {
+        "rate": 10,
+        "burst": 50
+      }
+    }
+  },
+  "log_filter": {
+    "exclude_hosts": ["telemetry.*", "*.analytics.com"],
+    "exclude_paths": ["/health", "/metrics", "/ping"],
+    "min_status": 0,
+    "sample_rate": 1.0
+  },
+  "log_retention": {
+    "max_age_days": 7,
+    "max_size_mb": 500,
+    "compress_after_days": 1
+  },
+  "notifications": {
+    "webhook_url": "",
+    "filters": {
+      "block_reasons": ["denied by rule", "not in allowlist"],
+      "cells": null,
+      "min_interval_seconds": 60
+    }
+  }
+}

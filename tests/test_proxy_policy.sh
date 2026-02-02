@@ -261,14 +261,14 @@ fi
 echo
 echo "--- Test 12: Requests logged to per-cell JSONL file ---"
 # Clear existing logs.
-run_in_vm sudo rm -f /var/log/cells/network/policy-test.jsonl 2>/dev/null || true
+run_in_vm sudo rm -f /var/log/brig/network/policy-test.jsonl 2>/dev/null || true
 # Make a request.
 run_in_vm sudo podman run --rm --network brig-policy-test \
     -e http_proxy="http://${PROXY_IP}:8080" \
     alpine wget -q -O /dev/null --timeout=10 http://example.com 2>/dev/null || true
 # Check log exists.
 sleep 1
-if run_in_vm sudo test -f /var/log/cells/network/policy-test.jsonl; then
+if run_in_vm sudo test -f /var/log/brig/network/policy-test.jsonl; then
     log_pass "Per-cell log file created"
 else
     log_fail "Per-cell log file not created"
@@ -277,7 +277,7 @@ fi
 # Test 13: Log entry has required fields.
 echo
 echo "--- Test 13: Log entry has required fields ---"
-LOG_ENTRY=$(run_in_vm sudo cat /var/log/cells/network/policy-test.jsonl 2>/dev/null | head -1)
+LOG_ENTRY=$(run_in_vm sudo cat /var/log/brig/network/policy-test.jsonl 2>/dev/null | head -1)
 if echo "$LOG_ENTRY" | grep -q '"cell"' && \
    echo "$LOG_ENTRY" | grep -q '"host"' && \
    echo "$LOG_ENTRY" | grep -q '"method"' && \
