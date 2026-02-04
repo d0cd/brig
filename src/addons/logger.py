@@ -35,6 +35,7 @@ import fnmatch
 import json
 import queue
 import random
+import signal
 import threading
 import time
 from datetime import datetime, timezone
@@ -43,6 +44,21 @@ from typing import Optional
 
 from mitmproxy import http, ctx, connection
 
+# Try to use orjson for faster JSON encoding, fall back to standard json.
+try:
+    import orjson
+    def _json_encode(obj: dict) -> str:
+        """Fast JSON encoding using orjson."""
+        return orjson.dumps(obj).decode("utf-8")
+    JSON_ENCODER = "orjson"
+except ImportError:
+    # Reusable JSON encoder for better performance.
+    _json_encoder = json.JSONEncoder(separators=(",", ":"))
+    def _json_encode(obj: dict) -> str:
+        """JSON encoding using reusable encoder."""
+        return _json_encoder.encode(obj)
+    JSON_ENCODER = "json"
+
 # Async logging configuration.
 ASYNC_QUEUE_SIZE = 10000
 ASYNC_FLUSH_INTERVAL_MS = 100
@@ -50,6 +66,12 @@ ASYNC_FLUSH_BATCH_SIZE = 100
 
 # Log directory.
 LOG_DIR = Path("/logs")
+
+# Default max log file size per cell (100MB).
+DEFAULT_MAX_LOG_SIZE = 100 * 1024 * 1024
+
+# Number of rotated log files to keep.
+MAX_ROTATED_FILES = 1
 
 # Subnet map for cell identification.
 SUBNET_MAP_FILE = Path("/var/run/cells/subnet-map.json")
@@ -66,17 +88,21 @@ class AsyncLogWriter:
 
     Uses a queue and background thread to avoid blocking on file I/O.
     Hybrid flush: writes batch when either time or count threshold is reached.
+    Supports per-cell disk quotas with log rotation.
     """
 
     def __init__(self, queue_size: int = ASYNC_QUEUE_SIZE,
                  flush_interval_ms: int = ASYNC_FLUSH_INTERVAL_MS,
-                 batch_size: int = ASYNC_FLUSH_BATCH_SIZE):
+                 batch_size: int = ASYNC_FLUSH_BATCH_SIZE,
+                 max_log_size: int = DEFAULT_MAX_LOG_SIZE):
         self.queue = queue.Queue(maxsize=queue_size)
         self.flush_interval = flush_interval_ms / 1000.0  # Convert to seconds.
         self.batch_size = batch_size
+        self.max_log_size = max_log_size
         self.running = False
         self.worker = None
         self._lock = threading.Lock()
+        self._file_sizes: dict[Path, int] = {}  # Cached file sizes.
 
     def start(self) -> None:
         """Start the background worker thread."""
@@ -154,33 +180,90 @@ class AsyncLogWriter:
         for log_file, entries in by_file.items():
             self._write_batch(entries, log_file)
 
+    def _rotate_log(self, log_file: Path) -> None:
+        """Rotate log file when size limit exceeded."""
+        try:
+            # Remove oldest rotated file if it exists.
+            for i in range(MAX_ROTATED_FILES, 0, -1):
+                old = log_file.with_suffix(f".{i}.jsonl")
+                if i == MAX_ROTATED_FILES and old.exists():
+                    old.unlink()
+                elif old.exists():
+                    old.rename(log_file.with_suffix(f".{i+1}.jsonl"))
+
+            # Rotate current log to .1.
+            if log_file.exists():
+                log_file.rename(log_file.with_suffix(".1.jsonl"))
+
+            # Reset cached size.
+            self._file_sizes[log_file] = 0
+        except (IOError, OSError) as e:
+            # Log rotation is best-effort; continue even on failure.
+            ctx.log.warn(f"RequestLogger: Failed to rotate log {log_file}: {e}")
+
+    def _check_rotation(self, log_file: Path, bytes_to_write: int) -> None:
+        """Check if log file needs rotation before writing."""
+        # Get current file size (cached or from disk).
+        if log_file not in self._file_sizes:
+            try:
+                self._file_sizes[log_file] = log_file.stat().st_size if log_file.exists() else 0
+            except (IOError, OSError):
+                self._file_sizes[log_file] = 0
+
+        # Rotate if adding these bytes would exceed limit.
+        if self._file_sizes[log_file] + bytes_to_write > self.max_log_size:
+            self._rotate_log(log_file)
+
     def _write_batch(self, entries: list, log_file: Path) -> None:
-        """Write multiple entries to a file with locking."""
+        """Write multiple entries to a file with locking and rotation."""
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Encode all entries first to know total size.
+            encoded = [_json_encode(entry) + "\n" for entry in entries]
+            total_bytes = sum(len(e.encode("utf-8")) for e in encoded)
+
+            # Check if rotation is needed.
+            self._check_rotation(log_file, total_bytes)
+
             with open(log_file, "a") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 try:
-                    for entry in entries:
-                        f.write(json.dumps(entry) + "\n")
+                    for line in encoded:
+                        f.write(line)
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            # Update cached size.
+            self._file_sizes[log_file] = self._file_sizes.get(log_file, 0) + total_bytes
+
         except (IOError, OSError) as e:
             # Log errors go to mitmproxy log, not recursively.
-            pass
+            ctx.log.warn(f"RequestLogger: Failed to write batch to {log_file}: {e}")
 
     def _write_sync(self, entry: dict, log_file: Path) -> None:
         """Synchronous write fallback when queue is full."""
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+            encoded = _json_encode(entry) + "\n"
+            byte_len = len(encoded.encode("utf-8"))
+
+            # Check if rotation is needed.
+            self._check_rotation(log_file, byte_len)
+
             with open(log_file, "a") as f:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 try:
-                    f.write(json.dumps(entry) + "\n")
+                    f.write(encoded)
                 finally:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except (IOError, OSError):
-            pass
+
+            # Update cached size.
+            self._file_sizes[log_file] = self._file_sizes.get(log_file, 0) + byte_len
+
+        except (IOError, OSError) as e:
+            ctx.log.warn(f"RequestLogger: Failed to write sync to {log_file}: {e}")
 
     def _flush_all(self) -> None:
         """Flush all remaining entries in queue."""
@@ -259,7 +342,8 @@ class RequestLogger:
         self.subnet_map_mtime = 0.0
         self.log_filter = LogFilter()
         self.policy_mtime = 0.0
-        self.async_writer = AsyncLogWriter()
+        self.max_log_size = DEFAULT_MAX_LOG_SIZE
+        self.async_writer = AsyncLogWriter(max_log_size=self.max_log_size)
 
     def load(self, loader):
         """Called when addon is loaded."""
@@ -267,7 +351,18 @@ class RequestLogger:
         self._reload_subnet_map()
         self._reload_log_filter()
         self.async_writer.start()
-        ctx.log.info("RequestLogger: Async logging enabled")
+        # Register SIGHUP handler for signal-based reload.
+        signal.signal(signal.SIGHUP, self._handle_sighup)
+        ctx.log.info("RequestLogger: Async logging enabled, SIGHUP reload handler registered")
+
+    def _handle_sighup(self, signum, frame):
+        """Handle SIGHUP signal for config reload."""
+        ctx.log.info("RequestLogger: Received SIGHUP, reloading config...")
+        # Force reload by resetting mtimes.
+        self.subnet_map_mtime = 0.0
+        self.policy_mtime = 0.0
+        self._reload_subnet_map()
+        self._reload_log_filter()
 
     def done(self):
         """Called when addon is unloaded."""
@@ -294,7 +389,7 @@ class RequestLogger:
             ctx.log.error(f"RequestLogger: Failed to load subnet map: {e}")
 
     def _reload_log_filter(self) -> None:
-        """Load log filter configuration from policy file."""
+        """Load log filter and quota configuration from policy file."""
         try:
             if not POLICY_FILE.exists():
                 return
@@ -308,9 +403,19 @@ class RequestLogger:
 
             filter_config = data.get("log_filter", {})
             self.log_filter = LogFilter(filter_config)
+
+            # Load disk quota configuration.
+            quota_config = data.get("log_quota", {})
+            max_size_mb = quota_config.get("max_size_mb", 100)
+            self.max_log_size = max_size_mb * 1024 * 1024
+            self.async_writer.max_log_size = self.max_log_size
+
             self.policy_mtime = mtime
 
-            ctx.log.info("RequestLogger: Loaded log filter configuration")
+            ctx.log.info(
+                f"RequestLogger: Loaded config (filter enabled, "
+                f"max log size: {max_size_mb}MB)"
+            )
 
         except (json.JSONDecodeError, IOError, OSError) as e:
             ctx.log.error(f"RequestLogger: Failed to load log filter: {e}")
@@ -400,9 +505,8 @@ class RequestLogger:
 
     def response(self, flow: http.HTTPFlow) -> None:
         """Log completed request."""
-        # Hot-reload configuration.
-        self._reload_subnet_map()
-        self._reload_log_filter()
+        # Config reload now handled via SIGHUP signal (see _handle_sighup).
+        # No per-request stat() calls for better performance.
 
         # Get cell name from metadata (set by enforce.py) or resolve.
         cell_name = flow.metadata.get("cell")

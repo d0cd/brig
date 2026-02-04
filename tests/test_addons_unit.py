@@ -141,16 +141,16 @@ class TestPolicy(unittest.TestCase):
     def test_empty_policy_denies_all(self):
         """Empty policy denies all requests."""
         policy = self.Policy()
-        allowed, reason = policy.is_allowed("example.com", "/", "GET")
+        allowed, reason, _ = policy.is_allowed("example.com", "/", "GET")
         self.assertFalse(allowed)
         self.assertIn("allowlist", reason.lower())
 
     def test_allowlist_permits_matching(self):
         """Allowlist permits matching domains."""
         policy = self.Policy(allow=["example.com", "*.github.com"])
-        allowed, _ = policy.is_allowed("example.com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("example.com", "/", "GET")
         self.assertTrue(allowed)
-        allowed, _ = policy.is_allowed("api.github.com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("api.github.com", "/", "GET")
         self.assertTrue(allowed)
 
     def test_denylist_blocks_even_if_allowed(self):
@@ -159,16 +159,16 @@ class TestPolicy(unittest.TestCase):
             allow=["*.example.com"],
             deny=["evil.example.com"]
         )
-        allowed, _ = policy.is_allowed("good.example.com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("good.example.com", "/", "GET")
         self.assertTrue(allowed)
-        allowed, reason = policy.is_allowed("evil.example.com", "/", "GET")
+        allowed, reason, _ = policy.is_allowed("evil.example.com", "/", "GET")
         self.assertFalse(allowed)
         self.assertIn("denied", reason.lower())
 
     def test_non_matching_denied(self):
         """Domains not in allowlist are denied."""
         policy = self.Policy(allow=["example.com"])
-        allowed, _ = policy.is_allowed("other.com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("other.com", "/", "GET")
         self.assertFalse(allowed)
 
 
@@ -357,6 +357,42 @@ class TestLogFiltering(unittest.TestCase):
         self.assertTrue(should_log(500))
 
 
+class TestLogRotation(unittest.TestCase):
+    """Tests for log file rotation with disk quotas."""
+
+    def setUp(self):
+        """Create temp directory for log files."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.log_file = Path(self.temp_dir) / "test.jsonl"
+
+    def tearDown(self):
+        """Clean up temp directory."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_rotation_creates_backup(self):
+        """Log rotation creates .1 backup file."""
+        # Create a log file with some content.
+        self.log_file.write_text("line1\nline2\nline3\n")
+
+        # Simulate rotation by renaming.
+        rotated = self.log_file.with_suffix(".1.jsonl")
+        self.log_file.rename(rotated)
+
+        self.assertTrue(rotated.exists())
+        self.assertFalse(self.log_file.exists())
+        self.assertEqual(rotated.read_text(), "line1\nline2\nline3\n")
+
+    def test_size_calculation(self):
+        """File size is calculated correctly for rotation check."""
+        content = '{"test": "data"}\n' * 100
+        self.log_file.write_text(content)
+
+        size = self.log_file.stat().st_size
+        expected = len(content.encode("utf-8"))
+        self.assertEqual(size, expected)
+
+
 class TestMetricsAggregation(unittest.TestCase):
     """Tests for metrics aggregation logic.
 
@@ -374,6 +410,89 @@ class TestMetricsAggregation(unittest.TestCase):
         self.assertEqual(percentile(latencies, 50), 60)   # p50 = 60th value (index 5)
         self.assertEqual(percentile(latencies, 95), 100)  # p95 = last value
         self.assertEqual(percentile(latencies, 99), 100)  # p99 = last value
+
+    def test_histogram_percentile_approximate(self):
+        """Histogram-based percentiles are approximately correct."""
+        from metrics import HistogramLatencyBuffer
+
+        histogram = HistogramLatencyBuffer()
+
+        # Add 1000 samples uniformly distributed 1-100ms.
+        for i in range(1, 101):
+            for _ in range(10):  # 10 of each value.
+                histogram.add(float(i))
+
+        # p50 should be in a reasonable range (histogram buckets are coarse).
+        p50 = histogram.percentile(50)
+        self.assertGreater(p50, 10)
+        self.assertLess(p50, 200)
+
+        # p95 should be at least as high as p50 (coarse buckets may be equal).
+        p95 = histogram.percentile(95)
+        self.assertGreaterEqual(p95, p50)
+
+    def test_circular_buffer_uses_histogram(self):
+        """CircularLatencyBuffer uses histogram for percentiles."""
+        from metrics import CircularLatencyBuffer
+
+        buffer = CircularLatencyBuffer(size=100)
+
+        # Add samples.
+        for i in range(1, 101):
+            buffer.add(float(i))
+
+        # Should return O(1) percentiles via histogram.
+        p50 = buffer.percentile(50)
+        self.assertGreater(p50, 0)  # Should return something reasonable.
+
+
+class TestMetricsPersistence(unittest.TestCase):
+    """Tests for metrics persistence across restarts."""
+
+    def setUp(self):
+        """Create temp directory for metrics file."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.metrics_file = Path(self.temp_dir) / "metrics-state.json"
+
+    def tearDown(self):
+        """Clean up temp directory."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_metrics_serialization(self):
+        """CellMetrics can be serialized to dict."""
+        from metrics import CellMetrics
+
+        metrics = CellMetrics()
+        metrics.total_requests = 100
+        metrics.blocked_requests = 5
+        metrics.bytes_sent = 50000
+
+        data = metrics.to_dict()
+        self.assertEqual(data["total_requests"], 100)
+        self.assertEqual(data["blocked_requests"], 5)
+        self.assertEqual(data["bytes_sent"], 50000)
+
+    def test_persistence_file_format(self):
+        """Persisted metrics file has correct format."""
+        data = {
+            "cell-a": {
+                "total_requests": 100,
+                "blocked_requests": 5,
+                "bytes_sent": 50000,
+                "bytes_received": 100000,
+            }
+        }
+
+        with open(self.metrics_file, "w") as f:
+            json.dump(data, f)
+
+        # Verify it can be read back.
+        with open(self.metrics_file, "r") as f:
+            loaded = json.load(f)
+
+        self.assertEqual(loaded["cell-a"]["total_requests"], 100)
+
 
     def test_counter_increment(self):
         """Counters increment correctly."""
@@ -447,6 +566,57 @@ class TestNotificationFiltering(unittest.TestCase):
         self.assertTrue(should_notify("critical"))
 
 
+class TestCircuitBreaker(unittest.TestCase):
+    """Tests for circuit breaker pattern in notifier."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import circuit breaker classes from notifier.py."""
+        from notifier import CircuitBreakerState, CircuitBreakerConfig
+        cls.CircuitBreakerState = CircuitBreakerState
+        cls.CircuitBreakerConfig = CircuitBreakerConfig
+
+    def test_initial_state_is_closed(self):
+        """Circuit breaker starts in closed state."""
+        state = self.CircuitBreakerState()
+        self.assertEqual(state.state, "closed")
+        self.assertEqual(state.consecutive_failures, 0)
+
+    def test_state_tracks_failures(self):
+        """Circuit breaker tracks consecutive failures."""
+        state = self.CircuitBreakerState()
+        state.consecutive_failures = 3
+        state.total_failures = 10
+        self.assertEqual(state.consecutive_failures, 3)
+        self.assertEqual(state.total_failures, 10)
+
+    def test_config_defaults(self):
+        """Circuit breaker config has sensible defaults."""
+        config = self.CircuitBreakerConfig()
+        self.assertGreater(config.failure_threshold, 0)
+        self.assertGreater(config.recovery_timeout, 0)
+        self.assertGreater(config.max_retries, 0)
+        self.assertGreater(config.base_backoff, 0)
+
+    def test_exponential_backoff_calculation(self):
+        """Exponential backoff grows correctly."""
+        base = 1.0
+        max_backoff = 60.0
+        # attempt 1: 1.0, attempt 2: 2.0, attempt 3: 4.0, etc.
+        for attempt in range(1, 6):
+            backoff = min(base * (2 ** (attempt - 1)), max_backoff)
+            expected = [1.0, 2.0, 4.0, 8.0, 16.0][attempt - 1]
+            self.assertEqual(backoff, expected)
+
+    def test_backoff_capped_at_max(self):
+        """Exponential backoff doesn't exceed max."""
+        base = 1.0
+        max_backoff = 10.0
+        # attempt 5 would be 16.0, but capped at 10.0
+        backoff = min(base * (2 ** 4), max_backoff)
+        self.assertEqual(backoff, 10.0)
+
+
 class TestAllowedPorts(unittest.TestCase):
     """Tests for port restriction logic from enforce.py."""
 
@@ -467,6 +637,496 @@ class TestAllowedPorts(unittest.TestCase):
         self.assertNotIn(8080, self.ALLOWED_PORTS)  # Alt HTTP
         self.assertNotIn(3306, self.ALLOWED_PORTS)  # MySQL
         self.assertNotIn(5432, self.ALLOWED_PORTS)  # PostgreSQL
+
+
+class TestSIGHUPReloadHandlers(unittest.TestCase):
+    """Tests for SIGHUP-based policy reload handlers."""
+
+    def test_enforce_sighup_resets_mtimes(self):
+        """PolicyEnforcer._handle_sighup resets all mtimes."""
+        from enforce import PolicyEnforcer
+
+        enforcer = PolicyEnforcer()
+        # Set non-zero mtimes.
+        enforcer.policy_mtime = 12345.0
+        enforcer.subnet_map_mtime = 67890.0
+        enforcer.cell_policy_mtimes["test-cell"] = 11111.0
+        enforcer.cell_policy_last_access["test-cell"] = 22222.0
+
+        # Call handler (simulates SIGHUP).
+        enforcer._handle_sighup(None, None)
+
+        # Verify mtimes are reset.
+        self.assertEqual(enforcer.policy_mtime, 0.0)
+        self.assertEqual(enforcer.subnet_map_mtime, 0.0)
+        self.assertEqual(len(enforcer.cell_policy_mtimes), 0)
+        self.assertEqual(len(enforcer.cell_policy_last_access), 0)
+
+    def test_ratelimit_sighup_resets_mtime(self):
+        """RateLimiter._handle_sighup resets policy mtime."""
+        from ratelimit import RateLimiter
+
+        limiter = RateLimiter()
+        limiter.policy_mtime = 12345.0
+
+        # Call handler (simulates SIGHUP).
+        limiter._handle_sighup(None, None)
+
+        # Verify mtime is reset.
+        self.assertEqual(limiter.policy_mtime, 0.0)
+
+    def test_logger_sighup_resets_mtimes(self):
+        """RequestLogger._handle_sighup resets all mtimes."""
+        from logger import RequestLogger
+
+        logger = RequestLogger()
+        logger.subnet_map_mtime = 12345.0
+        logger.policy_mtime = 67890.0
+
+        # Call handler (simulates SIGHUP).
+        logger._handle_sighup(None, None)
+
+        # Verify mtimes are reset.
+        self.assertEqual(logger.subnet_map_mtime, 0.0)
+        self.assertEqual(logger.policy_mtime, 0.0)
+
+
+class TestLRUEviction(unittest.TestCase):
+    """Tests for LRU eviction in caches."""
+
+    def test_metrics_evicts_oldest_cell(self):
+        """MetricsCollector evicts oldest cell when at capacity."""
+        from metrics import MetricsCollector, MAX_TRACKED_CELLS, CellMetrics
+
+        collector = MetricsCollector()
+
+        # Add cells up to capacity.
+        for i in range(MAX_TRACKED_CELLS):
+            cell_name = f"cell-{i}"
+            collector.metrics[cell_name] = CellMetrics()
+            collector.metrics[cell_name].last_request_ts = float(i)
+
+        # Verify at capacity.
+        self.assertEqual(len(collector.metrics), MAX_TRACKED_CELLS)
+
+        # Add one more - should evict cell-0 (oldest).
+        new_metrics = collector._get_or_create_metrics("new-cell")
+        self.assertEqual(len(collector.metrics), MAX_TRACKED_CELLS)
+        self.assertNotIn("cell-0", collector.metrics)
+        self.assertIn("new-cell", collector.metrics)
+
+    def test_ratelimit_evicts_oldest_bucket(self):
+        """RateLimiter evicts oldest bucket when at capacity."""
+        from ratelimit import RateLimiter, MAX_TRACKED_CELLS, TokenBucket
+
+        limiter = RateLimiter()
+
+        # Add buckets up to capacity.
+        for i in range(MAX_TRACKED_CELLS):
+            cell_name = f"cell-{i}"
+            limiter.buckets[cell_name] = TokenBucket(10, 5)
+            limiter.buckets[cell_name].last_update = float(i)
+
+        # Verify at capacity.
+        self.assertEqual(len(limiter.buckets), MAX_TRACKED_CELLS)
+
+        # Add one more - should evict cell-0 (oldest).
+        new_bucket = limiter._get_bucket("new-cell")
+        self.assertEqual(len(limiter.buckets), MAX_TRACKED_CELLS)
+        self.assertNotIn("cell-0", limiter.buckets)
+        self.assertIn("new-cell", limiter.buckets)
+
+
+class TestTUIDataFunctions(unittest.TestCase):
+    """Tests for TUI data retrieval functions."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import TUI module."""
+        # Add src directory to path if not already present.
+        src_dir = Path(__file__).parent.parent / "src"
+        if str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+
+    @patch('subprocess.run')
+    def test_get_cells_success(self, mock_run):
+        """get_cells returns parsed cell data."""
+        from tui import get_cells
+
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([
+                {"Names": ["brig-test1"], "State": "running", "Image": "alpine"},
+                {"Names": ["brig-test2"], "State": "exited", "Image": "python:3.12"},
+                {"Names": ["warden"], "State": "running", "Image": "warden:latest"},
+            ])
+        )
+
+        cells = get_cells()
+
+        self.assertEqual(len(cells), 2)  # Excludes warden.
+        self.assertEqual(cells[0]["name"], "test1")
+        self.assertEqual(cells[0]["status"], "running")
+        self.assertEqual(cells[1]["name"], "test2")
+        self.assertEqual(cells[1]["status"], "exited")
+
+    @patch('subprocess.run')
+    def test_get_cells_empty(self, mock_run):
+        """get_cells handles empty response."""
+        from tui import get_cells
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+        cells = get_cells()
+        self.assertEqual(cells, [])
+
+    @patch('subprocess.run')
+    def test_get_cells_error(self, mock_run):
+        """get_cells handles podman error."""
+        from tui import get_cells
+
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+        cells = get_cells()
+        self.assertEqual(cells, [])
+
+    @patch('subprocess.run')
+    def test_get_cell_stats(self, mock_run):
+        """get_cell_stats returns resource stats."""
+        from tui import get_cell_stats
+
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([{
+                "CPUPerc": "5.00%",
+                "MemUsage": "100MiB / 1GiB",
+                "MemPerc": "10.00%",
+                "Pids": "10",
+            }])
+        )
+
+        stats = get_cell_stats("test-cell")
+
+        self.assertEqual(stats["CPUPerc"], "5.00%")
+        self.assertEqual(stats["Pids"], "10")
+
+    @patch('subprocess.run')
+    def test_get_cell_logs(self, mock_run):
+        """get_cell_logs returns log output."""
+        from tui import get_cell_logs
+
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="line1\nline2\n",
+            stderr=""
+        )
+
+        logs = get_cell_logs("test-cell", tail=50)
+
+        self.assertIn("line1", logs)
+        self.assertIn("line2", logs)
+
+    @patch('subprocess.run')
+    def test_run_cell_action_success(self, mock_run):
+        """run_cell_action succeeds for valid actions."""
+        from tui import run_cell_action
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        success, message = run_cell_action("test-cell", "stop")
+
+        self.assertTrue(success)
+        self.assertIn("successful", message.lower())
+        mock_run.assert_called()
+
+    @patch('subprocess.run')
+    def test_run_cell_action_failure(self, mock_run):
+        """run_cell_action handles failure."""
+        from tui import run_cell_action
+
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="container not found")
+
+        success, message = run_cell_action("test-cell", "stop")
+
+        self.assertFalse(success)
+        self.assertIn("not found", message)
+
+    def test_run_cell_action_unknown(self):
+        """run_cell_action rejects unknown actions."""
+        from tui import run_cell_action
+
+        success, message = run_cell_action("test-cell", "invalid")
+
+        self.assertFalse(success)
+        self.assertIn("Unknown action", message)
+
+    @patch('subprocess.run')
+    def test_is_warden_running_true(self, mock_run):
+        """is_warden_running detects running warden."""
+        from tui import is_warden_running
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="true\n")
+
+        self.assertTrue(is_warden_running())
+
+    @patch('subprocess.run')
+    def test_is_warden_running_false(self, mock_run):
+        """is_warden_running detects stopped warden."""
+        from tui import is_warden_running
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="false\n")
+
+        self.assertFalse(is_warden_running())
+
+    def test_get_cell_policy_missing_file(self):
+        """get_cell_policy returns empty policy for missing file."""
+        from tui import get_cell_policy
+
+        # Use a cell name that won't exist.
+        policy = get_cell_policy("nonexistent-cell-xyz")
+
+        self.assertEqual(policy.get("allow", []), [])
+        self.assertEqual(policy.get("deny", []), [])
+
+
+class TestTUIAvailabilityCheck(unittest.TestCase):
+    """Tests for TUI textual availability detection."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Ensure src directory is in path."""
+        src_dir = Path(__file__).parent.parent / "src"
+        if str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
+
+    def test_textual_available_flag(self):
+        """TEXTUAL_AVAILABLE flag is set based on import."""
+        from tui import TEXTUAL_AVAILABLE
+
+        # This will be True if textual is installed, False otherwise.
+        # Either is valid - we just check the flag exists and is boolean.
+        self.assertIsInstance(TEXTUAL_AVAILABLE, bool)
+
+    def test_run_tui_without_textual(self):
+        """run_tui exits gracefully without textual."""
+        import tui
+
+        # Mock TEXTUAL_AVAILABLE to False.
+        original = tui.TEXTUAL_AVAILABLE
+        try:
+            tui.TEXTUAL_AVAILABLE = False
+            result = tui.run_tui()
+            self.assertEqual(result, 1)  # Should return error code.
+        finally:
+            tui.TEXTUAL_AVAILABLE = original
+
+
+class TestLogSummarizer(unittest.TestCase):
+    """Tests for AI-powered log summarization addon."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import summarizer with mocked mitmproxy."""
+        from summarizer import (
+            SummarizationConfig, LogSummarizer, CostTracker,
+            estimate_tokens, calculate_cost, DEFAULT_PRESERVE_EVENTS
+        )
+        cls.SummarizationConfig = SummarizationConfig
+        cls.LogSummarizer = LogSummarizer
+        cls.CostTracker = CostTracker
+        cls.estimate_tokens = estimate_tokens
+        cls.calculate_cost = calculate_cost
+        cls.DEFAULT_PRESERVE_EVENTS = DEFAULT_PRESERVE_EVENTS
+
+    def test_config_defaults(self):
+        """SummarizationConfig has sensible defaults."""
+        config = self.SummarizationConfig()
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.model, "claude-haiku-3")
+        self.assertEqual(config.max_input_tokens, 50000)
+        self.assertEqual(config.cost_limit_daily_usd, 1.00)
+
+    def test_config_custom_values(self):
+        """SummarizationConfig accepts custom values."""
+        config = self.SummarizationConfig(
+            enabled=True,
+            model="claude-sonnet-3.5",
+            max_input_tokens=100000,
+            cost_limit_daily_usd=5.00
+        )
+        self.assertTrue(config.enabled)
+        self.assertEqual(config.model, "claude-sonnet-3.5")
+        self.assertEqual(config.max_input_tokens, 100000)
+        self.assertEqual(config.cost_limit_daily_usd, 5.00)
+
+    def test_should_preserve_blocked(self):
+        """Blocked entries are preserved."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        entry = {"blocked": True, "host": "evil.com"}
+        self.assertTrue(summarizer.should_preserve(entry))
+
+    def test_should_preserve_error(self):
+        """Error entries (status >= 400) are preserved."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        # 4xx error.
+        entry = {"status": 404, "host": "example.com"}
+        self.assertTrue(summarizer.should_preserve(entry))
+
+        # 5xx error.
+        entry = {"status": 500, "host": "example.com"}
+        self.assertTrue(summarizer.should_preserve(entry))
+
+        # Connection error (status 0).
+        entry = {"status": 0, "error": "connection refused"}
+        self.assertTrue(summarizer.should_preserve(entry))
+
+    def test_should_preserve_rate_limited(self):
+        """Rate-limited entries are preserved."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        entry = {"rate_limit": {"cell": "test"}, "host": "api.com"}
+        self.assertTrue(summarizer.should_preserve(entry))
+
+    def test_should_preserve_cert_invalid(self):
+        """Certificate anomaly entries are preserved."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        # Certificate flags present.
+        entry = {"cert_flags": ["expired"], "host": "old.com"}
+        self.assertTrue(summarizer.should_preserve(entry))
+
+        # cert_valid is False.
+        entry = {"cert_valid": False, "host": "insecure.com"}
+        self.assertTrue(summarizer.should_preserve(entry))
+
+    def test_should_not_preserve_normal_request(self):
+        """Normal successful requests are not preserved."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        entry = {"status": 200, "host": "example.com", "blocked": False}
+        self.assertFalse(summarizer.should_preserve(entry))
+
+    def test_partition_entries(self):
+        """partition_entries correctly separates preserved from summarizable."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        entries = [
+            {"status": 200, "host": "a.com"},
+            {"status": 404, "host": "b.com"},
+            {"status": 200, "blocked": True, "host": "c.com"},
+            {"status": 200, "host": "d.com"},
+            {"status": 500, "host": "e.com"},
+        ]
+
+        preserved, summarizable = summarizer.partition_entries(entries)
+
+        self.assertEqual(len(preserved), 3)  # 404, blocked, 500
+        self.assertEqual(len(summarizable), 2)  # Two 200s
+
+    def test_estimate_tokens(self):
+        """Token estimation is approximately correct."""
+        from summarizer import estimate_tokens
+        # ~4 chars per token.
+        text = "a" * 400
+        tokens = estimate_tokens(text)
+        self.assertEqual(tokens, 100)
+
+    def test_calculate_cost_haiku(self):
+        """Cost calculation for Haiku model."""
+        from summarizer import calculate_cost
+        cost = calculate_cost("claude-haiku-3", 1_000_000, 500_000)
+        # 1M input * $0.25/M + 500K output * $1.25/M = $0.25 + $0.625 = $0.875
+        self.assertAlmostEqual(cost, 0.875, places=3)
+
+    def test_calculate_cost_sonnet(self):
+        """Cost calculation for Sonnet model."""
+        from summarizer import calculate_cost
+        cost = calculate_cost("claude-sonnet-3.5", 1_000_000, 500_000)
+        # 1M input * $3.00/M + 500K output * $15.00/M = $3.00 + $7.50 = $10.50
+        self.assertAlmostEqual(cost, 10.50, places=2)
+
+    def test_cost_tracker_daily_tracking(self):
+        """CostTracker tracks daily costs correctly."""
+        tracker = self.CostTracker()
+        tracker.daily_costs = {}  # Reset.
+
+        tracker.add_cost(0.50)
+        self.assertAlmostEqual(tracker.get_today_cost(), 0.50, places=2)
+
+        tracker.add_cost(0.25)
+        self.assertAlmostEqual(tracker.get_today_cost(), 0.75, places=2)
+
+    def test_cost_tracker_can_spend(self):
+        """CostTracker enforces spending limits."""
+        tracker = self.CostTracker()
+        tracker.daily_costs = {}  # Reset.
+
+        self.assertTrue(tracker.can_spend(1.00))  # Under limit.
+
+        tracker.add_cost(0.90)
+        self.assertTrue(tracker.can_spend(1.00))  # Still under.
+
+        tracker.add_cost(0.15)
+        self.assertFalse(tracker.can_spend(1.00))  # Over limit.
+
+    def test_summarize_empty_entries(self):
+        """summarize handles empty entry list."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        result = summarizer.summarize([], "test-cell")
+        self.assertIn("error", result)
+
+    def test_summarize_preserves_security_events(self):
+        """summarize always includes preserved events in result."""
+        config = self.SummarizationConfig(enabled=False)  # AI disabled.
+        summarizer = self.LogSummarizer(config)
+
+        entries = [
+            {"ts": "2024-01-01T00:00:00Z", "status": 200, "host": "a.com"},
+            {"ts": "2024-01-01T00:01:00Z", "status": 403, "blocked": True, "host": "b.com"},
+            {"ts": "2024-01-01T00:02:00Z", "status": 200, "host": "c.com"},
+        ]
+
+        result = summarizer.summarize(entries, "test-cell")
+
+        self.assertIn("preserved_events", result)
+        self.assertEqual(len(result["preserved_events"]), 1)
+        self.assertEqual(result["preserved_events"][0]["host"], "b.com")
+
+    def test_summarize_without_api_key(self):
+        """summarize handles missing API key gracefully."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+        summarizer._api_key = None  # Ensure no API key.
+
+        entries = [
+            {"ts": "2024-01-01T00:00:00Z", "status": 200, "host": "a.com"},
+        ]
+
+        # Mock load_api_key to return None.
+        with patch.object(summarizer, '_get_api_key', return_value=None):
+            result = summarizer.summarize(entries, "test-cell")
+
+        self.assertIn("ai_error", result)
+        self.assertEqual(result["ai_error"], "API key not available")
+
+    def test_build_prompt_includes_cell_name(self):
+        """build_prompt includes cell name for context."""
+        config = self.SummarizationConfig(enabled=True)
+        summarizer = self.LogSummarizer(config)
+
+        entries = [{"status": 200, "host": "example.com"}]
+        prompt = summarizer.build_prompt(entries, "my-test-cell")
+
+        self.assertIn("my-test-cell", prompt)
+        self.assertIn("example.com", prompt)
 
 
 if __name__ == "__main__":

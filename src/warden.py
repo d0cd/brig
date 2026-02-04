@@ -38,12 +38,16 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Version information.
+VERSION = "0.1.0"
 
 # Proxy container configuration.
 CONTAINER_NAME = "warden"
@@ -82,13 +86,29 @@ BLOCKED_NETWORKS = [
 ]
 
 
-def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    """Run a command."""
+DEFAULT_TIMEOUT = 30  # Default subprocess timeout in seconds.
+
+
+def run(cmd: list[str], check: bool = True, capture: bool = False,
+        timeout: int = DEFAULT_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run a command with timeout protection.
+
+    Args:
+        cmd: Command and arguments to run.
+        check: Raise CalledProcessError on non-zero exit.
+        capture: Capture stdout/stderr.
+        timeout: Timeout in seconds. Use None for no timeout.
+
+    Raises:
+        subprocess.TimeoutExpired: If command exceeds timeout.
+        subprocess.CalledProcessError: If check=True and command fails.
+    """
     return subprocess.run(
         cmd,
         check=check,
         capture_output=capture,
-        text=True
+        text=True,
+        timeout=timeout
     )
 
 
@@ -198,6 +218,133 @@ def load_policy() -> dict:
         return {}
 
 
+def preflight_validate() -> tuple[bool, list[str]]:
+    """Validate all prerequisites before starting proxy.
+
+    Returns (success, list of error messages).
+    """
+    errors = []
+
+    # Check required files exist and are readable.
+    required_files = [
+        ("/cells/addons/enforce.py", "Policy enforcement addon"),
+        ("/cells/addons/logger.py", "Logging addon"),
+        ("/cells/network-policy.json", "Network policy"),
+    ]
+
+    for path, name in required_files:
+        p = Path(path)
+        if not p.exists():
+            errors.append(f"{name} not found at {path}")
+        elif not os.access(path, os.R_OK):
+            errors.append(f"{name} at {path} is not readable")
+
+    # Validate policy file is valid JSON.
+    if POLICY_FILE.exists():
+        try:
+            with open(POLICY_FILE, "r") as f:
+                json.load(f)
+        except json.JSONDecodeError as e:
+            errors.append(f"Network policy is invalid JSON: {e}")
+        except IOError as e:
+            errors.append(f"Cannot read network policy: {e}")
+
+    # Check log directory exists and is writable.
+    if LOG_DIR.exists():
+        if not os.access(LOG_DIR, os.W_OK):
+            errors.append(f"Log directory {LOG_DIR} is not writable")
+    else:
+        # Try to create it.
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+        except (IOError, OSError) as e:
+            errors.append(f"Cannot create log directory {LOG_DIR}: {e}")
+
+    # Check proxy-external network exists.
+    result = run(["podman", "network", "exists", NETWORK], check=False, capture=True)
+    if result.returncode != 0:
+        errors.append(f"Network '{NETWORK}' does not exist. Create with: podman network create {NETWORK}")
+
+    return len(errors) == 0, errors
+
+
+def cmd_preflight() -> int:
+    """Run preflight validation checks."""
+    print("Running preflight validation...")
+    success, errors = preflight_validate()
+
+    if success:
+        print("All preflight checks passed")
+        return 0
+    else:
+        print("Preflight checks FAILED:")
+        for error in errors:
+            print(f"  - {error}")
+        return 1
+
+
+def cmd_watchdog(interval: int = 30, max_restarts: int = 5) -> int:
+    """Run watchdog that monitors and restarts proxy if it crashes.
+
+    Args:
+        interval: Check interval in seconds.
+        max_restarts: Maximum consecutive restarts before giving up.
+
+    This runs in the foreground and should be run as a background service.
+    """
+    import signal as sig
+
+    consecutive_restarts = 0
+    running = True
+
+    def handle_signal(signum, frame):
+        nonlocal running
+        print(f"\nWatchdog received signal {signum}, shutting down...")
+        running = False
+
+    sig.signal(sig.SIGTERM, handle_signal)
+    sig.signal(sig.SIGINT, handle_signal)
+
+    print(f"Watchdog started (interval={interval}s, max_restarts={max_restarts})")
+
+    while running:
+        try:
+            if is_running():
+                # Proxy is running, reset restart counter.
+                if consecutive_restarts > 0:
+                    print("Proxy recovered, resetting restart counter")
+                    consecutive_restarts = 0
+            else:
+                print(f"Proxy not running! Attempting restart ({consecutive_restarts + 1}/{max_restarts})")
+
+                if consecutive_restarts >= max_restarts:
+                    print(f"ERROR: Max restarts ({max_restarts}) exceeded. Giving up.", file=sys.stderr)
+                    print("Manual intervention required. Check: warden status", file=sys.stderr)
+                    return 1
+
+                # Try to start the proxy.
+                result = cmd_start()
+                if result == 0:
+                    print("Proxy restarted successfully")
+                    consecutive_restarts += 1
+                else:
+                    print(f"Failed to restart proxy (exit code {result})", file=sys.stderr)
+                    consecutive_restarts += 1
+
+            # Sleep in small increments to allow signal handling.
+            for _ in range(interval):
+                if not running:
+                    break
+                time.sleep(1)
+
+        except Exception as e:
+            print(f"Watchdog error: {e}", file=sys.stderr)
+            time.sleep(interval)
+
+    print("Watchdog stopped")
+    return 0
+
+
 def cmd_start() -> int:
     """Start the proxy container."""
     if is_running():
@@ -208,18 +355,14 @@ def cmd_start() -> int:
     if container_exists():
         run(["podman", "rm", "-f", CONTAINER_NAME], check=False)
 
-    # Check required files exist.
-    preflight_checks = [
-        ("/cells/addons/enforce.py", "Policy enforcement addon"),
-        ("/cells/addons/logger.py", "Logging addon"),
-        ("/cells/network-policy.json", "Network policy"),
-    ]
-
-    for path, name in preflight_checks:
-        result = run(["test", "-f", path], check=False)
-        if result.returncode != 0:
-            print(f"ERROR: {name} not found at {path}", file=sys.stderr)
-            return 1
+    # Run comprehensive preflight validation.
+    success, errors = preflight_validate()
+    if not success:
+        print("Preflight validation failed:", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        print("\nRun 'warden preflight' for detailed diagnostics", file=sys.stderr)
+        return 1
 
     # Check for optional addons.
     optional_addons = [
@@ -282,7 +425,8 @@ def cmd_start() -> int:
     cmd.extend(addon_args)
 
     try:
-        run(cmd)
+        # Podman run with -d returns quickly; use longer timeout for image pull.
+        run(cmd, timeout=120)
         print("Proxy started")
 
         # Wait for proxy to be ready.
@@ -295,6 +439,10 @@ def cmd_start() -> int:
         print("WARNING: Proxy may not have started correctly", file=sys.stderr)
         return 1
 
+    except subprocess.TimeoutExpired:
+        print("ERROR: Proxy start timed out (check network and image availability)",
+              file=sys.stderr)
+        return 1
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Failed to start proxy: {e}", file=sys.stderr)
         return 1
@@ -307,10 +455,14 @@ def cmd_stop() -> int:
         return 0
 
     try:
-        run(["podman", "stop", "-t", "10", CONTAINER_NAME])
+        # Stop timeout is 10s inside podman, allow extra time for the operation.
+        run(["podman", "stop", "-t", "10", CONTAINER_NAME], timeout=30)
         run(["podman", "rm", CONTAINER_NAME])
         print("Proxy stopped")
         return 0
+    except subprocess.TimeoutExpired:
+        print("ERROR: Stop command timed out. Try: podman kill warden", file=sys.stderr)
+        return 1
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Failed to stop proxy: {e}", file=sys.stderr)
         return 1
@@ -364,7 +516,8 @@ def cmd_logs() -> int:
         return 1
 
     try:
-        run(["podman", "logs", "-f", CONTAINER_NAME], check=False)
+        # No timeout for log following - user exits with Ctrl+C.
+        run(["podman", "logs", "-f", CONTAINER_NAME], check=False, timeout=None)
         return 0
     except KeyboardInterrupt:
         return 0
@@ -583,8 +736,15 @@ def cmd_stats(cell_name: str = None, format_json: bool = False) -> int:
         else:
             sock.send(b"all")
 
-        response = sock.recv(65536).decode("utf-8")
+        # Read response in loop to handle large payloads.
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
         sock.close()
+        response = b"".join(chunks).decode("utf-8")
 
         data = json.loads(response)
 
@@ -837,7 +997,7 @@ def _rule_str(rule) -> str:
 
 def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: str = "hourly",
                      samples_per_hour: int = 10, archive_path: str = None,
-                     older_than: str = "7d") -> int:
+                     older_than: str = "7d", model: str = None) -> int:
     """Compact log files using the specified strategy.
 
     Strategies:
@@ -845,6 +1005,7 @@ def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: st
         aggregate: Aggregate by (host, path, method, status) per time bucket.
         sample: Keep N random samples per time bucket.
         archive: Compress and move to archive location.
+        ai: Use Claude API to intelligently summarize while preserving security events.
     """
     from collections import defaultdict
     import random
@@ -1000,6 +1161,83 @@ def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: st
     return 0
 
 
+def cmd_logs_compact_ai(cell_name: str, older_than: str = "24h", model: str = None) -> int:
+    """Compact logs using AI-powered summarization.
+
+    Uses Claude API to intelligently summarize logs while preserving
+    security-relevant events (blocked, errors, rate-limited, cert issues).
+
+    Requires:
+        - API key at /run/secrets/anthropic-key or ANTHROPIC_API_KEY env var
+        - Per-cell config in policy file (optional, for customization)
+    """
+    if not cell_name:
+        print("ERROR: Cell name required for AI compaction", file=sys.stderr)
+        return 1
+
+    # Parse older_than duration.
+    duration_match = re.match(r"(\d+)([dhm])", older_than)
+    if not duration_match:
+        print(f"ERROR: Invalid duration format: {older_than}", file=sys.stderr)
+        return 1
+
+    duration_val = int(duration_match.group(1))
+    duration_unit = duration_match.group(2)
+    if duration_unit == "d":
+        older_than_hours = duration_val * 24
+    elif duration_unit == "h":
+        older_than_hours = duration_val
+    elif duration_unit == "m":
+        older_than_hours = max(1, duration_val // 60)
+
+    try:
+        # Import summarizer module.
+        sys.path.insert(0, str(Path(__file__).parent / "addons"))
+        from summarizer import compact_cell_logs, SummarizationConfig, LogSummarizer
+
+        # Use per-cell policy directory.
+        policy_dir = Path("/var/run/brig/policies")
+
+        result = compact_cell_logs(
+            cell_name=cell_name,
+            log_dir=LOG_DIR,
+            policy_dir=policy_dir,
+            older_than_hours=older_than_hours,
+        )
+
+        if "error" in result:
+            print(f"ERROR: {result['error']}", file=sys.stderr)
+            return 1
+
+        if "message" in result:
+            print(result["message"])
+            return 0
+
+        print(f"AI Log Compaction for '{cell_name}':")
+        print(f"  Compacted entries: {result.get('compacted_entries', 0)}")
+        print(f"  Preserved (security): {result.get('preserved_entries', 0)}")
+        print(f"  Recent entries kept: {result.get('recent_entries_kept', 0)}")
+        print(f"  Summary file: {result.get('summary_file', 'N/A')}")
+        print(f"  Archive file: {result.get('archive_file', 'N/A')}")
+
+        if result.get("ai_enabled"):
+            if result.get("ai_error"):
+                print(f"  AI status: {result['ai_error']}")
+            else:
+                print("  AI status: Summary generated")
+        else:
+            print("  AI status: Disabled (enable in cell policy)")
+
+        return 0
+
+    except ImportError as e:
+        print(f"ERROR: Failed to import summarizer module: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"ERROR: AI compaction failed: {e}", file=sys.stderr)
+        return 1
+
+
 def cmd_logs_export(cell_name: str = None, format_type: str = "jsonl",
                     output_file: str = None, days: int = 7) -> int:
     """Export log files in various formats.
@@ -1143,7 +1381,8 @@ def cmd_tor_start() -> int:
     ]
 
     try:
-        run(cmd)
+        # Allow extra time for image pull.
+        run(cmd, timeout=120)
         print("Tor started")
 
         # Wait for Tor to be ready (check if SOCKS5 port is listening).
@@ -1176,6 +1415,10 @@ def cmd_tor_start() -> int:
         print("WARNING: Tor may not have started correctly", file=sys.stderr)
         return 1
 
+    except subprocess.TimeoutExpired:
+        print("ERROR: Tor start timed out (check network and image availability)",
+              file=sys.stderr)
+        return 1
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Failed to start Tor: {e}", file=sys.stderr)
         return 1
@@ -1188,10 +1431,13 @@ def cmd_tor_stop() -> int:
         return 0
 
     try:
-        run(["podman", "stop", "-t", "10", TOR_CONTAINER_NAME])
+        run(["podman", "stop", "-t", "10", TOR_CONTAINER_NAME], timeout=30)
         run(["podman", "rm", TOR_CONTAINER_NAME])
         print("Tor stopped. Restart warden to disable Tor: warden restart")
         return 0
+    except subprocess.TimeoutExpired:
+        print("ERROR: Stop command timed out. Try: podman kill warden-tor", file=sys.stderr)
+        return 1
     except subprocess.CalledProcessError as e:
         print(f"ERROR: Failed to stop Tor: {e}", file=sys.stderr)
         return 1
@@ -1237,6 +1483,7 @@ def main():
         description="Warden - Egress proxy manager for Brig",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"warden {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Basic commands.
@@ -1245,6 +1492,14 @@ def main():
     subparsers.add_parser("restart", help="Restart the proxy")
     subparsers.add_parser("status", help="Show proxy status")
     subparsers.add_parser("reload", help="Reload policy")
+    subparsers.add_parser("preflight", help="Run preflight validation checks")
+
+    # Watchdog command.
+    p_watchdog = subparsers.add_parser("watchdog", help="Monitor and auto-restart proxy")
+    p_watchdog.add_argument("--interval", type=int, default=30,
+                            help="Check interval in seconds (default: 30)")
+    p_watchdog.add_argument("--max-restarts", type=int, default=5,
+                            help="Max consecutive restarts before giving up (default: 5)")
 
     # Logs commands.
     p_logs = subparsers.add_parser("logs", help="Show or manage proxy logs")
@@ -1254,9 +1509,9 @@ def main():
     p_logs_prune.add_argument("--size", type=int, help="Target total size in MB (delete oldest files until under limit)")
 
     p_logs_compact = logs_sub.add_parser("compact", help="Compact log files")
-    p_logs_compact.add_argument("cell_name", nargs="?", help="Specific cell (optional)")
-    p_logs_compact.add_argument("--strategy", choices=["delete", "aggregate", "sample", "archive"],
-                                default="delete", help="Compaction strategy")
+    p_logs_compact.add_argument("cell_name", nargs="?", help="Specific cell (required for ai strategy)")
+    p_logs_compact.add_argument("--strategy", choices=["delete", "aggregate", "sample", "archive", "ai"],
+                                default="delete", help="Compaction strategy (ai uses Claude API)")
     p_logs_compact.add_argument("--bucket", choices=["hourly", "daily"], default="hourly",
                                 help="Time bucket for aggregate strategy")
     p_logs_compact.add_argument("--samples-per-hour", type=int, default=10,
@@ -1264,6 +1519,7 @@ def main():
     p_logs_compact.add_argument("--archive-path", help="Archive directory for archive strategy")
     p_logs_compact.add_argument("--older-than", default="7d",
                                 help="Only compact files older than this (e.g., 7d, 24h)")
+    p_logs_compact.add_argument("--model", help="Claude model for ai strategy (default: claude-haiku-3)")
 
     p_logs_export = logs_sub.add_parser("export", help="Export logs to file")
     p_logs_export.add_argument("cell_name", nargs="?", help="Specific cell (optional)")
@@ -1318,14 +1574,23 @@ def main():
         sys.exit(cmd_status())
     elif args.command == "reload":
         sys.exit(cmd_reload())
+    elif args.command == "preflight":
+        sys.exit(cmd_preflight())
+    elif args.command == "watchdog":
+        sys.exit(cmd_watchdog(args.interval, args.max_restarts))
     elif args.command == "logs":
         if args.logs_command == "prune":
             sys.exit(cmd_logs_prune(args.days, args.size))
         elif args.logs_command == "compact":
-            sys.exit(cmd_logs_compact(
-                args.cell_name, args.strategy, args.bucket,
-                args.samples_per_hour, args.archive_path, args.older_than
-            ))
+            if args.strategy == "ai":
+                sys.exit(cmd_logs_compact_ai(
+                    args.cell_name, args.older_than, args.model
+                ))
+            else:
+                sys.exit(cmd_logs_compact(
+                    args.cell_name, args.strategy, args.bucket,
+                    args.samples_per_hour, args.archive_path, args.older_than
+                ))
         elif args.logs_command == "export":
             sys.exit(cmd_logs_export(
                 args.cell_name, args.format_type, args.output, args.days

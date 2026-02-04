@@ -25,6 +25,7 @@ Usage:
 """
 
 import json
+import signal
 import threading
 import time
 from dataclasses import dataclass
@@ -40,12 +41,38 @@ POLICY_FILE = Path("/policy.json")
 DEFAULT_RATE = 100  # requests per second
 DEFAULT_BURST = 500  # max burst size
 
+# Maximum number of cell buckets to track (LRU eviction beyond this).
+MAX_TRACKED_CELLS = 1000
+
 
 @dataclass
 class RateLimitConfig:
     """Rate limit configuration."""
     rate: float  # Tokens per second.
     burst: int  # Maximum tokens (bucket size).
+
+    def validate(self) -> list[str]:
+        """Validate configuration values. Returns list of error messages."""
+        errors = []
+        if self.rate <= 0:
+            errors.append(f"rate must be positive, got {self.rate}")
+        if self.burst <= 0:
+            errors.append(f"burst must be positive, got {self.burst}")
+        return errors
+
+    def warnings(self) -> list[str]:
+        """Check for potentially problematic configurations."""
+        warnings = []
+        if self.rate > self.burst:
+            warnings.append(
+                f"rate ({self.rate}/s) exceeds burst ({self.burst}), "
+                "requests may be unnecessarily rate limited"
+            )
+        if self.rate > 10000:
+            warnings.append(f"very high rate ({self.rate}/s) may indicate misconfiguration")
+        if self.burst > 100000:
+            warnings.append(f"very high burst ({self.burst}) may indicate misconfiguration")
+        return warnings
 
 
 class TokenBucket:
@@ -105,9 +132,23 @@ class RateLimiter:
         """Called when addon is loaded."""
         ctx.log.info("RateLimiter: Loading...")
         self._reload_config()
+        # Register SIGHUP handler for signal-based reload.
+        signal.signal(signal.SIGHUP, self._handle_sighup)
+        ctx.log.info("RateLimiter: SIGHUP reload handler registered")
+
+    def _handle_sighup(self, signum, frame):
+        """Handle SIGHUP signal for config reload."""
+        ctx.log.info("RateLimiter: Received SIGHUP, reloading config...")
+        # Force reload by resetting mtime.
+        self.policy_mtime = 0.0
+        self._reload_config()
 
     def _reload_config(self) -> None:
-        """Load rate limit configuration from policy file."""
+        """Load rate limit configuration from policy file.
+
+        Validates all configuration values and logs warnings for potentially
+        problematic settings. Invalid configs are rejected.
+        """
         try:
             if not POLICY_FILE.exists():
                 return
@@ -121,23 +162,59 @@ class RateLimiter:
 
             rate_limits = data.get("rate_limits", {})
 
-            # Load default config.
+            # Load and validate default config.
             default = rate_limits.get("default", {})
-            self.default_config = RateLimitConfig(
+            new_default = RateLimitConfig(
                 rate=default.get("rate", DEFAULT_RATE),
                 burst=default.get("burst", DEFAULT_BURST)
             )
 
-            # Load per-cell configs.
+            # Validate default config.
+            errors = new_default.validate()
+            if errors:
+                ctx.log.error(f"RateLimiter: Invalid default config: {'; '.join(errors)}")
+                return  # Reject invalid config.
+
+            # Log warnings for default config.
+            for warning in new_default.warnings():
+                ctx.log.warn(f"RateLimiter: default config: {warning}")
+
+            # Load and validate per-cell configs.
             cells = rate_limits.get("cells", {})
-            self.cell_configs = {}
+            new_cell_configs = {}
+            has_errors = False
+
             for cell_name, config in cells.items():
-                self.cell_configs[cell_name] = RateLimitConfig(
-                    rate=config.get("rate", self.default_config.rate),
-                    burst=config.get("burst", self.default_config.burst)
+                cell_config = RateLimitConfig(
+                    rate=config.get("rate", new_default.rate),
+                    burst=config.get("burst", new_default.burst)
                 )
 
+                # Validate cell config.
+                errors = cell_config.validate()
+                if errors:
+                    ctx.log.error(
+                        f"RateLimiter: Invalid config for cell '{cell_name}': "
+                        f"{'; '.join(errors)}"
+                    )
+                    has_errors = True
+                    continue
+
+                # Log warnings for cell config.
+                for warning in cell_config.warnings():
+                    ctx.log.warn(f"RateLimiter: cell '{cell_name}': {warning}")
+
+                new_cell_configs[cell_name] = cell_config
+
+            if has_errors:
+                ctx.log.error("RateLimiter: Config reload aborted due to validation errors")
+                return  # Reject entire config if any cell has errors.
+
+            # Apply validated config.
+            self.default_config = new_default
+            self.cell_configs = new_cell_configs
             self.policy_mtime = mtime
+
             ctx.log.info(
                 f"RateLimiter: Loaded config - "
                 f"default {self.default_config.rate}/s, burst {self.default_config.burst}, "
@@ -154,17 +231,28 @@ class RateLimiter:
             ctx.log.error(f"RateLimiter: Failed to load config: {e}")
 
     def _get_bucket(self, cell_name: str) -> TokenBucket:
-        """Get or create token bucket for a cell."""
+        """Get or create token bucket for a cell.
+
+        Applies LRU eviction when exceeding MAX_TRACKED_CELLS to bound memory.
+        """
         with self.buckets_lock:
             if cell_name not in self.buckets:
+                # Evict oldest bucket if at capacity.
+                if len(self.buckets) >= MAX_TRACKED_CELLS:
+                    oldest = min(
+                        self.buckets.keys(),
+                        key=lambda k: self.buckets[k].last_update
+                    )
+                    del self.buckets[oldest]
+                    ctx.log.debug(f"RateLimiter: Evicted bucket for '{oldest}'")
                 config = self.cell_configs.get(cell_name, self.default_config)
                 self.buckets[cell_name] = TokenBucket(config.rate, config.burst)
             return self.buckets[cell_name]
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Check rate limit for each request."""
-        # Hot-reload config.
-        self._reload_config()
+        # Config reload now handled via SIGHUP signal (see _handle_sighup).
+        # No per-request stat() calls for better performance.
 
         # Get cell name from metadata (set by enforce.py).
         cell_name = flow.metadata.get("cell", "unknown")

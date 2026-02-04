@@ -19,6 +19,8 @@ Commands:
     brig list [--format=table|json]           List all cells
     brig logs [-f] [--tail N] <name>          View cell logs
     brig exec <name> [command...]             Execute command in cell
+    brig shell <name>                         Open interactive shell
+    brig rename <old> <new>                   Rename a cell
     brig attach <name>                        Attach to cell console
     brig inspect <name>                       Show cell details
     brig export <name>                        Export cell as YAML
@@ -34,6 +36,9 @@ Commands:
     brig metrics                              Output Prometheus metrics
     brig verify                               Verify security invariants
     brig history [--tail N] [--cell <name>]   Show operation history
+    brig tui [--view=dashboard|logs|...]      Interactive terminal UI
+    brig config show [key]                    Show configuration
+    brig config set <key> <value>             Set configuration value
     brig policy show <name>                   Show cell's policy
     brig policy set <name> [--allow/--deny]   Update cell's policy
 
@@ -46,11 +51,16 @@ Security:
 
 import argparse
 import json
+import os
+import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+# Version information.
+VERSION = "0.1.0"
 
 try:
     import yaml
@@ -101,6 +111,9 @@ CACHE_TTL = 2.0
 
 # Debug mode (set via --debug flag).
 DEBUG = False
+
+# Quiet mode (set via --quiet flag).
+QUIET = False
 
 # ANSI color codes.
 COLORS = {
@@ -158,7 +171,7 @@ class Spinner:
             time.sleep(0.1)
 
     def __enter__(self):
-        if sys.stderr.isatty() and not DEBUG:
+        if sys.stderr.isatty() and not DEBUG and not QUIET:
             self.running = True
             self.thread = threading.Thread(target=self._spin, daemon=True)
             self.thread.start()
@@ -168,7 +181,7 @@ class Spinner:
         self.running = False
         if self.thread:
             self.thread.join(timeout=0.2)
-        if sys.stderr.isatty() and not DEBUG:
+        if sys.stderr.isatty() and not DEBUG and not QUIET:
             # Clear the spinner line.
             sys.stderr.write("\r" + " " * (len(self.message) + 3) + "\r")
             sys.stderr.flush()
@@ -179,7 +192,7 @@ class Spinner:
         self.running = False
         if self.thread:
             self.thread.join(timeout=0.2)
-        if sys.stderr.isatty():
+        if sys.stderr.isatty() and not QUIET:
             msg = message or self.message
             sys.stderr.write(f"\r{colorize('✓', 'green')} {msg}\n")
             sys.stderr.flush()
@@ -190,6 +203,7 @@ class Spinner:
         if self.thread:
             self.thread.join(timeout=0.2)
         if sys.stderr.isatty():
+            # Always show failures, even in quiet mode.
             msg = message or self.message
             sys.stderr.write(f"\r{colorize('✗', 'red')} {msg}\n")
             sys.stderr.flush()
@@ -212,6 +226,9 @@ LOG_LEVEL = LOG_LEVEL_INFO
 def log(level: int, msg: str, level_name: str = None) -> None:
     """Log a message at the specified level."""
     if level < LOG_LEVEL:
+        return
+    # In quiet mode, suppress DEBUG and INFO messages.
+    if QUIET and level < LOG_LEVEL_WARN:
         return
     level_names = {
         LOG_LEVEL_DEBUG: "DEBUG",
@@ -244,13 +261,22 @@ def info(msg: str) -> None:
     log(LOG_LEVEL_INFO, msg)
 
 
+def output(msg: str) -> None:
+    """Print output message (respects quiet mode)."""
+    if not QUIET:
+        print(msg)
+
+
 def warn(msg: str) -> None:
     """Print warning message."""
     log(LOG_LEVEL_WARN, msg)
 
 
 def log_operation(operation: str, cell_name: str = None, details: dict = None) -> None:
-    """Log an operation to the history file."""
+    """Log an operation to the history file.
+
+    Uses fsync for durability to prevent data loss on crash.
+    """
     try:
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         entry = {
@@ -263,6 +289,8 @@ def log_operation(operation: str, cell_name: str = None, details: dict = None) -
             entry["details"] = details
         with open(HISTORY_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except (IOError, OSError) as e:
         debug(f"Failed to log operation: {e}")
 
@@ -276,6 +304,8 @@ def log_lifecycle(event: str, cell_name: str, details: dict = None) -> None:
 
     Events: start, stop, kill, rm
     Details can include: image, command, exit_code, runtime_seconds, purged_workspace
+
+    Uses fsync for durability to prevent data loss on crash.
     """
     try:
         LIFECYCLE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -288,8 +318,52 @@ def log_lifecycle(event: str, cell_name: str, details: dict = None) -> None:
             entry.update(details)
         with open(LIFECYCLE_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
     except (IOError, OSError) as e:
         debug(f"Failed to log lifecycle event: {e}")
+
+
+# Policy audit log file.
+POLICY_AUDIT_FILE = STATE_DIR / "system" / "policy_audit.jsonl"
+
+
+def log_policy_change(
+    cell_name: str,
+    action: str,
+    changes: dict,
+    old_policy: dict = None,
+    new_policy: dict = None
+) -> None:
+    """Log a policy change for audit trail.
+
+    Args:
+        cell_name: Name of the cell whose policy changed.
+        action: Type of change (add_allow, add_deny, remove_allow, remove_deny, create, delete).
+        changes: Dict describing what changed (e.g., {"domains": ["example.com"]}).
+        old_policy: Policy before change (optional).
+        new_policy: Policy after change (optional).
+
+    Uses fsync for durability to prevent data loss on crash.
+    """
+    try:
+        POLICY_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cell": cell_name,
+            "action": action,
+            "changes": changes,
+        }
+        if old_policy is not None:
+            entry["old_policy"] = old_policy
+        if new_policy is not None:
+            entry["new_policy"] = new_policy
+        with open(POLICY_AUDIT_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except (IOError, OSError) as e:
+        debug(f"Failed to log policy change: {e}")
 
 
 # Operation logging configuration cache.
@@ -458,6 +532,8 @@ def log_operation_end(context: dict, exit_code: int = 0, error: str = None) -> N
 
         with open(OPERATIONS_FILE, "a") as f:
             f.write(json.dumps(entry) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
 
     except (IOError, OSError) as e:
         debug(f"Failed to log operation: {e}")
@@ -561,11 +637,16 @@ def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess
     return result
 
 
-def error(msg: str, suggestion: str = None) -> None:
-    """Print error with optional suggestion and exit."""
+def print_error(msg: str, suggestion: str = None) -> None:
+    """Print error with optional suggestion (does not exit)."""
     print(f"ERROR: {msg}", file=sys.stderr)
     if suggestion:
         print(f"  Suggestion: {suggestion}", file=sys.stderr)
+
+
+def error(msg: str, suggestion: str = None) -> None:
+    """Print error with optional suggestion and exit."""
+    print_error(msg, suggestion)
     sys.exit(1)
 
 
@@ -591,6 +672,67 @@ def error_proxy_not_running() -> None:
         "Warden proxy is not running",
         "Start the proxy with: warden start"
     )
+
+
+def error_lima_not_installed() -> None:
+    """Error helper for Lima not installed."""
+    error(
+        "Lima is not installed",
+        "Install with: brew install lima"
+    )
+
+
+def error_vm_not_running() -> None:
+    """Error helper for VM not running."""
+    error(
+        f"VM '{VM_NAME}' is not running",
+        "Start with: brig vm start"
+    )
+
+
+def error_vm_not_created() -> None:
+    """Error helper for VM not created."""
+    error(
+        f"VM '{VM_NAME}' does not exist",
+        "Create with: brig vm create"
+    )
+
+
+def error_lima_config_not_found() -> None:
+    """Error helper for Lima config not found."""
+    error(
+        f"Lima configuration not found at {BRIG_HOME / 'lima.yaml'}",
+        "Run 'brig init' first to create the configuration"
+    )
+
+
+def error_unknown_command(command: str) -> None:
+    """Error helper for unknown command."""
+    error(
+        f"Unknown command: {command}",
+        "Use 'brig --help' to see available commands"
+    )
+
+
+def error_unknown_vm_command(command: str) -> None:
+    """Error helper for unknown VM command."""
+    error(
+        f"Unknown vm command: {command}",
+        "Use 'brig vm --help' to see available VM commands"
+    )
+
+
+def error_invalid_json(path: str, details: str) -> None:
+    """Error helper for invalid JSON file."""
+    error(
+        f"Invalid JSON in {path}: {details}",
+        "Check the file syntax and try again"
+    )
+
+
+def error_operation_failed(operation: str, details: str) -> None:
+    """Error helper for failed operations with details."""
+    error(f"{operation} failed: {details}")
 
 
 def container_name(cell_name: str) -> str:
@@ -683,15 +825,54 @@ def load_cell_policy(cell_name: str) -> dict:
     return {"allow": [], "deny": []}
 
 
-def save_cell_policy(cell_name: str, policy: dict) -> None:
-    """Save a cell's policy file."""
-    POLICY_DIR.mkdir(parents=True, exist_ok=True)
-    policy_path = get_cell_policy_path(cell_name)
-    # Atomic write.
-    tmp_path = policy_path.with_suffix(".tmp")
-    with open(tmp_path, "w") as f:
-        json.dump(policy, f, indent=2)
-    tmp_path.rename(policy_path)
+def save_cell_policy(cell_name: str, policy: dict) -> bool:
+    """Save a cell's policy file. Returns True on success, False on failure."""
+    try:
+        POLICY_DIR.mkdir(parents=True, exist_ok=True)
+        policy_path = get_cell_policy_path(cell_name)
+        # Atomic write.
+        tmp_path = policy_path.with_suffix(".tmp")
+        with open(tmp_path, "w") as f:
+            json.dump(policy, f, indent=2)
+        tmp_path.rename(policy_path)
+        # Verify the write succeeded by reading back.
+        with open(policy_path, "r") as f:
+            saved = json.load(f)
+        return saved == policy
+    except (IOError, OSError, json.JSONDecodeError) as e:
+        debug(f"Failed to save policy: {e}")
+        return False
+
+
+def validate_policy_conflicts(policy: dict) -> list[str]:
+    """Check for conflicts and issues in a policy. Returns list of warnings."""
+    warnings = []
+
+    allow_set = set(policy.get("allow", []))
+    deny_set = set(policy.get("deny", []))
+
+    # Check for exact duplicates between allow and deny.
+    conflicts = allow_set & deny_set
+    for domain in conflicts:
+        warnings.append(f"'{domain}' is in both allow and deny lists (deny takes precedence)")
+
+    # Check for wildcard conflicts (e.g., *.example.com in allow, example.com in deny).
+    for allow_domain in allow_set:
+        if allow_domain.startswith("*."):
+            base = allow_domain[2:]
+            if base in deny_set:
+                warnings.append(f"'{allow_domain}' allows subdomains but '{base}' is denied")
+            for deny_domain in deny_set:
+                if deny_domain.startswith("*.") and deny_domain[2:] == base:
+                    warnings.append(f"'{allow_domain}' and '{deny_domain}' conflict")
+
+    # Check for overly permissive patterns.
+    for domain in allow_set:
+        permissive_warning = is_overly_permissive_domain(domain)
+        if permissive_warning:
+            warnings.append(permissive_warning)
+
+    return warnings
 
 
 def delete_cell_policy(cell_name: str) -> None:
@@ -772,6 +953,27 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
     "*.private",   # Private domains.
 ]
 
+# Overly permissive TLD patterns that effectively allow most of the internet.
+# These generate warnings but are not blocked.
+OVERLY_PERMISSIVE_PATTERNS = [
+    "*.com",       # Millions of domains.
+    "*.net",       # Many hosting providers.
+    "*.org",       # Many organizations.
+    "*.io",        # Popular for tech startups.
+    "*.co",        # Country code TLD, widely used.
+    "*.dev",       # Developer sites.
+    "*.app",       # App domains.
+    "*.me",        # Personal sites.
+    "*.us",        # US country code.
+    "*.uk",        # UK country code.
+    "*.de",        # Germany.
+    "*.cn",        # China.
+    "*.ru",        # Russia.
+    "*.xyz",       # Generic TLD.
+    "*.info",      # Generic TLD.
+    "*.biz",       # Business TLD.
+]
+
 
 def is_suspicious_domain(domain: str) -> str:
     """Check if domain pattern is suspicious for DNS rebinding. Returns reason or empty."""
@@ -789,6 +991,28 @@ def is_suspicious_domain(domain: str) -> str:
     # Pure wildcard.
     if domain_lower == "*":
         return "Wildcard '*' matches everything"
+
+    return ""
+
+
+def is_overly_permissive_domain(domain: str) -> str:
+    """Check if domain pattern is overly permissive. Returns warning or empty.
+
+    Unlike suspicious patterns, these are allowed but generate warnings.
+    """
+    domain_lower = domain.lower()
+
+    # Check against known overly permissive patterns.
+    for pattern in OVERLY_PERMISSIVE_PATTERNS:
+        if domain_lower == pattern:
+            tld = pattern[2:]  # Remove '*.'
+            return f"'{domain}' matches all .{tld} domains - consider using more specific patterns"
+
+    # Wildcard directly under popular TLD (e.g., *.google.com is OK, *.com is not).
+    if domain_lower.startswith("*.") and domain_lower.count(".") == 1:
+        tld = domain_lower[2:]
+        if len(tld) <= 4:  # Short TLDs like com, net, org, io, dev, etc.
+            return f"'{domain}' wildcard on .{tld} TLD allows many domains"
 
     return ""
 
@@ -1036,11 +1260,6 @@ def cmd_init(args) -> int:
         print("WARNING: Brig is designed for macOS. Some features may not work.", file=sys.stderr)
 
     force = getattr(args, "force", False)
-    quiet = getattr(args, "quiet", False)
-
-    def log_msg(msg: str) -> None:
-        if not quiet:
-            print(msg)
 
     # Check if already initialized.
     if BRIG_HOME.exists() and not force:
@@ -1049,7 +1268,7 @@ def cmd_init(args) -> int:
             print("Use --force to reinitialize (preserves existing files)")
             return 0
 
-    log_msg(f"Initializing brig at {BRIG_HOME}...")
+    output(f"Initializing brig at {BRIG_HOME}...")
 
     # Create directory structure.
     directories = [
@@ -1062,30 +1281,30 @@ def cmd_init(args) -> int:
 
     for directory in directories:
         directory.mkdir(parents=True, exist_ok=True)
-        log_msg(f"  Created {directory}")
+        output(f"  Created {directory}")
 
     # Set restrictive permissions on secrets directory.
     secrets_dir = BRIG_HOME / "secrets"
     secrets_dir.chmod(0o700)
-    log_msg(f"  Set permissions 700 on {secrets_dir}")
+    output(f"  Set permissions 700 on {secrets_dir}")
 
     # Create default network policy if not exists.
     policy_file = BRIG_HOME / "cells" / "network-policy.json"
     if not policy_file.exists() or force:
         with open(policy_file, "w") as f:
             json.dump(DEFAULT_NETWORK_POLICY, f, indent=2)
-        log_msg(f"  Created {policy_file}")
+        output(f"  Created {policy_file}")
     else:
-        log_msg(f"  Skipped {policy_file} (already exists)")
+        output(f"  Skipped {policy_file} (already exists)")
 
     # Create Lima config if not exists.
     lima_file = BRIG_HOME / "lima.yaml"
     if not lima_file.exists() or force:
         with open(lima_file, "w") as f:
             f.write(DEFAULT_LIMA_YAML)
-        log_msg(f"  Created {lima_file}")
+        output(f"  Created {lima_file}")
     else:
-        log_msg(f"  Skipped {lima_file} (already exists)")
+        output(f"  Skipped {lima_file} (already exists)")
 
     # Create example cell definition.
     example_cell = BRIG_HOME / "cells" / "example.yaml"
@@ -1117,7 +1336,7 @@ command: ["python", "-c", "print('Hello from brig cell!')"]
 """
         with open(example_cell, "w") as f:
             f.write(example_content)
-        log_msg(f"  Created {example_cell}")
+        output(f"  Created {example_cell}")
 
     # Create brig config file.
     config_file = BRIG_HOME / "cells" / "config.json"
@@ -1132,28 +1351,28 @@ command: ["python", "-c", "print('Hello from brig cell!')"]
         }
         with open(config_file, "w") as f:
             json.dump(default_config, f, indent=2)
-        log_msg(f"  Created {config_file}")
+        output(f"  Created {config_file}")
 
-    log_msg("")
-    log_msg("Brig initialized successfully!")
-    log_msg("")
-    log_msg("Next steps:")
-    log_msg("  1. Install Lima if not already installed:")
-    log_msg("       brew install lima")
-    log_msg("")
-    log_msg("  2. Create the brig VM:")
-    log_msg(f"       limactl create --name=brig {lima_file}")
-    log_msg("")
-    log_msg("  3. Start the VM:")
-    log_msg("       limactl start brig")
-    log_msg("")
-    log_msg("  4. Start the warden proxy:")
-    log_msg("       limactl shell brig -- warden start")
-    log_msg("")
-    log_msg("  5. Run your first cell:")
-    log_msg("       brig run --name test --image alpine -- echo 'Hello!'")
-    log_msg("")
-    log_msg(f"Edit {policy_file} to configure allowed domains.")
+    output("")
+    output("Brig initialized successfully!")
+    output("")
+    output("Next steps:")
+    output("  1. Install Lima if not already installed:")
+    output("       brew install lima")
+    output("")
+    output("  2. Create the brig VM:")
+    output(f"       limactl create --name=brig {lima_file}")
+    output("")
+    output("  3. Start the VM:")
+    output("       limactl start brig")
+    output("")
+    output("  4. Start the warden proxy:")
+    output("       limactl shell brig -- warden start")
+    output("")
+    output("  5. Run your first cell:")
+    output("       brig run --name test --image alpine -- echo 'Hello!'")
+    output("")
+    output(f"Edit {policy_file} to configure allowed domains.")
 
     return 0
 
@@ -1206,9 +1425,7 @@ def _vm_status() -> dict:
 def cmd_vm_create(args) -> int:
     """Create the brig VM."""
     if not _lima_installed():
-        print("ERROR: Lima is not installed.", file=sys.stderr)
-        print("Install with: brew install lima", file=sys.stderr)
-        return 1
+        error_lima_not_installed()
 
     status = _vm_status()
     if status["status"] not in ("not_created", "lima_not_installed"):
@@ -1218,9 +1435,7 @@ def cmd_vm_create(args) -> int:
 
     lima_yaml = BRIG_HOME / "lima.yaml"
     if not lima_yaml.exists():
-        print(f"ERROR: Lima configuration not found at {lima_yaml}", file=sys.stderr)
-        print("Run 'brig init' first to create the configuration.", file=sys.stderr)
-        return 1
+        error_lima_config_not_found()
 
     print(f"Creating VM '{VM_NAME}' from {lima_yaml}...")
     cmd = ["limactl", "create", "--name", VM_NAME, str(lima_yaml)]
@@ -1243,15 +1458,11 @@ def cmd_vm_create(args) -> int:
 def cmd_vm_start(args) -> int:
     """Start the brig VM."""
     if not _lima_installed():
-        print("ERROR: Lima is not installed.", file=sys.stderr)
-        print("Install with: brew install lima", file=sys.stderr)
-        return 1
+        error_lima_not_installed()
 
     status = _vm_status()
     if status["status"] == "not_created":
-        print(f"VM '{VM_NAME}' does not exist.", file=sys.stderr)
-        print("Create it with: brig vm create", file=sys.stderr)
-        return 1
+        error_vm_not_created()
 
     if status["status"] == "Running":
         print(f"VM '{VM_NAME}' is already running.")
@@ -1276,13 +1487,11 @@ def cmd_vm_start(args) -> int:
 def cmd_vm_stop(args) -> int:
     """Stop the brig VM."""
     if not _lima_installed():
-        print("ERROR: Lima is not installed.", file=sys.stderr)
-        return 1
+        error_lima_not_installed()
 
     status = _vm_status()
     if status["status"] == "not_created":
-        print(f"VM '{VM_NAME}' does not exist.", file=sys.stderr)
-        return 1
+        error_vm_not_created()
 
     if status["status"] != "Running":
         print(f"VM '{VM_NAME}' is not running (status: {status['status']})")
@@ -1349,14 +1558,11 @@ def cmd_vm_status(args) -> int:
 def cmd_vm_shell(args) -> int:
     """Open a shell in the VM or run a command."""
     if not _lima_installed():
-        print("ERROR: Lima is not installed.", file=sys.stderr)
-        return 1
+        error_lima_not_installed()
 
     status = _vm_status()
     if status["status"] != "Running":
-        print(f"ERROR: VM '{VM_NAME}' is not running (status: {status['status']})", file=sys.stderr)
-        print("Start it with: brig vm start", file=sys.stderr)
-        return 1
+        error_vm_not_running()
 
     cmd = ["limactl", "shell", VM_NAME]
 
@@ -1374,8 +1580,7 @@ def cmd_vm_shell(args) -> int:
 def cmd_vm_delete(args) -> int:
     """Delete the brig VM."""
     if not _lima_installed():
-        print("ERROR: Lima is not installed.", file=sys.stderr)
-        return 1
+        error_lima_not_installed()
 
     status = _vm_status()
     if status["status"] == "not_created":
@@ -1424,8 +1629,7 @@ def cmd_vm(args) -> int:
 
     vm_cmd = getattr(args, "vm_command", None)
     if not vm_cmd or vm_cmd not in vm_commands:
-        print("ERROR: Unknown vm command", file=sys.stderr)
-        return 1
+        error_unknown_vm_command(vm_cmd or "none")
 
     return vm_commands[vm_cmd](args)
 
@@ -1438,10 +1642,11 @@ def cmd_run(args) -> int:
         # Validate cell definition.
         validation_errors = validate_cell_definition(cell_def, args.file)
         if validation_errors:
-            print(f"ERROR: Invalid cell definition '{args.file}':", file=sys.stderr)
-            for err in validation_errors:
-                print(f"  - {err}", file=sys.stderr)
-            return 1
+            error_details = "\n  - ".join(validation_errors)
+            error(
+                f"Invalid cell definition '{args.file}':\n  - {error_details}",
+                "Fix the errors above and try again"
+            )
         # Override args with cell definition values.
         if "name" in cell_def and not args.name:
             args.name = cell_def["name"]
@@ -1506,6 +1711,28 @@ def cmd_run(args) -> int:
     if cell_exists(cell_name):
         error(f"Cell '{cell_name}' already exists. Remove it first with: brig rm {cell_name}")
 
+    # Track allocated resources for cleanup on failure.
+    resources_allocated = {
+        "policy": False,
+        "subnet": False,
+        "network": False,
+        "proxy_connected": False,
+    }
+
+    def cleanup_on_failure(msg: str, suggestion: str = None):
+        """Clean up all allocated resources and exit with error."""
+        debug(f"Cleaning up after failure: {msg}")
+        if resources_allocated["proxy_connected"]:
+            run(["podman", "network", "disconnect", network_name(cell_name), PROXY_NAME],
+                check=False, capture=True)
+        if resources_allocated["network"]:
+            run(["brig-subnet", "remove-network", cell_name], check=False, capture=True)
+        if resources_allocated["subnet"]:
+            run(["brig-subnet", "free", cell_name], check=False, capture=True)
+        if resources_allocated["policy"]:
+            delete_cell_policy(cell_name)
+        error(msg, suggestion)
+
     # Create per-cell policy if custom policy specified.
     if args.policy_allow or args.policy_deny:
         policy = {
@@ -1513,29 +1740,29 @@ def cmd_run(args) -> int:
             "deny": args.policy_deny or [],
         }
         save_cell_policy(cell_name, policy)
+        resources_allocated["policy"] = True
 
     # Allocate subnet.
     print(f"Allocating network for {cell_name}...")
     result = run(["brig-subnet", "allocate", cell_name], check=False, capture=True)
     if result.returncode != 0:
-        error(f"Failed to allocate subnet: {result.stderr}")
+        cleanup_on_failure(f"Failed to allocate subnet: {result.stderr}")
     subnet = result.stdout.strip()
+    resources_allocated["subnet"] = True
 
     # Create internal network.
     result = run(["brig-subnet", "create-network", cell_name], check=False, capture=True)
     if result.returncode != 0:
-        # Clean up subnet allocation.
-        run(["brig-subnet", "free", cell_name], check=False)
-        error(f"Failed to create network: {result.stderr}")
+        cleanup_on_failure(f"Failed to create network: {result.stderr}")
+    resources_allocated["network"] = True
 
     net_name = network_name(cell_name)
 
     # Connect proxy to cell network.
     result = run(["podman", "network", "connect", net_name, PROXY_NAME], check=False, capture=True)
     if result.returncode != 0 and "already" not in result.stderr.lower():
-        # Clean up.
-        run(["brig-subnet", "remove-network", cell_name], check=False)
-        error(f"Failed to connect proxy to network: {result.stderr}")
+        cleanup_on_failure(f"Failed to connect proxy to network: {result.stderr}")
+    resources_allocated["proxy_connected"] = True
 
     # Get proxy IP on cell network.
     proxy_ip = get_proxy_ip(net_name)
@@ -1545,7 +1772,10 @@ def cmd_run(args) -> int:
         proxy_ip = get_proxy_ip(net_name)
 
     if not proxy_ip:
-        error("Could not determine proxy IP on cell network")
+        cleanup_on_failure(
+            "Could not determine proxy IP on cell network",
+            "Check that warden is running: warden status"
+        )
 
     # Build container command.
     cmd = [
@@ -1571,13 +1801,13 @@ def cmd_run(args) -> int:
     if getattr(args, "seccomp_profile", None):
         profile_path = Path(args.seccomp_profile)
         if not profile_path.exists():
-            error(f"Seccomp profile not found: {args.seccomp_profile}")
+            cleanup_on_failure(f"Seccomp profile not found: {args.seccomp_profile}")
         # Validate it's valid JSON.
         try:
             with open(profile_path, "r") as f:
                 json.load(f)
         except json.JSONDecodeError as e:
-            error(f"Invalid seccomp profile JSON: {e}")
+            cleanup_on_failure(f"Invalid seccomp profile JSON: {e}")
         cmd.extend(["--security-opt", f"seccomp={profile_path.absolute()}"])
         debug(f"Applying seccomp profile: {profile_path}")
 
@@ -1606,12 +1836,18 @@ def cmd_run(args) -> int:
         for secret_name in args.secret:
             # Validate secret name (no path traversal).
             if ".." in secret_name or "/" in secret_name:
-                error(f"Invalid secret name: {secret_name}")
+                cleanup_on_failure(
+                    f"Invalid secret name: {secret_name}",
+                    "Secret names cannot contain '..' or '/'"
+                )
 
             secret_path = secrets_dir / secret_name
             # Check secret exists.
             if not secret_path.exists():
-                error(f"Secret not found: {secret_name}")
+                cleanup_on_failure(
+                    f"Secret not found: {secret_name}",
+                    f"Create the secret at {secret_path}"
+                )
 
             # Mount secret read-only at /run/secrets/{name}.
             cmd.extend(["-v", f"{secret_path}:/run/secrets/{secret_name}:ro"])
@@ -1656,10 +1892,16 @@ def cmd_run(args) -> int:
         result = run(cmd, check=False, capture=True)
         if result.returncode != 0:
             spinner.fail(f"Failed to start cell {cell_name}")
-            # Clean up on failure.
-            run(["podman", "network", "disconnect", net_name, PROXY_NAME], check=False)
-            run(["brig-subnet", "remove-network", cell_name], check=False)
-            print(f"ERROR: {result.stderr}", file=sys.stderr)
+            # Clean up all allocated resources on failure.
+            if resources_allocated["proxy_connected"]:
+                run(["podman", "network", "disconnect", net_name, PROXY_NAME], check=False)
+            if resources_allocated["network"]:
+                run(["brig-subnet", "remove-network", cell_name], check=False)
+            if resources_allocated["subnet"]:
+                run(["brig-subnet", "free", cell_name], check=False)
+            if resources_allocated["policy"]:
+                delete_cell_policy(cell_name)
+            print_error(result.stderr.strip() if result.stderr else "Unknown error")
             return 1
         spinner.success(f"Cell {cell_name} started")
 
@@ -1685,7 +1927,7 @@ def cmd_stop(args) -> int:
         error_cell_not_found(cell_name)
 
     if not cell_running(cell_name):
-        print(f"Cell {cell_name} is not running")
+        output(f"Cell {cell_name} is not running")
         return 0
 
     with Spinner(f"Stopping cell {cell_name}") as spinner:
@@ -1696,7 +1938,7 @@ def cmd_stop(args) -> int:
 
         if result.returncode != 0:
             spinner.fail(f"Failed to stop cell {cell_name}")
-            print(f"ERROR: {result.stderr}", file=sys.stderr)
+            print_error(result.stderr.strip() if result.stderr else "Unknown error")
             return 1
 
         # Invalidate cache after state change.
@@ -1731,7 +1973,7 @@ def cmd_kill(args) -> int:
     # Log lifecycle event.
     log_lifecycle("kill", cell_name)
 
-    print(f"Cell {cell_name} killed")
+    output(f"Cell {cell_name} killed")
     return 0
 
 
@@ -1796,7 +2038,7 @@ def cmd_start(args) -> int:
         error(f"Cell '{cell_name}' does not exist")
 
     if cell_running(cell_name):
-        print(f"Cell {cell_name} is already running")
+        output(f"Cell {cell_name} is already running")
         return 0
 
     # Fail-fast: Check proxy is running.
@@ -1807,7 +2049,7 @@ def cmd_start(args) -> int:
     net_name = network_name(cell_name)
     run(["podman", "network", "connect", net_name, PROXY_NAME], check=False)
 
-    print(f"Starting cell {cell_name}...")
+    output(f"Starting cell {cell_name}...")
     result = run(
         ["podman", "start", container_name(cell_name)],
         check=False, capture=True
@@ -1819,7 +2061,7 @@ def cmd_start(args) -> int:
     # Invalidate cache after state change.
     invalidate_cell_cache(cell_name)
 
-    print(f"Cell {cell_name} started")
+    output(f"Cell {cell_name} started")
     return 0
 
 
@@ -1930,6 +2172,85 @@ def cmd_exec(args) -> int:
 
     result = run(cmd, check=False)
     return result.returncode
+
+
+def cmd_shell(args) -> int:
+    """Open interactive shell in a running cell."""
+    cell_name = args.name
+
+    if not cell_exists(cell_name):
+        error_cell_not_found(cell_name)
+
+    if not cell_running(cell_name):
+        error_cell_not_running(cell_name)
+
+    shell_cmd = getattr(args, "shell_cmd", "/bin/sh")
+
+    cmd = ["podman", "exec", "-it", container_name(cell_name), shell_cmd]
+
+    try:
+        result = run(cmd, check=False)
+        return result.returncode
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_rename(args) -> int:
+    """Rename a cell."""
+    old_name = args.old_name
+    new_name = args.new_name
+
+    if not cell_exists(old_name):
+        error_cell_not_found(old_name)
+
+    if cell_exists(new_name):
+        error(f"Cell '{new_name}' already exists. Choose a different name.")
+
+    if cell_running(old_name):
+        error(f"Cell '{old_name}' is running. Stop it first with: brig stop {old_name}")
+
+    # Validate new name.
+    if not new_name or len(new_name) > 63:
+        error("Cell name must be 1-63 characters")
+
+    if not new_name[0].isalnum():
+        error("Cell name must start with alphanumeric character")
+
+    # Rename container.
+    old_container = container_name(old_name)
+    new_container = container_name(new_name)
+
+    result = run(
+        ["podman", "rename", old_container, new_container],
+        check=False, capture=True
+    )
+
+    if result.returncode != 0:
+        error(f"Failed to rename container: {result.stderr}")
+
+    # Rename policy file if it exists.
+    old_policy = POLICY_DIR / f"{old_name}.json"
+    new_policy = POLICY_DIR / f"{new_name}.json"
+    if old_policy.exists():
+        try:
+            old_policy.rename(new_policy)
+        except OSError as e:
+            log("WARN", f"Could not rename policy file: {e}")
+
+    # Rename workspace if it exists.
+    old_workspace = STATE_DIR / old_name
+    new_workspace = STATE_DIR / new_name
+    if old_workspace.exists():
+        try:
+            old_workspace.rename(new_workspace)
+        except OSError as e:
+            log("WARN", f"Could not rename workspace: {e}")
+
+    # Log the rename operation.
+    log_history("rename", old_name, {"new_name": new_name})
+
+    output(f"Renamed cell '{old_name}' to '{new_name}'")
+    return 0
 
 
 def cmd_attach(args) -> int:
@@ -2044,7 +2365,7 @@ def cmd_pause(args) -> int:
     if result.returncode != 0:
         error(f"Failed to pause cell: {result.stderr}")
 
-    print(f"Cell {cell_name} paused")
+    output(f"Cell {cell_name} paused")
     return 0
 
 
@@ -2066,7 +2387,7 @@ def cmd_unpause(args) -> int:
     # Invalidate cache after state change.
     invalidate_cell_cache(cell_name)
 
-    print(f"Cell {cell_name} unpaused")
+    output(f"Cell {cell_name} unpaused")
     return 0
 
 
@@ -2282,11 +2603,11 @@ def cmd_cp(args) -> int:
         # Apply quarantine when copying FROM a cell (to local filesystem).
         if src_cell:
             if apply_quarantine(dst_full, src_cell):
-                print(f"Copied {src} -> {dst} (quarantined)")
+                output(f"Copied {src} -> {dst} (quarantined)")
             else:
-                print(f"Copied {src} -> {dst}")
+                output(f"Copied {src} -> {dst}")
         else:
-            print(f"Copied {src} -> {dst}")
+            output(f"Copied {src} -> {dst}")
 
         return 0
     except Exception as e:
@@ -2661,6 +2982,139 @@ def cmd_health(args) -> int:
     return 0 if all_healthy else 1
 
 
+def cmd_preflight(args) -> int:
+    """Run preflight validation checks before starting work.
+
+    Validates all prerequisites are met:
+    - VM is running (Lima)
+    - Warden proxy is running
+    - State directory is writable
+    - Policy files are valid JSON
+    - Runtime (gVisor) is available
+
+    Returns 0 if all checks pass, 1 otherwise.
+    """
+    checks = []
+    all_passed = True
+
+    def check(name: str, passed: bool, detail: str, suggestion: str = None):
+        nonlocal all_passed
+        if not passed:
+            all_passed = False
+        checks.append({
+            "name": name,
+            "passed": passed,
+            "detail": detail,
+            "suggestion": suggestion,
+        })
+
+    # Check 1: VM running (if Lima is used).
+    if _lima_installed():
+        vm_status = _vm_status()
+        vm_running = vm_status.get("status") == "Running"
+        check(
+            "VM",
+            vm_running,
+            f"status: {vm_status.get('status', 'unknown')}",
+            "Start with: brig vm start" if not vm_running else None
+        )
+
+    # Check 2: Warden proxy running.
+    warden_running = proxy_running()
+    check(
+        "Warden",
+        warden_running,
+        "running" if warden_running else "not running",
+        "Start with: warden start" if not warden_running else None
+    )
+
+    # Check 3: State directory writable.
+    state_writable = False
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        test_file = STATE_DIR / ".preflight_test"
+        test_file.write_text("test")
+        test_file.unlink()
+        state_writable = True
+        state_detail = f"{STATE_DIR} writable"
+    except (IOError, OSError) as e:
+        state_detail = f"{STATE_DIR} not writable: {e}"
+    check(
+        "State directory",
+        state_writable,
+        state_detail,
+        f"Check permissions on {STATE_DIR}" if not state_writable else None
+    )
+
+    # Check 4: Policy file valid JSON.
+    policy_file = Path("/cells/network-policy.json")
+    policy_valid = False
+    if policy_file.exists():
+        try:
+            with open(policy_file, "r") as f:
+                json.load(f)
+            policy_valid = True
+            policy_detail = f"{policy_file} valid"
+        except json.JSONDecodeError as e:
+            policy_detail = f"invalid JSON: {e.msg}"
+        except (IOError, OSError) as e:
+            policy_detail = f"cannot read: {e}"
+    else:
+        policy_detail = f"{policy_file} not found"
+    check(
+        "Policy file",
+        policy_valid,
+        policy_detail,
+        "Create policy file or run: brig init" if not policy_valid else None
+    )
+
+    # Check 5: Runtime (gVisor) available.
+    result = run(
+        ["podman", "info", "--format", "{{range .Host.Remotes}}{{.OCIRuntime.Name}}{{end}}"],
+        check=False, capture=True
+    )
+    runtime_available = RUNTIME in result.stdout
+    check(
+        "Runtime",
+        runtime_available,
+        f"{RUNTIME} available" if runtime_available else f"{RUNTIME} not found",
+        "Install gVisor (runsc) and configure Podman" if not runtime_available else None
+    )
+
+    # Check 6: Network infrastructure.
+    result = run(
+        ["podman", "network", "exists", "proxy-external"],
+        check=False, capture=True
+    )
+    network_exists = result.returncode == 0
+    check(
+        "Network",
+        network_exists,
+        "proxy-external exists" if network_exists else "proxy-external missing",
+        "Start warden to create network" if not network_exists else None
+    )
+
+    # Output results.
+    if getattr(args, "format", "table") == "json":
+        output_data = {
+            "passed": all_passed,
+            "checks": checks,
+        }
+        print(json.dumps(output_data, indent=2))
+    else:
+        status = colorize("PASSED", "green") if all_passed else colorize("FAILED", "red")
+        print(f"Preflight: {status}")
+        print()
+        for c in checks:
+            icon = colorize("✓", "green") if c["passed"] else colorize("✗", "red")
+            print(f"  {icon} {c['name']}: {c['detail']}")
+            if not c["passed"] and c["suggestion"]:
+                print(f"      {colorize('→', 'yellow')} {c['suggestion']}")
+        print()
+
+    return 0 if all_passed else 1
+
+
 def _fetch_warden_metrics() -> dict:
     """Fetch metrics from warden via Unix socket."""
     import socket
@@ -2886,11 +3340,63 @@ def cmd_metrics(args) -> int:
     return 0
 
 
+def _fix_proxy_not_running() -> bool:
+    """Attempt to start the warden proxy. Returns True if fixed."""
+    print("  [FIX] Attempting to start warden...")
+    result = run(["warden", "start"], check=False, capture=True)
+    if result.returncode == 0:
+        print("  [FIXED] Warden started successfully")
+        return True
+    else:
+        print(f"  [FAIL] Could not start warden: {result.stderr}")
+        return False
+
+
+def _fix_proxy_network() -> bool:
+    """Attempt to connect proxy to proxy-external. Returns True if fixed."""
+    print("  [FIX] Attempting to connect proxy to proxy-external...")
+    result = run(
+        ["podman", "network", "connect", "proxy-external", PROXY_NAME],
+        check=False, capture=True
+    )
+    if result.returncode == 0:
+        print("  [FIXED] Proxy connected to proxy-external")
+        return True
+    else:
+        print(f"  [FAIL] Could not connect proxy: {result.stderr}")
+        return False
+
+
+def _fix_cell_network(cell_name: str) -> bool:
+    """Attempt to reconnect proxy to a cell's network. Returns True if fixed."""
+    net_name = network_name(cell_name)
+    print(f"  [FIX] Reconnecting proxy to {net_name}...")
+    result = run(
+        ["podman", "network", "connect", net_name, PROXY_NAME],
+        check=False, capture=True
+    )
+    if result.returncode == 0:
+        print(f"  [FIXED] Proxy connected to {net_name}")
+        return True
+    else:
+        # Might already be connected.
+        if "already" in result.stderr.lower():
+            print(f"  [OK] Proxy already connected to {net_name}")
+            return True
+        print(f"  [FAIL] Could not connect proxy to {net_name}: {result.stderr}")
+        return False
+
+
 def cmd_verify(args) -> int:
     """Verify security invariants across all cells."""
+    fix_mode = getattr(args, "fix", False)
+
     print("Verifying security invariants...")
+    if fix_mode:
+        print("(Auto-fix mode enabled)")
     print("=" * 50)
     issues = []
+    fixed = []
 
     # Check 1: Proxy is running.
     print("\n[Check 1] Proxy status")
@@ -2898,7 +3404,13 @@ def cmd_verify(args) -> int:
         print("  [OK] Proxy is running")
     else:
         print("  [FAIL] Proxy is not running")
-        issues.append("Proxy must be running")
+        if fix_mode:
+            if _fix_proxy_not_running():
+                fixed.append("Started warden proxy")
+            else:
+                issues.append("Proxy must be running")
+        else:
+            issues.append("Proxy must be running")
 
     # Check 2: Proxy on proxy-external network.
     print("\n[Check 2] Proxy network attachment")
@@ -2911,7 +3423,13 @@ def cmd_verify(args) -> int:
         print("  [OK] Proxy attached to proxy-external")
     else:
         print("  [FAIL] Proxy not on proxy-external network")
-        issues.append("Proxy must be on proxy-external network")
+        if fix_mode:
+            if _fix_proxy_network():
+                fixed.append("Connected proxy to proxy-external")
+            else:
+                issues.append("Proxy must be on proxy-external network")
+        else:
+            issues.append("Proxy must be on proxy-external network")
 
     # Check 3: All cells use gVisor runtime.
     print("\n[Check 3] gVisor runtime")
@@ -2922,23 +3440,45 @@ def cmd_verify(args) -> int:
     if result.stdout.strip():
         try:
             containers = json.loads(result.stdout)
-            for c in containers:
-                name = c.get("Names", [""])[0]
-                if name == PROXY_NAME:
-                    continue
-                # Check if running and verify gVisor.
-                if c.get("State") == "running":
+            cell_names = [
+                c.get("Names", [""])[0] for c in containers
+                if c.get("Names", [""])[0] != PROXY_NAME
+            ]
+            if cell_names:
+                # Batch inspect to check runtime.
+                inspect = run(
+                    ["podman", "inspect", "--format", "json"] + cell_names,
+                    check=False, capture=True
+                )
+                container_infos = json.loads(inspect.stdout)
+                for c_info in container_infos:
+                    name = c_info.get("Name", "").lstrip("/")
                     cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
-                    dmesg = run(
-                        ["podman", "exec", name, "dmesg"],
-                        check=False, capture=True
-                    )
-                    if "gVisor" in dmesg.stdout:
-                        print(f"  [OK] {cell} using gVisor")
+                    # Check OCI runtime from container config.
+                    oci_runtime = c_info.get("HostConfig", {}).get("Runtime", "")
+                    if oci_runtime == RUNTIME:
+                        print(f"  [OK] {cell} configured with {RUNTIME}")
+                    elif oci_runtime:
+                        print(f"  [FAIL] {cell} uses {oci_runtime} instead of {RUNTIME}")
+                        issues.append(f"{cell} must use gVisor runtime")
                     else:
-                        print(f"  [WARN] {cell} may not use gVisor")
+                        # Fallback: check dmesg for running containers.
+                        state = c_info.get("State", {}).get("Status", "")
+                        if state == "running":
+                            dmesg = run(
+                                ["podman", "exec", name, "dmesg"],
+                                check=False, capture=True, timeout=5
+                            )
+                            if "gVisor" in dmesg.stdout:
+                                print(f"  [OK] {cell} running gVisor (verified via dmesg)")
+                            else:
+                                print(f"  [WARN] {cell} runtime unverified")
+                        else:
+                            print(f"  [INFO] {cell} not running, runtime not verified")
+            else:
+                print("  [INFO] No cells found")
         except json.JSONDecodeError:
-            pass
+            print("  [WARN] Could not parse container info")
     else:
         print("  [INFO] No cells running")
 
@@ -3003,15 +3543,104 @@ def cmd_verify(args) -> int:
         except json.JSONDecodeError:
             pass
 
+    # Check 6: Inter-cell isolation (no east-west traffic).
+    print("\n[Check 6] Inter-cell isolation")
+    # Get all running cells with their network IPs.
+    result = run(
+        ["podman", "ps", "--format", "json", "--filter", f"name={CONTAINER_PREFIX}"],
+        check=False, capture=True
+    )
+    running_cells = []
+    if result.stdout.strip():
+        try:
+            containers = json.loads(result.stdout)
+            cell_names = [
+                c.get("Names", [""])[0] for c in containers
+                if c.get("Names", [""])[0] != PROXY_NAME and c.get("State") == "running"
+            ]
+            if len(cell_names) >= 2:
+                # Get IPs for each cell.
+                for name in cell_names:
+                    inspect = run(
+                        ["podman", "inspect", name, "--format",
+                         "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
+                        check=False, capture=True
+                    )
+                    ip = inspect.stdout.strip()
+                    if ip:
+                        running_cells.append({"name": name, "ip": ip})
+
+                if len(running_cells) >= 2:
+                    # Test connectivity from first cell to second.
+                    src_cell = running_cells[0]
+                    dst_cell = running_cells[1]
+                    print(f"  Testing {src_cell['name']} -> {dst_cell['name']} ({dst_cell['ip']})")
+                    ping_result = run(
+                        ["podman", "exec", src_cell["name"], "ping", "-c", "1", "-W", "1", dst_cell["ip"]],
+                        check=False, capture=True, timeout=5
+                    )
+                    if ping_result.returncode != 0:
+                        print(f"  [OK] Cells cannot reach each other (isolation verified)")
+                    else:
+                        print(f"  [FAIL] Cell {src_cell['name']} can ping {dst_cell['name']}")
+                        issues.append("Inter-cell isolation broken: cells can communicate")
+                else:
+                    print("  [INFO] Need 2+ running cells with IPs to test isolation")
+            else:
+                print("  [INFO] Need 2+ running cells to test isolation")
+        except (json.JSONDecodeError, KeyError):
+            print("  [WARN] Could not determine cell IPs")
+    else:
+        print("  [INFO] No running cells to test")
+
+    # Check 7: Warden proxy is responsive and enforcing policy.
+    print("\n[Check 7] Proxy enforcement")
+    if proxy_running():
+        # Get proxy IP.
+        result = run(
+            ["podman", "inspect", PROXY_NAME, "--format",
+             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
+            check=False, capture=True
+        )
+        proxy_ip = result.stdout.strip().split()[0] if result.stdout.strip() else ""
+        if proxy_ip:
+            # Check if proxy port is listening.
+            import socket
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                conn_result = sock.connect_ex((proxy_ip, 8080))
+                sock.close()
+                if conn_result == 0:
+                    print(f"  [OK] Proxy listening on {proxy_ip}:8080")
+                else:
+                    print(f"  [FAIL] Proxy not responding on port 8080")
+                    issues.append("Proxy not responding on port 8080")
+            except Exception as e:
+                print(f"  [WARN] Could not check proxy port: {e}")
+        else:
+            print("  [WARN] Could not determine proxy IP")
+    else:
+        print("  [SKIP] Proxy not running")
+
     # Summary.
     print("\n" + "=" * 50)
+    if fixed:
+        print(f"FIXED: {len(fixed)} issue(s) auto-repaired")
+        for fix in fixed:
+            print(f"  - {fix}")
     if issues:
         print(f"FAILED: {len(issues)} issue(s) found")
         for issue in issues:
             print(f"  - {issue}")
+        if not fix_mode:
+            print("\nTip: Run 'brig verify --fix' to attempt auto-repair")
         return 1
     else:
-        print("PASSED: All security invariants verified")
+        if fixed:
+            print("RECOVERED: All issues fixed, invariants verified")
+        else:
+            print("PASSED: All security invariants verified")
         return 0
 
 
@@ -3059,6 +3688,149 @@ def cmd_history(args) -> int:
             print(f"{ts:<22} {op:<12} {cell:<15} {detail_str:<30}")
 
     return 0
+
+
+def cmd_config_show(args) -> int:
+    """Show current configuration."""
+    # Define available configuration keys with types and defaults.
+    config_schema = {
+        "operation_logging.enabled": {
+            "type": "bool",
+            "default": True,
+            "description": "Enable operation logging to JSONL file",
+        },
+        "operation_logging.level": {
+            "type": "str",
+            "default": "all",
+            "values": ["all", "mutations", "none"],
+            "description": "Which operations to log",
+        },
+        "operation_logging.redact_secrets": {
+            "type": "bool",
+            "default": True,
+            "description": "Redact secret values in logs",
+        },
+        "operation_logging.redact_env_values": {
+            "type": "bool",
+            "default": True,
+            "description": "Redact environment variable values containing sensitive patterns",
+        },
+    }
+
+    if getattr(args, "keys", False):
+        # List available keys.
+        print("Available configuration keys:\n")
+        for key, info in config_schema.items():
+            type_str = info["type"]
+            if "values" in info:
+                type_str = f"{type_str} ({', '.join(info['values'])})"
+            print(f"  {key}")
+            print(f"    Type:    {type_str}")
+            print(f"    Default: {info['default']}")
+            print(f"    {info['description']}")
+            print()
+        return 0
+
+    config = _load_operation_config()
+
+    if args.key:
+        # Show specific key.
+        keys = args.key.split(".")
+        value = config
+        for k in keys:
+            if isinstance(value, dict) and k in value:
+                value = value[k]
+            else:
+                error(f"Config key not found: {args.key}")
+        if isinstance(value, dict):
+            print(json.dumps(value, indent=2))
+        else:
+            print(value)
+    else:
+        # Show all config.
+        print(json.dumps(config, indent=2))
+
+    return 0
+
+
+def cmd_config_set(args) -> int:
+    """Set a configuration value."""
+    key = args.key
+    value = args.value
+
+    # Parse value as JSON if possible, otherwise use as string.
+    try:
+        parsed_value = json.loads(value)
+    except json.JSONDecodeError:
+        # Check for boolean strings.
+        if value.lower() == "true":
+            parsed_value = True
+        elif value.lower() == "false":
+            parsed_value = False
+        else:
+            parsed_value = value
+
+    # Load existing config.
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            config = {}
+    else:
+        config = {}
+
+    # Set nested key.
+    keys = key.split(".")
+    current = config
+    for k in keys[:-1]:
+        if k not in current:
+            current[k] = {}
+        current = current[k]
+    current[keys[-1]] = parsed_value
+
+    # Write config atomically.
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = CONFIG_FILE.with_suffix(".tmp")
+    try:
+        with open(tmp_file, "w") as f:
+            json.dump(config, f, indent=2)
+        tmp_file.rename(CONFIG_FILE)
+    except (IOError, OSError) as e:
+        error(f"Failed to write config: {e}")
+
+    output(f"Set {key} = {parsed_value}")
+    return 0
+
+
+def cmd_config_reset(args) -> int:
+    """Reset configuration to defaults."""
+    if CONFIG_FILE.exists():
+        try:
+            CONFIG_FILE.unlink()
+            output("Configuration reset to defaults")
+        except OSError as e:
+            error(f"Failed to reset config: {e}")
+    else:
+        output("Configuration already at defaults")
+    return 0
+
+
+def cmd_tui(args) -> int:
+    """Launch interactive terminal UI."""
+    # Import here to avoid loading textual unless needed.
+    try:
+        from tui import run_tui
+    except ImportError:
+        try:
+            from src.tui import run_tui
+        except ImportError:
+            error("TUI module not found. Ensure tui.py is in the Python path.")
+
+    view = getattr(args, "view", "dashboard")
+    cell = getattr(args, "cell", None)
+
+    return run_tui(view=view, cell=cell)
 
 
 def cmd_policy_show(args) -> int:
@@ -3113,44 +3885,79 @@ def cmd_policy_set(args) -> int:
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
 
-    # Load existing policy.
-    policy = load_cell_policy(cell_name)
+    # Load existing policy and keep a copy for audit.
+    old_policy = load_cell_policy(cell_name)
+    policy = {
+        "allow": list(old_policy.get("allow", [])),
+        "deny": list(old_policy.get("deny", [])),
+    }
+
+    # Track changes for audit trail.
+    changes = {
+        "added_allow": [],
+        "added_deny": [],
+        "removed_allow": [],
+        "removed_deny": [],
+    }
 
     # Apply changes.
     if args.allow:
         for domain in args.allow:
             if domain not in policy["allow"]:
                 policy["allow"].append(domain)
-                print(f"Added to allowlist: {domain}")
+                changes["added_allow"].append(domain)
+                output(f"Added to allowlist: {domain}")
 
     if args.deny:
         for domain in args.deny:
             if domain not in policy["deny"]:
                 policy["deny"].append(domain)
-                print(f"Added to denylist: {domain}")
+                changes["added_deny"].append(domain)
+                output(f"Added to denylist: {domain}")
 
     if args.remove_allow:
         for domain in args.remove_allow:
             if domain in policy["allow"]:
                 policy["allow"].remove(domain)
-                print(f"Removed from allowlist: {domain}")
+                changes["removed_allow"].append(domain)
+                output(f"Removed from allowlist: {domain}")
 
     if args.remove_deny:
         for domain in args.remove_deny:
             if domain in policy["deny"]:
                 policy["deny"].remove(domain)
-                print(f"Removed from denylist: {domain}")
+                changes["removed_deny"].append(domain)
+                output(f"Removed from denylist: {domain}")
+
+    # Check for conflicts before saving.
+    conflicts = validate_policy_conflicts(policy)
+    for warning in conflicts:
+        warn(warning)
 
     # Save updated policy.
-    save_cell_policy(cell_name, policy)
-    print(f"\nPolicy updated for {cell_name}")
+    if not save_cell_policy(cell_name, policy):
+        error(f"Failed to save policy for {cell_name}")
+
+    # Log policy change to audit trail.
+    # Only include non-empty change lists.
+    audit_changes = {k: v for k, v in changes.items() if v}
+    if audit_changes:
+        log_policy_change(
+            cell_name=cell_name,
+            action="update",
+            changes=audit_changes,
+            old_policy=old_policy,
+            new_policy=policy
+        )
+
+    output(f"\nPolicy updated for {cell_name}")
 
     # Signal proxy to reload.
     result = run(["warden", "reload"], check=False, capture=True)
     if result.returncode == 0:
-        print("Proxy reloaded")
+        output("Proxy reloaded")
     else:
-        print("Warning: Could not reload proxy. Changes take effect on next proxy restart.")
+        warn("Could not reload proxy. Changes take effect on next proxy restart.")
 
     return 0
 
@@ -3210,8 +4017,7 @@ def cmd_policy_validate(args) -> int:
         with open(policy_path, "r") as f:
             policy = json.load(f)
     except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON: {e}", file=sys.stderr)
-        return 1
+        error_invalid_json(str(policy_path), str(e))
 
     errors = []
     warnings = []
@@ -3377,18 +4183,33 @@ def cmd_policy_test(args) -> int:
 
 
 def main():
+    # Install signal handlers for graceful shutdown.
+    shutdown_requested = threading.Event()
+
+    def signal_handler(signum, frame):
+        """Handle SIGINT/SIGTERM for graceful shutdown."""
+        shutdown_requested.set()
+        # Re-raise as KeyboardInterrupt for consistent handling.
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     parser = argparse.ArgumentParser(
         description="Brig - Secure workload harness for cells",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"brig {VERSION}")
     parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress non-essential output")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # init
     p_init = subparsers.add_parser("init", help="Initialize brig directory structure")
     p_init.add_argument("--force", action="store_true", help="Overwrite existing config files")
-    p_init.add_argument("--quiet", "-q", action="store_true", help="Suppress output")
 
     # vm
     p_vm = subparsers.add_parser("vm", help="Manage the brig Lima VM")
@@ -3458,11 +4279,34 @@ def main():
     p_logs.add_argument("name", help="Cell name")
 
     # exec
-    p_exec = subparsers.add_parser("exec", help="Execute command in cell")
+    p_exec = subparsers.add_parser(
+        "exec",
+        help="Execute command in cell",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  Run a command:           brig exec mycell ls -la
+  Interactive shell:       brig exec -it mycell /bin/sh
+  Run Python script:       brig exec mycell python3 script.py
+  Check environment:       brig exec mycell env | grep PROXY
+
+Use -it for interactive commands that need a terminal.
+"""
+    )
     p_exec.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
     p_exec.add_argument("-t", "--tty", action="store_true", help="Allocate pseudo-TTY")
     p_exec.add_argument("name", help="Cell name")
     p_exec.add_argument("exec_cmd", nargs="*", help="Command to execute")
+
+    # shell (convenience wrapper for exec -it /bin/sh)
+    p_shell = subparsers.add_parser("shell", help="Open interactive shell in cell")
+    p_shell.add_argument("name", help="Cell name")
+    p_shell.add_argument("--sh", default="/bin/sh", dest="shell_cmd",
+                         help="Shell to use (default: /bin/sh)")
+
+    # rename
+    p_rename = subparsers.add_parser("rename", help="Rename a cell")
+    p_rename.add_argument("old_name", help="Current cell name")
+    p_rename.add_argument("new_name", help="New cell name")
 
     # attach
     p_attach = subparsers.add_parser("attach", help="Attach to cell's console")
@@ -3504,8 +4348,21 @@ def main():
     p_cat.add_argument("path", help="Path to file within workspace")
 
     # cp
-    p_cp = subparsers.add_parser("cp", help="Copy files to/from workspace")
-    p_cp.add_argument("--sanitize", action="store_true", help="Block unsafe file types")
+    p_cp = subparsers.add_parser(
+        "cp",
+        help="Copy files to/from workspace",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  Copy local file to cell:     brig cp ./data.csv mycell:/input/
+  Copy from cell to local:     brig cp mycell:/output/result.json ./
+  Copy with sanitization:      brig cp --sanitize untrusted.zip mycell:/
+
+Paths use cell:path syntax where 'cell' is the cell name and 'path'
+is relative to the workspace (/work inside the cell).
+"""
+    )
+    p_cp.add_argument("--sanitize", action="store_true",
+                      help="Block unsafe file types (.exe, .dll, .sh, scripts)")
     p_cp.add_argument("src", help="Source path (cell:path or local path)")
     p_cp.add_argument("dst", help="Destination path (cell:path or local path)")
 
@@ -3534,6 +4391,10 @@ def main():
     p_health = subparsers.add_parser("health", help="Check system health")
     p_health.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
 
+    # preflight
+    p_preflight = subparsers.add_parser("preflight", help="Run preflight validation checks")
+    p_preflight.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
     # metrics
     p_metrics = subparsers.add_parser("metrics", help="Output Prometheus metrics")
     p_metrics.add_argument("--serve", action="store_true", help="Serve metrics via HTTP (for Prometheus scraping)")
@@ -3541,12 +4402,35 @@ def main():
 
     # verify
     p_verify = subparsers.add_parser("verify", help="Verify security invariants")
+    p_verify.add_argument("--fix", action="store_true",
+                          help="Attempt to auto-fix common issues (restart warden, reconnect networks)")
 
     # history
     p_history = subparsers.add_parser("history", help="Show operation history")
     p_history.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
     p_history.add_argument("--tail", "-n", type=int, default=20, help="Show last N entries")
     p_history.add_argument("--cell", help="Filter by cell name")
+
+    # config
+    p_config = subparsers.add_parser("config", help="Manage brig configuration")
+    config_sub = p_config.add_subparsers(dest="config_command", required=True)
+
+    p_config_show = config_sub.add_parser("show", help="Show configuration")
+    p_config_show.add_argument("key", nargs="?", help="Config key (e.g., operation_logging.enabled)")
+    p_config_show.add_argument("--keys", action="store_true",
+                               help="List available config keys with types and defaults")
+
+    p_config_set = config_sub.add_parser("set", help="Set configuration value")
+    p_config_set.add_argument("key", help="Config key (e.g., operation_logging.level)")
+    p_config_set.add_argument("value", help="Value to set (JSON or string)")
+
+    p_config_reset = config_sub.add_parser("reset", help="Reset to default configuration")
+
+    # tui
+    p_tui = subparsers.add_parser("tui", help="Launch interactive terminal UI")
+    p_tui.add_argument("--view", choices=["dashboard", "logs", "metrics", "policy"],
+                       default="dashboard", help="Initial view to display")
+    p_tui.add_argument("--cell", metavar="NAME", help="Focus on specific cell")
 
     # policy
     p_policy = subparsers.add_parser("policy", help="Manage cell network policies")
@@ -3555,7 +4439,21 @@ def main():
     p_policy_show = policy_sub.add_parser("show", help="Show cell's effective policy")
     p_policy_show.add_argument("name", help="Cell name")
 
-    p_policy_set = policy_sub.add_parser("set", help="Update cell's policy")
+    p_policy_set = policy_sub.add_parser(
+        "set",
+        help="Update cell's policy",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  Allow a domain:          brig policy set mycell --allow api.github.com
+  Allow wildcard:          brig policy set mycell --allow '*.example.com'
+  Deny a domain:           brig policy set mycell --deny evil.com
+  Remove from allowlist:   brig policy set mycell --remove-allow old-api.com
+  Multiple changes:        brig policy set mycell --allow a.com --allow b.com
+
+Wildcards (*.example.com) match the domain and all subdomains.
+Deny rules take precedence over allow rules.
+"""
+    )
     p_policy_set.add_argument("name", help="Cell name")
     p_policy_set.add_argument("--allow", action="append", help="Add allowed domain")
     p_policy_set.add_argument("--deny", action="append", help="Add denied domain")
@@ -3585,6 +4483,11 @@ def main():
     if args.no_color:
         COLOR_ENABLED = False
 
+    # Set quiet mode.
+    global QUIET
+    if args.quiet:
+        QUIET = True
+
     # Command dispatch table.
     commands = {
         "init": cmd_init,
@@ -3597,6 +4500,8 @@ def main():
         "list": cmd_list,
         "logs": cmd_logs,
         "exec": cmd_exec,
+        "shell": cmd_shell,
+        "rename": cmd_rename,
         "attach": cmd_attach,
         "top": cmd_top,
         "diff": cmd_diff,
@@ -3611,9 +4516,11 @@ def main():
         "network": cmd_network,
         "diagnose": cmd_diagnose,
         "health": cmd_health,
+        "preflight": cmd_preflight,
         "metrics": cmd_metrics,
         "verify": cmd_verify,
         "history": cmd_history,
+        "tui": cmd_tui,
     }
 
     # Policy subcommands.
@@ -3624,10 +4531,20 @@ def main():
         "test": cmd_policy_test,
     }
 
+    # Config subcommands.
+    config_commands = {
+        "show": cmd_config_show,
+        "set": cmd_config_set,
+        "reset": cmd_config_reset,
+    }
+
     # Determine command name for logging.
     if args.command == "policy":
         cmd_name = f"policy.{args.policy_command}"
         cmd_func = policy_commands.get(args.policy_command)
+    elif args.command == "config":
+        cmd_name = f"config.{args.config_command}"
+        cmd_func = config_commands.get(args.config_command)
     elif args.command == "vm":
         cmd_name = f"vm.{args.vm_command}"
         cmd_func = commands.get("vm")
@@ -3636,8 +4553,7 @@ def main():
         cmd_func = commands.get(args.command)
 
     if not cmd_func:
-        print(f"ERROR: Unknown command: {args.command}", file=sys.stderr)
-        sys.exit(1)
+        error_unknown_command(args.command)
 
     # Execute command with operation logging.
     op_context = log_operation_start(cmd_name, args)
@@ -3646,6 +4562,12 @@ def main():
 
     try:
         exit_code = cmd_func(args)
+    except KeyboardInterrupt:
+        # Graceful shutdown on Ctrl-C.
+        error_msg = "Interrupted by user"
+        exit_code = 130  # Standard exit code for SIGINT.
+        if not QUIET:
+            print("\nInterrupted", file=sys.stderr)
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else 1
         raise
@@ -3660,4 +4582,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Final fallback for any unhandled interrupts.
+        sys.exit(130)

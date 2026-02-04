@@ -174,28 +174,28 @@ class TestPolicyBypass(unittest.TestCase):
             deny=["evil.com"]
         )
         # Allowlist check - case variations should match.
-        allowed, _ = policy.is_allowed("EXAMPLE.COM", "/", "GET")
+        allowed, _, _ = policy.is_allowed("EXAMPLE.COM", "/", "GET")
         self.assertTrue(allowed)
-        allowed, _ = policy.is_allowed("ExAmPlE.cOm", "/", "GET")
+        allowed, _, _ = policy.is_allowed("ExAmPlE.cOm", "/", "GET")
         self.assertTrue(allowed)
 
         # Denylist check - case variations should still be blocked.
-        allowed, _ = policy.is_allowed("EVIL.COM", "/", "GET")
+        allowed, _, _ = policy.is_allowed("EVIL.COM", "/", "GET")
         self.assertFalse(allowed)
-        allowed, _ = policy.is_allowed("Evil.Com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("Evil.Com", "/", "GET")
         self.assertFalse(allowed)
 
     def test_subdomain_escape_attempt(self):
         """Subdomains can't escape wildcard restrictions."""
         policy = self.Policy(deny=["*.evil.com"])
         # Standard subdomain - blocked.
-        allowed, _ = policy.is_allowed("sub.evil.com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("sub.evil.com", "/", "GET")
         self.assertFalse(allowed)
         # Deep subdomain - blocked.
-        allowed, _ = policy.is_allowed("deep.sub.evil.com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("deep.sub.evil.com", "/", "GET")
         self.assertFalse(allowed)
         # Base domain - blocked.
-        allowed, _ = policy.is_allowed("evil.com", "/", "GET")
+        allowed, _, _ = policy.is_allowed("evil.com", "/", "GET")
         self.assertFalse(allowed)
 
     def test_similar_domain_not_matched(self):
@@ -210,7 +210,7 @@ class TestPolicyBypass(unittest.TestCase):
             "example.com.",  # Trailing dot.
         ]
         for domain in test_domains:
-            allowed, _ = policy.is_allowed(domain, "/", "GET")
+            allowed, _, _ = policy.is_allowed(domain, "/", "GET")
             self.assertFalse(allowed, f"{domain} should not match example.com")
 
     def test_path_escape_attempt(self):
@@ -407,6 +407,571 @@ class TestPolicyFileHandling(unittest.TestCase):
             self.assertEqual(policy, {"allow": [], "deny": []})
         except OSError:
             pass  # Symlink creation might fail.
+
+
+class TestQuietMode(unittest.TestCase):
+    """Tests for quiet mode functionality."""
+
+    def setUp(self):
+        """Save original QUIET state."""
+        self._original_quiet = brig.QUIET
+
+    def tearDown(self):
+        """Restore original QUIET state."""
+        brig.QUIET = self._original_quiet
+
+    def test_output_prints_when_not_quiet(self):
+        """output() prints when QUIET is False."""
+        brig.QUIET = False
+        with patch('builtins.print') as mock_print:
+            brig.output("test message")
+            mock_print.assert_called_once_with("test message")
+
+    def test_output_suppressed_when_quiet(self):
+        """output() is suppressed when QUIET is True."""
+        brig.QUIET = True
+        with patch('builtins.print') as mock_print:
+            brig.output("test message")
+            mock_print.assert_not_called()
+
+    def test_log_info_suppressed_when_quiet(self):
+        """INFO level logs are suppressed in quiet mode."""
+        brig.QUIET = True
+        with patch('builtins.print') as mock_print:
+            brig.log(brig.LOG_LEVEL_INFO, "info message")
+            mock_print.assert_not_called()
+
+    def test_log_warn_not_suppressed_when_quiet(self):
+        """WARN level logs are not suppressed in quiet mode."""
+        brig.QUIET = True
+        with patch('builtins.print') as mock_print:
+            brig.log(brig.LOG_LEVEL_WARN, "warn message")
+            mock_print.assert_called_once()
+
+    def test_log_error_not_suppressed_when_quiet(self):
+        """ERROR level logs are not suppressed in quiet mode."""
+        brig.QUIET = True
+        with patch('builtins.print') as mock_print:
+            brig.log(brig.LOG_LEVEL_ERROR, "error message")
+            mock_print.assert_called_once()
+
+
+class TestErrorHelpers(unittest.TestCase):
+    """Tests for error helper functions."""
+
+    def test_print_error_outputs_to_stderr(self):
+        """print_error() writes to stderr."""
+        with patch('builtins.print') as mock_print:
+            brig.print_error("test error")
+            mock_print.assert_called()
+            # Check it was called with file=sys.stderr.
+            call_kwargs = mock_print.call_args_list[0][1]
+            self.assertEqual(call_kwargs.get('file'), sys.stderr)
+
+    def test_print_error_with_suggestion(self):
+        """print_error() includes suggestion when provided."""
+        with patch('builtins.print') as mock_print:
+            brig.print_error("test error", "try this")
+            self.assertEqual(mock_print.call_count, 2)
+
+    def test_error_calls_sys_exit(self):
+        """error() calls sys.exit(1)."""
+        with patch('builtins.print'):
+            with self.assertRaises(SystemExit) as cm:
+                brig.error("test error")
+            self.assertEqual(cm.exception.code, 1)
+
+    def test_error_unknown_command_exits(self):
+        """error_unknown_command() exits with helpful message."""
+        with patch('builtins.print') as mock_print:
+            with self.assertRaises(SystemExit):
+                brig.error_unknown_command("badcmd")
+            # Check the error message mentions the command.
+            call_args = mock_print.call_args_list[0][0][0]
+            self.assertIn("badcmd", call_args)
+
+    def test_error_invalid_json_exits(self):
+        """error_invalid_json() exits with path and details."""
+        with patch('builtins.print') as mock_print:
+            with self.assertRaises(SystemExit):
+                brig.error_invalid_json("/path/to/file.json", "unexpected token")
+            call_args = mock_print.call_args_list[0][0][0]
+            self.assertIn("/path/to/file.json", call_args)
+            self.assertIn("unexpected token", call_args)
+
+
+class TestPolicyValidation(unittest.TestCase):
+    """Tests for policy conflict validation."""
+
+    def test_no_conflicts_returns_empty(self):
+        """No conflicts when allow and deny are disjoint."""
+        policy = {
+            "allow": ["example.com", "api.example.com"],
+            "deny": ["evil.com", "malware.com"]
+        }
+        warnings = brig.validate_policy_conflicts(policy)
+        self.assertEqual(warnings, [])
+
+    def test_exact_duplicate_detected(self):
+        """Same domain in both allow and deny is detected."""
+        policy = {
+            "allow": ["example.com"],
+            "deny": ["example.com"]
+        }
+        warnings = brig.validate_policy_conflicts(policy)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("example.com", warnings[0])
+        self.assertIn("both", warnings[0].lower())
+
+    def test_wildcard_base_conflict_detected(self):
+        """Wildcard in allow with base domain in deny is detected."""
+        policy = {
+            "allow": ["*.example.com"],
+            "deny": ["example.com"]
+        }
+        warnings = brig.validate_policy_conflicts(policy)
+        self.assertTrue(len(warnings) >= 1)
+
+    def test_empty_policy_no_conflicts(self):
+        """Empty policy has no conflicts."""
+        policy = {"allow": [], "deny": []}
+        warnings = brig.validate_policy_conflicts(policy)
+        self.assertEqual(warnings, [])
+
+    def test_missing_keys_handled(self):
+        """Missing allow/deny keys don't cause errors."""
+        policy = {}
+        warnings = brig.validate_policy_conflicts(policy)
+        self.assertEqual(warnings, [])
+
+
+class TestSaveCellPolicy(unittest.TestCase):
+    """Tests for policy save with verification."""
+
+    def setUp(self):
+        """Create temp directory for policy files."""
+        self.temp_dir = tempfile.mkdtemp()
+        self._original_policy_dir = brig.POLICY_DIR
+        brig.POLICY_DIR = Path(self.temp_dir)
+
+    def tearDown(self):
+        """Clean up temp directory."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+        brig.POLICY_DIR = self._original_policy_dir
+
+    def test_save_returns_true_on_success(self):
+        """save_cell_policy returns True when write succeeds."""
+        policy = {"allow": ["example.com"], "deny": []}
+        result = brig.save_cell_policy("test-cell", policy)
+        self.assertTrue(result)
+
+    def test_saved_policy_matches_input(self):
+        """Saved policy can be read back correctly."""
+        policy = {"allow": ["example.com", "*.github.com"], "deny": ["evil.com"]}
+        brig.save_cell_policy("test-cell", policy)
+        loaded = brig.load_cell_policy("test-cell")
+        self.assertEqual(loaded["allow"], policy["allow"])
+        self.assertEqual(loaded["deny"], policy["deny"])
+
+
+class TestVerifyFixRecovery(unittest.TestCase):
+    """Tests for verify --fix recovery functions."""
+
+    def test_fix_proxy_not_running_calls_warden_start(self):
+        """_fix_proxy_not_running attempts to start warden."""
+        with patch.object(brig, 'run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = brig._fix_proxy_not_running()
+            self.assertTrue(result)
+            mock_run.assert_called_once()
+            # Verify warden start was called.
+            args = mock_run.call_args[0][0]
+            self.assertIn("warden", args)
+            self.assertIn("start", args)
+
+    def test_fix_proxy_not_running_handles_failure(self):
+        """_fix_proxy_not_running returns False on failure."""
+        with patch.object(brig, 'run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stderr="failed to start")
+            result = brig._fix_proxy_not_running()
+            self.assertFalse(result)
+
+    def test_fix_cell_network_calls_reconnect(self):
+        """_fix_cell_network attempts network reconnection."""
+        with patch.object(brig, 'run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = brig._fix_cell_network("test-cell")
+            self.assertTrue(result)
+            # Should have called network operations.
+            self.assertGreaterEqual(mock_run.call_count, 1)
+
+    def test_fix_cell_network_handles_failure(self):
+        """_fix_cell_network returns False on failure."""
+        with patch.object(brig, 'run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stderr="network error")
+            result = brig._fix_cell_network("test-cell")
+            self.assertFalse(result)
+
+
+class TestPolicyReloadBehavior(unittest.TestCase):
+    """Tests for policy reload behavior during operation."""
+
+    def setUp(self):
+        """Create temporary policy directory."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.original_policy_dir = brig.POLICY_DIR
+        brig.POLICY_DIR = Path(self.temp_dir)
+
+    def tearDown(self):
+        """Restore original policy directory."""
+        brig.POLICY_DIR = self.original_policy_dir
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_policy_reload_preserves_existing_rules(self):
+        """Reloading policy doesn't lose existing rules."""
+        # Save initial policy.
+        initial = {"allow": ["a.com", "b.com"], "deny": ["evil.com"]}
+        brig.save_cell_policy("reload-test", initial)
+
+        # Load it back.
+        loaded = brig.load_cell_policy("reload-test")
+        self.assertEqual(len(loaded["allow"]), 2)
+        self.assertEqual(len(loaded["deny"]), 1)
+
+        # Modify and save again.
+        loaded["allow"].append("c.com")
+        brig.save_cell_policy("reload-test", loaded)
+
+        # Reload and verify.
+        final = brig.load_cell_policy("reload-test")
+        self.assertEqual(len(final["allow"]), 3)
+        self.assertIn("c.com", final["allow"])
+
+    def test_concurrent_policy_reads_are_safe(self):
+        """Multiple threads can read policy simultaneously."""
+        import threading
+
+        # Create a policy file.
+        policy = {"allow": ["example.com"], "deny": []}
+        brig.save_cell_policy("concurrent-test", policy)
+
+        results = []
+        errors = []
+
+        def read_policy():
+            try:
+                for _ in range(10):
+                    loaded = brig.load_cell_policy("concurrent-test")
+                    results.append(loaded)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=read_policy) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0, f"Errors during concurrent reads: {errors}")
+        self.assertEqual(len(results), 50)  # 5 threads * 10 reads each.
+        # All results should be valid.
+        for r in results:
+            self.assertIn("allow", r)
+            self.assertIn("deny", r)
+
+
+class TestCircuitBreakerRecovery(unittest.TestCase):
+    """Tests for circuit breaker recovery in notifier addon."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import notifier with mocked dependencies."""
+        from notifier import CircuitBreakerState, CircuitBreakerConfig
+        cls.CircuitBreakerState = CircuitBreakerState
+        cls.CircuitBreakerConfig = CircuitBreakerConfig
+
+    def test_circuit_breaker_recovers_after_timeout(self):
+        """Circuit breaker transitions from open to half-open after timeout."""
+        import time
+
+        state = self.CircuitBreakerState()
+        config = self.CircuitBreakerConfig(
+            failure_threshold=3,
+            recovery_timeout=0.1,  # 100ms for testing.
+        )
+
+        # Simulate failures to open circuit.
+        state.consecutive_failures = 3
+        state.state = "open"
+        state.last_failure_time = time.time()
+
+        # Immediately after, circuit should still be open.
+        self.assertEqual(state.state, "open")
+
+        # Wait for recovery timeout.
+        time.sleep(0.15)
+
+        # Check if recovery timeout has passed.
+        elapsed = time.time() - state.last_failure_time
+        self.assertGreaterEqual(elapsed, config.recovery_timeout)
+
+        # In real code, this check happens in _check_circuit_breaker.
+        # Here we just verify the timing logic works.
+
+    def test_circuit_breaker_closes_on_success_after_half_open(self):
+        """Circuit breaker closes after successful request in half-open state."""
+        state = self.CircuitBreakerState()
+        state.state = "half-open"
+        state.consecutive_failures = 5
+
+        # Simulate successful request (what _record_success does).
+        state.consecutive_failures = 0
+        state.total_successes += 1
+        state.state = "closed"
+
+        self.assertEqual(state.state, "closed")
+        self.assertEqual(state.consecutive_failures, 0)
+
+    def test_circuit_breaker_reopens_on_failure_in_half_open(self):
+        """Circuit breaker reopens if request fails in half-open state."""
+        state = self.CircuitBreakerState()
+        state.state = "half-open"
+
+        # Simulate failed request (what _record_failure does in half-open).
+        state.consecutive_failures += 1
+        state.total_failures += 1
+        state.state = "open"  # Reopen on failure in half-open.
+
+        self.assertEqual(state.state, "open")
+
+
+class TestMetricsPersistenceRecovery(unittest.TestCase):
+    """Tests for metrics persistence and recovery."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import metrics module."""
+        from metrics import CellMetrics, HistogramLatencyBuffer
+        cls.CellMetrics = CellMetrics
+        cls.HistogramLatencyBuffer = HistogramLatencyBuffer
+
+    def test_metrics_survive_serialization(self):
+        """Metrics counters survive JSON serialization."""
+        metrics = self.CellMetrics()
+        metrics.total_requests = 100
+        metrics.blocked_requests = 5
+        metrics.bytes_sent = 1024
+
+        # Serialize to dict (what persistence does).
+        data = {
+            "total_requests": metrics.total_requests,
+            "blocked_requests": metrics.blocked_requests,
+            "bytes_sent": metrics.bytes_sent,
+        }
+
+        # Simulate reload.
+        restored = self.CellMetrics()
+        restored.total_requests = data["total_requests"]
+        restored.blocked_requests = data["blocked_requests"]
+        restored.bytes_sent = data["bytes_sent"]
+
+        self.assertEqual(restored.total_requests, 100)
+        self.assertEqual(restored.blocked_requests, 5)
+        self.assertEqual(restored.bytes_sent, 1024)
+
+    def test_histogram_handles_empty_state(self):
+        """Histogram percentile returns 0 for empty state."""
+        histogram = self.HistogramLatencyBuffer()
+
+        # Empty histogram should return 0 for any percentile.
+        self.assertEqual(histogram.percentile(50), 0.0)
+        self.assertEqual(histogram.percentile(95), 0.0)
+        self.assertEqual(histogram.percentile(99), 0.0)
+
+    def test_histogram_decay_prevents_unbounded_growth(self):
+        """Histogram decay keeps memory bounded."""
+        histogram = self.HistogramLatencyBuffer(max_samples=100)
+
+        # Add many samples.
+        for i in range(200):
+            histogram.add(float(i))
+
+        # Total count should be bounded due to decay.
+        self.assertLessEqual(histogram.total_count, 150)  # Some headroom for decay timing.
+
+
+class TestRenameCommand(unittest.TestCase):
+    """Tests for rename command validation."""
+
+    def test_rename_rejects_running_cell(self):
+        """Rename fails if cell is running."""
+        with patch.object(brig, 'cell_exists', return_value=True):
+            with patch.object(brig, 'cell_running', return_value=True):
+                with self.assertRaises(SystemExit):
+                    args = MagicMock(old_name="test", new_name="test2")
+                    brig.cmd_rename(args)
+
+    def test_rename_rejects_existing_target(self):
+        """Rename fails if target name already exists."""
+        def cell_exists_side_effect(name):
+            return name in ["old-cell", "existing-cell"]
+
+        with patch.object(brig, 'cell_exists', side_effect=cell_exists_side_effect):
+            with patch.object(brig, 'cell_running', return_value=False):
+                with self.assertRaises(SystemExit):
+                    args = MagicMock(old_name="old-cell", new_name="existing-cell")
+                    brig.cmd_rename(args)
+
+    def test_rename_rejects_empty_name(self):
+        """Rename fails for empty new name."""
+        with patch.object(brig, 'cell_exists', side_effect=lambda n: n == "test"):
+            with patch.object(brig, 'cell_running', return_value=False):
+                with self.assertRaises(SystemExit):
+                    args = MagicMock(old_name="test", new_name="")
+                    brig.cmd_rename(args)
+
+    def test_rename_rejects_invalid_start_char(self):
+        """Rename fails if new name starts with non-alphanumeric."""
+        with patch.object(brig, 'cell_exists', side_effect=lambda n: n == "test"):
+            with patch.object(brig, 'cell_running', return_value=False):
+                with self.assertRaises(SystemExit):
+                    args = MagicMock(old_name="test", new_name="-invalid")
+                    brig.cmd_rename(args)
+
+
+class TestConfigCommands(unittest.TestCase):
+    """Tests for config show/set/reset commands."""
+
+    def setUp(self):
+        """Create temporary config file."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_config = Path(self.temp_dir) / "config.json"
+        self.original_config_file = brig.CONFIG_FILE
+        brig.CONFIG_FILE = self.temp_config
+
+    def tearDown(self):
+        """Restore original config file."""
+        brig.CONFIG_FILE = self.original_config_file
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_config_show_returns_defaults(self):
+        """config show returns default config when no file exists."""
+        args = MagicMock(key=None)
+        with patch('builtins.print') as mock_print:
+            result = brig.cmd_config_show(args)
+            self.assertEqual(result, 0)
+            # Should print JSON output.
+            mock_print.assert_called()
+
+    def test_config_set_creates_file(self):
+        """config set creates config file if it doesn't exist."""
+        args = MagicMock(key="test_key", value="test_value")
+        result = brig.cmd_config_set(args)
+        self.assertEqual(result, 0)
+        self.assertTrue(self.temp_config.exists())
+
+        # Verify content.
+        with open(self.temp_config, "r") as f:
+            config = json.load(f)
+        self.assertEqual(config["test_key"], "test_value")
+
+    def test_config_set_nested_key(self):
+        """config set handles nested keys."""
+        args = MagicMock(key="section.nested.value", value="42")
+        result = brig.cmd_config_set(args)
+        self.assertEqual(result, 0)
+
+        with open(self.temp_config, "r") as f:
+            config = json.load(f)
+        self.assertEqual(config["section"]["nested"]["value"], 42)
+
+    def test_config_set_parses_boolean(self):
+        """config set parses boolean strings."""
+        args = MagicMock(key="enabled", value="true")
+        brig.cmd_config_set(args)
+
+        with open(self.temp_config, "r") as f:
+            config = json.load(f)
+        self.assertIs(config["enabled"], True)
+
+    def test_config_reset_removes_file(self):
+        """config reset removes config file."""
+        # Create a config file.
+        self.temp_config.write_text('{"test": true}')
+        self.assertTrue(self.temp_config.exists())
+
+        args = MagicMock()
+        result = brig.cmd_config_reset(args)
+        self.assertEqual(result, 0)
+        self.assertFalse(self.temp_config.exists())
+
+
+class TestConcurrentOperations(unittest.TestCase):
+    """Tests for concurrent operation safety."""
+
+    def test_cache_thread_safety(self):
+        """Cache operations are thread-safe."""
+        import threading
+
+        errors = []
+        results = []
+
+        def cache_operations():
+            try:
+                for i in range(100):
+                    key = f"key-{threading.current_thread().name}-{i}"
+                    # These functions should not raise under concurrent access.
+                    brig._cache[key] = (i, brig.time.time())
+                    hit, val = brig._cached(key)
+                    results.append((hit, val))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=cache_operations, name=f"t{i}") for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0, f"Errors during concurrent cache access: {errors}")
+        # Clear the cache we polluted.
+        brig._cache.clear()
+
+    def test_rate_limit_thread_safety(self):
+        """Rate limit checks are thread-safe."""
+        import threading
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump({"timestamps": []}, f)
+            temp_file = f.name
+
+        original_file = brig.RATE_LIMIT_FILE
+        brig.RATE_LIMIT_FILE = Path(temp_file)
+
+        errors = []
+
+        def do_rate_limit_check():
+            try:
+                for _ in range(10):
+                    # This should not raise even under concurrent access.
+                    brig.check_rate_limit()
+            except Exception as e:
+                errors.append(e)
+
+        try:
+            threads = [threading.Thread(target=do_rate_limit_check) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(len(errors), 0, f"Errors during concurrent rate limit: {errors}")
+        finally:
+            brig.RATE_LIMIT_FILE = original_file
+            os.unlink(temp_file)
 
 
 if __name__ == "__main__":

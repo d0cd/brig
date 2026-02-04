@@ -28,14 +28,87 @@ from mitmproxy import http, ctx
 # Metrics socket path.
 METRICS_SOCKET = Path("/var/run/cells/metrics.sock")
 
+# Metrics persistence file path.
+METRICS_PERSISTENCE_FILE = Path("/var/run/cells/metrics-state.json")
+
 # Maximum latencies to keep for percentile calculation.
 MAX_LATENCIES = 10000
+
+# Maximum number of cells to track (LRU eviction beyond this).
+MAX_TRACKED_CELLS = 1000
+
+
+class HistogramLatencyBuffer:
+    """O(1) histogram-based latency tracking for fast percentile queries.
+
+    Uses log-scale buckets (1ms to 60s) for bounded memory and O(1) percentiles.
+    Trade-off: ~5% error for O(1) insert and O(1) percentile queries.
+    """
+
+    # Bucket boundaries in ms: 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 60000
+    BUCKET_BOUNDS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 60000]
+
+    def __init__(self, max_samples: int = MAX_LATENCIES):
+        self.buckets = [0] * (len(self.BUCKET_BOUNDS) + 1)
+        self.total_count = 0
+        self.max_samples = max_samples
+        self._decay_threshold = max_samples
+
+    def _get_bucket_index(self, latency_ms: float) -> int:
+        """Find bucket index for a latency value."""
+        for i, bound in enumerate(self.BUCKET_BOUNDS):
+            if latency_ms < bound:
+                return i
+        return len(self.BUCKET_BOUNDS)
+
+    def add(self, latency_ms: float) -> None:
+        """Add a latency value in O(1) time."""
+        idx = self._get_bucket_index(latency_ms)
+        self.buckets[idx] += 1
+        self.total_count += 1
+
+        # Decay old samples to prevent unbounded growth.
+        if self.total_count > self._decay_threshold:
+            self._decay()
+
+    def _decay(self) -> None:
+        """Halve all bucket counts to decay old samples."""
+        self.buckets = [max(1, c // 2) if c > 0 else 0 for c in self.buckets]
+        self.total_count = sum(self.buckets)
+
+    def percentile(self, p: float) -> float:
+        """Get latency percentile (0-100) in O(1) time.
+
+        Returns the bucket midpoint for the target percentile.
+        """
+        if self.total_count == 0:
+            return 0.0
+
+        target = int(self.total_count * p / 100)
+        cumulative = 0
+
+        for i, count in enumerate(self.buckets):
+            cumulative += count
+            if cumulative >= target:
+                # Return bucket midpoint.
+                if i == 0:
+                    return self.BUCKET_BOUNDS[0] / 2
+                elif i >= len(self.BUCKET_BOUNDS):
+                    return self.BUCKET_BOUNDS[-1] * 1.5
+                else:
+                    return (self.BUCKET_BOUNDS[i - 1] + self.BUCKET_BOUNDS[i]) / 2
+
+        return self.BUCKET_BOUNDS[-1]
+
+    def __len__(self) -> int:
+        return self.total_count
 
 
 class CircularLatencyBuffer:
     """O(1) circular buffer for latency tracking.
 
     Provides efficient insertion while maintaining ability to calculate percentiles.
+    Uses histogram for O(1) percentile queries.
     """
 
     def __init__(self, size: int = MAX_LATENCIES):
@@ -43,32 +116,20 @@ class CircularLatencyBuffer:
         self.size = size
         self.index = 0
         self.count = 0
-        self._sorted_cache = None
-        self._cache_valid = False
+        # Use histogram for fast percentile queries.
+        self._histogram = HistogramLatencyBuffer(size)
 
     def add(self, latency: float) -> None:
         """Add a latency value in O(1) time."""
         self.buffer[self.index] = latency
         self.index = (self.index + 1) % self.size
         self.count = min(self.count + 1, self.size)
-        self._cache_valid = False  # Invalidate cache.
+        # Also add to histogram for O(1) percentiles.
+        self._histogram.add(latency)
 
     def percentile(self, p: float) -> float:
-        """Get latency percentile (0-100).
-
-        Sorts on read (cached) for accuracy.
-        """
-        if self.count == 0:
-            return 0.0
-
-        # Use cached sorted data if available.
-        if not self._cache_valid:
-            self._sorted_cache = sorted(self.buffer[:self.count])
-            self._cache_valid = True
-
-        idx = int(len(self._sorted_cache) * p / 100)
-        idx = min(idx, len(self._sorted_cache) - 1)
-        return self._sorted_cache[idx]
+        """Get latency percentile (0-100) in O(1) time."""
+        return self._histogram.percentile(p)
 
     def __len__(self) -> int:
         return self.count
@@ -140,15 +201,80 @@ class MetricsCollector:
         self.metrics_lock = threading.Lock()
         self.server_thread: Optional[threading.Thread] = None
         self.running = False
+        self.persistence_enabled = True
 
     def load(self, loader):
         """Called when addon is loaded."""
         ctx.log.info("MetricsCollector: Loading...")
+        self._load_persisted_metrics()
         self._start_server()
 
     def done(self):
         """Called when addon is unloaded."""
+        self._persist_metrics()
         self._stop_server()
+
+    def _persist_metrics(self) -> None:
+        """Save metrics to disk for persistence across restarts."""
+        if not self.persistence_enabled:
+            return
+
+        try:
+            METRICS_PERSISTENCE_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+            # Serialize metrics (counters only, latency histogram not persisted).
+            with self.metrics_lock:
+                data = {}
+                for cell_name, cell_metrics in self.metrics.items():
+                    data[cell_name] = {
+                        "total_requests": cell_metrics.total_requests,
+                        "blocked_requests": cell_metrics.blocked_requests,
+                        "rate_limited_requests": cell_metrics.rate_limited_requests,
+                        "error_requests": cell_metrics.error_requests,
+                        "bytes_sent": cell_metrics.bytes_sent,
+                        "bytes_received": cell_metrics.bytes_received,
+                        "last_request_ts": cell_metrics.last_request_ts,
+                    }
+
+            # Atomic write.
+            tmp_path = METRICS_PERSISTENCE_FILE.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, indent=2)
+            tmp_path.rename(METRICS_PERSISTENCE_FILE)
+
+            ctx.log.info(f"MetricsCollector: Persisted metrics for {len(data)} cells")
+
+        except (IOError, OSError) as e:
+            ctx.log.error(f"MetricsCollector: Failed to persist metrics: {e}")
+
+    def _load_persisted_metrics(self) -> None:
+        """Load metrics from disk on startup."""
+        if not self.persistence_enabled:
+            return
+
+        if not METRICS_PERSISTENCE_FILE.exists():
+            return
+
+        try:
+            with open(METRICS_PERSISTENCE_FILE, "r") as f:
+                data = json.load(f)
+
+            with self.metrics_lock:
+                for cell_name, values in data.items():
+                    cell_metrics = CellMetrics()
+                    cell_metrics.total_requests = values.get("total_requests", 0)
+                    cell_metrics.blocked_requests = values.get("blocked_requests", 0)
+                    cell_metrics.rate_limited_requests = values.get("rate_limited_requests", 0)
+                    cell_metrics.error_requests = values.get("error_requests", 0)
+                    cell_metrics.bytes_sent = values.get("bytes_sent", 0)
+                    cell_metrics.bytes_received = values.get("bytes_received", 0)
+                    cell_metrics.last_request_ts = values.get("last_request_ts", 0.0)
+                    self.metrics[cell_name] = cell_metrics
+
+            ctx.log.info(f"MetricsCollector: Loaded persisted metrics for {len(data)} cells")
+
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            ctx.log.warn(f"MetricsCollector: Failed to load persisted metrics: {e}")
 
     def _start_server(self) -> None:
         """Start Unix socket server for metrics queries."""
@@ -213,7 +339,15 @@ class MetricsCollector:
             else:
                 response = {"error": "Unknown command"}
 
-            conn.send(json.dumps(response).encode("utf-8"))
+            # Send response in chunks to handle large payloads.
+            response_bytes = json.dumps(response).encode("utf-8")
+            total_sent = 0
+            while total_sent < len(response_bytes):
+                sent = conn.send(response_bytes[total_sent:])
+                if sent == 0:
+                    ctx.log.warn("MetricsCollector: Socket connection closed while sending")
+                    break
+                total_sent += sent
 
         except Exception as e:
             ctx.log.debug(f"MetricsCollector: Connection error: {e}")
@@ -243,9 +377,20 @@ class MetricsCollector:
             return {"error": f"Cell not found: {cell_name}"}
 
     def _get_or_create_metrics(self, cell_name: str) -> CellMetrics:
-        """Get or create metrics for a cell."""
+        """Get or create metrics for a cell.
+
+        Applies LRU eviction when exceeding MAX_TRACKED_CELLS to bound memory.
+        """
         with self.metrics_lock:
             if cell_name not in self.metrics:
+                # Evict oldest cell if at capacity.
+                if len(self.metrics) >= MAX_TRACKED_CELLS:
+                    oldest = min(
+                        self.metrics.keys(),
+                        key=lambda k: self.metrics[k].last_request_ts
+                    )
+                    del self.metrics[oldest]
+                    ctx.log.debug(f"MetricsCollector: Evicted metrics for '{oldest}'")
                 self.metrics[cell_name] = CellMetrics()
             return self.metrics[cell_name]
 

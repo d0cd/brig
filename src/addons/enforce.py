@@ -35,6 +35,8 @@ import json
 import fnmatch
 import os
 import re
+import signal
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -52,6 +54,9 @@ CELL_POLICY_DIR = Path("/var/run/cells/policies")
 
 # Allowed ports.
 ALLOWED_PORTS = {80, 443}
+
+# Maximum number of cell policies to cache (LRU eviction beyond this).
+MAX_CACHED_CELL_POLICIES = 1000
 
 # Blocked IP ranges.
 BLOCKED_NETWORKS = [
@@ -239,11 +244,29 @@ class PolicyEnforcer:
         self.policy_mtime = 0.0
         self.subnet_map_mtime = 0.0
         self.cell_policy_mtimes: dict[str, float] = {}
+        self.cell_policy_last_access: dict[str, float] = {}  # LRU tracking.
         self.trace_config = PolicyTraceConfig()
+        self._cell_policy_lock = threading.Lock()  # Protects cell_policies access.
 
     def load(self, loader):
         """Called when addon is loaded."""
         ctx.log.info("PolicyEnforcer: Loading...")
+        self._reload_policy()
+        self._reload_subnet_map()
+        self._reload_cell_policies()
+        # Register SIGHUP handler for signal-based reload.
+        signal.signal(signal.SIGHUP, self._handle_sighup)
+        ctx.log.info("PolicyEnforcer: SIGHUP reload handler registered")
+
+    def _handle_sighup(self, signum, frame):
+        """Handle SIGHUP signal for policy reload."""
+        ctx.log.info("PolicyEnforcer: Received SIGHUP, reloading policies...")
+        # Force reload by resetting mtimes and clearing caches.
+        self.policy_mtime = 0.0
+        self.subnet_map_mtime = 0.0
+        with self._cell_policy_lock:
+            self.cell_policy_mtimes.clear()
+            self.cell_policy_last_access.clear()
         self._reload_policy()
         self._reload_subnet_map()
         self._reload_cell_policies()
@@ -306,7 +329,7 @@ class PolicyEnforcer:
             ctx.log.error(f"PolicyEnforcer: Failed to load subnet map: {e}")
 
     def _reload_cell_policies(self) -> None:
-        """Load per-cell policies."""
+        """Load per-cell policies with LRU eviction to bound memory."""
         try:
             if not CELL_POLICY_DIR.exists():
                 return
@@ -315,17 +338,32 @@ class PolicyEnforcer:
                 cell_name = policy_file.stem
                 mtime = policy_file.stat().st_mtime
 
-                if self.cell_policy_mtimes.get(cell_name) == mtime:
-                    continue  # No change.
+                with self._cell_policy_lock:
+                    if self.cell_policy_mtimes.get(cell_name) == mtime:
+                        continue  # No change.
+
+                    # Evict oldest policy if at capacity.
+                    if cell_name not in self.cell_policies:
+                        if len(self.cell_policies) >= MAX_CACHED_CELL_POLICIES:
+                            oldest = min(
+                                self.cell_policy_last_access.keys(),
+                                key=lambda k: self.cell_policy_last_access[k]
+                            )
+                            del self.cell_policies[oldest]
+                            del self.cell_policy_mtimes[oldest]
+                            del self.cell_policy_last_access[oldest]
+                            ctx.log.debug(f"PolicyEnforcer: Evicted policy for '{oldest}'")
 
                 try:
                     with open(policy_file, "r") as f:
                         data = json.load(f)
-                    self.cell_policies[cell_name] = Policy(
-                        allow=data.get("allow", []),
-                        deny=data.get("deny", [])
-                    )
-                    self.cell_policy_mtimes[cell_name] = mtime
+                    with self._cell_policy_lock:
+                        self.cell_policies[cell_name] = Policy(
+                            allow=data.get("allow", []),
+                            deny=data.get("deny", [])
+                        )
+                        self.cell_policy_mtimes[cell_name] = mtime
+                        self.cell_policy_last_access[cell_name] = time.time()
                     ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
                 except (json.JSONDecodeError, IOError) as e:
                     ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
@@ -370,10 +408,8 @@ class PolicyEnforcer:
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Process each HTTP request."""
-        # Hot-reload on each request (cheap mtime check).
-        self._reload_policy()
-        self._reload_subnet_map()
-        self._reload_cell_policies()
+        # Policy reload now handled via SIGHUP signal (see _handle_sighup).
+        # No per-request stat() calls for better performance.
 
         # Extract request details.
         host = flow.request.host
@@ -405,8 +441,13 @@ class PolicyEnforcer:
             return
 
         # Check 4: Per-cell policy (if exists).
-        if cell_name and cell_name in self.cell_policies:
-            cell_policy = self.cell_policies[cell_name]
+        cell_policy = None
+        if cell_name:
+            with self._cell_policy_lock:
+                if cell_name in self.cell_policies:
+                    cell_policy = self.cell_policies[cell_name]
+                    self.cell_policy_last_access[cell_name] = time.time()  # LRU tracking.
+        if cell_policy:
             allowed, reason, trace = cell_policy.is_allowed(host, path, method, self.trace_config)
             if trace and self.trace_config.enabled:
                 flow.metadata["policy_trace"] = trace

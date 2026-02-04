@@ -715,6 +715,293 @@ Post-MVP enhancements for performance, functionality, and polish.
 
 ---
 
+## Future Roadmap
+
+Post-MVP improvements for stability, usability, and reliability.
+
+### Current State Assessment
+
+**Overall Assessment: 7.5/10 - Ready for personal/team use, needs polish for wider adoption**
+
+| Aspect | Score | Status |
+|--------|-------|--------|
+| Completeness | 8/10 | Core features work, some stubs remain |
+| Performance | 6/10 | Good design, has hot-reload bottleneck |
+| Usability | 7/10 | Helpful errors, inconsistent in places |
+| Security | 9/10 | Excellent, all invariants tested |
+| Reliability | 7/10 | Solid tests, gaps in failure recovery |
+| Documentation | 8/10 | Comprehensive, minor gaps |
+
+### Phase 1: Stability ✓
+
+**Goal: Fix issues that could cause problems in daily use**
+
+#### 1.1 Fix Hot-Reload Performance ✓
+**Files:** `src/addons/enforce.py`, `logger.py`, `ratelimit.py`
+
+- [x] Move policy reload from per-request mtime checks to SIGHUP signal-based
+- [x] Register signal handlers in `load()` method
+- [x] Add `_handle_sighup()` method to each addon
+- [x] Remove per-request stat() calls
+
+#### 1.2 Add Memory Bounds to Caches ✓
+**Files:** `src/addons/enforce.py`, `metrics.py`, `ratelimit.py`, `notifier.py`
+
+- [x] Add `MAX_TRACKED_CELLS = 1000` constant
+- [x] Implement LRU eviction when exceeding capacity
+- [x] Track last access time for cell policies
+- [x] Evict oldest entries based on timestamps
+
+#### 1.3 Add Subprocess Timeouts ✓
+**File:** `src/warden.py`
+
+- [x] Add `DEFAULT_TIMEOUT = 30` constant
+- [x] Add `timeout` parameter to `run()` function
+- [x] Handle `subprocess.TimeoutExpired` exceptions
+- [x] Use longer timeout (120s) for container start commands
+- [x] Use `timeout=None` for intentional long-running commands (logs -f)
+
+#### 1.4 Delete Stub Modules ✓
+**Files:** `src/brig/commands/*.py`
+
+- [x] Removed dead code stub modules that raised NotImplementedError
+- [x] Kept working utility modules (`config.py`, `utils.py`, `container.py`)
+
+---
+
+### Phase 2: Usability Polish
+
+**Goal: Improve day-to-day experience**
+
+#### 2.1 Consistent Error Messages
+**File:** `src/brig.py`
+
+- [ ] Audit all error paths
+- [ ] Ensure they use `error_cell_not_found()` style helpers
+- [ ] Add suggestions to all error messages
+
+#### 2.2 Add Missing Convenience Commands
+**File:** `src/brig.py`
+
+- [ ] `brig rename <old> <new>` - Rename cells
+- [ ] `brig config show/set` - View/modify defaults
+- [ ] `brig shell <cell>` - Shortcut for `exec -it /bin/sh`
+
+#### 2.3 Improve Help Text
+**File:** `src/brig.py`
+
+- [ ] Document `--sanitize` blocked file types
+- [ ] Add examples to policy commands
+- [ ] Show defaults consistently
+
+#### 2.4 Add --quiet Flag
+**File:** `src/brig.py`
+
+- [ ] Add to all commands for scripting use
+
+---
+
+### Phase 3: Reliability
+
+**Goal: Handle failures gracefully**
+
+#### 3.1 Proxy Crash Recovery
+**Files:** `src/brig.py`, `src/warden.py`
+
+- [ ] Add `warden` auto-restart on crash
+- [ ] Add `brig verify --fix` to auto-recover
+- [ ] Test recovery scenarios
+
+#### 3.2 Policy Validation on Set
+**File:** `src/brig.py`
+
+- [ ] Check for duplicate domains
+- [ ] Warn on allow/deny conflicts
+- [ ] Validate policy written successfully
+
+#### 3.3 Circuit Breaker for Webhooks
+**File:** `src/addons/notifier.py`
+
+- [ ] Stop retrying after N failures
+- [ ] Exponential backoff
+- [ ] Dead-letter queue for failed notifications
+
+#### 3.4 Add Missing Tests
+**Files:** `tests/`
+
+- [x] Tests for SIGHUP reload handlers
+- [x] Tests for LRU eviction
+- [ ] Proxy crash/restart recovery
+- [ ] Concurrent subnet allocation (100+ cells)
+- [ ] Policy reload during active requests
+- [ ] Resource limit enforcement verification
+
+---
+
+### Phase 4: Performance & Benchmarking
+
+**Goal: Establish baselines, prevent regressions, handle higher load**
+
+#### 4.1 Benchmarking Framework
+**Files:** `tests/benchmarks/`, `tests/bench_runner.py`
+
+- [ ] Create dedicated benchmark directory structure
+- [ ] Use `pyperf` or `pytest-benchmark` for statistical rigor
+- [ ] Minimum 5 iterations with warmup, report mean/stddev/p95
+- [ ] JSON output for historical tracking
+- [ ] Fail CI if regression exceeds threshold (e.g., >10% slower)
+
+#### 4.2 Proxy Throughput Benchmarks
+**File:** `tests/benchmarks/bench_proxy.py`
+
+- [ ] Requests per second (baseline: target 1000+ req/s)
+- [ ] Latency distribution (p50, p95, p99) under load
+- [ ] Memory usage under sustained load (1hr soak test)
+- [ ] Policy evaluation time with 10/100/1000 rules
+- [ ] Concurrent connections (10/50/100/500 simultaneous)
+
+Benchmark scenarios:
+```
+bench_allowed_request       # Request matching allowlist
+bench_denied_request        # Request blocked by denylist
+bench_default_deny          # Request not in any list
+bench_complex_rule          # Path + method matching
+bench_large_policy          # 1000+ rules
+```
+
+#### 4.3 Cell Lifecycle Benchmarks
+**File:** `tests/benchmarks/bench_lifecycle.py`
+
+- [ ] Cell creation time (target: <5s including network setup)
+- [ ] Cell startup time (target: <2s for running state)
+- [ ] Cell stop time (graceful shutdown)
+- [ ] Cell removal time (including network cleanup)
+- [ ] Concurrent cell creation (10/50/100 cells)
+- [ ] Subnet allocator performance at scale (200+ allocations)
+
+#### 4.4 CLI Response Time Benchmarks
+**File:** `tests/benchmarks/bench_cli.py`
+
+- [ ] `brig list` with 0/10/50/100 cells
+- [ ] `brig inspect` single cell
+- [ ] `brig logs --tail 100` response time
+- [ ] `brig verify` full check time
+- [ ] Cache hit vs miss comparison
+
+#### 4.5 Memory Profiling
+**File:** `tests/benchmarks/bench_memory.py`
+
+- [ ] Proxy RSS after startup (baseline)
+- [ ] Proxy RSS after 10k requests
+- [ ] Proxy RSS after 1hr idle (leak detection)
+- [ ] Per-cell memory overhead in metrics collector
+- [ ] LRU eviction effectiveness (memory bounded at MAX_TRACKED_CELLS)
+
+#### 4.6 Baseline Establishment
+**File:** `docs/benchmarks/BASELINES.md`
+
+- [ ] Document hardware specs for baseline measurements
+- [ ] Record baseline numbers for all benchmarks
+- [ ] Update baselines when intentional changes affect performance
+- [ ] Track historical trends
+
+Example baseline format:
+```markdown
+## Proxy Throughput (MacBook Pro M2, 16GB)
+| Metric | Baseline | Acceptable Range |
+|--------|----------|------------------|
+| req/s (allowed) | 2,500 | >2,000 |
+| p50 latency | 0.8ms | <2ms |
+| p99 latency | 3.2ms | <10ms |
+| memory (10k req) | 180MB | <256MB |
+```
+
+#### 4.7 Performance Optimizations
+
+##### 4.7.1 Reduce JSON Overhead
+**Files:** `src/addons/logger.py`, `enforce.py`
+
+- [ ] Reuse JSON encoder instance
+- [ ] Consider msgpack for internal communication
+- [ ] Benchmark before/after
+
+##### 4.7.2 Connection Pooling for Webhooks
+**File:** `src/addons/notifier.py`
+
+- [ ] Use `requests.Session()` for connection reuse
+- [ ] Benchmark webhook latency improvement
+
+##### 4.7.3 Latency Percentile Optimization
+**File:** `src/addons/metrics.py`
+
+- [ ] Replace full sort with t-digest or DDSketch for O(1) percentiles
+- [ ] Benchmark percentile calculation time
+
+##### 4.7.4 Policy Lookup Optimization
+**File:** `src/addons/enforce.py`
+
+- [ ] Consider trie or radix tree for domain matching at scale
+- [ ] Benchmark with 1000+ rules
+
+#### 4.8 Continuous Benchmarking
+
+- [ ] Run benchmarks on every PR (subset for speed)
+- [ ] Run full benchmark suite nightly
+- [ ] Alert on >10% regression
+- [ ] Generate trend graphs
+- [ ] Store results in `benchmarks/results/` (gitignored)
+
+---
+
+### Phase 5: Features (Nice to Have)
+
+**Goal: Extended functionality**
+
+#### 5.1 Per-Cell Disk Quotas
+**File:** `src/addons/logger.py`
+
+- [ ] Limit log file size per cell to prevent disk exhaustion
+
+#### 5.2 Metrics Persistence
+**File:** `src/addons/metrics.py`
+
+- [ ] Optionally persist metrics to disk on shutdown
+- [ ] Reload on start
+
+#### 5.3 AI-Powered Log Analysis
+**Files:** New addon
+
+- [ ] Use Claude API to summarize logs
+- [ ] Detect anomalies
+- [ ] Suggest policy changes
+
+#### 5.4 Web Dashboard
+**Files:** New module
+
+- [ ] Simple web UI for viewing cells, logs, metrics
+
+---
+
+### Verification Commands
+
+After implementing fixes:
+
+```bash
+# Performance check - should see no stat() spam
+strace -e stat -c brig list 2>&1 | grep stat
+
+# Memory check - run overnight, check RSS
+while true; do ps -o rss= -p $(pgrep -f mitmdump); sleep 60; done
+
+# Recovery check
+warden stop && sleep 2 && brig verify
+
+# Load test
+python3 tests/test_load.py -v
+```
+
+---
+
 ## Success Criteria
 
 ### Functional

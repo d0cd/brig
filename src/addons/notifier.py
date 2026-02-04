@@ -6,6 +6,9 @@ Sends real-time notifications on blocked requests:
     - Configurable filters (block reasons, cells, domains)
     - Rate-limited to prevent notification spam
     - Async HTTP to avoid blocking proxy
+    - Circuit breaker to prevent repeated failures
+    - Exponential backoff for retries
+    - Dead-letter queue for failed notifications
 
 Configuration in policy file:
     {
@@ -15,6 +18,11 @@ Configuration in policy file:
                 "block_reasons": ["denied by rule", "not in allowlist"],
                 "cells": ["sensitive-cell"],
                 "min_interval_seconds": 60
+            },
+            "circuit_breaker": {
+                "failure_threshold": 5,
+                "recovery_timeout": 300,
+                "max_retries": 3
             }
         }
     }
@@ -27,16 +35,26 @@ import json
 import queue
 import threading
 import time
-import urllib.request
-import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from mitmproxy import http, ctx
 
+# Try to use urllib3 for connection pooling, fall back to urllib.
+try:
+    import urllib3
+    URLLIB3_AVAILABLE = True
+except ImportError:
+    import urllib.request
+    import urllib.error
+    URLLIB3_AVAILABLE = False
+
 # Policy file path.
 POLICY_FILE = Path("/policy.json")
+
+# Dead letter queue file path.
+DEAD_LETTER_FILE = Path("/var/run/cells/dead-letters.json")
 
 # Default minimum interval between notifications (per cell).
 DEFAULT_MIN_INTERVAL = 60  # seconds
@@ -47,6 +65,39 @@ MAX_QUEUE_SIZE = 100
 # HTTP timeout for webhook requests.
 HTTP_TIMEOUT = 10  # seconds
 
+# Maximum number of cells to track for rate limiting (LRU eviction beyond this).
+MAX_TRACKED_CELLS = 1000
+
+# Circuit breaker defaults.
+DEFAULT_FAILURE_THRESHOLD = 5  # Consecutive failures before opening circuit.
+DEFAULT_RECOVERY_TIMEOUT = 300  # Seconds before attempting recovery.
+DEFAULT_MAX_RETRIES = 3  # Max retry attempts per notification.
+DEFAULT_BASE_BACKOFF = 1.0  # Base backoff in seconds.
+DEFAULT_MAX_BACKOFF = 60.0  # Maximum backoff in seconds.
+
+# Maximum dead letters to keep.
+MAX_DEAD_LETTERS = 1000
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Circuit breaker configuration."""
+    failure_threshold: int = DEFAULT_FAILURE_THRESHOLD
+    recovery_timeout: float = DEFAULT_RECOVERY_TIMEOUT
+    max_retries: int = DEFAULT_MAX_RETRIES
+    base_backoff: float = DEFAULT_BASE_BACKOFF
+    max_backoff: float = DEFAULT_MAX_BACKOFF
+
+
+@dataclass
+class CircuitBreakerState:
+    """Circuit breaker state tracking."""
+    consecutive_failures: int = 0
+    last_failure_time: float = 0.0
+    state: str = "closed"  # closed, open, half-open
+    total_failures: int = 0
+    total_successes: int = 0
+
 
 @dataclass
 class NotificationConfig:
@@ -56,6 +107,7 @@ class NotificationConfig:
     cells: Optional[list] = None  # None = all cells.
     min_interval_seconds: int = DEFAULT_MIN_INTERVAL
     enabled: bool = False
+    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
 
 
 class Notifier:
@@ -68,6 +120,29 @@ class Notifier:
         self.notification_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
         self.worker_thread: Optional[threading.Thread] = None
         self.running = False
+        self.circuit_breaker = CircuitBreakerState()
+        self.dead_letters: list[dict] = []
+        self._cb_lock = threading.Lock()  # Lock for circuit breaker state.
+        # Connection pool for HTTP requests (reuses connections).
+        self._http_pool: Optional[object] = None
+        self._pool_lock = threading.Lock()
+
+    def _get_http_pool(self):
+        """Get or create HTTP connection pool for the webhook URL."""
+        if not URLLIB3_AVAILABLE:
+            return None
+
+        with self._pool_lock:
+            if self._http_pool is None and self.config.webhook_url:
+                # Create a PoolManager for connection reuse.
+                self._http_pool = urllib3.PoolManager(
+                    num_pools=1,
+                    maxsize=10,
+                    timeout=urllib3.Timeout(total=HTTP_TIMEOUT),
+                    retries=False,  # We handle retries ourselves.
+                )
+                ctx.log.info("Notifier: Created HTTP connection pool")
+            return self._http_pool
 
     def load(self, loader):
         """Called when addon is loaded."""
@@ -79,6 +154,11 @@ class Notifier:
     def done(self):
         """Called when addon is unloaded."""
         self._stop_worker()
+        # Clean up connection pool.
+        with self._pool_lock:
+            if self._http_pool is not None:
+                self._http_pool.clear()
+                self._http_pool = None
 
     def _reload_config(self) -> None:
         """Load notification configuration from policy file."""
@@ -97,13 +177,21 @@ class Notifier:
 
             webhook_url = notifications.get("webhook_url", "")
             filters = notifications.get("filters", {})
+            cb_config = notifications.get("circuit_breaker", {})
 
             self.config = NotificationConfig(
                 webhook_url=webhook_url,
                 block_reasons=filters.get("block_reasons"),
                 cells=filters.get("cells"),
                 min_interval_seconds=filters.get("min_interval_seconds", DEFAULT_MIN_INTERVAL),
-                enabled=bool(webhook_url)
+                enabled=bool(webhook_url),
+                circuit_breaker=CircuitBreakerConfig(
+                    failure_threshold=cb_config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD),
+                    recovery_timeout=cb_config.get("recovery_timeout", DEFAULT_RECOVERY_TIMEOUT),
+                    max_retries=cb_config.get("max_retries", DEFAULT_MAX_RETRIES),
+                    base_backoff=cb_config.get("base_backoff", DEFAULT_BASE_BACKOFF),
+                    max_backoff=cb_config.get("max_backoff", DEFAULT_MAX_BACKOFF),
+                )
             )
 
             self.policy_mtime = mtime
@@ -150,31 +238,163 @@ class Notifier:
             except Exception as e:
                 ctx.log.error(f"Notifier: Worker error: {e}")
 
+    def _check_circuit_breaker(self) -> bool:
+        """Check if circuit breaker allows requests. Returns True if allowed."""
+        with self._cb_lock:
+            now = time.time()
+
+            if self.circuit_breaker.state == "closed":
+                return True
+
+            if self.circuit_breaker.state == "open":
+                # Check if recovery timeout has passed.
+                elapsed = now - self.circuit_breaker.last_failure_time
+                if elapsed >= self.config.circuit_breaker.recovery_timeout:
+                    self.circuit_breaker.state = "half-open"
+                    ctx.log.info("Notifier: Circuit breaker half-open, attempting recovery")
+                    return True
+                return False
+
+            # Half-open: allow one request to test.
+            return True
+
+    def _record_success(self) -> None:
+        """Record a successful webhook call."""
+        with self._cb_lock:
+            self.circuit_breaker.consecutive_failures = 0
+            self.circuit_breaker.total_successes += 1
+            if self.circuit_breaker.state == "half-open":
+                self.circuit_breaker.state = "closed"
+                ctx.log.info("Notifier: Circuit breaker closed (recovered)")
+
+    def _record_failure(self) -> None:
+        """Record a failed webhook call."""
+        with self._cb_lock:
+            self.circuit_breaker.consecutive_failures += 1
+            self.circuit_breaker.total_failures += 1
+            self.circuit_breaker.last_failure_time = time.time()
+
+            if self.circuit_breaker.state == "half-open":
+                self.circuit_breaker.state = "open"
+                ctx.log.warn("Notifier: Circuit breaker re-opened after failed recovery")
+            elif self.circuit_breaker.consecutive_failures >= self.config.circuit_breaker.failure_threshold:
+                self.circuit_breaker.state = "open"
+                ctx.log.warn(
+                    f"Notifier: Circuit breaker opened after "
+                    f"{self.circuit_breaker.consecutive_failures} consecutive failures"
+                )
+
+    def _add_to_dead_letter(self, notification: dict, error: str) -> None:
+        """Add failed notification to dead-letter queue."""
+        dead_letter = {
+            "notification": notification,
+            "error": str(error),
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "attempts": notification.get("_attempts", 1),
+        }
+
+        self.dead_letters.append(dead_letter)
+
+        # Trim if over limit.
+        if len(self.dead_letters) > MAX_DEAD_LETTERS:
+            self.dead_letters = self.dead_letters[-MAX_DEAD_LETTERS:]
+
+        # Persist to disk.
+        self._save_dead_letters()
+
+    def _save_dead_letters(self) -> None:
+        """Persist dead letters to disk."""
+        try:
+            DEAD_LETTER_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = DEAD_LETTER_FILE.with_suffix(".tmp")
+            with open(tmp_path, "w") as f:
+                json.dump(self.dead_letters, f, indent=2)
+            tmp_path.rename(DEAD_LETTER_FILE)
+        except (IOError, OSError) as e:
+            ctx.log.error(f"Notifier: Failed to save dead letters: {e}")
+
+    def _send_http_request(self, data: bytes) -> tuple[bool, Optional[str]]:
+        """Send HTTP request using connection pool or fallback. Returns (success, error)."""
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Warden/1.0",
+        }
+
+        pool = self._get_http_pool()
+        if pool is not None:
+            # Use urllib3 connection pool.
+            try:
+                response = pool.request(
+                    "POST",
+                    self.config.webhook_url,
+                    body=data,
+                    headers=headers,
+                )
+                if response.status < 400:
+                    return True, None
+                else:
+                    return False, f"HTTP {response.status}"
+            except urllib3.exceptions.HTTPError as e:
+                return False, str(e)
+        else:
+            # Fallback to urllib.
+            try:
+                req = urllib.request.Request(
+                    self.config.webhook_url,
+                    data=data,
+                    headers=headers,
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+                    if response.status < 400:
+                        return True, None
+                    else:
+                        return False, f"HTTP {response.status}"
+            except urllib.error.URLError as e:
+                return False, str(e)
+
     def _send_notification(self, notification: dict) -> None:
-        """Send notification to webhook."""
+        """Send notification to webhook with circuit breaker and retry logic."""
         if not self.config.webhook_url:
             return
 
-        try:
-            data = json.dumps(notification).encode("utf-8")
-            req = urllib.request.Request(
-                self.config.webhook_url,
-                data=data,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "Warden/1.0",
-                },
-                method="POST"
-            )
+        # Check circuit breaker.
+        if not self._check_circuit_breaker():
+            ctx.log.debug("Notifier: Circuit breaker open, dropping notification")
+            self._add_to_dead_letter(notification, "circuit_breaker_open")
+            return
 
-            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
-                if response.status >= 400:
-                    ctx.log.warn(f"Notifier: Webhook returned {response.status}")
+        attempts = notification.get("_attempts", 0)
+        max_retries = self.config.circuit_breaker.max_retries
 
-        except urllib.error.URLError as e:
-            ctx.log.error(f"Notifier: Failed to send notification: {e}")
-        except Exception as e:
-            ctx.log.error(f"Notifier: Unexpected error: {e}")
+        while attempts < max_retries:
+            attempts += 1
+            notification["_attempts"] = attempts
+
+            try:
+                data = json.dumps(notification).encode("utf-8")
+                success, error = self._send_http_request(data)
+
+                if success:
+                    self._record_success()
+                    return  # Success.
+                else:
+                    ctx.log.warn(f"Notifier: Webhook failed (attempt {attempts}): {error}")
+
+            except Exception as e:
+                ctx.log.error(f"Notifier: Unexpected error (attempt {attempts}): {e}")
+
+            # Calculate exponential backoff.
+            if attempts < max_retries:
+                backoff = min(
+                    self.config.circuit_breaker.base_backoff * (2 ** (attempts - 1)),
+                    self.config.circuit_breaker.max_backoff
+                )
+                time.sleep(backoff)
+
+        # All retries exhausted.
+        self._record_failure()
+        self._add_to_dead_letter(notification, f"max_retries_exceeded_{max_retries}")
 
     def _should_notify(self, cell_name: str, block_reason: str) -> bool:
         """Check if we should send a notification."""
@@ -218,7 +438,12 @@ class Notifier:
         if not self._should_notify(cell_name, block_reason):
             return
 
-        # Update last notification time.
+        # Update last notification time with LRU eviction.
+        if cell_name not in self.last_notification:
+            if len(self.last_notification) >= MAX_TRACKED_CELLS:
+                oldest = min(self.last_notification.keys(),
+                             key=lambda k: self.last_notification[k])
+                del self.last_notification[oldest]
         self.last_notification[cell_name] = time.time()
 
         # Build notification.
