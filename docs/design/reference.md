@@ -1,34 +1,47 @@
-# Cell Reference
+# Brig Reference
 
 ## CLI Reference
 
 ```
-cell - Secure Workload Harness CLI
+brig - Secure Workload Harness CLI
 
-COMMANDS:
-  run         Run a cell
-  verify      Verify invariants (networks, proxy, runtime)
+CELL MANAGEMENT:
+  run         Run a cell (supports --profile, --timeout, --network none)
   stop        Stop a cell gracefully
   kill        Kill a cell immediately
+  wait        Block until cell exits (returns exit code)
   rm          Remove a cell and its state
-  list        List cells (shows runtime, network, status)
   start       Start a stopped cell
+  list        List cells (--format json for structured output)
 
+INSPECTION & INTERACTION:
   logs        View cell logs (stdout/stderr)
   network     View cell network activity
+  events      Stream cell lifecycle events (JSON)
   files       List cell workspace
   cat         View file from workspace (safe, doesn't execute)
   cp          Copy file to/from workspace (validates paths)
   exec        Execute command in running cell
   inspect     Show cell details (runtime, network, mounts, secrets)
+  stats       Show resource usage (--output json)
 
-  proxy       Manage proxy service
+PERFORMANCE:
+  pull        Pull and cache container image
+  warmup      Pre-pull images for a profile
+  checkpoint  Checkpoint running cell (CRIU)
+  restore     Restore cell from checkpoint
+
+SYSTEM:
   vm          Manage Lima VM
-  workspace   Manage cell workspaces
-  secrets     List/validate secrets
-
+  verify      Verify security invariants
   diagnose    Diagnose connectivity issues
-  test        Run verification tests
+  health      Check system health
+  config      Manage configuration
+  policy      Manage cell network policies
+  history     Show operation history
+  metrics     Output Prometheus metrics
+  tui         Interactive terminal UI
+  secrets     List/validate secrets
 ```
 
 ### Run Flags
@@ -39,20 +52,36 @@ COMMANDS:
 -f FILE              Load config from file (includes secrets declarations)
 -d, --detach         Run in background
 --rm                 Remove after exit
---timeout DURATION   Kill after duration (e.g., 1h, 30m)
---restart POLICY     Restart policy (no, on-failure, unless-stopped, always)
---runtime RUNTIME    Container runtime (runsc default, runc requires --unsafe)
---unsafe             Allow dangerous operations (required for --runtime=runc)
---no-proxy-env       Don't set HTTP_PROXY/HTTPS_PROXY (for testing)
+--timeout DURATION   Kill after duration (e.g., 30s, 5m, 2h, 1d)
+--profile PROFILE    Trust profile (untrusted, supervised, dev, airgapped, honeypot)
+--network MODE       Network mode: default or none (air-gapped)
+--output FORMAT      Output format: text or json
+--label KEY=VALUE    Add label for orchestration metadata
+--memory SIZE        Memory limit (default: 2g)
+--cpus N             CPU limit (default: 2)
+--pids-limit N       PID limit (default: 512)
+--policy-allow DOMAIN  Allow domain (adds to global policy)
+--policy-deny DOMAIN   Deny domain (overrides global policy)
+--verify-image       Verify image signature before running
+--seccomp-profile F  Apply seccomp profile (JSON file)
 --env KEY=VALUE      Set additional environment variable
+--secret NAME        Mount secret file at /run/secrets/
+```
+
+### Wait Flags
+
+```
+brig wait <name>     Block until cell exits
+--timeout DURATION   Maximum time to wait
+--output FORMAT      Output format: text or json
 ```
 
 ### Secrets Commands
 
 ```
 brig secrets list              List all secret files in ~/.brig/secrets/
-cell secrets show SECRET       Show which cells use a secret
-cell secrets validate CELL     Check if all secrets for a cell exist
+brig secrets show SECRET       Show which cells use a secret
+brig secrets validate CELL     Check if all secrets for a cell exist
 ```
 
 ### CP Flags
@@ -68,25 +97,25 @@ cell secrets validate CELL     Check if all secrets for a cell exist
 ### VM Commands
 
 ```
-cell vm status       Show VM status
-cell vm shell        Open shell in VM
-cell vm restart      Restart VM
-cell vm recreate     Destroy and recreate VM (preserves macOS state)
-cell vm logs         Show VM provisioning logs
+brig vm status       Show VM status
+brig vm shell        Open shell in VM
+brig vm restart      Restart VM
+brig vm recreate     Destroy and recreate VM (preserves macOS state)
+brig vm logs         Show VM provisioning logs
 ```
 
 ### Workspace Commands
 
 ```
-cell workspace list CELL        List files in workspace
-cell workspace clean CELL       Delete all files in workspace
-cell workspace size CELL        Show disk usage
+brig workspace list CELL        List files in workspace
+brig workspace clean CELL       Delete all files in workspace
+brig workspace size CELL        Show disk usage
 ```
 
 ### Diagnose Command
 
 ```
-cell diagnose CELL              Run connectivity diagnostics
+brig diagnose CELL              Run connectivity diagnostics
 
 Output includes:
 - Proxy status (running/stopped)
@@ -99,16 +128,16 @@ Output includes:
 ### Examples
 
 ```bash
-cell run --name x --image python:3.11-slim
-cell run -f cells/my-cell.yaml -d
-cell secrets validate my-cell
-cell run --name test --no-proxy-env -- curl https://google.com
-cell logs x -f
-cell network x --json | jq 'select(.blocked)'
-cell cp --sanitize x:/work/report.html ./report.html
-cell stop x
-cell vm recreate
-cell diagnose x
+brig run --name x --image python:3.11-slim
+brig run -f cells/my-cell.yaml -d
+brig secrets validate my-cell
+brig run --name test --profile untrusted -- curl https://google.com
+brig logs x -f
+brig network x --json | jq 'select(.blocked)'
+brig cp --sanitize x:/work/report.html ./report.html
+brig stop x
+brig vm recreate
+brig diagnose x
 ```
 
 ---
@@ -204,6 +233,63 @@ mitm: true  # Triggers CA mount and trust setup
 
 ---
 
+## Trust Profiles
+
+Built-in profiles set defaults for resource limits, network mode, and policy.
+CLI flags override profile defaults.
+
+| Profile | Runtime | Network | Resources | Use case |
+|---------|---------|---------|-----------|----------|
+| `untrusted` | gVisor | Explicit allowlist | 512MB, 1 CPU, 256 PIDs | Unknown/hostile code |
+| `supervised` | gVisor | Broad allowlist | 2GB, 2 CPU, 512 PIDs | AI agents, CI/CD |
+| `dev` | gVisor | All egress, logged | 4GB, 4 CPU, 2048 PIDs | Your own code |
+| `airgapped` | gVisor | None (`--network none`) | 2GB, 2 CPU, 512 PIDs | Pure compute |
+| `honeypot` | gVisor | Connected, deny all | 1GB, 1 CPU, 256 PIDs | Behavior analysis |
+
+Usage: `brig run --profile supervised --name agent-a python:3.12`
+
+Custom profiles: Place YAML files in `~/.brig/profiles/`.
+
+---
+
+## Python SDK
+
+```python
+from brig.sdk import Brig
+
+b = Brig()
+
+# Launch a cell
+cell = await b.run(
+    name="agent-a", image="python:3.12",
+    command=["python", "agent.py"],
+    profile="supervised",
+    policy_allow=["api.openai.com"],
+    secrets=["openai-key"],
+    timeout="2h",
+)
+
+# Wait for completion
+result = await cell.wait()  # CellResult(exit_code=0)
+
+# Transfer files
+await cell.cp_in("input.json", "/work/input.json")
+await cell.cp_out("/work/output.json", "output.json")
+
+# Stream events
+async for event in cell.events():
+    print(f"{event.action}: {event.cell}")
+
+# Pipe data between cells (via host, preserving isolation)
+await b.pipe(cell_a, "/output.json", cell_b, "/input.json")
+
+# Sync wrappers available for non-async code
+cell = b.run_sync(name="test", image="alpine", command=["echo", "hi"])
+result = cell.wait_sync()
+```
+
+---
+
 ## Network Policy YAML Schema
 
 ```yaml
@@ -240,6 +326,8 @@ deny:
 ├── cells/                    # Cell definitions
 │   ├── research-agent.yaml
 │   └── github-bot.yaml
+├── profiles/                 # Trust profiles (custom)
+│   └── custom.yaml           # User-defined profile
 ├── secrets/                  # Single-value secret files
 │   ├── openai-key.txt        # Contains just: sk-...
 │   ├── anthropic-key.txt     # Contains just: sk-ant-...
@@ -247,7 +335,8 @@ deny:
 │   └── db-password.txt       # Contains just: hunter2
 └── state/                    # Cell state (workspaces, logs)
     ├── system/               # System state (survives VM recreate)
-    │   └── subnets.json      # Subnet allocator persistent state
+    │   ├── subnets.json      # Subnet allocator persistent state
+    │   └── checkpoints/      # Cell checkpoints (CRIU)
     ├── cell-abc123/
     │   ├── workspace/        # Cell's files
     │   ├── stdout.log
@@ -293,7 +382,7 @@ For a cell that declares `openai-key`:
 
 ### Secrets Non-goals
 
-- Cell does not prevent exfiltration to allowed domains
+- Brig does not prevent exfiltration to allowed domains
 - Secrets are readable by root inside the container
 - No per-process isolation within a cell
 
@@ -319,7 +408,7 @@ PROXY_NOFILE="8192"
 ### Override via CLI
 
 ```bash
-cell run --name my-cell --memory=4g --cpus=4 --image python:3.11-slim
+brig run --name my-cell --memory=4g --cpus=4 --image python:3.11-slim
 ```
 
 ---
@@ -383,7 +472,7 @@ Configured automatically during VM provisioning:
 
 ---
 
-## `cell cp` Safety Rules
+## `brig cp` Safety Rules
 
 ### Symlink Handling
 

@@ -1,8 +1,8 @@
-# Cell Architecture
+# Brig Architecture
 
 ## Overview
 
-**Cell** is a secure, observable harness for running untrusted code on macOS. It provides VM-isolated containers (hardware boundary at the Lima VM) with controlled network egress and full observability.
+**Brig** is a secure, observable harness for running untrusted code on macOS. It provides VM-isolated containers (hardware boundary at the Lima VM) with controlled network egress and full observability.
 
 ### What It Does
 
@@ -14,9 +14,9 @@
 
 ### Use Cases
 
-| Use Case | Why Cell Helps |
+| Use Case | Why Brig Helps |
 |----------|----------------|
-| **AI agents** | Agents execute arbitrary code; Cell contains the blast radius |
+| **AI agents** | Agents execute arbitrary code; Brig contains the blast radius |
 | **CI/CD runners** | Build untrusted code without risking the host |
 | **Student code** | Run submissions safely; prevent cheating via network |
 | **Plugin sandboxes** | Extensions can't escape or exfiltrate data unobserved |
@@ -27,19 +27,19 @@
 
 ## Threat Model
 
-**This is containment, not air-gapped isolation.** Cell provides:
+**This is containment, not air-gapped isolation.** Brig provides:
 - Strong host protection (Lima VM boundary)
 - Observable network egress (all traffic logged)
 - Reduced blast radius (cells can't attack each other)
 
-Cell does **not** provide:
+Brig does **not** provide:
 - Prevention of data exfiltration to allowed domains
 - Malware analysis isolation (cells have network access)
 - Protection against a determined attacker with allowed egress
 
 **Key boundary clarification:** Lima VM is the **only** hard security boundary. gVisor is defense-in-depth inside the VM—it reduces attack surface but is not a security boundary. If gVisor has a vulnerability, the Lima VM still protects macOS.
 
-**Proxy failure mode:** If the proxy stops, all cell egress fails closed (no network path exists). Cells may hang on network calls until timeout. Run `cell proxy status` to check, `cell proxy start` to recover.
+**Proxy failure mode:** If the proxy stops, all cell egress fails closed (no network path exists). Cells may hang on network calls until timeout. Run `warden status` to check, `warden start` to recover.
 
 **Covert channel note:** Even with a tight allowlist, covert exfiltration is possible via:
 - DNS over HTTPS (DoH) to allowed HTTPS endpoints
@@ -150,7 +150,7 @@ If you need true air-gap isolation, disable all network egress or use a dedicate
 ```
 
 **Key points:**
-- Each cell gets its own `--internal` network (created by `cell run`)
+- Each cell gets its own `--internal` network (created by `brig run`)
 - Proxy joins each cell's network (so DNS name `proxy` resolves)
 - No shared network = no east-west traffic by topology
 - No iptables rules needed = no chain ordering bugs

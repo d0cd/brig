@@ -12,6 +12,7 @@ Commands:
     brig run [options] <image> [command...]   Run a new cell
     brig stop <name>                          Gracefully stop a cell
     brig kill <name>                          Immediately kill a cell
+    brig wait <name>                          Block until cell exits
     brig rm [-f] <name>                       Remove a cell
     brig start <name>                         Start a stopped cell
     brig pause <name>                         Pause a running cell
@@ -31,6 +32,11 @@ Commands:
     brig cat <name> <path>                    View file in workspace
     brig cp <src> <dst>                       Copy files to/from workspace
     brig network <name>                       View network activity
+    brig events [name]                        Stream lifecycle events
+    brig pull <image>                         Pull and cache image
+    brig warmup [--profile <name>]            Pre-pull images for profile
+    brig checkpoint <name>                    Checkpoint running cell
+    brig restore <checkpoint>                 Restore from checkpoint
     brig diagnose <name>                      Run diagnostic checks
     brig health [--format=table|json]         Check system health
     brig metrics                              Output Prometheus metrics
@@ -52,12 +58,14 @@ Security:
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 # Version information.
 VERSION = "0.1.0"
@@ -210,7 +218,7 @@ class Spinner:
 
 
 # Simple TTL cache for expensive operations.
-_cache: dict[str, tuple[float, any]] = {}
+_cache: dict[str, tuple[float, Any]] = {}
 
 
 # Log levels.
@@ -399,7 +407,8 @@ def _load_operation_config() -> dict:
         _operation_config_mtime = mtime
         return _operation_config
 
-    except (json.JSONDecodeError, IOError, OSError):
+    except (json.JSONDecodeError, IOError, OSError) as e:
+        debug(f"Failed to load operation config: {e}")
         return default_config
 
 
@@ -553,7 +562,8 @@ def check_rate_limit() -> bool:
                 with open(RATE_LIMIT_FILE, "r") as f:
                     data = json.load(f)
                     timestamps = data.get("timestamps", [])
-            except (json.JSONDecodeError, IOError):
+            except (json.JSONDecodeError, IOError) as e:
+                debug(f"Failed to load rate limit data: {e}")
                 timestamps = []
 
         # Filter to only timestamps within the window.
@@ -595,9 +605,10 @@ def verify_image_signature(image: str) -> tuple[bool, str]:
             return True, "Signature verified with cosign"
         else:
             # Check if it's unsigned vs invalid signature.
-            if "no matching signatures" in result.stderr.lower():
+            stderr = result.stderr or ""
+            if "no matching signatures" in stderr.lower():
                 return False, "Image has no signature"
-            return False, f"Signature verification failed: {result.stderr.strip()}"
+            return False, f"Signature verification failed: {stderr.strip()}"
 
     # Fall back to podman image trust.
     debug(f"Verifying image with podman trust: {image}")
@@ -614,7 +625,7 @@ def verify_image_signature(image: str) -> tuple[bool, str]:
     return False, "No signature verification tool available (install cosign for full support)"
 
 
-def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, any]:
+def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, Any]:
     """Check if a cached value is still valid."""
     if key in _cache:
         ts, value = _cache[key]
@@ -623,18 +634,42 @@ def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, any]:
     return False, None
 
 
-def _set_cache(key: str, value: any) -> None:
+def _set_cache(key: str, value: Any) -> None:
     """Store a value in the cache."""
     _cache[key] = (time.time(), value)
 
 
-def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
-    """Run a command."""
+def run(cmd: list[str], check: bool = True, capture: bool = False,
+        timeout: int = None) -> subprocess.CompletedProcess:
+    """Run a command with optional timeout in seconds."""
     debug(f"Executing: {' '.join(cmd)}")
-    result = subprocess.run(cmd, check=check, capture_output=capture, text=True)
+    result = subprocess.run(cmd, check=check, capture_output=capture, text=True,
+                            timeout=timeout)
     if capture and result.returncode != 0:
         debug(f"Command failed with code {result.returncode}")
     return result
+
+
+def parse_duration(duration_str: str) -> int:
+    """Parse a duration string into seconds.
+
+    Supports: 30s, 5m, 2h, 1d, or plain integer (seconds).
+    Returns None if format is invalid.
+    """
+    duration_str = duration_str.strip()
+
+    # Plain integer means seconds.
+    if duration_str.isdigit():
+        return int(duration_str)
+
+    match = re.match(r"^(\d+)([smhd])$", duration_str)
+    if not match:
+        return None
+
+    value = int(match.group(1))
+    unit = match.group(2)
+    multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    return value * multipliers[unit]
 
 
 def print_error(msg: str, suggestion: str = None) -> None:
@@ -730,9 +765,45 @@ def error_invalid_json(path: str, details: str) -> None:
     )
 
 
-def error_operation_failed(operation: str, details: str) -> None:
-    """Error helper for failed operations with details."""
-    error(f"{operation} failed: {details}")
+def validate_workspace_path(workspace: Path, user_path: str) -> Path:
+    """Validate and resolve a path within a workspace directory.
+
+    Prevents path traversal attacks by resolving the full path and
+    verifying it stays within the workspace boundary.
+    Returns the resolved absolute path, or calls error() on violation.
+    """
+    # Reject obvious traversal patterns before resolution.
+    if ".." in user_path.split("/"):
+        error("Path traversal not allowed")
+
+    # Build and resolve the full path.
+    full_path = (workspace / user_path.lstrip("/")).resolve()
+    workspace_resolved = workspace.resolve()
+
+    # Verify the resolved path is within the workspace.
+    try:
+        full_path.relative_to(workspace_resolved)
+    except ValueError:
+        error("Path traversal not allowed: path escapes workspace")
+
+    return full_path
+
+
+def validate_cell_name(name: str) -> None:
+    """Validate a cell name for DNS safety and injection prevention.
+
+    Cell names must be 1-63 characters, start with alphanumeric,
+    and contain only alphanumeric, dash, or underscore.
+    """
+    if not name:
+        error("Cell name is required")
+    if len(name) > 63:
+        error("Cell name must be 63 characters or less")
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", name):
+        error(
+            f"Invalid cell name: {name}",
+            "Cell names must start with alphanumeric and contain only letters, digits, dash, or underscore"
+        )
 
 
 def container_name(cell_name: str) -> str:
@@ -755,13 +826,17 @@ def proxy_running() -> bool:
         ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={PROXY_NAME}"],
         check=False, capture=True
     )
-    is_running = PROXY_NAME in result.stdout
+    is_running = PROXY_NAME in result.stdout.strip().split("\n")
     _set_cache("proxy_running", is_running)
     return is_running
 
 
 def get_proxy_ip(network: str) -> str:
     """Get proxy IP on a specific network."""
+    # Validate network name to prevent Go template injection.
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', network):
+        debug(f"Invalid network name: {network}")
+        return ""
     result = run(
         ["podman", "inspect", PROXY_NAME, "--format",
          "{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k \"" + network + "\"}}{{$v.IPAddress}}{{end}}{{end}}"],
@@ -787,7 +862,7 @@ def cell_exists(cell_name: str) -> bool:
         ["podman", "ps", "-a", "--format", "{{.Names}}", "--filter", f"name={container_name(cell_name)}"],
         check=False, capture=True
     )
-    exists = container_name(cell_name) in result.stdout
+    exists = container_name(cell_name) in result.stdout.strip().split("\n")
     _set_cache(cache_key, exists)
     return exists
 
@@ -803,7 +878,7 @@ def cell_running(cell_name: str) -> bool:
         ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={container_name(cell_name)}"],
         check=False, capture=True
     )
-    is_running = container_name(cell_name) in result.stdout
+    is_running = container_name(cell_name) in result.stdout.strip().split("\n")
     _set_cache(cache_key, is_running)
     return is_running
 
@@ -820,8 +895,8 @@ def load_cell_policy(cell_name: str) -> dict:
         try:
             with open(policy_path, "r") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
+        except (json.JSONDecodeError, IOError) as e:
+            debug(f"Failed to load policy for {cell_name}: {e}")
     return {"allow": [], "deny": []}
 
 
@@ -896,7 +971,6 @@ def load_cell_definition(file_path: str) -> dict:
             # Fall back to JSON-style parsing for simple YAML.
             # This handles basic key: value format.
             try:
-                import re
                 result = {}
                 for line in content.split("\n"):
                     line = line.strip()
@@ -1019,7 +1093,6 @@ def is_overly_permissive_domain(domain: str) -> str:
 
 def validate_cell_definition(cell_def: dict, file_path: str = "") -> list[str]:
     """Validate a cell definition and return list of errors."""
-    import re
     errors = []
     context = f" in {file_path}" if file_path else ""
 
@@ -1124,6 +1197,130 @@ def validate_cell_definition(cell_def: dict, file_path: str = "") -> list[str]:
             errors.append(f"'detach' must be a boolean{context}")
 
     return errors
+
+
+# ──────────────────────────────────────────────────────────────────
+# Trust Profiles
+# ──────────────────────────────────────────────────────────────────
+
+# Profile directory (macOS side).
+PROFILES_DIR = BRIG_HOME / "profiles"
+
+# Built-in profiles. Each is a partial cell definition (no name/image/command).
+BUILTIN_PROFILES = {
+    "untrusted": {
+        "runtime": "runsc",
+        "memory": "512m",
+        "cpus": "1",
+        "pids_limit": 256,
+        "network": "default",
+        "policy": {"allow": [], "deny": []},
+        "labels": {"brig.profile": "untrusted"},
+    },
+    "supervised": {
+        "runtime": "runsc",
+        "memory": "2g",
+        "cpus": "2",
+        "pids_limit": 512,
+        "network": "default",
+        "labels": {"brig.profile": "supervised"},
+    },
+    "dev": {
+        "runtime": "runsc",
+        "memory": "4g",
+        "cpus": "4",
+        "pids_limit": 2048,
+        "network": "default",
+        "labels": {"brig.profile": "dev"},
+    },
+    "airgapped": {
+        "runtime": "runsc",
+        "memory": "2g",
+        "cpus": "2",
+        "pids_limit": 512,
+        "network": "none",
+        "labels": {"brig.profile": "airgapped"},
+    },
+    "honeypot": {
+        "runtime": "runsc",
+        "memory": "1g",
+        "cpus": "1",
+        "pids_limit": 256,
+        "network": "default",
+        "policy": {"allow": [], "deny": ["*"]},
+        "labels": {"brig.profile": "honeypot"},
+    },
+}
+
+
+def load_profile(name: str) -> dict:
+    """Load a trust profile by name.
+
+    Checks user profiles directory first, then built-in profiles.
+    Returns the profile dict or calls error() if not found.
+    """
+    # Check user-defined profiles.
+    for ext in (".yaml", ".yml", ".json"):
+        user_profile = PROFILES_DIR / f"{name}{ext}"
+        if user_profile.exists():
+            debug(f"Loading user profile: {user_profile}")
+            return load_cell_definition(str(user_profile))
+
+    # Check built-in profiles.
+    if name in BUILTIN_PROFILES:
+        debug(f"Loading built-in profile: {name}")
+        return BUILTIN_PROFILES[name].copy()
+
+    available = list(BUILTIN_PROFILES.keys())
+    # Also list user profiles.
+    if PROFILES_DIR.exists():
+        for f in PROFILES_DIR.iterdir():
+            if f.suffix in (".yaml", ".yml", ".json"):
+                available.append(f.stem)
+    error(
+        f"Unknown profile: {name}",
+        f"Available profiles: {', '.join(sorted(set(available)))}"
+    )
+
+
+def _apply_profile(args) -> None:
+    """Apply a trust profile to args, setting defaults for unset fields.
+
+    Merge order: profile defaults → cell definition file → CLI flags.
+    Profile sets defaults; explicit CLI flags always win.
+    Uses None sentinel to detect which flags the user explicitly provided.
+    """
+    profile = load_profile(args.profile)
+
+    # Apply profile defaults only for fields not explicitly set by the user.
+    # Fields default to None in argparse; non-None means user provided a value.
+    if "memory" in profile and args.memory is None:
+        args.memory = profile["memory"]
+    if "cpus" in profile and args.cpus is None:
+        args.cpus = str(profile["cpus"])
+    if "pids_limit" in profile and args.pids_limit is None:
+        args.pids_limit = profile["pids_limit"]
+    if "network" in profile and getattr(args, "network", None) is None:
+        args.network = profile["network"]
+    if "policy" in profile:
+        pol = profile["policy"]
+        if "allow" in pol and not args.policy_allow:
+            args.policy_allow = pol["allow"]
+        if "deny" in pol and not args.policy_deny:
+            args.policy_deny = pol["deny"]
+    if "labels" in profile:
+        profile_labels = [f"{k}={v}" for k, v in profile["labels"].items()]
+        args.label = profile_labels + (args.label or [])
+
+    # Apply hardcoded defaults for still-None fields.
+    if args.memory is None:
+        args.memory = "2g"
+    if args.cpus is None:
+        args.cpus = "2"
+    if args.pids_limit is None:
+        args.pids_limit = 512
+    if getattr(args, "network", None) is None:
+        args.network = "default"
 
 
 # Default network policy for new installations.
@@ -1636,6 +1833,10 @@ def cmd_vm(args) -> int:
 
 def cmd_run(args) -> int:
     """Run a new cell."""
+    # Apply trust profile if specified (profile defaults → cell def → CLI flags).
+    if getattr(args, "profile", None):
+        _apply_profile(args)
+
     # Load cell definition from file if provided.
     if args.file:
         cell_def = load_cell_definition(args.file)
@@ -1676,12 +1877,44 @@ def cmd_run(args) -> int:
                 args.policy_deny = (args.policy_deny or []) + policy["deny"]
         if "detach" in cell_def:
             args.detach = cell_def["detach"]
+        if "timeout" in cell_def and not getattr(args, "timeout", None):
+            args.timeout = cell_def["timeout"]
+        if "network" in cell_def and getattr(args, "network", None) is None:
+            args.network = cell_def["network"]
+        if "labels" in cell_def:
+            args.label = (args.label or []) + [
+                f"{k}={v}" for k, v in cell_def["labels"].items()
+            ]
+
+    # Apply hardcoded defaults for any still-None fields.
+    if args.memory is None:
+        args.memory = "2g"
+    if args.cpus is None:
+        args.cpus = "2"
+    if args.pids_limit is None:
+        args.pids_limit = 512
+    if getattr(args, "network", None) is None:
+        args.network = "default"
 
     cell_name = args.name
     if not cell_name:
         error("Cell name is required (use --name or specify in definition file)")
+    validate_cell_name(cell_name)
     if not args.image:
         error("Image is required (provide as argument or in definition file)")
+
+    # Determine if this is an air-gapped cell.
+    airgapped = getattr(args, "network", "default") == "none"
+
+    # Validate timeout if specified.
+    timeout_seconds = None
+    if getattr(args, "timeout", None):
+        timeout_seconds = parse_duration(args.timeout)
+        if timeout_seconds is None:
+            error(
+                f"Invalid timeout format: {args.timeout}",
+                "Use a duration like '30s', '5m', '2h', or '1d'"
+            )
 
     # Optional image signature verification.
     if getattr(args, "verify_image", False):
@@ -1696,8 +1929,8 @@ def cmd_run(args) -> int:
                     "Use a signed image or remove --verify-image to skip verification"
                 )
 
-    # Fail-fast: Check proxy is running.
-    if not proxy_running():
+    # Fail-fast: Check proxy is running (skip for air-gapped cells).
+    if not airgapped and not proxy_running():
         error("Proxy is not running. Start it with: warden start")
 
     # Rate limit check.
@@ -1733,8 +1966,8 @@ def cmd_run(args) -> int:
             delete_cell_policy(cell_name)
         error(msg, suggestion)
 
-    # Create per-cell policy if custom policy specified.
-    if args.policy_allow or args.policy_deny:
+    # Create per-cell policy if custom policy specified (not for air-gapped).
+    if not airgapped and (args.policy_allow or args.policy_deny):
         policy = {
             "allow": args.policy_allow or [],
             "deny": args.policy_deny or [],
@@ -1742,60 +1975,90 @@ def cmd_run(args) -> int:
         save_cell_policy(cell_name, policy)
         resources_allocated["policy"] = True
 
-    # Allocate subnet.
-    print(f"Allocating network for {cell_name}...")
-    result = run(["brig-subnet", "allocate", cell_name], check=False, capture=True)
-    if result.returncode != 0:
-        cleanup_on_failure(f"Failed to allocate subnet: {result.stderr}")
-    subnet = result.stdout.strip()
-    resources_allocated["subnet"] = True
+    # Network setup depends on mode.
+    net_name = None
+    proxy_ip = None
+    if airgapped:
+        debug(f"Air-gapped mode: skipping network allocation for {cell_name}")
+    else:
+        # Allocate subnet.
+        output(f"Allocating network for {cell_name}...")
+        result = run(["brig-subnet", "allocate", cell_name], check=False, capture=True)
+        if result.returncode != 0:
+            cleanup_on_failure(f"Failed to allocate subnet: {result.stderr}")
+        subnet = result.stdout.strip()
+        resources_allocated["subnet"] = True
 
-    # Create internal network.
-    result = run(["brig-subnet", "create-network", cell_name], check=False, capture=True)
-    if result.returncode != 0:
-        cleanup_on_failure(f"Failed to create network: {result.stderr}")
-    resources_allocated["network"] = True
+        # Create internal network.
+        result = run(["brig-subnet", "create-network", cell_name], check=False, capture=True)
+        if result.returncode != 0:
+            cleanup_on_failure(f"Failed to create network: {result.stderr}")
+        resources_allocated["network"] = True
 
-    net_name = network_name(cell_name)
+        net_name = network_name(cell_name)
 
-    # Connect proxy to cell network.
-    result = run(["podman", "network", "connect", net_name, PROXY_NAME], check=False, capture=True)
-    if result.returncode != 0 and "already" not in result.stderr.lower():
-        cleanup_on_failure(f"Failed to connect proxy to network: {result.stderr}")
-    resources_allocated["proxy_connected"] = True
+        # Connect proxy to cell network.
+        result = run(["podman", "network", "connect", net_name, PROXY_NAME], check=False, capture=True)
+        if result.returncode != 0 and "already" not in result.stderr.lower():
+            cleanup_on_failure(f"Failed to connect proxy to network: {result.stderr}")
+        resources_allocated["proxy_connected"] = True
 
-    # Get proxy IP on cell network.
-    proxy_ip = get_proxy_ip(net_name)
-    if not proxy_ip:
-        # Proxy might need a moment.
-        time.sleep(1)
+        # Get proxy IP on cell network.
         proxy_ip = get_proxy_ip(net_name)
+        if not proxy_ip:
+            # Proxy might need a moment.
+            time.sleep(1)
+            proxy_ip = get_proxy_ip(net_name)
 
-    if not proxy_ip:
-        cleanup_on_failure(
-            "Could not determine proxy IP on cell network",
-            "Check that warden is running: warden status"
-        )
+        if not proxy_ip:
+            cleanup_on_failure(
+                "Could not determine proxy IP on cell network",
+                "Check that warden is running: warden status"
+            )
 
     # Build container command.
     cmd = [
         "podman", "run",
         "--name", container_name(cell_name),
         "--runtime", RUNTIME,
-        "--network", net_name,
+    ]
 
-        # Proxy environment variables.
-        "-e", f"http_proxy=http://{proxy_ip}:8080",
-        "-e", f"https_proxy=http://{proxy_ip}:8080",
-        "-e", f"HTTP_PROXY=http://{proxy_ip}:8080",
-        "-e", f"HTTPS_PROXY=http://{proxy_ip}:8080",
-        "-e", "no_proxy=localhost,127.0.0.1",
+    if airgapped:
+        # Air-gapped: no network, drop all capabilities, enforce gVisor.
+        cmd.extend(["--network", "none"])
+        cmd.extend(["--cap-drop", "ALL"])
+    else:
+        cmd.extend([
+            "--network", net_name,
 
-        # Resource limits.
+            # Proxy environment variables.
+            "-e", f"http_proxy=http://{proxy_ip}:8080",
+            "-e", f"https_proxy=http://{proxy_ip}:8080",
+            "-e", f"HTTP_PROXY=http://{proxy_ip}:8080",
+            "-e", f"HTTPS_PROXY=http://{proxy_ip}:8080",
+            "-e", "no_proxy=localhost,127.0.0.1",
+        ])
+
+    # Resource limits.
+    cmd.extend([
         "--memory", args.memory,
         "--cpus", args.cpus,
         "--pids-limit", str(args.pids_limit),
-    ]
+    ])
+
+    # Timeout: Podman --timeout flag kills container after N seconds.
+    if timeout_seconds:
+        cmd.extend(["--timeout", str(timeout_seconds)])
+
+    # Labels for orchestration metadata.
+    if getattr(args, "label", None):
+        for label in args.label:
+            if "=" not in label:
+                cleanup_on_failure(
+                    f"Invalid label format: {label}",
+                    "Labels must be key=value format"
+                )
+            cmd.extend(["--label", label])
 
     # Seccomp profile (defense-in-depth on top of gVisor).
     if getattr(args, "seccomp_profile", None):
@@ -1824,7 +2087,7 @@ def cmd_run(args) -> int:
         for env in args.env:
             cmd.extend(["-e", env])
 
-    # Workspace mount.
+    # Workspace mount (each cell gets its own, never shared).
     workspace_dir = STATE_DIR / cell_name / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     cmd.extend(["-v", f"{workspace_dir}:/work:rw"])
@@ -1869,13 +2132,17 @@ def cmd_run(args) -> int:
         print(f"Cell name:    {cell_name}")
         print(f"Image:        {args.image}")
         print(f"Command:      {' '.join(args.container_cmd) if args.container_cmd else '(default)'}")
-        print(f"Network:      {net_name}")
+        print(f"Network:      {'none (air-gapped)' if airgapped else net_name}")
         print(f"Runtime:      {RUNTIME}")
         print(f"Memory:       {args.memory}")
         print(f"CPUs:         {args.cpus}")
         print(f"PIDs limit:   {args.pids_limit}")
         print(f"Detach:       {args.detach}")
         print(f"Auto-remove:  {args.rm}")
+        if timeout_seconds:
+            print(f"Timeout:      {args.timeout} ({timeout_seconds}s)")
+        if getattr(args, "label", None):
+            print(f"Labels:       {', '.join(args.label)}")
         if args.env:
             print(f"Environment:  {', '.join(args.env)}")
         if args.secret:
@@ -1888,6 +2155,7 @@ def cmd_run(args) -> int:
         return 0
 
     # Run container.
+    start_time = time.time()
     with Spinner(f"Starting cell {cell_name}") as spinner:
         result = run(cmd, check=False, capture=True)
         if result.returncode != 0:
@@ -1908,12 +2176,37 @@ def cmd_run(args) -> int:
     # Invalidate cache after state change.
     invalidate_cell_cache(cell_name)
 
+    # Get container ID from podman output.
+    cell_id = result.stdout.strip()[:12] if result.stdout.strip() else ""
+
+    # Structured JSON output.
+    if getattr(args, "output", "text") == "json":
+        run_result = {
+            "cell": cell_name,
+            "cell_id": cell_id,
+            "image": args.image,
+            "status": "running" if args.detach else "started",
+            "network": "none" if airgapped else net_name,
+            "runtime": RUNTIME,
+        }
+        if timeout_seconds:
+            run_result["timeout_seconds"] = timeout_seconds
+        if getattr(args, "label", None):
+            run_result["labels"] = dict(l.split("=", 1) for l in args.label)
+        print(json.dumps(run_result, indent=2))
+
     # Log operation and lifecycle event.
-    log_operation("run", cell_name, {"image": args.image, "detach": args.detach})
+    log_operation("run", cell_name, {
+        "image": args.image,
+        "detach": args.detach,
+        "airgapped": airgapped,
+        "timeout": args.timeout if getattr(args, "timeout", None) else None,
+    })
     log_lifecycle("start", cell_name, {
         "image": args.image,
         "command": args.container_cmd if args.container_cmd else None,
         "detach": args.detach,
+        "airgapped": airgapped,
     })
 
     return 0
@@ -1922,6 +2215,7 @@ def cmd_run(args) -> int:
 def cmd_stop(args) -> int:
     """Gracefully stop a cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error_cell_not_found(cell_name)
@@ -1954,11 +2248,12 @@ def cmd_stop(args) -> int:
 def cmd_kill(args) -> int:
     """Immediately kill a cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
-        error(f"Cell '{cell_name}' does not exist")
+        error_cell_not_found(cell_name)
 
-    print(f"Killing cell {cell_name}...")
+    output(f"Killing cell {cell_name}...")
     result = run(
         ["podman", "kill", container_name(cell_name)],
         check=False, capture=True
@@ -1977,9 +2272,61 @@ def cmd_kill(args) -> int:
     return 0
 
 
+def cmd_wait(args) -> int:
+    """Block until a cell exits, returning its exit code."""
+    cell_name = args.name
+    validate_cell_name(cell_name)
+
+    if not cell_exists(cell_name):
+        error_cell_not_found(cell_name)
+
+    # Parse optional timeout.
+    timeout_seconds = None
+    if getattr(args, "timeout", None):
+        timeout_seconds = parse_duration(args.timeout)
+        if timeout_seconds is None:
+            error(
+                f"Invalid timeout format: {args.timeout}",
+                "Use a duration like '30s', '5m', '2h', or '1d'"
+            )
+
+    debug(f"Waiting for cell {cell_name} to exit")
+
+    # Use podman wait to block until container exits.
+    cmd = ["podman", "wait", container_name(cell_name)]
+    try:
+        result = run(cmd, check=False, capture=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        error(f"Timeout waiting for cell {cell_name} after {args.timeout}")
+
+    if result.returncode != 0:
+        # Container might already be removed.
+        if "no such container" in result.stderr.lower():
+            error(f"Cell '{cell_name}' no longer exists (may have been removed with --rm)")
+        error(f"Failed to wait for cell: {result.stderr.strip()}")
+
+    # podman wait outputs the exit code of the container.
+    try:
+        cell_exit_code = int(result.stdout.strip())
+    except ValueError:
+        error(f"Unexpected output from podman wait: {result.stdout.strip()}")
+
+    # Structured JSON output.
+    if getattr(args, "output", None) == "json":
+        print(json.dumps({
+            "cell": cell_name,
+            "exit_code": cell_exit_code,
+        }))
+    else:
+        output(f"Cell {cell_name} exited with code {cell_exit_code}")
+
+    return cell_exit_code
+
+
 def cmd_rm(args) -> int:
     """Remove a cell and clean up resources."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     # Stop container if running.
     if cell_running(cell_name):
@@ -2033,9 +2380,10 @@ def cmd_rm(args) -> int:
 def cmd_start(args) -> int:
     """Start a stopped cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
-        error(f"Cell '{cell_name}' does not exist")
+        error_cell_not_found(cell_name)
 
     if cell_running(cell_name):
         output(f"Cell {cell_name} is already running")
@@ -2080,13 +2428,16 @@ def cmd_list(args) -> int:
     if result.stdout.strip():
         try:
             containers = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            debug(f"Failed to parse container list: {e}")
 
     if args.format == "json":
         cells = []
         for c in containers:
-            name = c.get("Names", [""])[0]
+            names = c.get("Names", [])
+            if not names:
+                continue
+            name = names[0]
             if name.startswith(CONTAINER_PREFIX):
                 cell_name = name[len(CONTAINER_PREFIX):]
                 cells.append({
@@ -2094,13 +2445,16 @@ def cmd_list(args) -> int:
                     "status": c.get("State", "unknown"),
                     "image": c.get("Image", "unknown"),
                 })
-        print(json.dumps(cells, indent=2))
+        output(json.dumps(cells, indent=2))
     else:
         # Table format.
-        print(f"{'NAME':<20} {'STATUS':<15} {'IMAGE':<30}")
-        print("-" * 65)
+        output(f"{'NAME':<20} {'STATUS':<15} {'IMAGE':<30}")
+        output("-" * 65)
         for c in containers:
-            name = c.get("Names", [""])[0]
+            names = c.get("Names", [])
+            if not names:
+                continue
+            name = names[0]
             if name.startswith(CONTAINER_PREFIX):
                 cell_name = name[len(CONTAINER_PREFIX):]
                 status = c.get("State", "unknown")
@@ -2115,7 +2469,7 @@ def cmd_list(args) -> int:
                     colored_status = status_color(status) + " " * (15 - len(status))
                 else:
                     colored_status = padded_status
-                print(f"{cell_name:<20} {colored_status} {image:<30}")
+                output(f"{cell_name:<20} {colored_status} {image:<30}")
 
     return 0
 
@@ -2123,6 +2477,7 @@ def cmd_list(args) -> int:
 def cmd_logs(args) -> int:
     """View cell logs."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error_cell_not_found(cell_name)
@@ -2148,6 +2503,7 @@ def cmd_logs(args) -> int:
 def cmd_exec(args) -> int:
     """Execute command in a running cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error_cell_not_found(cell_name)
@@ -2177,6 +2533,7 @@ def cmd_exec(args) -> int:
 def cmd_shell(args) -> int:
     """Open interactive shell in a running cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error_cell_not_found(cell_name)
@@ -2199,6 +2556,8 @@ def cmd_rename(args) -> int:
     """Rename a cell."""
     old_name = args.old_name
     new_name = args.new_name
+    validate_cell_name(old_name)
+    validate_cell_name(new_name)
 
     if not cell_exists(old_name):
         error_cell_not_found(old_name)
@@ -2208,13 +2567,6 @@ def cmd_rename(args) -> int:
 
     if cell_running(old_name):
         error(f"Cell '{old_name}' is running. Stop it first with: brig stop {old_name}")
-
-    # Validate new name.
-    if not new_name or len(new_name) > 63:
-        error("Cell name must be 1-63 characters")
-
-    if not new_name[0].isalnum():
-        error("Cell name must start with alphanumeric character")
 
     # Rename container.
     old_container = container_name(old_name)
@@ -2235,7 +2587,7 @@ def cmd_rename(args) -> int:
         try:
             old_policy.rename(new_policy)
         except OSError as e:
-            log("WARN", f"Could not rename policy file: {e}")
+            warn(f"Could not rename policy file: {e}")
 
     # Rename workspace if it exists.
     old_workspace = STATE_DIR / old_name
@@ -2244,10 +2596,10 @@ def cmd_rename(args) -> int:
         try:
             old_workspace.rename(new_workspace)
         except OSError as e:
-            log("WARN", f"Could not rename workspace: {e}")
+            warn(f"Could not rename workspace: {e}")
 
     # Log the rename operation.
-    log_history("rename", old_name, {"new_name": new_name})
+    log_operation("rename", old_name, {"new_name": new_name})
 
     output(f"Renamed cell '{old_name}' to '{new_name}'")
     return 0
@@ -2256,6 +2608,7 @@ def cmd_rename(args) -> int:
 def cmd_attach(args) -> int:
     """Attach to a cell's console."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2276,6 +2629,7 @@ def cmd_attach(args) -> int:
 def cmd_top(args) -> int:
     """Show processes running inside a cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2291,6 +2645,7 @@ def cmd_top(args) -> int:
 def cmd_diff(args) -> int:
     """Show filesystem changes from base image."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2326,6 +2681,34 @@ def cmd_diff(args) -> int:
 
 def cmd_stats(args) -> int:
     """Show cell resource usage statistics."""
+    # Validate cell name if provided.
+    if args.name:
+        validate_cell_name(args.name)
+
+    # JSON output mode uses podman's JSON format.
+    if getattr(args, "output", "text") == "json":
+        cmd = ["podman", "stats", "--format", "json", "--no-stream"]
+        if args.name:
+            if not cell_exists(args.name):
+                error(f"Cell '{args.name}' does not exist")
+            cmd.append(container_name(args.name))
+        else:
+            cmd.extend(["--filter", f"name={CONTAINER_PREFIX}"])
+        result = run(cmd, check=False, capture=True)
+        if result.returncode != 0:
+            error(f"Failed to get stats: {result.stderr}")
+        try:
+            stats = json.loads(result.stdout) if result.stdout.strip() else []
+            # Strip container prefix from names.
+            for s in stats:
+                name = s.get("name", s.get("Name", ""))
+                if name.startswith(CONTAINER_PREFIX):
+                    s["cell"] = name[len(CONTAINER_PREFIX):]
+            output(json.dumps(stats, indent=2))
+        except json.JSONDecodeError:
+            output(result.stdout)
+        return 0
+
     cmd = ["podman", "stats", "--format",
            "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.PIDs}}"]
 
@@ -2350,9 +2733,10 @@ def cmd_stats(args) -> int:
 def cmd_pause(args) -> int:
     """Pause a running cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
-        error(f"Cell '{cell_name}' does not exist")
+        error_cell_not_found(cell_name)
 
     if not cell_running(cell_name):
         error(f"Cell '{cell_name}' is not running")
@@ -2372,9 +2756,10 @@ def cmd_pause(args) -> int:
 def cmd_unpause(args) -> int:
     """Unpause a paused cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
-        error(f"Cell '{cell_name}' does not exist")
+        error_cell_not_found(cell_name)
 
     result = run(
         ["podman", "unpause", container_name(cell_name)],
@@ -2394,6 +2779,7 @@ def cmd_unpause(args) -> int:
 def cmd_files(args) -> int:
     """List contents of a cell's workspace."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2406,10 +2792,7 @@ def cmd_files(args) -> int:
     # Build path within workspace.
     target_path = workspace_dir
     if args.path:
-        # Validate path (no traversal).
-        if ".." in args.path.split("/"):
-            error("Path traversal not allowed")
-        target_path = workspace_dir / args.path
+        target_path = validate_workspace_path(workspace_dir, args.path)
 
     if not target_path.exists():
         error(f"Path does not exist: {args.path}")
@@ -2429,6 +2812,7 @@ def cmd_files(args) -> int:
 def cmd_cat(args) -> int:
     """View contents of a file in cell's workspace."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2438,10 +2822,7 @@ def cmd_cat(args) -> int:
         error(f"No workspace for cell '{cell_name}'")
 
     # Validate path (no traversal).
-    if ".." in args.path.split("/"):
-        error("Path traversal not allowed")
-
-    file_path = workspace_dir / args.path
+    file_path = validate_workspace_path(workspace_dir, args.path)
 
     if not file_path.exists():
         error(f"File not found: {args.path}")
@@ -2491,6 +2872,11 @@ UNSAFE_EXTENSIONS = {
 
 SCRIPT_EXTENSIONS = {
     ".sh", ".py", ".js", ".rb", ".pl", ".php",
+}
+
+OFFICE_EXTENSIONS = {
+    ".doc", ".docx", ".docm", ".xls", ".xlsx", ".xlsm",
+    ".ppt", ".pptx", ".pptm", ".odt", ".ods", ".odp",
 }
 
 
@@ -2543,6 +2929,7 @@ def cmd_cp(args) -> int:
     if ":" in src and not src.startswith("/"):
         parts = src.split(":", 1)
         src_cell = parts[0]
+        validate_cell_name(src_cell)
         src_path = parts[1]
     else:
         src_path = src
@@ -2550,6 +2937,7 @@ def cmd_cp(args) -> int:
     if ":" in dst and not dst.startswith("/"):
         parts = dst.split(":", 1)
         dst_cell = parts[0]
+        validate_cell_name(dst_cell)
         dst_path = parts[1]
     else:
         dst_path = dst
@@ -2560,23 +2948,19 @@ def cmd_cp(args) -> int:
     if not src_cell and not dst_cell:
         error("At least one path must be a cell (cell:path format)")
 
-    # Get workspace paths.
+    # Get workspace paths with traversal validation.
     if src_cell:
         if not cell_exists(src_cell):
             error(f"Cell '{src_cell}' does not exist")
         workspace = STATE_DIR / src_cell / "workspace"
-        if ".." in src_path.split("/"):
-            error("Path traversal not allowed")
-        src_full = workspace / src_path.lstrip("/")
+        src_full = validate_workspace_path(workspace, src_path)
         dst_full = Path(dst_path)
     else:
         if not cell_exists(dst_cell):
             error(f"Cell '{dst_cell}' does not exist")
         workspace = STATE_DIR / dst_cell / "workspace"
-        if ".." in dst_path.split("/"):
-            error("Path traversal not allowed")
         src_full = Path(src_path)
-        dst_full = workspace / dst_path.lstrip("/")
+        dst_full = validate_workspace_path(workspace, dst_path)
 
     # Check source exists.
     if not src_full.exists():
@@ -2587,9 +2971,12 @@ def cmd_cp(args) -> int:
         ext = src_full.suffix.lower()
         if ext in UNSAFE_EXTENSIONS:
             error(f"Blocked unsafe file type: {ext}")
-        if ext in SCRIPT_EXTENSIONS:
-            print(f"Warning: Script file {src_full.name} - use --allow-scripts to permit")
+        if ext in SCRIPT_EXTENSIONS and not args.allow_scripts:
+            warn(f"Script file {src_full.name} - use --allow-scripts to permit")
             error(f"Blocked script file: {ext}")
+        if ext in OFFICE_EXTENSIONS and not args.allow_office:
+            warn(f"Office file {src_full.name} - use --allow-office to permit")
+            error(f"Blocked office file: {ext}")
 
     # Perform copy.
     import shutil
@@ -2617,6 +3004,7 @@ def cmd_cp(args) -> int:
 def cmd_inspect(args) -> int:
     """Show cell details."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2639,7 +3027,7 @@ def cmd_inspect(args) -> int:
         error(f"Failed to parse container data: {e}")
 
     if args.format == "json":
-        print(json.dumps(container, indent=2))
+        output(json.dumps(container, indent=2))
     else:
         # Table format.
         name = container.get("Name", "").lstrip("/")
@@ -2648,22 +3036,22 @@ def cmd_inspect(args) -> int:
         host_config = container.get("HostConfig", {})
         networks = container.get("NetworkSettings", {}).get("Networks", {})
 
-        print(f"Name:    {name}")
-        print(f"Status:  {state.get('Status', 'unknown')}")
-        print(f"Runtime: {host_config.get('Runtime', 'unknown')}")
-        print(f"Image:   {config.get('Image', 'unknown')}")
-        print(f"Network: {', '.join(networks.keys())}")
-        print(f"Pid:     {state.get('Pid', 'N/A')}")
+        output(f"Name:    {name}")
+        output(f"Status:  {state.get('Status', 'unknown')}")
+        output(f"Runtime: {host_config.get('Runtime', 'unknown')}")
+        output(f"Image:   {config.get('Image', 'unknown')}")
+        output(f"Network: {', '.join(networks.keys())}")
+        output(f"Pid:     {state.get('Pid', 'N/A')}")
 
         # Show mounts.
         mounts = container.get("Mounts", [])
         if mounts:
-            print("Mounts:")
+            output("Mounts:")
             for m in mounts:
                 src = m.get("Source", "")
                 dst = m.get("Destination", "")
                 rw = "rw" if m.get("RW", True) else "ro"
-                print(f"  {src} -> {dst} ({rw})")
+                output(f"  {src} -> {dst} ({rw})")
 
     return 0
 
@@ -2671,6 +3059,7 @@ def cmd_inspect(args) -> int:
 def cmd_export(args) -> int:
     """Export cell definition as YAML."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2778,6 +3167,7 @@ def cmd_export(args) -> int:
 def cmd_network(args) -> int:
     """View cell network activity logs."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -2824,12 +3214,208 @@ def cmd_network(args) -> int:
     return 0
 
 
+def cmd_events(args) -> int:
+    """Stream cell lifecycle events as JSON."""
+    cell_name = getattr(args, "name", None)
+
+    # Use podman events to stream container lifecycle events.
+    cmd = ["podman", "events", "--format", "json"]
+    if cell_name:
+        validate_cell_name(cell_name)
+        if not cell_exists(cell_name):
+            error_cell_not_found(cell_name)
+        cmd.extend(["--filter", f"container={container_name(cell_name)}"])
+    else:
+        # Filter to only brig containers.
+        cmd.extend(["--filter", f"container={CONTAINER_PREFIX}"])
+
+    # Event type filter.
+    cmd.extend(["--filter", "type=container"])
+
+    if getattr(args, "since", None):
+        cmd.extend(["--since", args.since])
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                # Enrich with cell name.
+                actor_name = event.get("Actor", {}).get("Attributes", {}).get("name", "")
+                if actor_name.startswith(CONTAINER_PREFIX):
+                    event["cell"] = actor_name[len(CONTAINER_PREFIX):]
+
+                if getattr(args, "output", "json") == "json":
+                    output(json.dumps(event))
+                    sys.stdout.flush()
+                else:
+                    # Human-readable format.
+                    cell = event.get("cell", actor_name)
+                    action = event.get("Action", event.get("Status", "unknown"))
+                    ts = event.get("time", event.get("Time", ""))
+                    output(f"{ts} {cell}: {action}")
+                    sys.stdout.flush()
+            except json.JSONDecodeError:
+                output(line)
+        proc.wait()
+        return proc.returncode
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_pull(args) -> int:
+    """Pull and cache a container image inside the Lima VM."""
+    image = args.image
+
+    with Spinner(f"Pulling image {image}") as spinner:
+        result = run(["podman", "pull", image], check=False, capture=True)
+        if result.returncode != 0:
+            spinner.fail(f"Failed to pull {image}")
+            print_error(result.stderr.strip() if result.stderr else "Unknown error")
+            return 1
+        spinner.success(f"Image {image} pulled successfully")
+
+    return 0
+
+
+def cmd_warmup(args) -> int:
+    """Pre-pull commonly used images for a profile or explicit image list."""
+    profile_name = getattr(args, "profile", None)
+    images = getattr(args, "images", None) or []
+
+    # Default images for profiles.
+    profile_images = {
+        "untrusted": ["alpine:3.21"],
+        "supervised": ["python:3.12-slim", "node:20-slim"],
+        "dev": ["python:3.12", "node:20", "golang:1.22", "ubuntu:22.04"],
+        "airgapped": ["alpine:3.21", "python:3.12-slim"],
+    }
+
+    if profile_name:
+        images = profile_images.get(profile_name, []) + images
+        output(f"Warming up images for profile: {profile_name}")
+    elif not images:
+        error(
+            "Specify --profile or provide image names",
+            "Example: brig warmup --profile supervised"
+        )
+
+    # Deduplicate.
+    seen = set()
+    unique_images = []
+    for img in images:
+        if img not in seen:
+            seen.add(img)
+            unique_images.append(img)
+
+    failures = 0
+    for image in unique_images:
+        with Spinner(f"Pulling {image}") as spinner:
+            result = run(["podman", "pull", image], check=False, capture=True)
+            if result.returncode != 0:
+                spinner.fail(f"Failed to pull {image}")
+                failures += 1
+            else:
+                spinner.success(f"Pulled {image}")
+
+    if failures:
+        print_error(f"{failures} image(s) failed to pull")
+        return 1
+
+    output(f"Warmed up {len(unique_images)} image(s)")
+    return 0
+
+
+def cmd_checkpoint(args) -> int:
+    """Checkpoint a running cell's state using CRIU."""
+    cell_name = args.name
+    validate_cell_name(cell_name)
+
+    if not cell_exists(cell_name):
+        error_cell_not_found(cell_name)
+    if not cell_running(cell_name):
+        error(
+            f"Cell '{cell_name}' is not running",
+            "Only running cells can be checkpointed"
+        )
+
+    checkpoint_name = getattr(args, "checkpoint_name", None) or f"{cell_name}-checkpoint"
+    # Validate checkpoint name to prevent path traversal.
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", checkpoint_name):
+        error("Invalid checkpoint name: must be alphanumeric with dashes, underscores, and dots")
+
+    cmd = ["podman", "container", "checkpoint"]
+    if getattr(args, "keep_running", False):
+        cmd.append("--keep")
+    cmd.extend(["--export", f"/state/checkpoints/{checkpoint_name}.tar.gz"])
+    cmd.append(container_name(cell_name))
+
+    # Ensure checkpoint directory exists.
+    Path("/state/checkpoints").mkdir(parents=True, exist_ok=True)
+
+    with Spinner(f"Checkpointing cell {cell_name}") as spinner:
+        result = run(cmd, check=False, capture=True)
+        if result.returncode != 0:
+            spinner.fail(f"Failed to checkpoint {cell_name}")
+            print_error(result.stderr.strip() if result.stderr else "Unknown error")
+            return 1
+        spinner.success(f"Cell {cell_name} checkpointed as {checkpoint_name}")
+
+    log_operation("checkpoint", cell_name, {"checkpoint": checkpoint_name})
+    return 0
+
+
+def cmd_restore(args) -> int:
+    """Restore a cell from a checkpoint."""
+    checkpoint_name = args.checkpoint
+    # Validate checkpoint name to prevent path traversal.
+    if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$", checkpoint_name):
+        error("Invalid checkpoint name: must be alphanumeric with dashes, underscores, and dots")
+    cell_name = getattr(args, "name", None) or checkpoint_name.replace("-checkpoint", "")
+    validate_cell_name(cell_name)
+
+    checkpoint_path = Path(f"/state/checkpoints/{checkpoint_name}.tar.gz")
+    if not checkpoint_path.exists():
+        error(
+            f"Checkpoint not found: {checkpoint_name}",
+            "List checkpoints with: ls /state/checkpoints/"
+        )
+
+    # Check cell doesn't already exist.
+    if cell_exists(cell_name):
+        error(f"Cell '{cell_name}' already exists. Remove it first with: brig rm {cell_name}")
+
+    cmd = [
+        "podman", "container", "restore",
+        "--import", str(checkpoint_path),
+        "--name", container_name(cell_name),
+    ]
+
+    with Spinner(f"Restoring cell {cell_name} from {checkpoint_name}") as spinner:
+        result = run(cmd, check=False, capture=True)
+        if result.returncode != 0:
+            spinner.fail(f"Failed to restore {cell_name}")
+            print_error(result.stderr.strip() if result.stderr else "Unknown error")
+            return 1
+        spinner.success(f"Cell {cell_name} restored from {checkpoint_name}")
+
+    invalidate_cell_cache(cell_name)
+    log_operation("restore", cell_name, {"checkpoint": checkpoint_name})
+    return 0
+
+
 def cmd_diagnose(args) -> int:
     """Run diagnostic checks on a cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
-        error(f"Cell '{cell_name}' does not exist")
+        error_cell_not_found(cell_name)
 
     print(f"Diagnosing cell: {cell_name}")
     print("-" * 40)
@@ -2868,7 +3454,7 @@ def cmd_diagnose(args) -> int:
              "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}"],
             check=False, capture=True
         )
-        if net_name in result.stdout:
+        if net_name in result.stdout.strip().split():
             print(f"[OK] Proxy connected to {net_name}")
         else:
             print(f"[WARN] Proxy not connected to {net_name}")
@@ -3130,7 +3716,8 @@ def _fetch_warden_metrics() -> dict:
         response = sock.recv(65536).decode("utf-8")
         sock.close()
         return json.loads(response)
-    except Exception:
+    except Exception as e:
+        debug(f"Failed to fetch metrics from socket: {e}")
         return {}
 
 
@@ -3177,8 +3764,8 @@ def _generate_metrics() -> list:
                     state = c.get("State", "unknown").lower()
                     if state in state_counts:
                         state_counts[state] += 1
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            debug(f"Failed to parse container stats for metrics: {e}")
 
     add_metric("brig_cells_total", total_cells, "Total number of cells")
 
@@ -3289,8 +3876,8 @@ def _generate_metrics() -> list:
                                 ops_last_hour += 1
                     except (json.JSONDecodeError, ValueError):
                         continue
-        except IOError:
-            pass
+        except IOError as e:
+            debug(f"Failed to read operations log for metrics: {e}")
 
     add_metric("brig_operations_last_hour", ops_last_hour,
                "Number of operations in the last hour")
@@ -3419,7 +4006,7 @@ def cmd_verify(args) -> int:
          "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}"],
         check=False, capture=True
     )
-    if "proxy-external" in result.stdout:
+    if "proxy-external" in result.stdout.strip().split():
         print("  [OK] Proxy attached to proxy-external")
     else:
         print("  [FAIL] Proxy not on proxy-external network")
@@ -3540,8 +4127,8 @@ def cmd_verify(args) -> int:
                     else:
                         print(f"  [WARN] {name} has {len(networks)} networks")
                         issues.append(f"{name} should be single-homed")
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            debug(f"Failed to parse container info for single-homed check: {e}")
 
     # Check 6: Inter-cell isolation (no east-west traffic).
     print("\n[Check 6] Inter-cell isolation")
@@ -3775,7 +4362,8 @@ def cmd_config_set(args) -> int:
         try:
             with open(CONFIG_FILE, "r") as f:
                 config = json.load(f)
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, IOError) as e:
+            debug(f"Failed to load config file: {e}")
             config = {}
     else:
         config = {}
@@ -3836,6 +4424,7 @@ def cmd_tui(args) -> int:
 def cmd_policy_show(args) -> int:
     """Show a cell's effective network policy."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -3850,8 +4439,8 @@ def cmd_policy_show(args) -> int:
         try:
             with open(global_policy_path, "r") as f:
                 global_policy = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
+        except (json.JSONDecodeError, IOError) as e:
+            debug(f"Failed to load global policy: {e}")
 
     print(f"Policy for cell: {cell_name}")
     print("=" * 40)
@@ -3881,6 +4470,7 @@ def cmd_policy_show(args) -> int:
 def cmd_policy_set(args) -> int:
     """Update a cell's network policy."""
     cell_name = args.name
+    validate_cell_name(cell_name)
 
     if not cell_exists(cell_name):
         error(f"Cell '{cell_name}' does not exist")
@@ -4086,13 +4676,18 @@ def cmd_policy_validate(args) -> int:
 
 
 def _matches_domain(pattern: str, domain: str) -> bool:
-    """Check if domain matches pattern."""
+    """Check if domain matches pattern.
+
+    Wildcard patterns match subdomains only:
+        *.example.com matches foo.example.com, NOT example.com itself.
+    This matches enforce.py's PolicyRule.matches_domain() behavior.
+    """
     pattern = pattern.lower()
     domain = domain.lower()
 
     if pattern.startswith("*."):
         suffix = pattern[1:]  # Keep the dot.
-        return domain.endswith(suffix) or domain == pattern[2:]
+        return domain.endswith(suffix)
     else:
         return domain == pattern
 
@@ -4124,6 +4719,7 @@ def _matches_rule(rule, domain: str, path: str, method: str) -> bool:
 def cmd_policy_test(args) -> int:
     """Test if a domain would be allowed by policy for a specific cell."""
     cell_name = args.name
+    validate_cell_name(cell_name)
     domain = args.domain
     path = args.path
     method = args.method
@@ -4141,8 +4737,8 @@ def cmd_policy_test(args) -> int:
         try:
             with open(global_policy_path, "r") as f:
                 global_policy = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            pass
+        except (json.JSONDecodeError, IOError) as e:
+            debug(f"Failed to load global policy: {e}")
 
     verbose = args.verbose
 
@@ -4240,13 +4836,20 @@ def main():
     p_run.add_argument("--dry-run", action="store_true", help="Show what would be done without executing")
     p_run.add_argument("-e", "--env", action="append", help="Set environment variable")
     p_run.add_argument("--secret", action="append", help="Mount secret file at /run/secrets/")
-    p_run.add_argument("--memory", default="2g", help="Memory limit (default: 2g)")
-    p_run.add_argument("--cpus", default="2", help="CPU limit (default: 2)")
-    p_run.add_argument("--pids-limit", type=int, default=512, help="PID limit (default: 512)")
+    p_run.add_argument("--memory", default=None, help="Memory limit (default: 2g)")
+    p_run.add_argument("--cpus", default=None, help="CPU limit (default: 2)")
+    p_run.add_argument("--pids-limit", type=int, default=None, help="PID limit (default: 512)")
     p_run.add_argument("--policy-allow", action="append", help="Allow domain (adds to global policy)")
     p_run.add_argument("--policy-deny", action="append", help="Deny domain (overrides global policy)")
     p_run.add_argument("--verify-image", action="store_true", help="Verify image signature before running")
     p_run.add_argument("--seccomp-profile", help="Apply seccomp profile (path to JSON file)")
+    p_run.add_argument("--timeout", help="Kill cell after duration (e.g., 30m, 2h, 1d)")
+    p_run.add_argument("--output", choices=["text", "json"], default="text",
+                         help="Output format")
+    p_run.add_argument("--network", choices=["default", "none"], default=None,
+                         help="Network mode (none for air-gapped cells)")
+    p_run.add_argument("--profile", help="Trust profile to apply (e.g., untrusted, supervised, dev)")
+    p_run.add_argument("--label", action="append", help="Add label (key=value)")
     p_run.add_argument("image", nargs="?", help="Container image")
     p_run.add_argument("container_cmd", nargs="*", help="Command to run")
 
@@ -4257,6 +4860,13 @@ def main():
     # kill
     p_kill = subparsers.add_parser("kill", help="Immediately kill a cell")
     p_kill.add_argument("name", help="Cell name")
+
+    # wait
+    p_wait = subparsers.add_parser("wait", help="Block until a cell exits")
+    p_wait.add_argument("--timeout", help="Maximum time to wait (e.g., 30s, 5m, 2h)")
+    p_wait.add_argument("--output", choices=["text", "json"], default="text",
+                         help="Output format")
+    p_wait.add_argument("name", help="Cell name")
 
     # rm
     p_rm = subparsers.add_parser("rm", help="Remove a cell")
@@ -4324,6 +4934,8 @@ Use -it for interactive commands that need a terminal.
     # stats
     p_stats = subparsers.add_parser("stats", help="Show cell resource usage")
     p_stats.add_argument("--no-stream", action="store_true", help="Disable live updates")
+    p_stats.add_argument("--output", choices=["text", "json"], default="text",
+                          help="Output format")
     p_stats.add_argument("name", nargs="?", help="Cell name (all cells if omitted)")
 
     # pause
@@ -4363,6 +4975,10 @@ is relative to the workspace (/work inside the cell).
     )
     p_cp.add_argument("--sanitize", action="store_true",
                       help="Block unsafe file types (.exe, .dll, .sh, scripts)")
+    p_cp.add_argument("--allow-scripts", action="store_true",
+                      help="Allow script files (.sh, .py, .js, etc.) in sanitize mode")
+    p_cp.add_argument("--allow-office", action="store_true",
+                      help="Allow office files (.docx, .xlsx, etc.) in sanitize mode")
     p_cp.add_argument("src", help="Source path (cell:path or local path)")
     p_cp.add_argument("dst", help="Destination path (cell:path or local path)")
 
@@ -4382,6 +4998,35 @@ is relative to the workspace (/work inside the cell).
     p_network.add_argument("--json", action="store_true", help="Output raw JSONL")
     p_network.add_argument("--tail", type=int, default=20, help="Number of lines to show")
     p_network.add_argument("name", help="Cell name")
+
+    # events
+    p_events = subparsers.add_parser("events", help="Stream cell lifecycle events")
+    p_events.add_argument("--output", choices=["text", "json"], default="json",
+                           help="Output format (default: json)")
+    p_events.add_argument("--since", help="Show events since timestamp (e.g., 2024-01-01T00:00:00)")
+    p_events.add_argument("name", nargs="?", help="Cell name (all cells if omitted)")
+
+    # pull
+    p_pull = subparsers.add_parser("pull", help="Pull and cache a container image")
+    p_pull.add_argument("image", help="Container image to pull")
+
+    # warmup
+    p_warmup = subparsers.add_parser("warmup", help="Pre-pull images for a profile")
+    p_warmup.add_argument("--profile", help="Pull images commonly used with this profile")
+    p_warmup.add_argument("images", nargs="*", help="Additional images to pull")
+
+    # checkpoint
+    p_checkpoint = subparsers.add_parser("checkpoint", help="Checkpoint a running cell")
+    p_checkpoint.add_argument("--keep", dest="keep_running", action="store_true",
+                               help="Keep cell running after checkpoint")
+    p_checkpoint.add_argument("--export-name", dest="checkpoint_name",
+                               help="Checkpoint name (default: <cell>-checkpoint)")
+    p_checkpoint.add_argument("name", help="Cell name")
+
+    # restore
+    p_restore = subparsers.add_parser("restore", help="Restore a cell from checkpoint")
+    p_restore.add_argument("--name", help="Name for restored cell (default: derived from checkpoint)")
+    p_restore.add_argument("checkpoint", help="Checkpoint name")
 
     # diagnose
     p_diagnose = subparsers.add_parser("diagnose", help="Run diagnostic checks on cell")
@@ -4495,6 +5140,7 @@ Deny rules take precedence over allow rules.
         "run": cmd_run,
         "stop": cmd_stop,
         "kill": cmd_kill,
+        "wait": cmd_wait,
         "rm": cmd_rm,
         "start": cmd_start,
         "list": cmd_list,
@@ -4514,6 +5160,11 @@ Deny rules take precedence over allow rules.
         "inspect": cmd_inspect,
         "export": cmd_export,
         "network": cmd_network,
+        "events": cmd_events,
+        "pull": cmd_pull,
+        "warmup": cmd_warmup,
+        "checkpoint": cmd_checkpoint,
+        "restore": cmd_restore,
         "diagnose": cmd_diagnose,
         "health": cmd_health,
         "preflight": cmd_preflight,

@@ -548,7 +548,7 @@ Recommended sequence:
 
 ### Internal
 
-- Subnet allocator must work before `cell run`
+- Subnet allocator must work before `brig run`
 - Proxy must work before cells can have network
 - Policy enforcement must work before cells are useful
 

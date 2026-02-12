@@ -1,4 +1,4 @@
-# Cell Security
+# Brig Security
 
 ## Security Invariants
 
@@ -18,7 +18,7 @@ These are the rules that must hold for the security model to work. Violations br
 - No chain ordering issues, no hardcoded IPs
 - Self-evidently correct
 
-**Cell creation (what `cell run` does internally):**
+**Cell creation (what `brig run` does internally):**
 
 ```bash
 CELL_NAME="cell-abc123"
@@ -139,14 +139,14 @@ xattr -w com.apple.quarantine "0181;$(printf %x $(date +%s));brig;$(uuidgen)" ~/
 **Rules:**
 
 1. **Default runtime is gVisor** — set in containers.conf, not just CLI flag
-2. **`cell list` shows runtime** — always visible which runtime a cell uses
+2. **`brig list` shows runtime** — always visible which runtime a cell uses
 3. **`--runtime=runc` requires `--unsafe` flag** — explicit acknowledgment
 4. **Runtime is verified at startup** — don't rely solely on config defaults
 
 **Implementation:**
 
 ```bash
-# cell run enforces runtime verification:
+# brig run enforces runtime verification:
 
 # 1. Reject runc without --unsafe
 if [ "$RUNTIME" = "runc" ] && [ "$UNSAFE" != "true" ]; then
@@ -206,7 +206,7 @@ done
 
 **Why this matters:** Attribution relies on source subnet. If a container joins multiple networks, it may have multiple IP addresses. The proxy cannot reliably attribute traffic to the correct cell.
 
-**Enforcement (in `cell verify`):**
+**Enforcement (in `brig verify`):**
 
 ```bash
 verify_cell_single_homed() {
@@ -228,7 +228,7 @@ verify_cell_single_homed() {
 
 ### Invariant 9: Proxy Must Be Running Before Cells Start
 
-**Rule:** `cell run` and `cell start` must verify the proxy is running and healthy before starting any cell.
+**Rule:** `brig run` and `brig start` must verify the proxy is running and healthy before starting any cell.
 
 **Why this matters:** If cells start without a running proxy, they will have no network path. This creates a confusing debugging experience.
 
@@ -241,8 +241,8 @@ Run these to verify isolation is working correctly.
 ### Test 1: Cell Can't Reach Internet Directly
 
 ```bash
-# Use --no-proxy-env to test network topology, not proxy
-cell run --name test-direct --rm --no-proxy-env -- curl -m 5 https://google.com
+# Use --network none to test without proxy connectivity
+brig run --name test-direct --rm --network none -- curl -m 5 https://google.com
 echo "Exit code: $?"  # MUST be non-zero
 ```
 
@@ -251,14 +251,14 @@ echo "Exit code: $?"  # MUST be non-zero
 ### Test 2: Cell CAN Reach Internet Via Proxy
 
 ```bash
-cell run --name test-proxy --rm -- curl -m 5 https://httpbin.org/ip
+brig run --name test-proxy --rm -- curl -m 5 https://httpbin.org/ip
 echo "Exit code: $?"  # Should be 0
 ```
 
 ### Test 3: Blocked Domain Is Blocked
 
 ```bash
-cell run --name test-blocked --rm -- curl -s -o /dev/null -w "%{http_code}" https://pastebin.com
+brig run --name test-blocked --rm -- curl -s -o /dev/null -w "%{http_code}" https://pastebin.com
 # Should print: 403
 ```
 
@@ -266,35 +266,35 @@ cell run --name test-blocked --rm -- curl -s -o /dev/null -w "%{http_code}" http
 
 ```bash
 # Create a file in cell-a
-cell run --name cell-a -d -- sh -c "echo 'secret' > /work/secret.txt && sleep 300"
+brig run --name cell-a -d -- sh -c "echo 'secret' > /work/secret.txt && sleep 300"
 
 # Try to read it from cell-b (should fail)
-cell run --name cell-b --rm -- cat /work/secret.txt
+brig run --name cell-b --rm -- cat /work/secret.txt
 # Should fail: file not found
 
 # Cleanup
-cell kill cell-a && cell rm cell-a
+brig kill cell-a && brig rm cell-a
 ```
 
 ### Test 5: Cell Can't See Another Cell's Processes
 
 ```bash
 # Start cell-a with a known process
-cell run --name cell-a -d -- sleep 3600
+brig run --name cell-a -d -- sleep 3600
 
 # Check if cell-b can see it
-cell run --name cell-b --rm -- ps aux
+brig run --name cell-b --rm -- ps aux
 # Should only show cell-b's own processes
 
 # Cleanup
-cell kill cell-a && cell rm cell-a
+brig kill cell-a && brig rm cell-a
 ```
 
 ### Test 6: No Foreign Containers Attached to Cell Networks
 
 ```bash
 # Run inside VM:
-cell vm shell -- bash -c '
+brig vm shell -- bash -c '
 for net in $(podman network ls --format "{{.Name}}" | grep "^cell-"); do
   echo "== $net =="
   podman network inspect "$net" --format "{{json .Containers}}"
@@ -306,11 +306,11 @@ done
 
 ```bash
 # Check runtime via podman inspect
-cell vm shell -- podman inspect my-cell --format '{{.OCIRuntime}}'
+brig vm shell -- podman inspect my-cell --format '{{.OCIRuntime}}'
 # Should output: runsc
 
 # Verify from inside container
-cell run --name test-gvisor --rm -- cat /proc/version
+brig run --name test-gvisor --rm -- cat /proc/version
 # Should contain "gvisor"
 ```
 
@@ -318,20 +318,20 @@ cell run --name test-gvisor --rm -- cat /proc/version
 
 ```bash
 # Start cell-a with an HTTP server
-cell run --name cell-a -d -- sh -c "python3 -m http.server 9000 || sleep 300"
+brig run --name cell-a -d -- sh -c "python3 -m http.server 9000 || sleep 300"
 
 # Try to reach from cell-b (MUST FAIL)
-cell run --name cell-b --rm -- curl -m 5 http://cell-a:9000/
+brig run --name cell-b --rm -- curl -m 5 http://cell-a:9000/
 echo "Exit code: $?"  # MUST be non-zero
 
 # Cleanup
-cell kill cell-a && cell rm cell-a
+brig kill cell-a && brig rm cell-a
 ```
 
 ### Test 9: Proxy Only Exposes Port 8080
 
 ```bash
-cell run --name test-portscan --rm -- sh -c '
+brig run --name test-portscan --rm -- sh -c '
   apk add --no-cache nmap >/dev/null 2>&1
   nmap -p 1-65535 proxy --open -T4 2>/dev/null | grep "^[0-9]"
 '
@@ -342,15 +342,15 @@ cell run --name test-portscan --rm -- sh -c '
 
 ```bash
 # Try CONNECT to non-443 port (should be rejected)
-cell run --name test --rm -- curl -s -x http://proxy:8080 http://example.com:8080/
+brig run --name test --rm -- curl -s -x http://proxy:8080 http://example.com:8080/
 # Expected: 403 Forbidden
 
 # Try CONNECT to literal IP (should be rejected)
-cell run --name test --rm -- curl -s -x http://proxy:8080 https://142.250.80.46/
+brig run --name test --rm -- curl -s -x http://proxy:8080 https://142.250.80.46/
 # Expected: 403 Forbidden
 
 # Try CONNECT to internal range (should be rejected)
-cell run --name test --rm -- curl -s -x http://proxy:8080 http://10.50.0.1/
+brig run --name test --rm -- curl -s -x http://proxy:8080 http://10.50.0.1/
 # Expected: 403 Forbidden
 ```
 
@@ -358,21 +358,21 @@ cell run --name test --rm -- curl -s -x http://proxy:8080 http://10.50.0.1/
 
 ```bash
 # Run without specifying runtime (should use gVisor)
-cell run --name test-default --rm -- cat /proc/version
+brig run --name test-default --rm -- cat /proc/version
 # Should show gVisor
 
 # Verify runc requires --unsafe
-cell run --name test --runtime=runc -- echo hello
+brig run --name test --runtime=runc -- echo hello
 # Should fail with: "Error: runc runtime requires --unsafe flag"
 ```
 
 ### Test 12: IPv6 Is Disabled
 
 ```bash
-cell run --name test-ipv6 --rm -- curl -6 -m 5 http://ipv6.google.com/
+brig run --name test-ipv6 --rm -- curl -6 -m 5 http://ipv6.google.com/
 echo "Exit code: $?"  # MUST be non-zero
 
-cell run --name test-ipv6 --rm -- cat /proc/sys/net/ipv6/conf/all/disable_ipv6
+brig run --name test-ipv6 --rm -- cat /proc/sys/net/ipv6/conf/all/disable_ipv6
 # Should output: 1
 ```
 
@@ -380,14 +380,14 @@ cell run --name test-ipv6 --rm -- cat /proc/sys/net/ipv6/conf/all/disable_ipv6
 
 ```bash
 # Try UDP DNS query to external resolver (should fail)
-cell run --name test-udp --rm --no-proxy-env -- nslookup google.com 8.8.8.8
+brig run --name test-udp --rm --network none -- nslookup google.com 8.8.8.8
 echo "Exit code: $?"  # MUST be non-zero
 ```
 
 ### Test 14: Subnet Allocator Bounds
 
 ```bash
-cell vm shell -- python3 -c '
+brig vm shell -- python3 -c '
 import json
 state = {"next_index": 255, "allocated": {}, "freed": []}
 if state["next_index"] > 254:
@@ -401,18 +401,18 @@ else:
 
 ```bash
 # Create a cell and verify proxy sees correct subnet
-cell run --name test-identity -d -- sleep 300
+brig run --name test-identity -d -- sleep 300
 
 # Make a request and check proxy log
-cell exec test-identity -- curl -s https://httpbin.org/ip
+brig exec test-identity -- curl -s https://httpbin.org/ip
 sleep 1
 
 # Check last log entry
-cell vm shell -- tail -1 /var/log/cells/network/test-identity.jsonl | jq .
+brig vm shell -- tail -1 /var/log/cells/network/test-identity.jsonl | jq .
 # Should show src_ip within expected subnet
 
 # Cleanup
-cell kill test-identity && cell rm test-identity
+brig kill test-identity && brig rm test-identity
 ```
 
 ---
@@ -423,42 +423,42 @@ cell kill test-identity && cell rm test-identity
 
 1. Verify network is `--internal`:
    ```bash
-   cell vm shell -- podman network inspect cell-xxx | grep -i internal
+   brig vm shell -- podman network inspect cell-xxx | grep -i internal
    ```
 
 2. Verify no gateway is set:
    ```bash
-   cell vm shell -- podman network inspect cell-xxx | grep -i gateway
+   brig vm shell -- podman network inspect cell-xxx | grep -i gateway
    ```
 
 3. Recreate the network:
    ```bash
-   cell rm my-cell
-   cell run -f cells/my-cell.yaml
+   brig rm my-cell
+   brig run -f cells/my-cell.yaml
    ```
 
 ### gVisor not active
 
 1. Check containers.conf:
    ```bash
-   cell vm shell -- cat /etc/containers/containers.conf.d/gvisor.conf
+   brig vm shell -- cat /etc/containers/containers.conf.d/gvisor.conf
    ```
 
 2. Verify runsc is installed:
    ```bash
-   cell vm shell -- runsc --version
+   brig vm shell -- runsc --version
    ```
 
 ### Unexpected container on cell network
 
 1. Run verification:
    ```bash
-   cell verify
+   brig verify
    ```
 
 2. Disconnect the container:
    ```bash
-   cell vm shell -- podman network disconnect cell-xxx unexpected-container
+   brig vm shell -- podman network disconnect cell-xxx unexpected-container
    ```
 
 ---
@@ -468,35 +468,35 @@ cell kill test-identity && cell rm test-identity
 ### Soft Reset (restart cells and proxy)
 
 ```bash
-cell stop --all
-cell proxy restart
-cell start --all
+brig stop --all
+warden restart
+brig start --all
 ```
 
 ### Hard Reset (kill everything, keep state)
 
 ```bash
-cell kill --all
-cell proxy stop
-cell vm shell -- 'for net in $(podman network ls -q | grep "^cell-"); do podman network rm "$net" 2>/dev/null; done'
-cell proxy start
-cell start --all
+brig kill --all
+warden stop
+brig vm shell -- 'for net in $(podman network ls -q | grep "^cell-"); do podman network rm "$net" 2>/dev/null; done'
+warden start
+brig start --all
 ```
 
 ### VM Restart (preserves macOS state)
 
 ```bash
-cell vm restart
+brig vm restart
 # Proxy starts automatically via systemd
-cell start --all
+brig start --all
 ```
 
 ### VM Recreate (clean slate VM, preserves macOS state)
 
 ```bash
-cell vm recreate
+brig vm recreate
 # All VM state destroyed and rebuilt
-cell start --all
+brig start --all
 ```
 
 ### Full Reset (destroy everything)
@@ -513,10 +513,10 @@ After any recovery:
 
 ```bash
 # Quick smoke test
-cell run --name recovery-test --rm -- curl -m 5 https://httpbin.org/ip
+brig run --name recovery-test --rm -- curl -m 5 https://httpbin.org/ip
 
 # Full verification suite
-cell test isolation
+brig test isolation
 ```
 
 ---

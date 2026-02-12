@@ -67,6 +67,7 @@ NETWORK = "proxy-external"
 MEMORY_LIMIT = "1g"
 CPU_LIMIT = "1"
 PIDS_LIMIT = "256"
+FD_LIMIT = "nofile=1024:2048"  # Soft:hard file descriptor limit.
 
 # File paths.
 POLICY_FILE = Path("/cells/network-policy.json")
@@ -401,6 +402,7 @@ def cmd_start() -> int:
         "--memory", MEMORY_LIMIT,
         "--cpus", CPU_LIMIT,
         "--pids-limit", PIDS_LIMIT,
+        "--ulimit", FD_LIMIT,
 
         # Mount volumes.
         "-v", "/var/log/brig/network:/logs:rw",
@@ -414,6 +416,9 @@ def cmd_start() -> int:
         # mitmdump arguments.
         "--listen-host", "0.0.0.0",
         "--listen-port", "8080",
+        # Disable mitmproxy's built-in global IP blocking; enforce addon
+        # handles this with a comprehensive BLOCKED_NETWORKS list covering
+        # RFC1918, CGNAT, multicast, IPv4-mapped IPv6, and more.
         "--set", "block_global=false",
     ]
 
@@ -970,13 +975,17 @@ def _matches_rule(rule, domain: str, path: str, method: str) -> bool:
 
 
 def _matches_domain(pattern: str, domain: str) -> bool:
-    """Check if domain matches pattern."""
+    """Check if domain matches pattern.
+
+    Wildcard patterns match subdomains only:
+        *.example.com matches foo.example.com, NOT example.com itself.
+    """
     pattern = pattern.lower()
     domain = domain.lower()
 
     if pattern.startswith("*."):
-        suffix = pattern[1:]  # Keep the dot.
-        return domain.endswith(suffix) or domain == pattern[2:]
+        suffix = pattern[1:]  # ".example.com"
+        return domain.endswith(suffix)
     else:
         return domain == pattern
 

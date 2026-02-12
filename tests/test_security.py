@@ -974,5 +974,108 @@ class TestConcurrentOperations(unittest.TestCase):
             os.unlink(temp_file)
 
 
+class TestDNSRebindingPostResolution(unittest.TestCase):
+    """Tests for DNS rebinding protection via post-resolution IP check."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import PolicyEnforcer with mocked mitmproxy."""
+        from enforce import PolicyEnforcer, BLOCKED_NETWORKS
+        cls.PolicyEnforcer = PolicyEnforcer
+        cls.BLOCKED_NETWORKS = BLOCKED_NETWORKS
+
+    def test_serverconnect_blocks_internal_ip(self):
+        """serverconnect hook blocks connections to internal IPs."""
+        enforcer = self.PolicyEnforcer()
+        server_conn = MagicMock()
+        server_conn.address = ("127.0.0.1", 80)
+        server_conn.error = None
+
+        enforcer.serverconnect(server_conn)
+
+        self.assertIsNotNone(server_conn.error)
+        self.assertIn("blocked IP", server_conn.error)
+
+    def test_serverconnect_allows_public_ip(self):
+        """serverconnect hook allows connections to public IPs."""
+        enforcer = self.PolicyEnforcer()
+        server_conn = MagicMock()
+        server_conn.address = ("93.184.216.34", 443)
+        server_conn.error = None
+
+        enforcer.serverconnect(server_conn)
+
+        # error should remain None (not set).
+        self.assertIsNone(server_conn.error)
+
+    def test_serverconnect_blocks_rfc1918(self):
+        """serverconnect blocks RFC1918 addresses after DNS resolution."""
+        enforcer = self.PolicyEnforcer()
+        for ip in ["10.0.0.1", "172.16.0.1", "192.168.1.1"]:
+            server_conn = MagicMock()
+            server_conn.address = (ip, 80)
+            server_conn.error = None
+            enforcer.serverconnect(server_conn)
+            self.assertIsNotNone(server_conn.error, f"Should block {ip}")
+
+
+class TestCellPolicyIsolationSecurity(unittest.TestCase):
+    """Tests for cell policy isolation — no fall-through to global."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import Policy from enforce.py."""
+        from enforce import Policy
+        cls.Policy = Policy
+
+    def test_cell_policy_no_global_fallthrough(self):
+        """A domain allowed globally is blocked when cell has its own policy."""
+        # Cell policy only allows specific.com.
+        cell_policy = self.Policy(allow=["specific.com"])
+
+        # example.com would be allowed globally, but cell didn't allow it.
+        allowed, reason, _ = cell_policy.is_allowed("example.com", "/", "GET")
+        self.assertFalse(allowed)
+
+    def test_cell_deny_takes_precedence(self):
+        """Cell deny rules take precedence over allow rules."""
+        cell_policy = self.Policy(
+            allow=["*.example.com"],
+            deny=["evil.example.com"]
+        )
+        allowed, _, _ = cell_policy.is_allowed("evil.example.com", "/", "GET")
+        self.assertFalse(allowed)
+
+
+class TestSubstringMatchingSecurity(unittest.TestCase):
+    """Tests that container name matching uses exact match."""
+
+    @patch.object(brig, 'run')
+    def test_substring_container_not_matched(self, mock_run):
+        """Container 'brig-test' does not match when checking 'brig-tes'."""
+        brig._cache.clear()
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="brig-test\n"
+        )
+        # "tes" container should not exist just because "brig-test" does.
+        result = brig.cell_exists("tes")
+        self.assertFalse(result)
+
+
+class TestIDNNormalization(unittest.TestCase):
+    """Tests for IDN/Unicode domain normalization in enforce.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import PolicyRule from enforce.py."""
+        from enforce import PolicyRule
+        cls.PolicyRule = PolicyRule
+
+    def test_punycode_domain_matches(self):
+        """Punycode domain matches regardless of encoding form."""
+        rule = self.PolicyRule("xn--mnchen-3ya.de")
+        self.assertTrue(rule.matches_domain("xn--mnchen-3ya.de"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

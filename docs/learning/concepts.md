@@ -1,10 +1,10 @@
 # Concepts
 
-Deep dives into how Cell works.
+Deep dives into how Brig works.
 
 ## Lima VM as Security Boundary
 
-The Lima VM is Cell's **only hard security boundary**. It provides hardware virtualization using Apple's Virtualization.framework (VZ).
+The Lima VM is Brig's **only hard security boundary**. It provides hardware virtualization using Apple's Virtualization.framework (VZ).
 
 ### Why a VM?
 
@@ -78,14 +78,14 @@ Some programs don't work with gVisor:
 If you must run without gVisor (not recommended):
 
 ```bash
-cell run --name test --runtime=runc --unsafe -- your-command
+brig run --name test --runtime=runc --unsafe -- your-command
 ```
 
 ---
 
 ## Per-Cell Network Isolation
 
-Each cell gets its own isolated network. This is the key to Cell's security model.
+Each cell gets its own isolated network. This is the key to Brig's security model.
 
 ### How It Works
 
@@ -175,7 +175,7 @@ Requests to non-allowed domains return 403.
 Policy can be reloaded without restarting the proxy:
 
 ```bash
-cell proxy reload
+warden reload
 ```
 
 During reload:
@@ -187,7 +187,7 @@ During reload:
 
 ## Secrets Model (Files, Not Env Vars)
 
-Cell mounts secrets as files, not environment variables.
+Brig mounts secrets as files, not environment variables.
 
 ### Why Files?
 
@@ -303,13 +303,13 @@ The `~/.brig/state/` directory contains untrusted output from cells.
 
 1. Review files inside the VM first:
    ```bash
-   cell cat my-cell /work/output.txt
-   cell files my-cell
+   brig cat my-cell /work/output.txt
+   brig files my-cell
    ```
 
 2. Export with sanitization:
    ```bash
-   cell cp --sanitize my-cell:/work/report.html ./report.html
+   brig cp --sanitize my-cell:/work/report.html ./report.html
    ```
 
 3. Never run from state directory directly

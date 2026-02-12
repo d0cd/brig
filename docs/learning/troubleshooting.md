@@ -56,7 +56,7 @@ brig exec my-cell -- curl -v http://proxy:8080/
 If DNS fails, the proxy isn't joined to the cell's network:
 
 ```bash
-brig vm shell -- podman network connect cell-my-warden
+brig vm shell -- podman network connect brig-my-cell warden
 ```
 
 **5. Is the domain blocked?**
@@ -314,7 +314,7 @@ memory: 16GiB
 Then recreate the VM:
 
 ```bash
-cell vm recreate
+brig vm recreate
 ```
 
 ---

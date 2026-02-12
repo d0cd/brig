@@ -43,6 +43,23 @@ from typing import Optional
 
 from mitmproxy import http, ctx
 
+# Shared SIGHUP dispatcher — only one signal handler for all addons.
+_sighup_callbacks = []
+
+
+def register_sighup(callback):
+    """Register a callback to be invoked on SIGHUP."""
+    _sighup_callbacks.append(callback)
+    # Ensure the dispatcher is registered (idempotent after first call).
+    signal.signal(signal.SIGHUP, _sighup_dispatcher)
+
+
+def _sighup_dispatcher(signum, frame):
+    """Dispatch SIGHUP to all registered callbacks."""
+    for cb in _sighup_callbacks:
+        cb()
+
+
 # Policy file path (mounted into container).
 POLICY_FILE = Path("/policy.json")
 
@@ -74,10 +91,18 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("198.18.0.0/15"),
     # Reserved.
     ipaddress.ip_network("240.0.0.0/4"),
+    # "This network" (used in SSRF attacks).
+    ipaddress.ip_network("0.0.0.0/8"),
+    # Multicast.
+    ipaddress.ip_network("224.0.0.0/4"),
     # IPv6 equivalents.
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+    # IPv4-mapped IPv6 (bypass for all IPv4 blocked ranges).
+    ipaddress.ip_network("::ffff:0:0/96"),
+    # Documentation prefix (should never appear in production).
+    ipaddress.ip_network("2001:db8::/32"),
 ]
 
 
@@ -102,14 +127,23 @@ class PolicyRule:
         else:
             raise ValueError(f"Invalid rule format: {rule}")
 
-        # Pre-compile domain pattern.
+        # Pre-compile domain pattern (normalize IDN to punycode).
         self.is_wildcard = self.domain.startswith("*.")
         if self.is_wildcard:
-            self.suffix = self.domain[1:].lower()  # Keep the dot for suffix matching.
-            self.domain_exact = self.domain[2:].lower()  # For exact match of base domain.
+            base = self.domain[2:]
+            try:
+                base = base.encode("idna").decode("ascii")
+            except (UnicodeError, UnicodeDecodeError):
+                pass
+            self.suffix = ("." + base).lower()  # Keep the dot for suffix matching.
+            self.domain_exact = base.lower()  # For exact match of base domain.
         else:
+            try:
+                normalized = self.domain.encode("idna").decode("ascii")
+            except (UnicodeError, UnicodeDecodeError):
+                normalized = self.domain
             self.suffix = None
-            self.domain_exact = self.domain.lower()
+            self.domain_exact = normalized.lower()
 
         # Pre-compile path patterns to regex for faster matching.
         self._path_patterns = None
@@ -120,13 +154,25 @@ class PolicyRule:
                 regex_pattern = fnmatch.translate(p)
                 self._path_patterns.append(re.compile(regex_pattern))
 
+    @staticmethod
+    def _normalize_domain(domain: str) -> str:
+        """Normalize domain to ASCII/punycode for consistent matching."""
+        try:
+            return domain.encode("idna").decode("ascii").lower()
+        except (UnicodeError, UnicodeDecodeError):
+            return domain.lower()
+
     def matches_domain(self, host: str) -> bool:
-        """Check if host matches this rule's domain pattern."""
-        host = host.lower()
+        """Check if host matches this rule's domain pattern.
+
+        Wildcard patterns match subdomains only:
+            *.example.com matches foo.example.com, NOT example.com itself.
+        """
+        host = self._normalize_domain(host)
 
         if self.is_wildcard:
-            # Wildcard: *.example.com matches sub.example.com and example.com.
-            return host.endswith(self.suffix) or host == self.domain_exact
+            # Wildcard: *.example.com matches sub.example.com only.
+            return host.endswith(self.suffix)
         else:
             # Exact match.
             return host == self.domain_exact
@@ -247,6 +293,7 @@ class PolicyEnforcer:
         self.cell_policy_last_access: dict[str, float] = {}  # LRU tracking.
         self.trace_config = PolicyTraceConfig()
         self._cell_policy_lock = threading.Lock()  # Protects cell_policies access.
+        self._reload_pending = False  # Deferred reload flag for signal safety.
 
     def load(self, loader):
         """Called when addon is loaded."""
@@ -254,14 +301,17 @@ class PolicyEnforcer:
         self._reload_policy()
         self._reload_subnet_map()
         self._reload_cell_policies()
-        # Register SIGHUP handler for signal-based reload.
-        signal.signal(signal.SIGHUP, self._handle_sighup)
+        # Register with shared SIGHUP dispatcher.
+        register_sighup(self._on_sighup)
         ctx.log.info("PolicyEnforcer: SIGHUP reload handler registered")
 
-    def _handle_sighup(self, signum, frame):
-        """Handle SIGHUP signal for policy reload."""
-        ctx.log.info("PolicyEnforcer: Received SIGHUP, reloading policies...")
-        # Force reload by resetting mtimes and clearing caches.
+    def _on_sighup(self):
+        """Set deferred reload flag on SIGHUP. Safe to call from signal context."""
+        self._reload_pending = True
+
+    def _do_reload(self):
+        """Perform the actual reload outside of signal context."""
+        ctx.log.info("PolicyEnforcer: Reloading policies...")
         self.policy_mtime = 0.0
         self.subnet_map_mtime = 0.0
         with self._cell_policy_lock:
@@ -408,8 +458,10 @@ class PolicyEnforcer:
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Process each HTTP request."""
-        # Policy reload now handled via SIGHUP signal (see _handle_sighup).
-        # No per-request stat() calls for better performance.
+        # Check for deferred SIGHUP reload (signal-safe pattern).
+        if self._reload_pending:
+            self._reload_pending = False
+            self._do_reload()
 
         # Extract request details.
         host = flow.request.host
@@ -454,10 +506,9 @@ class PolicyEnforcer:
             if allowed:
                 flow.metadata["policy_reason"] = f"cell:{reason}"
                 return
-            # Fall through to global policy check if not explicitly denied.
-            if "denied by rule" in reason:
-                self._block(flow, f"cell policy: {reason}")
-                return
+            # Cell policy exists but didn't allow — block without falling through.
+            self._block(flow, f"cell policy: {reason}")
+            return
 
         # Check 5: Global policy.
         allowed, reason, trace = self.global_policy.is_allowed(host, path, method, self.trace_config)
@@ -475,12 +526,28 @@ class PolicyEnforcer:
         flow.metadata["blocked"] = True
         flow.metadata["block_reason"] = reason
 
+        # Return generic message to cell; log details server-side only.
         flow.response = http.Response.make(
             403,
-            f"Blocked by Warden: {reason}",
+            "Blocked by network policy",
             {"Content-Type": "text/plain"}
         )
         ctx.log.info(f"BLOCKED: {flow.request.host}{flow.request.path} - {reason}")
+
+    def serverconnect(self, server_conn):
+        """Check resolved IP against blocked ranges after DNS resolution."""
+        addr = getattr(server_conn, "address", None)
+        if addr:
+            ip_str = addr[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                for net in BLOCKED_NETWORKS:
+                    if ip in net:
+                        server_conn.error = f"DNS resolved to blocked IP: {ip_str}"
+                        ctx.log.info(f"BLOCKED: DNS rebinding to {ip_str}")
+                        return
+            except ValueError:
+                pass
 
 
 addons = [PolicyEnforcer()]

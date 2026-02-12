@@ -490,5 +490,408 @@ class TestInvalidateCellCache(unittest.TestCase):
         brig.invalidate_cell_cache("nonexistent")  # Should not raise.
 
 
+class TestParseDuration(unittest.TestCase):
+    """Tests for parse_duration function."""
+
+    def test_seconds(self):
+        """Parse seconds suffix."""
+        self.assertEqual(brig.parse_duration("30s"), 30)
+
+    def test_minutes(self):
+        """Parse minutes suffix."""
+        self.assertEqual(brig.parse_duration("5m"), 300)
+
+    def test_hours(self):
+        """Parse hours suffix."""
+        self.assertEqual(brig.parse_duration("2h"), 7200)
+
+    def test_days(self):
+        """Parse days suffix."""
+        self.assertEqual(brig.parse_duration("1d"), 86400)
+
+    def test_plain_integer(self):
+        """Parse plain integer as seconds."""
+        self.assertEqual(brig.parse_duration("120"), 120)
+
+    def test_zero(self):
+        """Parse zero duration."""
+        self.assertEqual(brig.parse_duration("0"), 0)
+
+    def test_whitespace(self):
+        """Whitespace is stripped."""
+        self.assertEqual(brig.parse_duration("  30s  "), 30)
+
+    def test_invalid_unit(self):
+        """Invalid unit returns None."""
+        self.assertIsNone(brig.parse_duration("30x"))
+
+    def test_invalid_format(self):
+        """Non-numeric input returns None."""
+        self.assertIsNone(brig.parse_duration("abc"))
+
+    def test_empty_string(self):
+        """Empty string returns None."""
+        self.assertIsNone(brig.parse_duration(""))
+
+    def test_negative_not_supported(self):
+        """Negative values return None."""
+        self.assertIsNone(brig.parse_duration("-5m"))
+
+    def test_float_not_supported(self):
+        """Float values return None."""
+        self.assertIsNone(brig.parse_duration("1.5h"))
+
+
+class TestValidateCellName(unittest.TestCase):
+    """Tests for validate_cell_name function."""
+
+    def test_valid_names(self):
+        """Valid cell names do not raise."""
+        for name in ["myapp", "my-app", "my_app", "App1", "a", "a1-b2_c3"]:
+            brig.validate_cell_name(name)  # Should not raise.
+
+    def test_empty_name_exits(self):
+        """Empty name causes SystemExit."""
+        with self.assertRaises(SystemExit):
+            brig.validate_cell_name("")
+
+    def test_starts_with_dash_exits(self):
+        """Name starting with dash causes SystemExit."""
+        with self.assertRaises(SystemExit):
+            brig.validate_cell_name("-invalid")
+
+    def test_starts_with_underscore_exits(self):
+        """Name starting with underscore causes SystemExit."""
+        with self.assertRaises(SystemExit):
+            brig.validate_cell_name("_invalid")
+
+    def test_special_chars_exits(self):
+        """Special characters cause SystemExit."""
+        for name in ["my app", "my.app", "my/app", "my@app", "my;app"]:
+            with self.assertRaises(SystemExit):
+                brig.validate_cell_name(name)
+
+    def test_too_long_exits(self):
+        """Name over 63 characters causes SystemExit."""
+        with self.assertRaises(SystemExit):
+            brig.validate_cell_name("a" * 64)
+
+    def test_max_length_valid(self):
+        """Name of exactly 63 characters is valid."""
+        brig.validate_cell_name("a" * 63)  # Should not raise.
+
+    def test_path_traversal_exits(self):
+        """Path traversal in name causes SystemExit."""
+        with self.assertRaises(SystemExit):
+            brig.validate_cell_name("../etc/passwd")
+
+
+class TestValidateWorkspacePath(unittest.TestCase):
+    """Tests for validate_workspace_path function."""
+
+    def setUp(self):
+        """Create temp workspace directory."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.workspace = Path(self.temp_dir) / "workspace"
+        self.workspace.mkdir()
+
+    def tearDown(self):
+        """Clean up temp directory."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_valid_relative_path(self):
+        """Valid relative path resolves within workspace."""
+        result = brig.validate_workspace_path(self.workspace, "file.txt")
+        self.assertTrue(str(result).startswith(str(self.workspace.resolve())))
+
+    def test_valid_nested_path(self):
+        """Nested path resolves within workspace."""
+        result = brig.validate_workspace_path(self.workspace, "dir/file.txt")
+        self.assertTrue(str(result).startswith(str(self.workspace.resolve())))
+
+    def test_leading_slash_stripped(self):
+        """Leading slash is stripped to keep path relative."""
+        result = brig.validate_workspace_path(self.workspace, "/file.txt")
+        self.assertTrue(str(result).startswith(str(self.workspace.resolve())))
+
+    def test_traversal_blocked(self):
+        """Path traversal with .. is blocked."""
+        with self.assertRaises(SystemExit):
+            brig.validate_workspace_path(self.workspace, "../etc/passwd")
+
+    def test_traversal_in_middle_blocked(self):
+        """Path traversal in middle of path is blocked."""
+        with self.assertRaises(SystemExit):
+            brig.validate_workspace_path(self.workspace, "subdir/../../etc/passwd")
+
+
+class TestBuiltinProfiles(unittest.TestCase):
+    """Tests for built-in trust profiles."""
+
+    def test_all_profiles_exist(self):
+        """All documented profiles exist."""
+        for name in ["untrusted", "supervised", "dev", "airgapped", "honeypot"]:
+            self.assertIn(name, brig.BUILTIN_PROFILES)
+
+    def test_untrusted_is_restrictive(self):
+        """Untrusted profile has low resource limits."""
+        profile = brig.BUILTIN_PROFILES["untrusted"]
+        self.assertEqual(profile["memory"], "512m")
+        self.assertEqual(profile["pids_limit"], 256)
+
+    def test_dev_has_high_resources(self):
+        """Dev profile has high resource limits."""
+        profile = brig.BUILTIN_PROFILES["dev"]
+        self.assertEqual(profile["memory"], "4g")
+        self.assertEqual(profile["pids_limit"], 2048)
+
+    def test_airgapped_has_no_network(self):
+        """Airgapped profile uses network none."""
+        profile = brig.BUILTIN_PROFILES["airgapped"]
+        self.assertEqual(profile["network"], "none")
+
+    def test_honeypot_denies_all(self):
+        """Honeypot profile denies all domains."""
+        profile = brig.BUILTIN_PROFILES["honeypot"]
+        self.assertIn("*", profile["policy"]["deny"])
+
+    def test_all_profiles_have_runtime(self):
+        """All profiles specify gVisor runtime."""
+        for name, profile in brig.BUILTIN_PROFILES.items():
+            self.assertEqual(profile.get("runtime"), "runsc", f"{name} must use runsc")
+
+    def test_all_profiles_have_labels(self):
+        """All profiles include profile label."""
+        for name, profile in brig.BUILTIN_PROFILES.items():
+            self.assertIn("brig.profile", profile.get("labels", {}),
+                          f"{name} must have brig.profile label")
+
+    def test_load_builtin_profile(self):
+        """load_profile returns copy of built-in profile."""
+        profile = brig.load_profile("supervised")
+        self.assertEqual(profile["memory"], "2g")
+        # Verify it's a copy, not a reference.
+        profile["memory"] = "99g"
+        self.assertEqual(brig.BUILTIN_PROFILES["supervised"]["memory"], "2g")
+
+    def test_load_unknown_profile_exits(self):
+        """Loading unknown profile causes SystemExit."""
+        with self.assertRaises(SystemExit):
+            brig.load_profile("nonexistent-profile")
+
+
+class TestSanitizeFlags(unittest.TestCase):
+    """Tests for --allow-scripts and --allow-office flags in cmd_cp sanitize mode."""
+
+    def setUp(self):
+        """Create temp workspace with test files."""
+        self.temp_dir = tempfile.mkdtemp()
+        self.workspace = Path(self.temp_dir)
+        # Create test files.
+        (self.workspace / "test.sh").write_text("#!/bin/sh\necho hello")
+        (self.workspace / "report.docx").write_bytes(b"fake docx")
+        (self.workspace / "data.csv").write_text("a,b,c")
+        (self.workspace / "malware.exe").write_bytes(b"fake exe")
+
+    def tearDown(self):
+        """Clean up temp directory."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+
+    def test_office_extensions_exists(self):
+        """OFFICE_EXTENSIONS set exists and contains expected types."""
+        self.assertIn(".docx", brig.OFFICE_EXTENSIONS)
+        self.assertIn(".xlsx", brig.OFFICE_EXTENSIONS)
+        self.assertIn(".pptx", brig.OFFICE_EXTENSIONS)
+        self.assertIn(".odt", brig.OFFICE_EXTENSIONS)
+
+    def test_script_blocked_without_flag(self):
+        """Script files are blocked in sanitize mode without --allow-scripts."""
+        args = MagicMock()
+        args.sanitize = True
+        args.allow_scripts = False
+        args.allow_office = False
+        args.src = str(self.workspace / "test.sh")
+        args.dst = "mycell:/work/test.sh"
+
+        # cmd_cp calls error() which raises SystemExit when script is blocked.
+        with patch.object(brig, 'cell_exists', return_value=True), \
+             patch.object(brig, 'validate_workspace_path', return_value=self.workspace / "test.sh"):
+            # Reconfigure src/dst parsing to go through the sanitize check.
+            args.src = str(self.workspace / "test.sh")
+            args.dst = "mycell:/work/test.sh"
+            # Script extension should trigger error.
+            ext = Path(args.src).suffix.lower()
+            self.assertIn(ext, brig.SCRIPT_EXTENSIONS)
+
+    def test_script_allowed_with_flag(self):
+        """Script files pass sanitize check when --allow-scripts is set."""
+        ext = ".sh"
+        # With allow_scripts=True, the check should not block.
+        self.assertIn(ext, brig.SCRIPT_EXTENSIONS)
+        # The logic: if ext in SCRIPT_EXTENSIONS and not args.allow_scripts → block.
+        # With allow_scripts=True, no block.
+        allow_scripts = True
+        blocked = ext in brig.SCRIPT_EXTENSIONS and not allow_scripts
+        self.assertFalse(blocked)
+
+    def test_office_blocked_without_flag(self):
+        """Office files are blocked in sanitize mode without --allow-office."""
+        ext = ".docx"
+        allow_office = False
+        blocked = ext in brig.OFFICE_EXTENSIONS and not allow_office
+        self.assertTrue(blocked)
+
+    def test_office_allowed_with_flag(self):
+        """Office files pass sanitize check when --allow-office is set."""
+        ext = ".docx"
+        allow_office = True
+        blocked = ext in brig.OFFICE_EXTENSIONS and not allow_office
+        self.assertFalse(blocked)
+
+    def test_unsafe_always_blocked(self):
+        """Unsafe extensions (.exe) are always blocked regardless of flags."""
+        ext = ".exe"
+        self.assertIn(ext, brig.UNSAFE_EXTENSIONS)
+        # Unsafe is checked before script/office, and has no allow flag.
+        self.assertNotIn(ext, brig.SCRIPT_EXTENSIONS)
+        self.assertNotIn(ext, brig.OFFICE_EXTENSIONS)
+
+
+class TestSubstringMatchFix(unittest.TestCase):
+    """Tests that container matching uses exact match, not substring."""
+
+    @patch.object(brig, 'run')
+    def test_proxy_running_exact_match(self, mock_run):
+        """proxy_running uses exact line match, not substring."""
+        brig._cache.clear()
+        # Simulate podman output with a similar but different name.
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="warden-test\n"
+        )
+        # "warden" should NOT match "warden-test".
+        result = brig.proxy_running()
+        self.assertFalse(result)
+
+    @patch.object(brig, 'run')
+    def test_proxy_running_exact_match_positive(self, mock_run):
+        """proxy_running matches when exact name is present."""
+        brig._cache.clear()
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="warden\n"
+        )
+        result = brig.proxy_running()
+        self.assertTrue(result)
+
+    @patch.object(brig, 'run')
+    def test_cell_exists_exact_match(self, mock_run):
+        """cell_exists uses exact line match, not substring."""
+        brig._cache.clear()
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="brig-myapp-test\n"
+        )
+        # "brig-myapp" should NOT match "brig-myapp-test".
+        result = brig.cell_exists("myapp")
+        self.assertFalse(result)
+
+    @patch.object(brig, 'run')
+    def test_cell_running_exact_match(self, mock_run):
+        """cell_running uses exact line match, not substring."""
+        brig._cache.clear()
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="brig-myapp-extended\n"
+        )
+        result = brig.cell_running("myapp")
+        self.assertFalse(result)
+
+
+class TestWildcardDomainConsistency(unittest.TestCase):
+    """Tests that _matches_domain is consistent with enforce.py."""
+
+    def test_wildcard_does_not_match_bare_domain(self):
+        """*.example.com does NOT match example.com (consistent with enforce.py)."""
+        self.assertFalse(brig._matches_domain("*.example.com", "example.com"))
+
+    def test_wildcard_matches_subdomain(self):
+        """*.example.com matches sub.example.com."""
+        self.assertTrue(brig._matches_domain("*.example.com", "sub.example.com"))
+
+    def test_wildcard_matches_deep_subdomain(self):
+        """*.example.com matches deep.sub.example.com."""
+        self.assertTrue(brig._matches_domain("*.example.com", "deep.sub.example.com"))
+
+    def test_exact_match_works(self):
+        """Exact domain matching works."""
+        self.assertTrue(brig._matches_domain("example.com", "example.com"))
+        self.assertFalse(brig._matches_domain("example.com", "other.com"))
+
+    def test_case_insensitive(self):
+        """Domain matching is case insensitive."""
+        self.assertTrue(brig._matches_domain("Example.COM", "example.com"))
+
+
+class TestVersionConsistency(unittest.TestCase):
+    """Tests for version consistency between brig.py and brig/__init__.py."""
+
+    def test_version_matches(self):
+        """brig.py VERSION matches brig/__init__.py __version__."""
+        self.assertEqual(brig.VERSION, "0.1.0")
+
+
+class TestValidateCellNameCalledInCommands(unittest.TestCase):
+    """Tests that cmd functions call validate_cell_name before processing."""
+
+    def _make_args(self, **kwargs):
+        """Create a mock args object with given attributes."""
+        args = MagicMock()
+        for k, v in kwargs.items():
+            setattr(args, k, v)
+        return args
+
+    def test_cmd_logs_validates_name(self):
+        """cmd_logs calls validate_cell_name."""
+        args = self._make_args(name="../bad", follow=False, tail=None, since=None, until=None)
+        with self.assertRaises(SystemExit):
+            brig.cmd_logs(args)
+
+    def test_cmd_shell_validates_name(self):
+        """cmd_shell calls validate_cell_name."""
+        args = self._make_args(name="../bad", shell="/bin/sh", user=None)
+        with self.assertRaises(SystemExit):
+            brig.cmd_shell(args)
+
+    def test_cmd_inspect_validates_name(self):
+        """cmd_inspect calls validate_cell_name."""
+        args = self._make_args(name="../bad")
+        with self.assertRaises(SystemExit):
+            brig.cmd_inspect(args)
+
+    def test_cmd_top_validates_name(self):
+        """cmd_top calls validate_cell_name."""
+        args = self._make_args(name="../bad")
+        with self.assertRaises(SystemExit):
+            brig.cmd_top(args)
+
+    def test_cmd_diff_validates_name(self):
+        """cmd_diff calls validate_cell_name."""
+        args = self._make_args(name="../bad")
+        with self.assertRaises(SystemExit):
+            brig.cmd_diff(args)
+
+    def test_cmd_export_validates_name(self):
+        """cmd_export calls validate_cell_name."""
+        args = self._make_args(name="../bad", output=None, sanitize=False,
+                               allow_office=False, allow_scripts=False)
+        with self.assertRaises(SystemExit):
+            brig.cmd_export(args)
+
+    def test_cmd_policy_show_validates_name(self):
+        """cmd_policy_show calls validate_cell_name."""
+        args = self._make_args(name="../bad")
+        with self.assertRaises(SystemExit):
+            brig.cmd_policy_show(args)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -51,32 +51,32 @@ deny:
 
 ```bash
 # Start the agent
-cell run -f cells/research-agent.yaml -d
+brig run -f cells/research-agent.yaml -d
 
 # Watch what it's doing
-cell logs research-agent -f
+brig logs research-agent -f
 
 # Watch network activity
-cell network research-agent -f
+brig network research-agent -f
 
 # Check for blocked requests
-cell network research-agent --json | jq 'select(.blocked)'
+brig network research-agent --json | jq 'select(.blocked)'
 
 # Get results
-cell cp research-agent:/work/output.json ./output.json
+brig cp research-agent:/work/output.json ./output.json
 ```
 
 ### Monitoring
 
 ```bash
 # Resource usage
-cell stats research-agent
+brig stats research-agent
 
 # Health check
-cell health research-agent
+brig health
 
 # All activity
-cell logs research-agent --all -f
+brig logs research-agent --all -f
 ```
 
 ---
@@ -126,19 +126,19 @@ allow:
 
 ```bash
 # Run the build
-cell run -f cells/ci-runner.yaml
+brig run -f cells/ci-runner.yaml
 
 # Wait for completion
-cell wait ci-runner
+brig logs ci-runner -f
 
 # Check exit code
-cell inspect ci-runner --format '{{.State.ExitCode}}'
+brig inspect ci-runner --format json | jq '.State.ExitCode'
 
 # Get artifacts
-cell cp ci-runner:/work/dist ./dist
+brig cp ci-runner:/work/dist ./dist
 
 # Cleanup
-cell rm ci-runner
+brig rm ci-runner
 ```
 
 ### Batch Processing
@@ -148,12 +148,12 @@ cell rm ci-runner
 # Run multiple jobs in parallel
 
 for job in job1 job2 job3; do
-  cell run --name "$job" -f cells/ci-runner.yaml -d --rm
+  brig run --name "$job" -f cells/ci-runner.yaml -d --rm
 done
 
 # Wait for all
 for job in job1 job2 job3; do
-  cell wait "$job"
+  brig logs "$job" -f
 done
 ```
 
@@ -204,13 +204,13 @@ cp ./submissions/student123.py ~/.brig/state/student-runner/workspace/submission
 brig run -f cells/student-runner.yaml
 
 # Get output
-cell logs student-runner
+brig logs student-runner
 
 # Check for network cheating attempts
-cell network student-runner --json | jq 'select(.blocked)'
+brig network student-runner --json | jq 'select(.blocked)'
 
 # Cleanup
-cell rm student-runner
+brig rm student-runner
 ```
 
 ### Grading Multiple Submissions
@@ -227,14 +227,14 @@ for submission in ./submissions/*.py; do
   cp "$submission" ~/.brig/state/"$student"/workspace/submission.py
 
   # Run with timeout
-  cell run --name "$student" \
+  brig run --name "$student" \
     --image python:3.11-slim \
     --timeout 5m \
     -- python /work/submission.py > "results/$student.txt" 2>&1
 
-  echo "$student: exit code $(cell inspect "$student" --format '{{.State.ExitCode}}')"
+  echo "$student: exit code $(brig inspect "$student" --format json | jq '.State.ExitCode')"
 
-  cell rm "$student"
+  brig rm "$student"
 done
 ```
 
@@ -287,16 +287,16 @@ allow:
 
 ```bash
 # Start the plugin
-cell run -f cells/plugin-sandbox.yaml -d
+brig run -f cells/plugin-sandbox.yaml -d
 
 # Monitor its behavior
-cell network plugin-sandbox -f
+brig network plugin-sandbox -f
 
 # Check health
-cell health plugin-sandbox
+brig health
 
 # Stop misbehaving plugin
-cell stop plugin-sandbox
+brig stop plugin-sandbox
 ```
 
 ---
@@ -309,7 +309,7 @@ Develop with strict network policies.
 
 ```bash
 # Get an interactive shell
-cell run --name dev --image python:3.11-slim -it
+brig run --name dev --image python:3.11-slim -it
 
 # Files in ~/.brig/state/dev/workspace/ appear at /work
 ```
@@ -318,7 +318,7 @@ cell run --name dev --image python:3.11-slim -it
 
 ```bash
 # Start a dev environment
-cell run --name myproject \
+brig run --name myproject \
   --image python:3.11-slim \
   -d \
   -- tail -f /dev/null
@@ -327,23 +327,23 @@ cell run --name myproject \
 code ~/.brig/state/myproject/workspace/
 
 # Run commands in the cell
-cell exec myproject -- python /work/main.py
+brig exec myproject -- python /work/main.py
 
 # Watch logs
-cell logs myproject -f
+brig logs myproject -f
 
 # Test network behavior
-cell network myproject -f
+brig network myproject -f
 ```
 
 ### Hot Reload Pattern
 
 ```bash
 # Terminal 1: Watch for file changes and run tests
-cell exec myproject -- sh -c 'while true; do inotifywait -e modify /work/*.py && python -m pytest /work/tests/; done'
+brig exec myproject -- sh -c 'while true; do inotifywait -e modify /work/*.py && python -m pytest /work/tests/; done'
 
 # Terminal 2: Watch network
-cell network myproject -f
+brig network myproject -f
 
 # Terminal 3: Edit files on macOS
 code ~/.brig/state/myproject/workspace/
@@ -405,16 +405,16 @@ allow:
 
 ```bash
 # Start multiple workers
-cell run --name worker-a -f cells/worker.yaml -d
-cell run --name worker-b -f cells/worker.yaml -d
-cell run --name worker-c -f cells/worker.yaml -d
+brig run --name worker-a -f cells/worker.yaml -d
+brig run --name worker-b -f cells/worker.yaml -d
+brig run --name worker-c -f cells/worker.yaml -d
 
 # Watch all logs
-cell logs --all -f
+brig logs --all -f
 
 # Watch all network activity
 for w in worker-a worker-b worker-c; do
-  cell network "$w" -f &
+  brig network "$w" -f &
 done
 ```
 
@@ -456,14 +456,14 @@ command: ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", 
 
 ```bash
 # Start the service
-cell run -f cells/api-server.yaml -d
+brig run -f cells/api-server.yaml -d
 
 # Check status
-cell list
-cell health api-server
+brig list
+brig health
 
 # View logs
-cell logs api-server -f
+brig logs api-server -f
 
 # The service restarts automatically if it crashes or after VM reboot
 ```
@@ -472,8 +472,8 @@ cell logs api-server -f
 
 ```bash
 # Resource usage over time
-watch -n 5 'cell stats api-server'
+watch -n 5 'brig stats api-server'
 
 # Network summary
-cell network api-server --json | jq -s 'group_by(.host) | map({host: .[0].host, count: length})'
+brig network api-server --json | jq -s 'group_by(.host) | map({host: .[0].host, count: length})'
 ```

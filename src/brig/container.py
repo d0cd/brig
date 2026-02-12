@@ -3,6 +3,7 @@ Container management functions for Brig.
 """
 
 import json
+import re
 import time
 import threading
 import sys
@@ -125,6 +126,10 @@ def proxy_running() -> bool:
 
 def get_proxy_ip(network: str) -> str:
     """Get proxy IP address on a specific network."""
+    # Validate network name to prevent Go template injection.
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', network):
+        debug(f"Invalid network name: {network}")
+        return ""
     result = run(
         ["podman", "inspect", PROXY_NAME, "--format",
          "{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k \"" + network + "\"}}{{$v.IPAddress}}{{end}}{{end}}"],
@@ -146,18 +151,22 @@ def load_cell_policy(cell_name: str) -> dict:
 
 
 def save_cell_policy(cell_name: str, policy: dict) -> None:
-    """Save per-cell network policy."""
+    """Save per-cell network policy using atomic write."""
     POLICY_DIR.mkdir(parents=True, exist_ok=True)
     policy_file = POLICY_DIR / f"{cell_name}.json"
-    with open(policy_file, "w") as f:
+    tmp_file = policy_file.with_suffix(".tmp")
+    with open(tmp_file, "w") as f:
         json.dump(policy, f, indent=2)
+    tmp_file.rename(policy_file)  # Atomic on POSIX.
 
 
 def delete_cell_policy(cell_name: str) -> None:
     """Delete per-cell network policy if it exists."""
     policy_file = POLICY_DIR / f"{cell_name}.json"
-    if policy_file.exists():
+    try:
         policy_file.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def verify_image_signature(image: str) -> tuple[bool, str]:
@@ -197,6 +206,9 @@ def apply_quarantine(path, source_cell: str = None) -> bool:
 
     try:
         ts = int(time.time())
+        # Sanitize source_cell to prevent injection into xattr value.
+        if source_cell and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', source_cell):
+            source_cell = None
         agent = f"brig:{source_cell}" if source_cell else "brig"
         qattr = f"0082;{ts:x};{agent};{uuid.uuid4()}"
 

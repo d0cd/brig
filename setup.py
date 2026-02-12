@@ -41,7 +41,7 @@ setup(
     ],
     package_dir={"": "src"},
     packages=find_packages(where="src", include=["brig*", "addons*"]),
-    py_modules=["brig_cli", "warden_cli", "brig_subnet_cli", "brig", "warden", "brig_subnet"],
+    py_modules=["brig_cli", "warden_cli", "brig_subnet_cli"],
     entry_points={
         "console_scripts": [
             "brig=brig_cli:main",
@@ -49,7 +49,7 @@ setup(
             "brig-subnet=brig_subnet_cli:main",
         ],
     },
-    install_requires=[],
+    install_requires=["pyyaml>=6.0"],
     extras_require={
         "yaml": ["pyyaml>=6.0"],
         "dev": ["pytest>=7.0", "ruff>=0.1.0"],

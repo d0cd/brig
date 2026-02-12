@@ -32,11 +32,11 @@ class TestPolicyMatching(unittest.TestCase):
         self.assertFalse(_matches_domain("example.com", "sub.example.com"))
 
     def test_wildcard_domain_match(self):
-        """Wildcard domain patterns match subdomains."""
+        """Wildcard domain patterns match subdomains only."""
         from warden import _matches_domain
         self.assertTrue(_matches_domain("*.example.com", "sub.example.com"))
         self.assertTrue(_matches_domain("*.example.com", "deep.sub.example.com"))
-        self.assertTrue(_matches_domain("*.example.com", "example.com"))
+        self.assertFalse(_matches_domain("*.example.com", "example.com"))
         self.assertFalse(_matches_domain("*.example.com", "other.com"))
         self.assertFalse(_matches_domain("*.example.com", "exampleXcom"))
 

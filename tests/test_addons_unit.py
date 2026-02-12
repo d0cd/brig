@@ -57,11 +57,11 @@ class TestPolicyRule(unittest.TestCase):
         self.assertTrue(rule.matches_domain("EXAMPLE.com"))
 
     def test_wildcard_rule_subdomain(self):
-        """Wildcard rule matches subdomains."""
+        """Wildcard rule matches subdomains only, not the bare domain."""
         rule = self.PolicyRule("*.example.com")
         self.assertTrue(rule.matches_domain("sub.example.com"))
         self.assertTrue(rule.matches_domain("deep.sub.example.com"))
-        self.assertTrue(rule.matches_domain("example.com"))  # Also matches base.
+        self.assertFalse(rule.matches_domain("example.com"))
         self.assertFalse(rule.matches_domain("other.com"))
 
     def test_wildcard_rule_no_cross_boundary(self):
@@ -640,55 +640,289 @@ class TestAllowedPorts(unittest.TestCase):
 
 
 class TestSIGHUPReloadHandlers(unittest.TestCase):
-    """Tests for SIGHUP-based policy reload handlers."""
+    """Tests for SIGHUP-based deferred policy reload handlers."""
 
-    def test_enforce_sighup_resets_mtimes(self):
-        """PolicyEnforcer._handle_sighup resets all mtimes."""
+    def test_enforce_sighup_sets_flag(self):
+        """PolicyEnforcer._on_sighup sets reload pending flag."""
         from enforce import PolicyEnforcer
 
         enforcer = PolicyEnforcer()
-        # Set non-zero mtimes.
+        self.assertFalse(enforcer._reload_pending)
+
+        # Simulate SIGHUP.
+        enforcer._on_sighup()
+
+        # Flag should be set (deferred reload).
+        self.assertTrue(enforcer._reload_pending)
+
+    def test_enforce_do_reload_resets_mtimes(self):
+        """PolicyEnforcer._do_reload resets all mtimes."""
+        from enforce import PolicyEnforcer
+
+        enforcer = PolicyEnforcer()
         enforcer.policy_mtime = 12345.0
         enforcer.subnet_map_mtime = 67890.0
         enforcer.cell_policy_mtimes["test-cell"] = 11111.0
         enforcer.cell_policy_last_access["test-cell"] = 22222.0
 
-        # Call handler (simulates SIGHUP).
-        enforcer._handle_sighup(None, None)
+        enforcer._do_reload()
 
-        # Verify mtimes are reset.
         self.assertEqual(enforcer.policy_mtime, 0.0)
         self.assertEqual(enforcer.subnet_map_mtime, 0.0)
         self.assertEqual(len(enforcer.cell_policy_mtimes), 0)
         self.assertEqual(len(enforcer.cell_policy_last_access), 0)
 
-    def test_ratelimit_sighup_resets_mtime(self):
-        """RateLimiter._handle_sighup resets policy mtime."""
+    def test_ratelimit_sighup_sets_flag(self):
+        """RateLimiter._on_sighup sets reload pending flag."""
+        from ratelimit import RateLimiter
+
+        limiter = RateLimiter()
+        self.assertFalse(limiter._reload_pending)
+
+        limiter._on_sighup()
+
+        self.assertTrue(limiter._reload_pending)
+
+    def test_ratelimit_do_reload_resets_mtime(self):
+        """RateLimiter._do_reload resets policy mtime."""
         from ratelimit import RateLimiter
 
         limiter = RateLimiter()
         limiter.policy_mtime = 12345.0
 
-        # Call handler (simulates SIGHUP).
-        limiter._handle_sighup(None, None)
+        limiter._do_reload()
 
-        # Verify mtime is reset.
         self.assertEqual(limiter.policy_mtime, 0.0)
 
-    def test_logger_sighup_resets_mtimes(self):
-        """RequestLogger._handle_sighup resets all mtimes."""
+    def test_logger_sighup_sets_flag(self):
+        """RequestLogger._on_sighup sets reload pending flag."""
         from logger import RequestLogger
 
-        logger = RequestLogger()
-        logger.subnet_map_mtime = 12345.0
-        logger.policy_mtime = 67890.0
+        req_logger = RequestLogger()
+        self.assertFalse(req_logger._reload_pending)
 
-        # Call handler (simulates SIGHUP).
-        logger._handle_sighup(None, None)
+        req_logger._on_sighup()
 
-        # Verify mtimes are reset.
-        self.assertEqual(logger.subnet_map_mtime, 0.0)
-        self.assertEqual(logger.policy_mtime, 0.0)
+        self.assertTrue(req_logger._reload_pending)
+
+    def test_logger_do_reload_resets_mtimes(self):
+        """RequestLogger._do_reload resets all mtimes."""
+        from logger import RequestLogger
+
+        req_logger = RequestLogger()
+        req_logger.subnet_map_mtime = 12345.0
+        req_logger.policy_mtime = 67890.0
+
+        req_logger._do_reload()
+
+        self.assertEqual(req_logger.subnet_map_mtime, 0.0)
+        self.assertEqual(req_logger.policy_mtime, 0.0)
+
+
+class TestSIGHUPDispatcher(unittest.TestCase):
+    """Tests for shared SIGHUP dispatcher."""
+
+    def test_dispatcher_calls_all_callbacks(self):
+        """SIGHUP dispatcher invokes all registered callbacks."""
+        from enforce import _sighup_callbacks, _sighup_dispatcher
+
+        results = []
+        original = _sighup_callbacks.copy()
+
+        try:
+            _sighup_callbacks.clear()
+            _sighup_callbacks.append(lambda: results.append("a"))
+            _sighup_callbacks.append(lambda: results.append("b"))
+
+            _sighup_dispatcher(None, None)
+
+            self.assertEqual(results, ["a", "b"])
+        finally:
+            _sighup_callbacks.clear()
+            _sighup_callbacks.extend(original)
+
+    def test_register_sighup_adds_callback(self):
+        """register_sighup adds callback to the list."""
+        from enforce import _sighup_callbacks, register_sighup
+
+        original = _sighup_callbacks.copy()
+        count_before = len(_sighup_callbacks)
+
+        try:
+            register_sighup(lambda: None)
+            self.assertEqual(len(_sighup_callbacks), count_before + 1)
+        finally:
+            _sighup_callbacks.clear()
+            _sighup_callbacks.extend(original)
+
+
+class TestCellPolicyIsolation(unittest.TestCase):
+    """Tests for cell policy isolation (no fall-through to global)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import Policy and PolicyEnforcer with mocked mitmproxy."""
+        from enforce import Policy, PolicyEnforcer
+        cls.Policy = Policy
+        cls.PolicyEnforcer = PolicyEnforcer
+
+    def test_cell_policy_blocks_without_global_fallthrough(self):
+        """Cell policy blocks requests not in its allowlist, even if global would allow."""
+        cell_policy = self.Policy(allow=["specific.com"])
+        global_policy = self.Policy(allow=["example.com", "specific.com"])
+
+        # Request for example.com — allowed by global, but cell only allows specific.com.
+        allowed, reason, _ = cell_policy.is_allowed("example.com", "/", "GET")
+        self.assertFalse(allowed)
+        self.assertIn("allowlist", reason.lower())
+
+    def test_cell_policy_allows_matching_domain(self):
+        """Cell policy allows domains in its allowlist."""
+        cell_policy = self.Policy(allow=["specific.com"])
+
+        allowed, reason, _ = cell_policy.is_allowed("specific.com", "/", "GET")
+        self.assertTrue(allowed)
+
+
+class TestBlockedNetworksExpanded(unittest.TestCase):
+    """Tests for expanded blocked IP ranges."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import BLOCKED_NETWORKS from enforce.py."""
+        from enforce import BLOCKED_NETWORKS
+        cls.BLOCKED_NETWORKS = BLOCKED_NETWORKS
+
+    def test_this_network_blocked(self):
+        """0.0.0.0/8 'this network' range is blocked."""
+        self.assertTrue(any(
+            ipaddress.ip_address("0.0.0.1") in net
+            for net in self.BLOCKED_NETWORKS
+        ))
+
+    def test_multicast_blocked(self):
+        """224.0.0.0/4 multicast range is blocked."""
+        self.assertTrue(any(
+            ipaddress.ip_address("224.0.0.1") in net
+            for net in self.BLOCKED_NETWORKS
+        ))
+
+    def test_ipv4_mapped_ipv6_blocked(self):
+        """::ffff:0:0/96 IPv4-mapped IPv6 range is blocked."""
+        self.assertTrue(any(
+            ipaddress.ip_address("::ffff:127.0.0.1") in net
+            for net in self.BLOCKED_NETWORKS
+        ))
+
+    def test_documentation_ipv6_blocked(self):
+        """2001:db8::/32 documentation range is blocked."""
+        self.assertTrue(any(
+            ipaddress.ip_address("2001:db8::1") in net
+            for net in self.BLOCKED_NETWORKS
+        ))
+
+
+class TestGenericBlockMessage(unittest.TestCase):
+    """Tests for generic block message (no policy details leaked)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import PolicyEnforcer with mocked mitmproxy."""
+        from enforce import PolicyEnforcer
+        cls.PolicyEnforcer = PolicyEnforcer
+
+    def test_block_response_is_generic(self):
+        """_block() returns generic message, not the internal reason."""
+        enforcer = self.PolicyEnforcer()
+        flow = MagicMock()
+        flow.metadata = {}
+        flow.request.host = "evil.com"
+        flow.request.path = "/secret"
+
+        enforcer._block(flow, "cell policy: denied by rule: *.evil.com")
+
+        # Response body should be generic.
+        call_args = flow.response
+        # The mock captures the Response.make() call.
+        self.assertIn("block_reason", flow.metadata)
+        self.assertEqual(flow.metadata["block_reason"], "cell policy: denied by rule: *.evil.com")
+
+
+class TestNaNRateLimitBypass(unittest.TestCase):
+    """Tests for NaN bypass prevention in rate limit config."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import RateLimitConfig from ratelimit.py."""
+        from ratelimit import RateLimitConfig
+        cls.RateLimitConfig = RateLimitConfig
+
+    def test_nan_rate_rejected(self):
+        """NaN rate value is rejected by validation."""
+        import math
+        config = self.RateLimitConfig(rate=float('nan'), burst=500)
+        errors = config.validate()
+        self.assertTrue(len(errors) > 0)
+        self.assertTrue(any("finite" in e for e in errors))
+
+    def test_inf_rate_rejected(self):
+        """Infinity rate value is rejected by validation."""
+        config = self.RateLimitConfig(rate=float('inf'), burst=500)
+        errors = config.validate()
+        self.assertTrue(len(errors) > 0)
+
+    def test_nan_burst_rejected(self):
+        """NaN burst value is rejected by validation."""
+        config = self.RateLimitConfig(rate=100, burst=float('nan'))
+        errors = config.validate()
+        self.assertTrue(len(errors) > 0)
+
+
+class TestLoggerPathTraversal(unittest.TestCase):
+    """Tests for logger cell name path traversal prevention."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import RequestLogger from logger.py."""
+        from logger import RequestLogger, LOG_DIR, UNKNOWN_LOG_FILE
+        cls.RequestLogger = RequestLogger
+        cls.LOG_DIR = LOG_DIR
+        cls.UNKNOWN_LOG_FILE = UNKNOWN_LOG_FILE
+
+    def test_traversal_cell_name_falls_back_to_unknown(self):
+        """Cell name with path traversal falls back to unknown log."""
+        req_logger = self.RequestLogger()
+        # Mock the async_writer.log method.
+        req_logger.async_writer = MagicMock()
+
+        req_logger._write_log("../../../etc/passwd", {"test": True})
+
+        # Should have written to unknown log, not traversal path.
+        call_args = req_logger.async_writer.log.call_args
+        log_file = call_args[0][1]
+        self.assertEqual(log_file, self.UNKNOWN_LOG_FILE)
+
+    def test_slash_cell_name_falls_back_to_unknown(self):
+        """Cell name with slash falls back to unknown log."""
+        req_logger = self.RequestLogger()
+        req_logger.async_writer = MagicMock()
+
+        req_logger._write_log("subdir/evil", {"test": True})
+
+        call_args = req_logger.async_writer.log.call_args
+        log_file = call_args[0][1]
+        self.assertEqual(log_file, self.UNKNOWN_LOG_FILE)
+
+    def test_normal_cell_name_uses_cell_log(self):
+        """Normal cell name writes to cell-specific log."""
+        req_logger = self.RequestLogger()
+        req_logger.async_writer = MagicMock()
+
+        req_logger._write_log("my-cell", {"test": True})
+
+        call_args = req_logger.async_writer.log.call_args
+        log_file = call_args[0][1]
+        self.assertEqual(log_file, self.LOG_DIR / "my-cell.jsonl")
 
 
 class TestLRUEviction(unittest.TestCase):
@@ -1127,6 +1361,170 @@ class TestLogSummarizer(unittest.TestCase):
 
         self.assertIn("my-test-cell", prompt)
         self.assertIn("example.com", prompt)
+
+
+class TestDeferredSIGHUPEndToEnd(unittest.TestCase):
+    """Tests that deferred SIGHUP triggers reload on next request."""
+
+    def test_enforce_reload_triggered_by_request(self):
+        """PolicyEnforcer reload happens on next request after SIGHUP."""
+        from enforce import PolicyEnforcer
+
+        enforcer = PolicyEnforcer()
+        enforcer._on_sighup()
+        self.assertTrue(enforcer._reload_pending)
+
+        # Simulate a request; _do_reload should be called.
+        with patch.object(enforcer, '_do_reload') as mock_reload:
+            flow = MagicMock()
+            flow.request.host = "example.com"
+            flow.request.port = 443
+            flow.request.path = "/"
+            flow.request.method = "GET"
+            flow.client_conn.peername = ("10.60.1.2", 12345)
+            flow.metadata = {}
+
+            enforcer.request(flow)
+
+            mock_reload.assert_called_once()
+        self.assertFalse(enforcer._reload_pending)
+
+    def test_enforce_no_reload_without_flag(self):
+        """PolicyEnforcer skips reload when flag is not set."""
+        from enforce import PolicyEnforcer
+
+        enforcer = PolicyEnforcer()
+        self.assertFalse(enforcer._reload_pending)
+
+        with patch.object(enforcer, '_do_reload') as mock_reload:
+            flow = MagicMock()
+            flow.request.host = "example.com"
+            flow.request.port = 443
+            flow.request.path = "/"
+            flow.request.method = "GET"
+            flow.client_conn.peername = ("10.60.1.2", 12345)
+            flow.metadata = {}
+
+            enforcer.request(flow)
+
+            mock_reload.assert_not_called()
+
+    def test_ratelimit_reload_triggered_by_request(self):
+        """RateLimiter reload happens on next request after SIGHUP."""
+        from ratelimit import RateLimiter
+
+        limiter = RateLimiter()
+        limiter._on_sighup()
+        self.assertTrue(limiter._reload_pending)
+
+        with patch.object(limiter, '_do_reload') as mock_reload:
+            flow = MagicMock()
+            flow.request.host = "example.com"
+            flow.request.port = 443
+            flow.request.path = "/"
+            flow.request.method = "GET"
+            flow.client_conn.peername = ("10.60.1.2", 12345)
+            flow.metadata = {}
+
+            limiter.request(flow)
+
+            mock_reload.assert_called_once()
+        self.assertFalse(limiter._reload_pending)
+
+
+class TestIDNEquivalence(unittest.TestCase):
+    """Tests for IDN/punycode equivalence in policy rules."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import PolicyRule with mocked mitmproxy."""
+        from enforce import PolicyRule
+        cls.PolicyRule = PolicyRule
+
+    def test_unicode_domain_matches_punycode(self):
+        """Unicode domain rule matches punycode request."""
+        try:
+            rule = self.PolicyRule("münchen.de")
+            self.assertTrue(rule.matches_domain("xn--mnchen-3ya.de"))
+        except UnicodeError:
+            self.skipTest("IDNA encoding not supported on this platform")
+
+    def test_punycode_domain_matches_unicode(self):
+        """Punycode domain rule matches Unicode request."""
+        rule = self.PolicyRule("xn--mnchen-3ya.de")
+        # Unicode request should also be normalized to punycode for matching.
+        try:
+            self.assertTrue(rule.matches_domain("münchen.de"))
+        except UnicodeError:
+            self.skipTest("IDNA encoding not supported on this platform")
+
+    def test_wildcard_idn_matches_subdomain(self):
+        """Wildcard IDN rule matches punycode subdomain."""
+        try:
+            rule = self.PolicyRule("*.münchen.de")
+            self.assertTrue(rule.matches_domain("sub.xn--mnchen-3ya.de"))
+        except UnicodeError:
+            self.skipTest("IDNA encoding not supported on this platform")
+
+    def test_ascii_domain_unaffected(self):
+        """Plain ASCII domains are unaffected by normalization."""
+        rule = self.PolicyRule("example.com")
+        self.assertTrue(rule.matches_domain("example.com"))
+        self.assertFalse(rule.matches_domain("other.com"))
+
+
+class TestQueryStringRedaction(unittest.TestCase):
+    """Tests for query string redaction in logger."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Import _redact_path from logger."""
+        from logger import _redact_path
+        cls._redact_path = staticmethod(_redact_path)
+
+    def test_api_key_redacted(self):
+        """API key in query string is redacted."""
+        path = "/api/v1/data?key=sk-abc123&other=val"
+        result = self._redact_path(path)
+        self.assertNotIn("sk-abc123", result)
+        self.assertIn("key=REDACTED", result)
+        self.assertIn("other=val", result)
+
+    def test_token_redacted(self):
+        """Token in query string is redacted."""
+        path = "/callback?token=eyJhbGciOiJ&state=ok"
+        result = self._redact_path(path)
+        self.assertNotIn("eyJhbGciOiJ", result)
+        self.assertIn("token=REDACTED", result)
+        self.assertIn("state=ok", result)
+
+    def test_multiple_secrets_redacted(self):
+        """Multiple secret parameters are all redacted."""
+        path = "/auth?api_key=abc&password=xyz&client_secret=def"
+        result = self._redact_path(path)
+        self.assertNotIn("abc", result)
+        self.assertNotIn("xyz", result)
+        self.assertNotIn("def", result)
+        self.assertIn("api_key=REDACTED", result)
+        self.assertIn("password=REDACTED", result)
+        self.assertIn("client_secret=REDACTED", result)
+
+    def test_no_query_string_unchanged(self):
+        """Path without query string is unchanged."""
+        path = "/api/v1/data"
+        self.assertEqual(self._redact_path(path), path)
+
+    def test_safe_params_preserved(self):
+        """Non-secret query parameters are preserved."""
+        path = "/search?q=hello&page=2&limit=10"
+        self.assertEqual(self._redact_path(path), path)
+
+    def test_case_insensitive_redaction(self):
+        """Redaction is case insensitive."""
+        path = "/api?API_KEY=secret123"
+        result = self._redact_path(path)
+        self.assertNotIn("secret123", result)
+        self.assertIn("REDACTED", result)
 
 
 if __name__ == "__main__":

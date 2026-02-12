@@ -59,11 +59,7 @@ try:
 except ImportError:
     TEXTUAL_AVAILABLE = False
 
-# Container naming prefix.
-CONTAINER_PREFIX = "brig-"
-
-# Proxy container name.
-PROXY_NAME = "warden"
+from brig.config import CONTAINER_PREFIX, PROXY_NAME
 
 # Metrics socket path.
 METRICS_SOCKET = Path("/var/run/cells/metrics.sock")

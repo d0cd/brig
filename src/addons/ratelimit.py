@@ -25,6 +25,7 @@ Usage:
 """
 
 import json
+import math
 import signal
 import threading
 import time
@@ -33,6 +34,14 @@ from pathlib import Path
 from typing import Optional
 
 from mitmproxy import http, ctx
+
+# Import shared SIGHUP dispatcher from enforce addon.
+try:
+    from enforce import register_sighup
+except ImportError:
+    # Standalone mode: register our own handler.
+    def register_sighup(callback):
+        signal.signal(signal.SIGHUP, lambda s, f: callback())
 
 # Policy file path.
 POLICY_FILE = Path("/policy.json")
@@ -54,9 +63,13 @@ class RateLimitConfig:
     def validate(self) -> list[str]:
         """Validate configuration values. Returns list of error messages."""
         errors = []
-        if self.rate <= 0:
+        if math.isnan(self.rate) or math.isinf(self.rate):
+            errors.append(f"rate must be a finite number, got {self.rate}")
+        elif self.rate <= 0:
             errors.append(f"rate must be positive, got {self.rate}")
-        if self.burst <= 0:
+        if isinstance(self.burst, float) and (math.isnan(self.burst) or math.isinf(self.burst)):
+            errors.append(f"burst must be a finite number, got {self.burst}")
+        elif self.burst <= 0:
             errors.append(f"burst must be positive, got {self.burst}")
         return errors
 
@@ -127,19 +140,23 @@ class RateLimiter:
         self.buckets: dict[str, TokenBucket] = {}
         self.buckets_lock = threading.Lock()
         self.policy_mtime = 0.0
+        self._reload_pending = False  # Deferred reload flag for signal safety.
 
     def load(self, loader):
         """Called when addon is loaded."""
         ctx.log.info("RateLimiter: Loading...")
         self._reload_config()
-        # Register SIGHUP handler for signal-based reload.
-        signal.signal(signal.SIGHUP, self._handle_sighup)
+        # Register with shared SIGHUP dispatcher.
+        register_sighup(self._on_sighup)
         ctx.log.info("RateLimiter: SIGHUP reload handler registered")
 
-    def _handle_sighup(self, signum, frame):
-        """Handle SIGHUP signal for config reload."""
-        ctx.log.info("RateLimiter: Received SIGHUP, reloading config...")
-        # Force reload by resetting mtime.
+    def _on_sighup(self):
+        """Set deferred reload flag on SIGHUP. Safe to call from signal context."""
+        self._reload_pending = True
+
+    def _do_reload(self):
+        """Perform the actual reload outside of signal context."""
+        ctx.log.info("RateLimiter: Reloading config...")
         self.policy_mtime = 0.0
         self._reload_config()
 
@@ -251,8 +268,10 @@ class RateLimiter:
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Check rate limit for each request."""
-        # Config reload now handled via SIGHUP signal (see _handle_sighup).
-        # No per-request stat() calls for better performance.
+        # Check for deferred SIGHUP reload (signal-safe pattern).
+        if self._reload_pending:
+            self._reload_pending = False
+            self._do_reload()
 
         # Get cell name from metadata (set by enforce.py).
         cell_name = flow.metadata.get("cell", "unknown")

@@ -35,6 +35,7 @@ import fnmatch
 import json
 import queue
 import random
+import re
 import signal
 import threading
 import time
@@ -43,6 +44,14 @@ from pathlib import Path
 from typing import Optional
 
 from mitmproxy import http, ctx, connection
+
+# Import shared SIGHUP dispatcher from enforce addon.
+try:
+    from enforce import register_sighup
+except ImportError:
+    # Standalone mode: register our own handler.
+    def register_sighup(callback):
+        signal.signal(signal.SIGHUP, lambda s, f: callback())
 
 # Try to use orjson for faster JSON encoding, fall back to standard json.
 try:
@@ -81,6 +90,20 @@ POLICY_FILE = Path("/policy.json")
 
 # Default log file for unknown sources.
 UNKNOWN_LOG_FILE = LOG_DIR / "unknown.jsonl"
+
+# Pattern matching common secret query parameters.
+_SECRET_PARAM_RE = re.compile(
+    r'([?&])'
+    r'(key|api_key|apikey|token|access_token|secret|password|auth|authorization|'
+    r'client_secret|private_key|signing_key|bearer)'
+    r'=([^&]*)',
+    re.IGNORECASE,
+)
+
+
+def _redact_path(path: str) -> str:
+    """Redact sensitive query string parameters from a request path."""
+    return _SECRET_PARAM_RE.sub(r'\1\2=REDACTED', path)
 
 
 class AsyncLogWriter:
@@ -344,6 +367,7 @@ class RequestLogger:
         self.policy_mtime = 0.0
         self.max_log_size = DEFAULT_MAX_LOG_SIZE
         self.async_writer = AsyncLogWriter(max_log_size=self.max_log_size)
+        self._reload_pending = False  # Deferred reload flag for signal safety.
 
     def load(self, loader):
         """Called when addon is loaded."""
@@ -351,14 +375,17 @@ class RequestLogger:
         self._reload_subnet_map()
         self._reload_log_filter()
         self.async_writer.start()
-        # Register SIGHUP handler for signal-based reload.
-        signal.signal(signal.SIGHUP, self._handle_sighup)
+        # Register with shared SIGHUP dispatcher.
+        register_sighup(self._on_sighup)
         ctx.log.info("RequestLogger: Async logging enabled, SIGHUP reload handler registered")
 
-    def _handle_sighup(self, signum, frame):
-        """Handle SIGHUP signal for config reload."""
-        ctx.log.info("RequestLogger: Received SIGHUP, reloading config...")
-        # Force reload by resetting mtimes.
+    def _on_sighup(self):
+        """Set deferred reload flag on SIGHUP. Safe to call from signal context."""
+        self._reload_pending = True
+
+    def _do_reload(self):
+        """Perform the actual reload outside of signal context."""
+        ctx.log.info("RequestLogger: Reloading config...")
         self.subnet_map_mtime = 0.0
         self.policy_mtime = 0.0
         self._reload_subnet_map()
@@ -492,6 +519,9 @@ class RequestLogger:
 
     def _write_log(self, cell_name: str, entry: dict) -> None:
         """Queue log entry for async writing."""
+        # Validate cell name to prevent path traversal.
+        if cell_name and ("/" in cell_name or ".." in cell_name):
+            cell_name = None  # Fall back to unknown log.
         if cell_name:
             log_file = LOG_DIR / f"{cell_name}.jsonl"
         else:
@@ -505,8 +535,10 @@ class RequestLogger:
 
     def response(self, flow: http.HTTPFlow) -> None:
         """Log completed request."""
-        # Config reload now handled via SIGHUP signal (see _handle_sighup).
-        # No per-request stat() calls for better performance.
+        # Check for deferred SIGHUP reload (signal-safe pattern).
+        if self._reload_pending:
+            self._reload_pending = False
+            self._do_reload()
 
         # Get cell name from metadata (set by enforce.py) or resolve.
         cell_name = flow.metadata.get("cell")
@@ -540,7 +572,7 @@ class RequestLogger:
             "src_ip": flow.client_conn.peername[0] if flow.client_conn.peername else "unknown",
             "method": flow.request.method,
             "host": flow.request.host,
-            "path": flow.request.path,
+            "path": _redact_path(flow.request.path),
             "status": status,
             "bytes": response_bytes,
             "request_bytes": request_bytes,
@@ -636,7 +668,7 @@ class RequestLogger:
             "src_ip": flow.client_conn.peername[0] if flow.client_conn.peername else "unknown",
             "method": flow.request.method if flow.request else "UNKNOWN",
             "host": flow.request.host if flow.request else "unknown",
-            "path": flow.request.path if flow.request else "/",
+            "path": _redact_path(flow.request.path) if flow.request else "/",
             "status": 0,
             "bytes": 0,
             "request_bytes": len(flow.request.content) if flow.request and flow.request.content else 0,
