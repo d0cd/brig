@@ -30,10 +30,10 @@ Usage:
     mitmdump -s enforce.py
 """
 
+import collections
+import fnmatch
 import ipaddress
 import json
-import fnmatch
-import os
 import re
 import signal
 import threading
@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from mitmproxy import http, ctx
+from mitmproxy import ctx, http
 
 # Shared SIGHUP dispatcher — only one signal handler for all addons.
 _sighup_callbacks = []
@@ -49,7 +49,8 @@ _sighup_callbacks = []
 
 def register_sighup(callback):
     """Register a callback to be invoked on SIGHUP."""
-    _sighup_callbacks.append(callback)
+    if callback not in _sighup_callbacks:
+        _sighup_callbacks.append(callback)
     # Ensure the dispatcher is registered (idempotent after first call).
     signal.signal(signal.SIGHUP, _sighup_dispatcher)
 
@@ -57,7 +58,12 @@ def register_sighup(callback):
 def _sighup_dispatcher(signum, frame):
     """Dispatch SIGHUP to all registered callbacks."""
     for cb in _sighup_callbacks:
-        cb()
+        try:
+            cb()
+        except Exception as e:
+            # Log is not signal-safe, but flag is set for deferred handling.
+            import sys
+            print(f"SIGHUP callback error: {e}", file=sys.stderr)
 
 
 # Policy file path (mounted into container).
@@ -103,6 +109,8 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("::ffff:0:0/96"),
     # Documentation prefix (should never appear in production).
     ipaddress.ip_network("2001:db8::/32"),
+    # IPv6 multicast.
+    ipaddress.ip_network("ff00::/8"),
 ]
 
 
@@ -115,11 +123,13 @@ class PolicyRule:
     def __init__(self, rule):
         """Parse a rule from string or dict format."""
         if isinstance(rule, str):
-            self.domain = rule
+            self.domain = rule.rstrip(".")
             self.paths = None
             self.methods = None
         elif isinstance(rule, dict):
-            self.domain = rule.get("domain", "")
+            self.domain = rule.get("domain", "").rstrip(".")
+            if not self.domain:
+                raise ValueError("PolicyRule: domain must not be empty")
             self.paths = rule.get("paths")
             self.methods = rule.get("methods")
             if self.methods:
@@ -131,17 +141,23 @@ class PolicyRule:
         self.is_wildcard = self.domain.startswith("*.")
         if self.is_wildcard:
             base = self.domain[2:]
-            try:
-                base = base.encode("idna").decode("ascii")
-            except (UnicodeError, UnicodeDecodeError):
-                pass
+            # Fast path: skip IDN encode for ASCII domains.
+            if not base.isascii():
+                try:
+                    base = base.encode("idna").decode("ascii")
+                except (UnicodeError, UnicodeDecodeError):
+                    pass
             self.suffix = ("." + base).lower()  # Keep the dot for suffix matching.
             self.domain_exact = base.lower()  # For exact match of base domain.
         else:
-            try:
-                normalized = self.domain.encode("idna").decode("ascii")
-            except (UnicodeError, UnicodeDecodeError):
+            # Fast path: skip IDN encode for ASCII domains.
+            if self.domain.isascii():
                 normalized = self.domain
+            else:
+                try:
+                    normalized = self.domain.encode("idna").decode("ascii")
+                except (UnicodeError, UnicodeDecodeError):
+                    normalized = self.domain
             self.suffix = None
             self.domain_exact = normalized.lower()
 
@@ -157,6 +173,10 @@ class PolicyRule:
     @staticmethod
     def _normalize_domain(domain: str) -> str:
         """Normalize domain to ASCII/punycode for consistent matching."""
+        domain = domain.rstrip(".")
+        # Fast path: skip IDN encode for ASCII domains.
+        if domain.isascii():
+            return domain.lower()
         try:
             return domain.encode("idna").decode("ascii").lower()
         except (UnicodeError, UnicodeDecodeError):
@@ -172,7 +192,9 @@ class PolicyRule:
 
         if self.is_wildcard:
             # Wildcard: *.example.com matches sub.example.com only.
-            return host.endswith(self.suffix)
+            # Does NOT match the bare domain (example.com).
+            # Dot-boundary check prevents "notexample.com" matching ".example.com".
+            return host.endswith(self.suffix) and len(host) > len(self.suffix)
         else:
             # Exact match.
             return host == self.domain_exact
@@ -285,12 +307,12 @@ class PolicyEnforcer:
 
     def __init__(self):
         self.global_policy = Policy()
-        self.cell_policies: dict[str, Policy] = {}
+        self.cell_policies: collections.OrderedDict[str, Policy] = collections.OrderedDict()
         self.subnet_map: dict[str, str] = {}
+        self._subnet_index: dict[int, str] = {}  # Third-octet index for O(1) /24 lookup.
         self.policy_mtime = 0.0
         self.subnet_map_mtime = 0.0
         self.cell_policy_mtimes: dict[str, float] = {}
-        self.cell_policy_last_access: dict[str, float] = {}  # LRU tracking.
         self.trace_config = PolicyTraceConfig()
         self._cell_policy_lock = threading.Lock()  # Protects cell_policies access.
         self._reload_pending = False  # Deferred reload flag for signal safety.
@@ -316,7 +338,6 @@ class PolicyEnforcer:
         self.subnet_map_mtime = 0.0
         with self._cell_policy_lock:
             self.cell_policy_mtimes.clear()
-            self.cell_policy_last_access.clear()
         self._reload_policy()
         self._reload_subnet_map()
         self._reload_cell_policies()
@@ -372,11 +393,29 @@ class PolicyEnforcer:
             with open(SUBNET_MAP_FILE, "r") as f:
                 self.subnet_map = json.load(f)
             self.subnet_map_mtime = mtime
+            self._build_subnet_index()
 
             ctx.log.info(f"PolicyEnforcer: Loaded subnet map - {len(self.subnet_map)} cells")
 
         except (json.JSONDecodeError, IOError, OSError) as e:
             ctx.log.error(f"PolicyEnforcer: Failed to load subnet map: {e}")
+
+    def _build_subnet_index(self) -> None:
+        """Build O(1) lookup index for /24 subnets keyed by top 24 bits.
+
+        Uses the network prefix (top 24 bits) as key to avoid collisions
+        between subnets in different /16 ranges.
+        """
+        index = {}
+        for subnet_str, cell_name in self.subnet_map.items():
+            try:
+                net = ipaddress.ip_network(subnet_str, strict=False)
+                if net.version == 4 and net.prefixlen == 24:
+                    prefix = int(net.network_address) >> 8
+                    index[prefix] = cell_name
+            except ValueError:
+                continue
+        self._subnet_index = index
 
     def _reload_cell_policies(self) -> None:
         """Load per-cell policies with LRU eviction to bound memory."""
@@ -392,17 +431,12 @@ class PolicyEnforcer:
                     if self.cell_policy_mtimes.get(cell_name) == mtime:
                         continue  # No change.
 
-                    # Evict oldest policy if at capacity.
+                    # Evict least recently used policy if at capacity.
                     if cell_name not in self.cell_policies:
                         if len(self.cell_policies) >= MAX_CACHED_CELL_POLICIES:
-                            oldest = min(
-                                self.cell_policy_last_access.keys(),
-                                key=lambda k: self.cell_policy_last_access[k]
-                            )
-                            del self.cell_policies[oldest]
-                            del self.cell_policy_mtimes[oldest]
-                            del self.cell_policy_last_access[oldest]
-                            ctx.log.debug(f"PolicyEnforcer: Evicted policy for '{oldest}'")
+                            oldest_key, _ = self.cell_policies.popitem(last=False)
+                            del self.cell_policy_mtimes[oldest_key]
+                            ctx.log.debug(f"PolicyEnforcer: Evicted policy for '{oldest_key}'")
 
                 try:
                     with open(policy_file, "r") as f:
@@ -413,7 +447,6 @@ class PolicyEnforcer:
                             deny=data.get("deny", [])
                         )
                         self.cell_policy_mtimes[cell_name] = mtime
-                        self.cell_policy_last_access[cell_name] = time.time()
                     ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
                 except (json.JSONDecodeError, IOError) as e:
                     ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
@@ -422,9 +455,20 @@ class PolicyEnforcer:
             ctx.log.error(f"PolicyEnforcer: Failed to scan cell policies: {e}")
 
     def _get_cell_name(self, client_ip: str) -> Optional[str]:
-        """Resolve client IP to cell name via subnet map."""
+        """Resolve client IP to cell name via subnet map.
+
+        Fast path: O(1) dict lookup by third octet for /24 IPv4 subnets.
+        Slow path: linear scan for non-/24 or IPv6 subnets.
+        """
         try:
             ip = ipaddress.ip_address(client_ip)
+            # Fast path: IPv4 with /24 index.
+            if isinstance(ip, ipaddress.IPv4Address) and self._subnet_index:
+                prefix = int(ip) >> 8
+                result = self._subnet_index.get(prefix)
+                if result is not None:
+                    return result
+            # Slow path: linear scan for non-indexed subnets.
             for subnet_str, cell_name in self.subnet_map.items():
                 try:
                     subnet = ipaddress.ip_network(subnet_str, strict=False)
@@ -439,7 +483,8 @@ class PolicyEnforcer:
     def _is_internal_ip(self, host: str) -> bool:
         """Check if host is an internal/reserved IP address."""
         try:
-            ip = ipaddress.ip_address(host)
+            addr = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+            ip = ipaddress.ip_address(addr)
             for network in BLOCKED_NETWORKS:
                 if ip in network:
                     return True
@@ -451,7 +496,8 @@ class PolicyEnforcer:
     def _is_literal_ip(self, host: str) -> bool:
         """Check if host is a literal IP address (not a domain)."""
         try:
-            ipaddress.ip_address(host)
+            addr = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+            ipaddress.ip_address(addr)
             return True
         except ValueError:
             return False
@@ -498,7 +544,7 @@ class PolicyEnforcer:
             with self._cell_policy_lock:
                 if cell_name in self.cell_policies:
                     cell_policy = self.cell_policies[cell_name]
-                    self.cell_policy_last_access[cell_name] = time.time()  # LRU tracking.
+                    self.cell_policies.move_to_end(cell_name)  # LRU tracking.
         if cell_policy:
             allowed, reason, trace = cell_policy.is_allowed(host, path, method, self.trace_config)
             if trace and self.trace_config.enabled:
@@ -532,22 +578,80 @@ class PolicyEnforcer:
             "Blocked by network policy",
             {"Content-Type": "text/plain"}
         )
-        ctx.log.info(f"BLOCKED: {flow.request.host}{flow.request.path} - {reason}")
+        safe_host = re.sub(r'[\x00-\x1f\x7f]', '', flow.request.host)
+        safe_path = re.sub(r'[\x00-\x1f\x7f]', '', flow.request.path)
+        ctx.log.info(f"BLOCKED: {safe_host}{safe_path} - {reason}")
 
-    def serverconnect(self, server_conn):
+    def http_connect(self, flow: http.HTTPFlow) -> None:
+        """Enforce port and domain policy on CONNECT tunnels."""
+        host = flow.request.host
+        port = flow.request.port
+
+        if port not in ALLOWED_PORTS:
+            self._block(flow, f"port {port} not allowed (only 80, 443)")
+            return
+
+        # Block internal IP ranges.
+        if self._is_internal_ip(host):
+            self._block(flow, f"internal IP range blocked: {host}")
+            return
+
+        # Block literal IP addresses.
+        if self._is_literal_ip(host):
+            self._block(flow, f"literal IP addresses blocked: {host}")
+            return
+
+        # Resolve cell name for per-cell policy.
+        client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
+        cell_name = self._get_cell_name(client_ip)
+
+        # Check per-cell policy.
+        cell_policy = None
+        if cell_name:
+            with self._cell_policy_lock:
+                if cell_name in self.cell_policies:
+                    cell_policy = self.cell_policies[cell_name]
+                    self.cell_policies.move_to_end(cell_name)
+        if cell_policy:
+            allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
+            if not allowed:
+                self._block(flow, f"cell policy: {reason}")
+            return
+
+        # Check global policy.
+        allowed, reason, _ = self.global_policy.is_allowed(host, "/", "CONNECT")
+        if not allowed:
+            self._block(flow, f"global policy: {reason}")
+
+    def server_connected(self, data):
         """Check resolved IP against blocked ranges after DNS resolution."""
-        addr = getattr(server_conn, "address", None)
-        if addr:
-            ip_str = addr[0]
-            try:
+        try:
+            peername = data.server.peername
+            if peername:
+                ip_str = peername[0]
                 ip = ipaddress.ip_address(ip_str)
                 for net in BLOCKED_NETWORKS:
                     if ip in net:
-                        server_conn.error = f"DNS resolved to blocked IP: {ip_str}"
-                        ctx.log.info(f"BLOCKED: DNS rebinding to {ip_str}")
+                        ctx.log.warn(f"BLOCKED: DNS rebinding detected - resolved to {ip_str}")
+                        data.server.close()
                         return
-            except ValueError:
-                pass
+        except (ValueError, AttributeError, OSError):
+            pass
+
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        """Block responses from connections that resolved to internal IPs."""
+        if not flow.server_conn or not flow.server_conn.peername:
+            return
+        try:
+            ip_str = flow.server_conn.peername[0]
+            ip = ipaddress.ip_address(ip_str)
+            for net in BLOCKED_NETWORKS:
+                if ip in net:
+                    reason = f"DNS rebinding: resolved to {ip_str}"
+                    self._block(flow, reason)
+                    return
+        except (ValueError, AttributeError, OSError):
+            pass
 
 
 addons = [PolicyEnforcer()]

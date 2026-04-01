@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - **macOS** (required - Brig uses Lima VM which runs on macOS)
-- **Python 3.9+** (usually pre-installed on macOS)
+- **Python 3.10+** (usually pre-installed on macOS)
 - **Lima** (virtual machine manager)
 
 ### Install Lima
@@ -92,7 +92,7 @@ After initialization, `~/.brig` contains:
 ```
 ~/.brig/
 ├── lima.yaml           # VM configuration
-├── network-policy.yaml # Default network policy
+├── network-policy.json # Default network policy
 ├── cells/              # Cell definitions
 │   └── addons/         # Warden mitmproxy addons
 ├── secrets/            # Secret files (one per secret)
@@ -107,7 +107,7 @@ After initialization, `~/.brig` contains:
 Add Python user bin to your PATH:
 
 ```bash
-export PATH="$HOME/Library/Python/3.9/bin:$PATH"
+export PATH="$HOME/Library/Python/3.10/bin:$PATH"
 ```
 
 Add this line to your `~/.zshrc` or `~/.bashrc` for persistence.

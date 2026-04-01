@@ -1,14 +1,34 @@
 """
-Utility functions for Brig.
+Utility functions for the Brig SDK package.
+
+Note: src/brig.py (the CLI monolith) has its own copies of several functions
+defined here (colorize, log, debug, etc.). The brig.py versions include QUIET
+mode, fsync durability, and timeout parameters that the SDK versions do not.
+Shared constants live in brig.config to avoid duplication.
 """
 
+import fcntl
 import json
 import subprocess
 import sys
 import time
-from pathlib import Path
+from typing import Any
 
 from .config import CACHE_TTL, HISTORY_FILE, RATE_LIMIT_FILE, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW
+
+
+class BrigError(Exception):
+    """Base error for brig operations.
+
+    Raised instead of sys.exit() so SDK consumers get a catchable exception.
+    CLI entry points catch this and exit with the appropriate code.
+    """
+    def __init__(self, message: str, returncode: int = 1, stderr: str = "",
+                 suggestion: str = None):
+        super().__init__(message)
+        self.returncode = returncode
+        self.stderr = stderr
+        self.suggestion = suggestion
 
 # Debug mode (set via --debug flag).
 DEBUG = False
@@ -36,7 +56,7 @@ COLORS = {
 }
 
 # Simple TTL cache.
-_cache: dict[str, tuple[float, any]] = {}
+_cache: dict[str, tuple[float, Any]] = {}
 
 
 def colorize(text: str, color: str) -> str:
@@ -102,18 +122,18 @@ def warn(msg: str) -> None:
 
 
 def error(msg: str, suggestion: str = None) -> None:
-    """Print error with optional suggestion and exit."""
-    print(f"ERROR: {msg}", file=sys.stderr)
-    if suggestion:
-        print(f"  Suggestion: {suggestion}", file=sys.stderr)
-    sys.exit(1)
+    """Raise BrigError with message and optional suggestion.
+
+    SDK consumers catch BrigError; CLI entry points print and sys.exit().
+    """
+    raise BrigError(msg, suggestion=suggestion)
 
 
 def error_cell_not_found(cell_name: str) -> None:
     """Error helper for cell not found."""
     error(
         f"Cell '{cell_name}' does not exist",
-        f"Use 'brig list' to see available cells, or 'brig run' to create one"
+        "Use 'brig list' to see available cells, or 'brig run' to create one"
     )
 
 
@@ -134,7 +154,10 @@ def error_proxy_not_running() -> None:
 
 
 def log_operation(operation: str, cell_name: str = None, details: dict = None) -> None:
-    """Log an operation to the history file."""
+    """Log an operation to the history file.
+
+    Uses file locking to prevent corruption from concurrent processes.
+    """
     try:
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
         entry = {
@@ -146,44 +169,58 @@ def log_operation(operation: str, cell_name: str = None, details: dict = None) -
         if details:
             entry["details"] = details
         with open(HISTORY_FILE, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(json.dumps(entry) + "\n")
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except (IOError, OSError) as e:
         debug(f"Failed to log operation: {e}")
 
 
 def check_rate_limit() -> bool:
-    """Check if cell creation is rate limited. Returns True if allowed."""
+    """Check if cell creation is rate limited. Returns True if allowed.
+
+    Uses file locking to prevent races between concurrent brig processes.
+    """
     try:
         RATE_LIMIT_FILE.parent.mkdir(parents=True, exist_ok=True)
 
         now = time.time()
-        timestamps = []
 
-        if RATE_LIMIT_FILE.exists():
+        # Use a lock file to serialize rate limit read-modify-write.
+        lock_path = RATE_LIMIT_FILE.with_suffix(".lock")
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
-                with open(RATE_LIMIT_FILE, "r") as f:
-                    data = json.load(f)
-                    timestamps = data.get("timestamps", [])
-            except (json.JSONDecodeError, IOError):
                 timestamps = []
+                if RATE_LIMIT_FILE.exists():
+                    try:
+                        with open(RATE_LIMIT_FILE, "r") as f:
+                            data = json.load(f)
+                            timestamps = data.get("timestamps", [])
+                    except (json.JSONDecodeError, IOError):
+                        timestamps = []
 
-        cutoff = now - RATE_LIMIT_WINDOW
-        timestamps = [ts for ts in timestamps if ts > cutoff]
+                cutoff = now - RATE_LIMIT_WINDOW
+                timestamps = [ts for ts in timestamps if ts > cutoff]
 
-        if len(timestamps) >= RATE_LIMIT_MAX:
-            return False
+                if len(timestamps) >= RATE_LIMIT_MAX:
+                    return False
 
-        timestamps.append(now)
-        with open(RATE_LIMIT_FILE, "w") as f:
-            json.dump({"timestamps": timestamps}, f)
+                timestamps.append(now)
+                with open(RATE_LIMIT_FILE, "w") as f:
+                    json.dump({"timestamps": timestamps}, f)
 
-        return True
+                return True
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     except (IOError, OSError) as e:
         debug(f"Rate limit check failed: {e}")
         return True
 
 
-def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, any]:
+def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, Any]:
     """Check if a cached value is still valid."""
     if key in _cache:
         ts, value = _cache[key]
@@ -192,7 +229,7 @@ def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, any]:
     return False, None
 
 
-def _set_cache(key: str, value: any) -> None:
+def _set_cache(key: str, value: Any) -> None:
     """Store a value in the cache."""
     _cache[key] = (time.time(), value)
 
@@ -203,9 +240,28 @@ def invalidate_cell_cache(cell_name: str) -> None:
     _cache.pop(f"cell_running:{cell_name}", None)
 
 
+def _redact_cmd(cmd: list[str]) -> str:
+    """Redact sensitive arguments from command for debug logging."""
+    redacted = []
+    skip_next = False
+    sensitive_flags = {"--secret", "--password", "--token", "--key"}
+    for i, arg in enumerate(cmd):
+        if skip_next:
+            redacted.append("***")
+            skip_next = False
+        elif arg in sensitive_flags:
+            redacted.append(arg)
+            skip_next = True
+        elif "=" in arg and arg.split("=", 1)[0] in sensitive_flags:
+            redacted.append(f"{arg.split('=', 1)[0]}=***")
+        else:
+            redacted.append(arg)
+    return " ".join(redacted)
+
+
 def run(cmd: list[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
     """Run a command."""
-    debug(f"Executing: {' '.join(cmd)}")
+    debug(f"Executing: {_redact_cmd(cmd)}")
     result = subprocess.run(cmd, check=check, capture_output=capture, text=True)
     if capture and result.returncode != 0:
         debug(f"Command failed with code {result.returncode}")

@@ -1,0 +1,7 @@
+# Default owner for all files.
+* @d0cd
+
+# Security-sensitive components require explicit review.
+src/addons/enforce.py @d0cd
+src/warden.py @d0cd
+src/brig/sdk.py @d0cd

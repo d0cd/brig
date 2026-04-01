@@ -65,7 +65,7 @@ brig vm shell -- podman network connect brig-my-cell warden
 brig network my-cell --json | jq 'select(.blocked)' | tail -5
 ```
 
-If your domain is being blocked, add it to `~/.brig/network-policy.yaml` and reload:
+If your domain is being blocked, add it to `~/.brig/cells/network-policy.json` and reload:
 
 ```bash
 warden reload

@@ -33,6 +33,8 @@ PERFORMANCE:
 
 SYSTEM:
   vm          Manage Lima VM
+  init        Initialize brig (create directories, VM config)
+  upgrade     Upgrade state to current schema
   verify      Verify security invariants
   diagnose    Diagnose connectivity issues
   health      Check system health
@@ -66,6 +68,7 @@ SYSTEM:
 --seccomp-profile F  Apply seccomp profile (JSON file)
 --env KEY=VALUE      Set additional environment variable
 --secret NAME        Mount secret file at /run/secrets/
+--tor                Route through Tor (requires: warden tor start && warden restart)
 ```
 
 ### Wait Flags
@@ -223,6 +226,15 @@ restart_max_attempts: 3  # Stop trying after 3 failures
 restart_window: 300s     # Reset failure count after 5 minutes
 ```
 
+### Tor Routing
+
+```yaml
+name: anon-agent
+image: python:3.11-slim
+tor: true  # Pre-flight check that Tor stack + Warden upstream are active
+command: ["python", "/work/agent.py"]
+```
+
 ### MITM Inspection
 
 ```yaml
@@ -322,8 +334,8 @@ deny:
 ```
 ~/.brig/
 ├── lima.yaml                 # VM config
-├── network-policy.yaml       # Allowlist
 ├── cells/                    # Cell definitions
+│   ├── network-policy.json   # Allowlist (mounted as /policy.json in VM)
 │   ├── research-agent.yaml
 │   └── github-bot.yaml
 ├── profiles/                 # Trust profiles (custom)
@@ -498,6 +510,27 @@ Configured automatically during VM provisioning:
 | **Block (scripts)** | `.sh`, `.py`, `.js`, `.rb`, `.pl` | Refuse unless `--allow-scripts` |
 | **Allow** | `.txt`, `.json`, `.csv`, `.md`, `.xml`, `.yaml`, `.log` | Copy directly |
 | **Allow (images)** | `.png`, `.jpg`, `.gif`, `.svg`, `.webp` | Copy directly |
+
+---
+
+## Warden Tor Commands
+
+```
+warden tor start     Start Tor + Privoxy bridge on proxy-external network
+warden tor stop      Stop Tor + Privoxy and remove config
+warden tor status    Show Tor stack status and routing chain
+```
+
+After `warden tor start`, restart Warden to activate upstream routing: `warden restart`.
+After `warden tor stop`, restart Warden to disable upstream routing: `warden restart`.
+
+### Components
+
+| Container | Port | Role |
+|-----------|------|------|
+| `warden-tor` | 9050 | Tor SOCKS5 proxy |
+| `warden-privoxy` | 8118 | HTTP→SOCKS5 bridge |
+| `warden` | 8080 | Policy-enforcing mitmproxy (chains to Privoxy when Tor active) |
 
 ---
 

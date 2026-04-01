@@ -31,6 +31,8 @@ Usage:
     mitmdump -s notifier.py
 """
 
+import collections
+import ipaddress
 import json
 import queue
 import threading
@@ -39,16 +41,64 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from mitmproxy import http, ctx
+from mitmproxy import ctx, http
 
 # Try to use urllib3 for connection pooling, fall back to urllib.
 try:
     import urllib3
     URLLIB3_AVAILABLE = True
 except ImportError:
-    import urllib.request
     import urllib.error
+    import urllib.request
     URLLIB3_AVAILABLE = False
+
+# Blocked networks for SSRF prevention.
+# Must match enforce.py BLOCKED_NETWORKS to prevent webhook-based SSRF.
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    # IPv6.
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("::ffff:0:0/96"),
+    ipaddress.ip_network("ff00::/8"),
+]
+
+
+def _is_safe_webhook_url(url: str) -> bool:
+    """Validate webhook URL is not targeting internal networks."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if not parsed.hostname:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    try:
+        import socket as _socket
+        addrs = _socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+        for family, socktype, proto, canonname, sockaddr in addrs:
+            ip = ipaddress.ip_address(sockaddr[0])
+            for net in BLOCKED_NETWORKS:
+                if ip in net:
+                    return False
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _redact_notification_path(path: str) -> str:
+    """Remove query parameters from path for notifications."""
+    return path.split("?")[0] if "?" in path else path
+
 
 # Policy file path.
 POLICY_FILE = Path("/policy.json")
@@ -116,12 +166,14 @@ class Notifier:
     def __init__(self):
         self.config = NotificationConfig()
         self.policy_mtime = 0.0
-        self.last_notification: dict[str, float] = {}  # cell -> timestamp
+        self.last_notification: collections.OrderedDict[str, float] = collections.OrderedDict()
         self.notification_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
         self.worker_thread: Optional[threading.Thread] = None
         self.running = False
         self.circuit_breaker = CircuitBreakerState()
         self.dead_letters: list[dict] = []
+        self._dl_lock = threading.Lock()  # Lock for dead_letters list.
+        self._dl_dirty_count = 0  # Pending unsaved dead letters.
         self._cb_lock = threading.Lock()  # Lock for circuit breaker state.
         # Connection pool for HTTP requests (reuses connections).
         self._http_pool: Optional[object] = None
@@ -176,6 +228,10 @@ class Notifier:
             notifications = data.get("notifications", {})
 
             webhook_url = notifications.get("webhook_url", "")
+            # Validate webhook URL at load time for fast feedback.
+            if webhook_url and not _is_safe_webhook_url(webhook_url):
+                ctx.log.error("Notifier: webhook URL targets internal network, disabling")
+                webhook_url = ""
             filters = notifications.get("filters", {})
             cb_config = notifications.get("circuit_breaker", {})
 
@@ -293,14 +349,18 @@ class Notifier:
             "attempts": notification.get("_attempts", 1),
         }
 
-        self.dead_letters.append(dead_letter)
+        with self._dl_lock:
+            self.dead_letters.append(dead_letter)
 
-        # Trim if over limit.
-        if len(self.dead_letters) > MAX_DEAD_LETTERS:
-            self.dead_letters = self.dead_letters[-MAX_DEAD_LETTERS:]
+            # Trim if over limit.
+            if len(self.dead_letters) > MAX_DEAD_LETTERS:
+                self.dead_letters = self.dead_letters[-MAX_DEAD_LETTERS:]
 
-        # Persist to disk.
-        self._save_dead_letters()
+            # Batch disk writes: persist every 10 failures or on trim.
+            self._dl_dirty_count += 1
+            if self._dl_dirty_count >= 10 or len(self.dead_letters) >= MAX_DEAD_LETTERS:
+                self._save_dead_letters()
+                self._dl_dirty_count = 0
 
     def _save_dead_letters(self) -> None:
         """Persist dead letters to disk."""
@@ -358,6 +418,11 @@ class Notifier:
         if not self.config.webhook_url:
             return
 
+        # Validate webhook URL against internal networks.
+        if not _is_safe_webhook_url(self.config.webhook_url):
+            ctx.log.warn("Notifier: webhook URL targets internal network, skipping")
+            return
+
         # Check circuit breaker.
         if not self._check_circuit_breaker():
             ctx.log.debug("Notifier: Circuit breaker open, dropping notification")
@@ -372,7 +437,9 @@ class Notifier:
             notification["_attempts"] = attempts
 
             try:
-                data = json.dumps(notification).encode("utf-8")
+                # Strip internal fields before sending to webhook.
+                payload = {k: v for k, v in notification.items() if not k.startswith("_")}
+                data = json.dumps(payload).encode("utf-8")
                 success, error = self._send_http_request(data)
 
                 if success:
@@ -441,9 +508,9 @@ class Notifier:
         # Update last notification time with LRU eviction.
         if cell_name not in self.last_notification:
             if len(self.last_notification) >= MAX_TRACKED_CELLS:
-                oldest = min(self.last_notification.keys(),
-                             key=lambda k: self.last_notification[k])
-                del self.last_notification[oldest]
+                self.last_notification.popitem(last=False)
+        else:
+            self.last_notification.move_to_end(cell_name)
         self.last_notification[cell_name] = time.time()
 
         # Build notification.
@@ -452,7 +519,7 @@ class Notifier:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "cell": cell_name,
             "host": flow.request.host,
-            "path": flow.request.path,
+            "path": _redact_notification_path(flow.request.path),
             "method": flow.request.method,
             "block_reason": block_reason,
             "client_ip": flow.client_conn.peername[0] if flow.client_conn.peername else "unknown",
@@ -462,7 +529,8 @@ class Notifier:
         try:
             self.notification_queue.put_nowait(notification)
         except queue.Full:
-            ctx.log.warn("Notifier: Queue full, dropping notification")
+            ctx.log.warn("Notifier: Queue full, adding to dead-letter queue")
+            self._add_to_dead_letter(notification, "queue_full")
 
 
 addons = [Notifier()]

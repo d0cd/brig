@@ -46,8 +46,10 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from brig.config import CELL_NAME_PATTERN
+
 # Version information.
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # Proxy container configuration.
 CONTAINER_NAME = "warden"
@@ -61,13 +63,24 @@ TOR_CONTAINER_NAME = "warden-tor"
 # osminogin/tor-simple - minimal Tor SOCKS5 proxy (~8MB Alpine-based).
 TOR_IMAGE = "docker.io/osminogin/tor-simple@sha256:4e64295fbafd856adc73d3ebc402b0d84598ddd278383ec1adaa32e4ecf0bea1"
 
+# Privoxy container configuration (HTTP-to-SOCKS5 bridge for Tor).
+PRIVOXY_CONTAINER_NAME = "warden-privoxy"
+PRIVOXY_IMAGE = "docker.io/vimagick/privoxy@sha256:6f53634c62a05ee6a12e8c60fabf15a0d2f8e46e0d5fa42a0fa34b5e0d59f090"
+PRIVOXY_PORT = 8118
+TOR_SOCKS_PORT = 9050
+PRIVOXY_CONFIG_HOST = Path.home() / ".brig/cells/addons/privoxy.conf"  # macOS side.
+
 NETWORK = "proxy-external"
 
-# Resource limits.
+# Resource limits — sized for a single mitmproxy instance.
+# 1g RAM: mitmproxy with typical request buffering and addon state.
+# 1 CPU: proxy is I/O-bound, rarely needs more.
+# 256 PIDs: mitmproxy workers + addon processes.
+# 2048 FDs: mitmproxy holds concurrent TCP connections (soft 1024, hard 2048).
 MEMORY_LIMIT = "1g"
 CPU_LIMIT = "1"
 PIDS_LIMIT = "256"
-FD_LIMIT = "nofile=1024:2048"  # Soft:hard file descriptor limit.
+FD_LIMIT = "nofile=1024:2048"
 
 # File paths.
 POLICY_FILE = Path("/cells/network-policy.json")
@@ -88,6 +101,97 @@ BLOCKED_NETWORKS = [
 
 
 DEFAULT_TIMEOUT = 30  # Default subprocess timeout in seconds.
+
+def validate_cell_name(name: str) -> bool:
+    """Validate cell name against safe pattern."""
+    return bool(CELL_NAME_PATTERN.match(name))
+
+
+# Log levels.
+LOG_LEVEL_DEBUG = 0
+LOG_LEVEL_INFO = 1
+LOG_LEVEL_WARN = 2
+LOG_LEVEL_ERROR = 3
+
+# Current log level (set based on --debug flag).
+LOG_LEVEL = LOG_LEVEL_INFO
+
+# Quiet mode suppresses DEBUG and INFO messages.
+QUIET = False
+
+# Color output.
+COLOR_ENABLED = sys.stderr.isatty()
+
+
+def colorize(text: str, color: str) -> str:
+    """Wrap text in ANSI color codes."""
+    if not COLOR_ENABLED:
+        return text
+    colors = {
+        "red": "\033[31m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "gray": "\033[90m",
+        "green": "\033[32m",
+    }
+    if color in colors:
+        return f"{colors[color]}{text}\033[0m"
+    return text
+
+
+def log(level: int, msg: str, level_name: str = None) -> None:
+    """Log a message at the specified level."""
+    if level < LOG_LEVEL:
+        return
+    if QUIET and level < LOG_LEVEL_WARN:
+        return
+    level_names = {
+        LOG_LEVEL_DEBUG: "DEBUG",
+        LOG_LEVEL_INFO: "INFO",
+        LOG_LEVEL_WARN: "WARN",
+        LOG_LEVEL_ERROR: "ERROR",
+    }
+    level_colors = {
+        LOG_LEVEL_DEBUG: "gray",
+        LOG_LEVEL_INFO: "blue",
+        LOG_LEVEL_WARN: "yellow",
+        LOG_LEVEL_ERROR: "red",
+    }
+    name = level_name or level_names.get(level, "INFO")
+    color = level_colors.get(level, None)
+    if COLOR_ENABLED and color:
+        prefix = colorize(f"[{name}]", color)
+    else:
+        prefix = f"[{name}]"
+    print(f"{prefix} {msg}", file=sys.stderr)
+
+
+def debug(msg: str) -> None:
+    """Print debug message if debug mode is enabled."""
+    log(LOG_LEVEL_DEBUG, msg)
+
+
+def info(msg: str) -> None:
+    """Print info message."""
+    log(LOG_LEVEL_INFO, msg)
+
+
+def output(msg: str) -> None:
+    """Print output message (respects quiet mode)."""
+    if not QUIET:
+        print(msg)
+
+
+def warn(msg: str) -> None:
+    """Print warning message."""
+    log(LOG_LEVEL_WARN, msg)
+
+
+def print_error(msg: str, suggestion: str = None) -> None:
+    """Print error message to stderr (does not exit)."""
+    print(f"ERROR: {msg}", file=sys.stderr)
+    if suggestion:
+        print(f"  Suggestion: {suggestion}", file=sys.stderr)
 
 
 def run(cmd: list[str], check: bool = True, capture: bool = False,
@@ -138,35 +242,109 @@ def container_exists() -> bool:
 def tor_running() -> bool:
     """Check if Tor container is running."""
     result = run(
-        ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={TOR_CONTAINER_NAME}"],
+        ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name=^{TOR_CONTAINER_NAME}$"],
         check=False,
         capture=True
     )
-    return TOR_CONTAINER_NAME in result.stdout
+    return TOR_CONTAINER_NAME in result.stdout.split()
 
 
 def tor_exists() -> bool:
     """Check if Tor container exists (running or stopped)."""
     result = run(
-        ["podman", "ps", "-a", "--format", "{{.Names}}", "--filter", f"name={TOR_CONTAINER_NAME}"],
+        ["podman", "ps", "-a", "--format", "{{.Names}}", "--filter", f"name=^{TOR_CONTAINER_NAME}$"],
         check=False,
         capture=True
     )
-    return TOR_CONTAINER_NAME in result.stdout
+    return TOR_CONTAINER_NAME in result.stdout.split()
+
+
+def privoxy_running() -> bool:
+    """Check if Privoxy container is running."""
+    result = run(
+        ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name=^{PRIVOXY_CONTAINER_NAME}$"],
+        check=False,
+        capture=True
+    )
+    return PRIVOXY_CONTAINER_NAME in result.stdout.split()
+
+
+def privoxy_exists() -> bool:
+    """Check if Privoxy container exists (running or stopped)."""
+    result = run(
+        ["podman", "ps", "-a", "--format", "{{.Names}}", "--filter", f"name=^{PRIVOXY_CONTAINER_NAME}$"],
+        check=False,
+        capture=True
+    )
+    return PRIVOXY_CONTAINER_NAME in result.stdout.split()
+
+
+def _get_container_ip(container_name: str, network: str = NETWORK) -> str:
+    """Get container IP on a specific network."""
+    # Validate network name to prevent Go template injection.
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', network):
+        return ""
+    result = run(
+        ["podman", "inspect", container_name, "--format", "json"],
+        check=False,
+        capture=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return ""
+    try:
+        data = json.loads(result.stdout)
+        if not data:
+            return ""
+        networks = data[0].get("NetworkSettings", {}).get("Networks", {})
+        net_info = networks.get(network, {})
+        return net_info.get("IPAddress", "")
+    except (json.JSONDecodeError, IndexError, KeyError):
+        return ""
+
+
+def _is_warden_tor_mode() -> bool:
+    """Check if Warden is running with upstream proxy mode (Tor routing)."""
+    if not is_running():
+        return False
+    result = run(
+        ["podman", "inspect", CONTAINER_NAME, "--format", "json"],
+        check=False,
+        capture=True
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return False
+    try:
+        data = json.loads(result.stdout)
+        if not data:
+            return False
+        # Check command args for --mode upstream.
+        args = data[0].get("Config", {}).get("Cmd", [])
+        return any("upstream:" in str(a) for a in args)
+    except (json.JSONDecodeError, IndexError, KeyError):
+        return False
 
 
 def get_proxy_ip(network: str) -> str:
     """Get proxy IP on a specific network."""
+    # Validate network name to prevent Go template injection.
+    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$', network):
+        return ""
     result = run(
-        ["podman", "inspect", CONTAINER_NAME, "--format",
-         "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}"],
+        ["podman", "inspect", CONTAINER_NAME, "--format", "json"],
         check=False,
         capture=True
     )
-    for ip in result.stdout.strip().split():
-        if ip:
-            return ip
-    return ""
+    if result.returncode != 0 or not result.stdout.strip():
+        return ""
+    try:
+        data = json.loads(result.stdout)
+        if not data:
+            return ""
+        networks = data[0].get("NetworkSettings", {}).get("Networks", {})
+        net_info = networks.get(network, {})
+        return net_info.get("IPAddress", "")
+    except (json.JSONDecodeError, IndexError, KeyError):
+        return ""
 
 
 def get_cell_networks() -> list[str]:
@@ -200,10 +378,10 @@ def reconnect_to_cell_networks() -> int:
         if result.returncode == 0:
             connected += 1
         elif "already" not in result.stderr.lower():
-            print(f"WARNING: Failed to connect to {network}: {result.stderr}", file=sys.stderr)
+            warn(f"Failed to connect to {network}: {result.stderr}")
 
     if connected > 0:
-        print(f"Reconnected to {connected} cell network(s)")
+        info(f"Reconnected to {connected} cell network(s)")
     return connected
 
 
@@ -215,7 +393,7 @@ def load_policy() -> dict:
         with open(POLICY_FILE, "r") as f:
             return json.load(f)
     except (json.JSONDecodeError, IOError) as e:
-        print(f"ERROR: Failed to load policy: {e}", file=sys.stderr)
+        print_error(f"Failed to load policy: {e}")
         return {}
 
 
@@ -293,44 +471,48 @@ def cmd_watchdog(interval: int = 30, max_restarts: int = 5) -> int:
 
     This runs in the foreground and should be run as a background service.
     """
-    import signal as sig
+    if interval <= 0:
+        print_error("Interval must be positive")
+        return 1
+    if max_restarts <= 0:
+        print_error("Max restarts must be positive")
+        return 1
 
     consecutive_restarts = 0
     running = True
 
     def handle_signal(signum, frame):
         nonlocal running
-        print(f"\nWatchdog received signal {signum}, shutting down...")
+        info(f"Watchdog received signal {signum}, shutting down...")
         running = False
 
-    sig.signal(sig.SIGTERM, handle_signal)
-    sig.signal(sig.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
-    print(f"Watchdog started (interval={interval}s, max_restarts={max_restarts})")
+    info(f"Watchdog started (interval={interval}s, max_restarts={max_restarts})")
 
     while running:
         try:
             if is_running():
                 # Proxy is running, reset restart counter.
                 if consecutive_restarts > 0:
-                    print("Proxy recovered, resetting restart counter")
+                    info("Proxy recovered, resetting restart counter")
                     consecutive_restarts = 0
             else:
-                print(f"Proxy not running! Attempting restart ({consecutive_restarts + 1}/{max_restarts})")
+                warn(f"Proxy not running! Attempting restart ({consecutive_restarts + 1}/{max_restarts})")
 
                 if consecutive_restarts >= max_restarts:
-                    print(f"ERROR: Max restarts ({max_restarts}) exceeded. Giving up.", file=sys.stderr)
-                    print("Manual intervention required. Check: warden status", file=sys.stderr)
+                    print_error(f"Max restarts ({max_restarts}) exceeded. Giving up.")
+                    print_error("Manual intervention required. Check: warden status")
                     return 1
 
                 # Try to start the proxy.
                 result = cmd_start()
                 if result == 0:
-                    print("Proxy restarted successfully")
-                    consecutive_restarts += 1
+                    info("Proxy restarted successfully")
                 else:
-                    print(f"Failed to restart proxy (exit code {result})", file=sys.stderr)
                     consecutive_restarts += 1
+                    print_error(f"Failed to restart proxy (exit code {result})")
 
             # Sleep in small increments to allow signal handling.
             for _ in range(interval):
@@ -339,10 +521,10 @@ def cmd_watchdog(interval: int = 30, max_restarts: int = 5) -> int:
                 time.sleep(1)
 
         except Exception as e:
-            print(f"Watchdog error: {e}", file=sys.stderr)
+            print_error(f"Watchdog error: {e}")
             time.sleep(interval)
 
-    print("Watchdog stopped")
+    info("Watchdog stopped")
     return 0
 
 
@@ -359,10 +541,10 @@ def cmd_start() -> int:
     # Run comprehensive preflight validation.
     success, errors = preflight_validate()
     if not success:
-        print("Preflight validation failed:", file=sys.stderr)
+        print_error("Preflight validation failed:")
         for error in errors:
             print(f"  - {error}", file=sys.stderr)
-        print("\nRun 'warden preflight' for detailed diagnostics", file=sys.stderr)
+        print_error("Run 'warden preflight' for detailed diagnostics")
         return 1
 
     # Check for optional addons.
@@ -371,6 +553,7 @@ def cmd_start() -> int:
         "/cells/addons/metrics.py",
         "/cells/addons/health.py",
         "/cells/addons/notifier.py",
+        "/cells/addons/canary.py",
     ]
 
     addon_args = ["-s", "/addons/enforce.py", "-s", "/addons/logger.py"]
@@ -379,7 +562,7 @@ def cmd_start() -> int:
         if result.returncode == 0:
             addon_name = Path(addon).name
             addon_args.extend(["-s", f"/addons/{addon_name}"])
-            print(f"Loading addon: {addon_name}")
+            info(f"Loading addon: {addon_name}")
 
     # Build podman run command with security hardening.
     cmd = [
@@ -394,8 +577,10 @@ def cmd_start() -> int:
         # Note: NET_BIND_SERVICE not needed since 8080 is unprivileged.
         "--security-opt", "no-new-privileges",
         "--read-only",                     # Read-only root filesystem.
-        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",  # Writable /tmp.
-        "--tmpfs", "/home/mitmproxy/.mitmproxy:rw,noexec,nosuid,size=32m",  # mitmproxy state.
+        # 64 MB /tmp: mitmproxy uses /tmp for request body buffering.
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+        # 32 MB state: mitmproxy certificates and session data.
+        "--tmpfs", "/home/mitmproxy/.mitmproxy:rw,noexec,nosuid,size=32m",
         "--user", "mitmproxy",             # Run as non-root user.
 
         # Resource limits.
@@ -415,41 +600,42 @@ def cmd_start() -> int:
 
         # mitmdump arguments.
         "--listen-host", "0.0.0.0",
-        "--listen-port", "8080",
+        "--listen-port", "8080",     # Standard HTTP proxy port (unprivileged).
         # Disable mitmproxy's built-in global IP blocking; enforce addon
         # handles this with a comprehensive BLOCKED_NETWORKS list covering
         # RFC1918, CGNAT, multicast, IPv4-mapped IPv6, and more.
         "--set", "block_global=false",
     ]
 
-    # Note: Tor integration is available but requires additional setup.
-    # mitmproxy doesn't support SOCKS5 upstream directly.
-    # To use Tor, run a HTTP proxy (like privoxy) in front of Tor.
-    # See: warden tor status for more info.
+    # Chain through Privoxy->Tor if the Tor stack is running.
+    if privoxy_running():
+        privoxy_ip = _get_container_ip(PRIVOXY_CONTAINER_NAME)
+        if privoxy_ip:
+            cmd.extend(["--mode", f"upstream:http://{privoxy_ip}:{PRIVOXY_PORT}"])
+            info("Tor routing enabled via Privoxy bridge")
 
     cmd.extend(addon_args)
 
     try:
-        # Podman run with -d returns quickly; use longer timeout for image pull.
+        # 120s timeout: image pull can be slow on first run.
         run(cmd, timeout=120)
-        print("Proxy started")
+        info("Proxy started")
 
-        # Wait for proxy to be ready.
+        # Wait up to 5s (10 × 0.5s) for proxy to become ready.
         for _ in range(10):
             time.sleep(0.5)
             if is_running():
                 reconnect_to_cell_networks()
                 return 0
 
-        print("WARNING: Proxy may not have started correctly", file=sys.stderr)
+        warn("Proxy may not have started correctly")
         return 1
 
     except subprocess.TimeoutExpired:
-        print("ERROR: Proxy start timed out (check network and image availability)",
-              file=sys.stderr)
+        print_error("Proxy start timed out (check network and image availability)")
         return 1
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to start proxy: {e}", file=sys.stderr)
+        print_error(f"Failed to start proxy: {e}")
         return 1
 
 
@@ -460,22 +646,26 @@ def cmd_stop() -> int:
         return 0
 
     try:
-        # Stop timeout is 10s inside podman, allow extra time for the operation.
+        # -t 10: give mitmproxy 10s to drain connections gracefully.
+        # timeout=30: outer deadline covers stop + cleanup overhead.
         run(["podman", "stop", "-t", "10", CONTAINER_NAME], timeout=30)
         run(["podman", "rm", CONTAINER_NAME])
         print("Proxy stopped")
         return 0
     except subprocess.TimeoutExpired:
-        print("ERROR: Stop command timed out. Try: podman kill warden", file=sys.stderr)
+        print_error("Stop command timed out. Try: podman kill warden")
         return 1
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to stop proxy: {e}", file=sys.stderr)
+        print_error(f"Failed to stop proxy: {e}")
         return 1
 
 
 def cmd_restart() -> int:
     """Restart the proxy container."""
-    cmd_stop()
+    result = cmd_stop()
+    if result != 0:
+        print_error("Failed to stop proxy, aborting restart")
+        return result
     return cmd_start()
 
 
@@ -499,25 +689,65 @@ def cmd_status() -> int:
 
 
 def cmd_reload() -> int:
-    """Reload policy by sending SIGHUP to mitmproxy."""
+    """Reload policy by sending SIGHUP to mitmproxy.
+
+    Validates the policy file before sending the reload signal.
+    If validation fails, the old policy remains in effect.
+    """
     if not is_running():
-        print("ERROR: Proxy is not running", file=sys.stderr)
+        print_error("Proxy is not running. Start with: warden start")
         return 1
+
+    # Validate policy before reloading to prevent breaking all cells.
+    if not POLICY_FILE.exists():
+        print_error(f"Policy file not found: {POLICY_FILE}. Create it at ~/.brig/cells/network-policy.json")
+        return 1
+
+    try:
+        with open(POLICY_FILE, "r") as f:
+            policy = json.load(f)
+    except json.JSONDecodeError as e:
+        print_error(
+            f"Policy file contains invalid JSON: {e}",
+            "Fix the policy file and try again. Current policy remains in effect."
+        )
+        return 1
+    except IOError as e:
+        print_error(f"Cannot read policy file: {e}")
+        return 1
+
+    # Basic structural checks.
+    if not isinstance(policy, dict):
+        print_error(
+            "Policy must be a JSON object",
+            "Fix the policy file and try again. Current policy remains in effect."
+        )
+        return 1
+
+    for key in ("allow", "deny"):
+        if key in policy and not isinstance(policy[key], list):
+            print_error(
+                f"Policy '{key}' must be a list",
+                "Fix the policy file and try again. Current policy remains in effect."
+            )
+            return 1
+
+    info("Policy validation passed")
 
     try:
         # Send SIGHUP to the container's main process (PID 1).
         run(["podman", "kill", "-s", "HUP", CONTAINER_NAME])
-        print("Policy reload signal sent")
+        info("Policy reload signal sent")
         return 0
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to reload policy: {e}", file=sys.stderr)
+        print_error(f"Failed to reload policy: {e}")
         return 1
 
 
 def cmd_logs() -> int:
     """Show proxy logs."""
     if not container_exists():
-        print("ERROR: Proxy container does not exist", file=sys.stderr)
+        print_error("Proxy container does not exist")
         return 1
 
     try:
@@ -532,9 +762,13 @@ def cmd_logs_prune(days: int = 7, size_mb: int = None) -> int:
     """Clean old log files.
 
     Args:
-        days: Delete logs older than N days.
+        days: Delete logs older than N days (default 7 — matches logrotate retention).
         size_mb: Target total size in MB. If specified, delete oldest files until under limit.
     """
+    if days < 0:
+        print_error("Days must be non-negative")
+        return 1
+
     if not LOG_DIR.exists():
         print("No log directory found")
         return 0
@@ -567,25 +801,32 @@ def cmd_logs_prune(days: int = 7, size_mb: int = None) -> int:
                 removed += 1
                 all_files.remove(f)
             except (IOError, OSError) as e:
-                print(f"WARNING: Failed to remove {f['path']}: {e}", file=sys.stderr)
+                warn(f"Failed to remove {f['path']}: {e}")
 
-    # Phase 2: Compress uncompressed files older than 1 day.
+    # Phase 2: Compress files older than 1 day (keep today's logs uncompressed for tailing).
     compress_cutoff = datetime.now() - timedelta(days=1)
     for f in all_files:
         if f["path"].suffix == ".jsonl" and f["mtime"] < compress_cutoff:
             try:
                 gz_path = f["path"].with_suffix(".jsonl.gz")
                 if not gz_path.exists():
-                    with open(f["path"], "rb") as f_in:
-                        with gzip.open(gz_path, "wb") as f_out:
-                            f_out.writelines(f_in)
-                    f["path"].unlink()
-                    compressed += 1
-                    # Update file info for size calculation.
-                    f["path"] = gz_path
-                    f["size"] = gz_path.stat().st_size
+                    tmp_gz = gz_path.with_suffix(".gz.tmp")
+                    try:
+                        with open(f["path"], "rb") as f_in:
+                            with gzip.open(tmp_gz, "wb") as f_out:
+                                f_out.writelines(f_in)
+                        tmp_gz.rename(gz_path)
+                        f["path"].unlink()
+                        compressed += 1
+                        # Update file info for size calculation.
+                        f["path"] = gz_path
+                        f["size"] = gz_path.stat().st_size
+                    except (IOError, OSError):
+                        if tmp_gz.exists():
+                            tmp_gz.unlink()
+                        raise
             except (IOError, OSError) as e:
-                print(f"WARNING: Failed to compress {f['path']}: {e}", file=sys.stderr)
+                warn(f"Failed to compress {f['path']}: {e}")
 
     # Phase 3: Size-based pruning if specified.
     if size_mb is not None:
@@ -605,7 +846,7 @@ def cmd_logs_prune(days: int = 7, size_mb: int = None) -> int:
                     f["path"].unlink()
                     removed += 1
                 except (IOError, OSError) as e:
-                    print(f"WARNING: Failed to remove {f['path']}: {e}", file=sys.stderr)
+                    warn(f"Failed to remove {f['path']}: {e}")
 
             print(f"Size pruning: reduced to {total_size / 1024 / 1024:.1f} MB (target: {size_mb} MB)")
 
@@ -617,15 +858,18 @@ def cmd_logs_prune(days: int = 7, size_mb: int = None) -> int:
 
 def cmd_join(cell_name: str) -> int:
     """Connect proxy to a cell's network."""
+    if not validate_cell_name(cell_name):
+        print_error(f"Invalid cell name: {cell_name}")
+        return 1
     if not is_running():
-        print("ERROR: Warden is not running", file=sys.stderr)
+        print_error("Warden is not running")
         return 1
 
     network_name = f"brig-{cell_name}"
 
     result = run(["podman", "network", "exists", network_name], check=False)
     if result.returncode != 0:
-        print(f"ERROR: Network {network_name} does not exist", file=sys.stderr)
+        print_error(f"Network {network_name} does not exist")
         return 1
 
     try:
@@ -636,14 +880,17 @@ def cmd_join(cell_name: str) -> int:
         if "already" in str(e).lower():
             print(f"Proxy already connected to {network_name}")
             return 0
-        print(f"ERROR: Failed to connect: {e}", file=sys.stderr)
+        print_error(f"Failed to connect: {e}")
         return 1
 
 
 def cmd_leave(cell_name: str) -> int:
     """Disconnect proxy from a cell's network."""
+    if not validate_cell_name(cell_name):
+        print_error(f"Invalid cell name: {cell_name}")
+        return 1
     if not is_running():
-        print("ERROR: Warden is not running", file=sys.stderr)
+        print_error("Warden is not running")
         return 1
 
     network_name = f"brig-{cell_name}"
@@ -667,16 +914,19 @@ def cmd_health(format_json: bool = False) -> int:
     # Check 2: mitmproxy responsive (try TCP connect to port 8080).
     checks["mitmproxy_responsive"] = False
     if checks["container_running"]:
+        sock = None
         try:
             proxy_ip = get_proxy_ip(NETWORK)
             if proxy_ip:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(2.0)
+                sock.settimeout(2.0)  # Health checks should be fast; 2s is generous.
                 result = sock.connect_ex((proxy_ip, 8080))
-                sock.close()
                 checks["mitmproxy_responsive"] = result == 0
-        except Exception:
+        except (OSError, socket.error):
             pass
+        finally:
+            if sock:
+                sock.close()
 
     # Check 3: Policy loaded.
     checks["policy_loaded"] = POLICY_FILE.exists()
@@ -688,7 +938,7 @@ def cmd_health(format_json: bool = False) -> int:
         test_file.touch()
         test_file.unlink()
         checks["log_writable"] = True
-    except Exception:
+    except (IOError, OSError):
         pass
 
     # Check 5: Metrics socket available.
@@ -701,11 +951,12 @@ def cmd_health(format_json: bool = False) -> int:
             proxy_ip = get_proxy_ip(NETWORK)
             if proxy_ip:
                 import urllib.request
+                # Port 8089: health addon's dedicated HTTP endpoint.
                 req = urllib.request.Request(f"http://{proxy_ip}:8089/health")
                 with urllib.request.urlopen(req, timeout=2.0) as resp:
                     if resp.status == 200:
                         checks["health_endpoint"] = True
-        except Exception:
+        except (OSError, urllib.error.URLError, ValueError):
             # Health endpoint is optional.
             pass
 
@@ -727,34 +978,50 @@ def cmd_health(format_json: bool = False) -> int:
 def cmd_stats(cell_name: str = None, format_json: bool = False) -> int:
     """Show request metrics."""
     if not METRICS_SOCKET.exists():
-        print("ERROR: Metrics socket not available. Ensure metrics.py addon is loaded.",
-              file=sys.stderr)
+        print_error("Metrics socket not available. Ensure metrics.py addon is loaded.")
         return 1
 
+    # Cap response size to prevent OOM from misbehaving socket.
+    # 10 MB is generous: typical metrics for 100 cells is ~200 KB.
+    max_response_bytes = 10 * 1024 * 1024
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(str(METRICS_SOCKET))
-        sock.settimeout(5.0)
+        sock.settimeout(5.0)  # Metrics aggregation may take a moment.
 
         if cell_name:
-            sock.send(f"cell:{cell_name}".encode("utf-8"))
+            sock.sendall(f"cell:{cell_name}".encode("utf-8"))
         else:
-            sock.send(b"all")
+            sock.sendall(b"all")
 
         # Read response in loop to handle large payloads.
         chunks = []
+        total_bytes = 0
         while True:
-            chunk = sock.recv(65536)
+            chunk = sock.recv(65536)  # 64 KB recv buffer — standard socket read size.
             if not chunk:
                 break
+            if total_bytes + len(chunk) > max_response_bytes:
+                print_error("Metrics response exceeds size limit")
+                return 1
+            total_bytes += len(chunk)
             chunks.append(chunk)
-        sock.close()
         response = b"".join(chunks).decode("utf-8")
 
-        data = json.loads(response)
+        try:
+            data = json.loads(response)
+        except json.JSONDecodeError as e:
+            print_error(f"Failed to parse metrics response: {e}")
+            return 1
+
+        if not isinstance(data, dict):
+            print_error("Metrics response must be a JSON object")
+            return 1
 
         if "error" in data:
-            print(f"ERROR: {data['error']}", file=sys.stderr)
+            error_msg = str(data.get("error", "unknown"))[:500]
+            print_error(f"Metrics error: {error_msg}")
             return 1
 
         if format_json:
@@ -773,11 +1040,13 @@ def cmd_stats(cell_name: str = None, format_json: bool = False) -> int:
         return 0
 
     except socket.error as e:
-        print(f"ERROR: Failed to connect to metrics socket: {e}", file=sys.stderr)
+        print_error(f"Failed to connect to metrics socket: {e}")
         return 1
     except json.JSONDecodeError as e:
-        print(f"ERROR: Failed to parse metrics response: {e}", file=sys.stderr)
+        print_error(f"Failed to parse metrics response: {e}")
         return 1
+    finally:
+        sock.close()
 
 
 def _print_metrics(metrics: dict) -> None:
@@ -798,14 +1067,14 @@ def cmd_policy_validate(file_path: str = None) -> int:
     policy_path = Path(file_path) if file_path else POLICY_FILE
 
     if not policy_path.exists():
-        print(f"ERROR: Policy file not found: {policy_path}", file=sys.stderr)
+        print_error(f"Policy file not found: {policy_path}")
         return 1
 
     try:
         with open(policy_path, "r") as f:
             policy = json.load(f)
     except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON: {e}", file=sys.stderr)
+        print_error(f"Invalid JSON: {e}")
         return 1
 
     errors = []
@@ -843,15 +1112,23 @@ def cmd_policy_validate(file_path: str = None) -> int:
     log_filter = policy.get("log_filter", {})
     if log_filter:
         sample_rate = log_filter.get("sample_rate", 1.0)
-        if not (0 <= sample_rate <= 1):
+        if not isinstance(sample_rate, (int, float)):
+            errors.append("log_filter.sample_rate must be a number")
+        elif not (0 <= sample_rate <= 1):
             errors.append("log_filter.sample_rate must be between 0 and 1")
 
     # Validate notifications.
     notifications = policy.get("notifications", {})
     if notifications:
         webhook_url = notifications.get("webhook_url", "")
-        if webhook_url and not webhook_url.startswith(("http://", "https://")):
-            errors.append("notifications.webhook_url must be a valid HTTP(S) URL")
+        if webhook_url:
+            if not webhook_url.startswith(("http://", "https://")):
+                errors.append("notifications.webhook_url must be a valid HTTP(S) URL")
+            else:
+                from urllib.parse import urlparse
+                parsed = urlparse(webhook_url)
+                if not parsed.hostname:
+                    errors.append("notifications.webhook_url must have a valid hostname")
 
     # Check for overlapping rules.
     all_domains = []
@@ -880,6 +1157,7 @@ def cmd_policy_validate(file_path: str = None) -> int:
         rate_limits = policy.get("rate_limits", {})
         if rate_limits:
             default = rate_limits.get("default", {})
+            # Display defaults match DEFAULT_NETWORK_POLICY (100/s, burst 500).
             default_rate = default.get("rate", 100)
             default_burst = default.get("burst", 500)
             print(f"  Rate limits: {default_rate}/s (burst: {default_burst})")
@@ -932,7 +1210,7 @@ def cmd_policy_test(domain: str, path: str = "/", method: str = "GET") -> int:
     """Test if a domain would be allowed by current policy."""
     policy = load_policy()
     if not policy:
-        print("ERROR: Could not load policy", file=sys.stderr)
+        print_error("Could not load policy")
         return 1
 
     # Check deny rules first.
@@ -985,7 +1263,9 @@ def _matches_domain(pattern: str, domain: str) -> bool:
 
     if pattern.startswith("*."):
         suffix = pattern[1:]  # ".example.com"
-        return domain.endswith(suffix)
+        # Wildcard matches subdomains only, NOT the bare domain.
+        # Dot-boundary check prevents "notexample.com" matching ".example.com".
+        return domain.endswith(suffix) and len(domain) > len(suffix)
     else:
         return domain == pattern
 
@@ -1007,6 +1287,7 @@ def _rule_str(rule) -> str:
 def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: str = "hourly",
                      samples_per_hour: int = 10, archive_path: str = None,
                      older_than: str = "7d", model: str = None) -> int:
+    # samples_per_hour=10: enough to spot patterns without keeping every request.
     """Compact log files using the specified strategy.
 
     Strategies:
@@ -1016,21 +1297,29 @@ def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: st
         archive: Compress and move to archive location.
         ai: Use Claude API to intelligently summarize while preserving security events.
     """
-    from collections import defaultdict
     import random
     import shutil
+    from collections import defaultdict
 
     if not LOG_DIR.exists():
         print("No log directory found")
         return 0
 
+    # Validate cell name to prevent glob injection.
+    if cell_name and not validate_cell_name(cell_name):
+        print_error(f"Invalid cell name: {cell_name}")
+        return 1
+
     # Parse older_than duration.
     duration_match = re.match(r"(\d+)([dhm])", older_than)
     if not duration_match:
-        print(f"ERROR: Invalid duration format: {older_than}", file=sys.stderr)
+        print_error(f"Invalid duration format: {older_than}")
         return 1
 
     duration_val = int(duration_match.group(1))
+    if duration_val <= 0:
+        print_error("Duration must be positive")
+        return 1
     duration_unit = duration_match.group(2)
     if duration_unit == "d":
         cutoff = datetime.now() - timedelta(days=duration_val)
@@ -1055,7 +1344,6 @@ def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: st
             if mtime >= cutoff:
                 continue  # Skip recent files.
 
-            cell = log_file.stem
             entries = []
 
             with open(log_file, "r") as f:
@@ -1107,6 +1395,7 @@ def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: st
                 with open(compact_file, "w") as f:
                     for (bucket_ts, host, method, status), agg in aggregated.items():
                         latencies = sorted(agg["latencies"])
+                        # 95th percentile — standard SRE latency indicator.
                         p95_idx = int(len(latencies) * 0.95) if latencies else 0
                         compact_entry = {
                             "bucket": bucket_ts,
@@ -1146,10 +1435,20 @@ def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: st
 
             elif strategy == "archive":
                 if not archive_path:
-                    print("ERROR: --archive-path required for archive strategy", file=sys.stderr)
+                    print_error("--archive-path required for archive strategy")
                     return 1
 
+                if ".." in archive_path.split("/"):
+                    print_error("Archive path must not contain path traversal")
+                    return 1
                 archive_dir = Path(archive_path)
+                try:
+                    archive_dir = archive_dir.resolve()
+                except OSError:
+                    print_error(f"Invalid archive path: {archive_path}")
+                    return 1
+                if not archive_dir.is_absolute():
+                    archive_dir = Path.cwd() / archive_dir
                 archive_dir.mkdir(parents=True, exist_ok=True)
 
                 # Compress and move.
@@ -1164,7 +1463,7 @@ def cmd_logs_compact(cell_name: str = None, strategy: str = "delete", bucket: st
                 compacted += 1
 
         except (IOError, OSError) as e:
-            print(f"WARNING: Failed to process {log_file}: {e}", file=sys.stderr)
+            warn(f"Failed to process {log_file}: {e}")
 
     print(f"Compacted {compacted} files ({entries_processed} entries) using '{strategy}' strategy")
     return 0
@@ -1181,13 +1480,13 @@ def cmd_logs_compact_ai(cell_name: str, older_than: str = "24h", model: str = No
         - Per-cell config in policy file (optional, for customization)
     """
     if not cell_name:
-        print("ERROR: Cell name required for AI compaction", file=sys.stderr)
+        print_error("Cell name required for AI compaction")
         return 1
 
     # Parse older_than duration.
     duration_match = re.match(r"(\d+)([dhm])", older_than)
     if not duration_match:
-        print(f"ERROR: Invalid duration format: {older_than}", file=sys.stderr)
+        print_error(f"Invalid duration format: {older_than}")
         return 1
 
     duration_val = int(duration_match.group(1))
@@ -1202,7 +1501,7 @@ def cmd_logs_compact_ai(cell_name: str, older_than: str = "24h", model: str = No
     try:
         # Import summarizer module.
         sys.path.insert(0, str(Path(__file__).parent / "addons"))
-        from summarizer import compact_cell_logs, SummarizationConfig, LogSummarizer
+        from summarizer import compact_cell_logs
 
         # Use per-cell policy directory.
         policy_dir = Path("/var/run/brig/policies")
@@ -1215,7 +1514,7 @@ def cmd_logs_compact_ai(cell_name: str, older_than: str = "24h", model: str = No
         )
 
         if "error" in result:
-            print(f"ERROR: {result['error']}", file=sys.stderr)
+            print_error(result['error'])
             return 1
 
         if "message" in result:
@@ -1240,10 +1539,10 @@ def cmd_logs_compact_ai(cell_name: str, older_than: str = "24h", model: str = No
         return 0
 
     except ImportError as e:
-        print(f"ERROR: Failed to import summarizer module: {e}", file=sys.stderr)
+        print_error(f"Failed to import summarizer module: {e}")
         return 1
     except Exception as e:
-        print(f"ERROR: AI compaction failed: {e}", file=sys.stderr)
+        print_error(f"AI compaction failed: {e}")
         return 1
 
 
@@ -1259,6 +1558,11 @@ def cmd_logs_export(cell_name: str = None, format_type: str = "jsonl",
     if not LOG_DIR.exists():
         print("No log directory found")
         return 0
+
+    # Validate cell name to prevent glob injection.
+    if cell_name and not validate_cell_name(cell_name):
+        print_error(f"Invalid cell name: {cell_name}")
+        return 1
 
     # Find log files.
     pattern = f"{cell_name}.jsonl" if cell_name else "*.jsonl"
@@ -1294,7 +1598,10 @@ def cmd_logs_export(cell_name: str = None, format_type: str = "jsonl",
 
     # Determine output.
     if output_file:
-        out_path = Path(output_file)
+        if ".." in output_file.split("/"):
+            print_error("Output path must not contain path traversal")
+            return 1
+        out_path = Path(output_file).resolve()
     else:
         suffix = {"jsonl": ".jsonl", "csv": ".csv", "parquet": ".parquet"}[format_type]
         out_path = Path(f"warden-logs-export{suffix}")
@@ -1335,8 +1642,7 @@ def cmd_logs_export(cell_name: str = None, format_type: str = "jsonl",
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError:
-            print("ERROR: pyarrow required for parquet export. Install with: pip install pyarrow",
-                  file=sys.stderr)
+            print_error("pyarrow required for parquet export. Install with: pip install pyarrow")
             return 1
 
         # Convert to columnar format.
@@ -1360,130 +1666,231 @@ def cmd_logs_export(cell_name: str = None, format_type: str = "jsonl",
     return 0
 
 
+def _cleanup_tor_stack() -> None:
+    """Remove Tor and Privoxy containers and config file."""
+    for name in [PRIVOXY_CONTAINER_NAME, TOR_CONTAINER_NAME]:
+        run(["podman", "rm", "-f", name], check=False, capture=True)
+    try:
+        PRIVOXY_CONFIG_HOST.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _wait_for_port(container_name: str, port: int, timeout_secs: int = 30) -> bool:
+    """Wait until a TCP port is reachable on a container."""
+    for i in range(timeout_secs):
+        time.sleep(1)
+        ip = _get_container_ip(container_name)
+        if ip:
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                if sock.connect_ex((ip, port)) == 0:
+                    return True
+            except (OSError, socket.error):
+                pass
+            finally:
+                if sock:
+                    sock.close()
+        if i % 5 == 0 and i > 0:
+            info(f"Waiting for {container_name}:{port}... ({i}s)")
+    return False
+
+
 def cmd_tor_start() -> int:
-    """Start Tor container."""
-    if tor_running():
-        print("Tor is already running")
+    """Start the Tor stack (Tor + Privoxy bridge).
+
+    Architecture: Cell -> Warden (policy) -> Privoxy (HTTP->SOCKS5) -> Tor -> Internet.
+    Cells cannot reach Privoxy or Tor directly (different networks).
+    """
+    # Idempotent: both running means nothing to do.
+    if tor_running() and privoxy_running():
+        print("Tor stack is already running")
         return 0
 
-    # Remove existing stopped container.
-    if tor_exists():
-        run(["podman", "rm", "-f", TOR_CONTAINER_NAME], check=False)
+    # Recovery: only Tor up but Privoxy down.
+    if tor_running() and not privoxy_running():
+        info("Tor running, recovering Privoxy bridge")
+    else:
+        # Remove any stopped containers.
+        if tor_exists():
+            run(["podman", "rm", "-f", TOR_CONTAINER_NAME], check=False)
+        if privoxy_exists():
+            run(["podman", "rm", "-f", PRIVOXY_CONTAINER_NAME], check=False)
 
-    cmd = [
+        # Start Tor container with hardening.
+        tor_cmd = [
+            "podman", "run", "-d",
+            "--name", TOR_CONTAINER_NAME,
+            "--runtime", "crun",
+            "--network", NETWORK,
+
+            # Security hardening.
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--read-only",
+            "--tmpfs", "/var/lib/tor:rw,noexec,nosuid,size=64m",
+            "--tmpfs", "/run:rw,noexec,nosuid,size=4m",
+
+            # Resource limits.
+            "--memory", "256m",
+            "--cpus", "0.5",
+            "--pids-limit", "64",
+
+            TOR_IMAGE,
+        ]
+
+        try:
+            run(tor_cmd, timeout=120)
+            info("Tor container started")
+        except subprocess.TimeoutExpired:
+            print_error("Tor start timed out (check network and image availability)")
+            _cleanup_tor_stack()
+            return 1
+        except subprocess.CalledProcessError as e:
+            print_error(f"Failed to start Tor: {e}")
+            _cleanup_tor_stack()
+            return 1
+
+        # Wait for Tor SOCKS5 port up to 60s for bootstrap.
+        if not _wait_for_port(TOR_CONTAINER_NAME, TOR_SOCKS_PORT, timeout_secs=60):
+            print_error("Tor did not become ready in 60s")
+            _cleanup_tor_stack()
+            return 1
+
+        info(f"Tor SOCKS5 is ready on port {TOR_SOCKS_PORT}")
+
+    # Write Privoxy config atomically.
+    # Podman DNS resolves 'warden-tor' within proxy-external network.
+    privoxy_conf = (
+        f"forward-socks5t / {TOR_CONTAINER_NAME}:{TOR_SOCKS_PORT} .\n"
+        f"listen-address 0.0.0.0:{PRIVOXY_PORT}\n"
+        "toggle 0\n"
+    )
+    try:
+        PRIVOXY_CONFIG_HOST.parent.mkdir(parents=True, exist_ok=True)
+        tmp_file = PRIVOXY_CONFIG_HOST.with_suffix(".tmp")
+        with open(tmp_file, "w") as f:
+            f.write(privoxy_conf)
+        tmp_file.rename(PRIVOXY_CONFIG_HOST)
+    except (IOError, OSError) as e:
+        print_error(f"Failed to write Privoxy config: {e}")
+        _cleanup_tor_stack()
+        return 1
+
+    # Remove stopped Privoxy container if recovery path.
+    if privoxy_exists():
+        run(["podman", "rm", "-f", PRIVOXY_CONTAINER_NAME], check=False)
+
+    # Start Privoxy container.
+    privoxy_cmd = [
         "podman", "run", "-d",
-        "--name", TOR_CONTAINER_NAME,
+        "--name", PRIVOXY_CONTAINER_NAME,
         "--runtime", "crun",
         "--network", NETWORK,
 
         # Security hardening.
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
+        "--read-only",
+        "--tmpfs", "/var/log/privoxy:rw,noexec,nosuid,size=16m",
+        "--tmpfs", "/var/run/privoxy:rw,noexec,nosuid,size=1m",
+
+        # Mount Privoxy config read-only.
+        "-v", f"{PRIVOXY_CONFIG_HOST}:/etc/privoxy/config:ro",
 
         # Resource limits.
-        "--memory", "256m",
-        "--cpus", "0.5",
-        "--pids-limit", "64",
+        "--memory", "128m",
+        "--cpus", "0.25",
+        "--pids-limit", "32",
 
-        # Use digest-pinned image.
-        TOR_IMAGE,
+        PRIVOXY_IMAGE,
     ]
 
     try:
-        # Allow extra time for image pull.
-        run(cmd, timeout=120)
-        print("Tor started")
-
-        # Wait for Tor to be ready (check if SOCKS5 port is listening).
-        for i in range(30):
-            time.sleep(1)
-            if tor_running():
-                # Get Tor container IP on proxy-external network.
-                result = run(
-                    ["podman", "inspect", TOR_CONTAINER_NAME, "--format",
-                     "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
-                    check=False, capture=True
-                )
-                tor_ip = result.stdout.strip()
-                if tor_ip:
-                    # Check if port 9050 is reachable.
-                    try:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(2.0)
-                        if sock.connect_ex((tor_ip, 9050)) == 0:
-                            sock.close()
-                            print(f"Tor is ready at {tor_ip}:9050")
-                            print("Restart warden to use Tor: warden restart")
-                            return 0
-                        sock.close()
-                    except Exception:
-                        pass
-            if i % 5 == 0 and i > 0:
-                print(f"Waiting for Tor to bootstrap... ({i}s)")
-
-        print("WARNING: Tor may not have started correctly", file=sys.stderr)
-        return 1
-
+        run(privoxy_cmd, timeout=60)
+        info("Privoxy bridge started")
     except subprocess.TimeoutExpired:
-        print("ERROR: Tor start timed out (check network and image availability)",
-              file=sys.stderr)
+        print_error("Privoxy start timed out")
+        _cleanup_tor_stack()
         return 1
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to start Tor: {e}", file=sys.stderr)
+        print_error(f"Failed to start Privoxy: {e}")
+        _cleanup_tor_stack()
         return 1
+
+    # Wait for Privoxy port (8118) up to 15s.
+    if not _wait_for_port(PRIVOXY_CONTAINER_NAME, PRIVOXY_PORT, timeout_secs=15):
+        print_error("Privoxy did not become ready in 15s")
+        _cleanup_tor_stack()
+        return 1
+
+    print("Tor is ready. Restart Warden to route through Tor: warden restart")
+    return 0
 
 
 def cmd_tor_stop() -> int:
-    """Stop Tor container."""
-    if not tor_exists():
-        print("Tor is not running")
+    """Stop the Tor stack (Privoxy + Tor)."""
+    if not tor_exists() and not privoxy_exists():
+        print("Tor stack is not running")
         return 0
 
+    # Stop Privoxy first (depends on Tor).
+    if privoxy_exists():
+        try:
+            run(["podman", "stop", "-t", "5", PRIVOXY_CONTAINER_NAME], timeout=15)
+            run(["podman", "rm", PRIVOXY_CONTAINER_NAME])
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            run(["podman", "rm", "-f", PRIVOXY_CONTAINER_NAME], check=False)
+
+    # Stop Tor.
+    if tor_exists():
+        try:
+            run(["podman", "stop", "-t", "10", TOR_CONTAINER_NAME], timeout=30)
+            run(["podman", "rm", TOR_CONTAINER_NAME])
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            run(["podman", "rm", "-f", TOR_CONTAINER_NAME], check=False)
+
+    # Delete Privoxy config file.
     try:
-        run(["podman", "stop", "-t", "10", TOR_CONTAINER_NAME], timeout=30)
-        run(["podman", "rm", TOR_CONTAINER_NAME])
-        print("Tor stopped. Restart warden to disable Tor: warden restart")
-        return 0
-    except subprocess.TimeoutExpired:
-        print("ERROR: Stop command timed out. Try: podman kill warden-tor", file=sys.stderr)
-        return 1
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to stop Tor: {e}", file=sys.stderr)
-        return 1
+        PRIVOXY_CONFIG_HOST.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    print("Tor stopped. Restart Warden to disable Tor: warden restart")
+    return 0
 
 
 def cmd_tor_status() -> int:
-    """Show Tor status."""
-    if tor_running():
-        print("Tor: running")
+    """Show Tor stack status."""
+    tor_up = tor_running()
+    privoxy_up = privoxy_running()
+    warden_upstream = _is_warden_tor_mode()
 
-        # Get Tor network info.
-        result = run(
-            ["podman", "inspect", TOR_CONTAINER_NAME, "--format",
-             "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}: {{$v.IPAddress}}\n{{end}}"],
-            check=False, capture=True
-        )
-        if result.returncode == 0:
-            print(f"Networks:\n{result.stdout}")
+    # Show component status.
+    print(f"Tor:     {'running' if tor_up else 'stopped'}")
+    print(f"Privoxy: {'running' if privoxy_up else 'stopped'}")
+    print(f"Warden:  {'upstream mode (Tor active)' if warden_upstream else 'direct mode'}")
 
-        # Show usage instructions.
-        result = run(
-            ["podman", "inspect", TOR_CONTAINER_NAME, "--format",
-             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
-            check=False, capture=True
-        )
-        tor_ip = result.stdout.strip()
-        if tor_ip:
-            print("Usage: Cells can use Tor directly via SOCKS5:")
-            print(f"  export ALL_PROXY=socks5://{tor_ip}:9050")
-            print(f"  curl --proxy socks5://{tor_ip}:9050 https://check.torproject.org/api/ip")
+    if tor_up and privoxy_up:
+        print(f"\nChain: cell -> warden:8080 -> privoxy:{PRIVOXY_PORT} -> tor:{TOR_SOCKS_PORT} -> internet")
+
+        if not warden_upstream:
+            warn("Warden must be restarted to activate Tor routing: warden restart")
+        else:
+            print("\nVerify with: brig exec <cell> curl https://check.torproject.org/api/ip")
 
         return 0
-    elif tor_exists():
-        print("Tor: stopped")
+    elif tor_up and not privoxy_up:
+        warn("Tor is running but Privoxy bridge is down. Run: warden tor start")
+        return 1
+    elif tor_exists() or privoxy_exists():
+        print("\nTor stack: stopped")
         return 1
     else:
-        print("Tor: not created")
+        print("\nTor stack: not created")
+        print("Start with: warden tor start")
         return 1
 
 
@@ -1493,6 +1900,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version", version=f"warden {VERSION}")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output")
+    parser.add_argument("--quiet", "-q", action="store_true", help="Suppress info messages")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Basic commands.
@@ -1573,6 +1982,13 @@ def main():
 
     args = parser.parse_args()
 
+    # Configure log level from flags.
+    global LOG_LEVEL, QUIET
+    if args.debug:
+        LOG_LEVEL = LOG_LEVEL_DEBUG
+    if args.quiet:
+        QUIET = True
+
     if args.command == "start":
         sys.exit(cmd_start())
     elif args.command == "stop":
@@ -1591,6 +2007,9 @@ def main():
         if args.logs_command == "prune":
             sys.exit(cmd_logs_prune(args.days, args.size))
         elif args.logs_command == "compact":
+            if args.cell_name and not validate_cell_name(args.cell_name):
+                print_error(f"Invalid cell name: {args.cell_name}")
+                sys.exit(1)
             if args.strategy == "ai":
                 sys.exit(cmd_logs_compact_ai(
                     args.cell_name, args.older_than, args.model
@@ -1601,18 +2020,30 @@ def main():
                     args.samples_per_hour, args.archive_path, args.older_than
                 ))
         elif args.logs_command == "export":
+            if args.cell_name and not validate_cell_name(args.cell_name):
+                print_error(f"Invalid cell name: {args.cell_name}")
+                sys.exit(1)
             sys.exit(cmd_logs_export(
                 args.cell_name, args.format_type, args.output, args.days
             ))
         else:
             sys.exit(cmd_logs())
     elif args.command == "join":
+        if not validate_cell_name(args.cell_name):
+            print_error(f"Invalid cell name: {args.cell_name}")
+            sys.exit(1)
         sys.exit(cmd_join(args.cell_name))
     elif args.command == "leave":
+        if not validate_cell_name(args.cell_name):
+            print_error(f"Invalid cell name: {args.cell_name}")
+            sys.exit(1)
         sys.exit(cmd_leave(args.cell_name))
     elif args.command == "health":
         sys.exit(cmd_health(args.format_json))
     elif args.command == "stats":
+        if args.cell_name and not validate_cell_name(args.cell_name):
+            print_error(f"Invalid cell name: {args.cell_name}")
+            sys.exit(1)
         sys.exit(cmd_stats(args.cell_name, args.format_json))
     elif args.command == "policy":
         if args.policy_command == "validate":

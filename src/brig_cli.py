@@ -10,9 +10,9 @@ The actual implementation is in brig.py (which must be renamed or this must impo
 
 def main():
     """Entry point for brig CLI."""
+    import os
     import runpy
     import sys
-    import os
 
     # Find brig.py in the same directory.
     src_dir = os.path.dirname(os.path.abspath(__file__))

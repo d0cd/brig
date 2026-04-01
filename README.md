@@ -17,7 +17,7 @@ Brig isolates workloads in **cells** - containers with gVisor sandboxing, dedica
 ### Prerequisites
 
 - macOS
-- Python 3.9+
+- Python 3.10+
 - [Lima](https://github.com/lima-vm/lima): `brew install lima`
 
 ### Installation
@@ -100,6 +100,8 @@ warden status                # Check proxy status
 warden stats                 # View request metrics
 warden health                # Health check
 warden policy validate       # Validate policy file
+warden tor start             # Start Tor + Privoxy bridge
+warden tor status            # Check Tor routing status
 ```
 
 ## Network Policy
@@ -141,6 +143,9 @@ Configure allowed domains in `~/.brig/cells/network-policy.json`:
 ## Documentation
 
 - [Installation Guide](INSTALLATION.md)
+- [Concepts](docs/learning/concepts.md)
+- [Workflows](docs/learning/workflows.md)
+- [CLI Reference](docs/design/reference.md)
 - [Security Design](docs/design/security.md)
 - [Troubleshooting](docs/learning/troubleshooting.md)
 

@@ -1,0 +1,242 @@
+name: E2E
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"  # Weekly Monday 04:00 UTC (cost control).
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/brig/commands/_helpers.py"
+      - "src/warden.py"
+      - "src/brig_subnet.py"
+      - "src/addons/*.py"
+      - "tests/test_*.sh"
+      - "install.sh"
+      - ".github/workflows/e2e.yml"
+      - ".github/e2e/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CELL_VM_NAME: cell
+
+jobs:
+  e2e:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install brig on host
+        timeout-minutes: 3
+        run: pip install -e .
+
+      - name: Install Lima
+        timeout-minutes: 3
+        run: |
+          brew install lima
+          LIMA_VERSION=$(limactl --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+          echo "Lima version: $LIMA_VERSION"
+
+      - name: Create brig home
+        timeout-minutes: 1
+        run: mkdir -p ~/.brig/{cells/addons,secrets,state/system}
+
+      - name: Copy CI Lima YAML
+        run: cp .github/e2e/lima-ci.yaml ~/.brig/lima.yaml
+
+      - name: Install addons
+        run: |
+          cp src/addons/*.py ~/.brig/cells/addons/
+          cat > ~/.brig/cells/network-policy.json << 'EOF'
+          {
+            "allow": [
+              "pypi.org",
+              "*.pythonhosted.org",
+              "files.pythonhosted.org",
+              "github.com",
+              "api.github.com",
+              "*.githubusercontent.com",
+              "registry.npmjs.org"
+            ],
+            "deny": [],
+            "rate_limits": {"default": {"rate": 100, "burst": 500}},
+            "log_filter": {"exclude_hosts": [], "exclude_paths": ["/health", "/ping"], "sample_rate": 1.0},
+            "policy_trace": {"enabled": true, "include_rule_details": true, "include_timing": false}
+          }
+          EOF
+
+      - name: Restore VM cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        id: vm-cache
+        with:
+          path: ~/.lima/cell/
+          key: lima-vm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/e2e/lima-ci.yaml') }}
+
+      - name: Create VM (cache miss)
+        if: steps.vm-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 15
+        run: |
+          limactl create --name=cell ~/.brig/lima.yaml
+          limactl start cell
+          # Poll for Running state.
+          for i in $(seq 1 60); do
+            STATUS=$(limactl list --json | python3 -c "import sys,json; vms=json.load(sys.stdin); print(next((v['status'] for v in vms if v['name']=='cell'), 'unknown'))" 2>/dev/null || echo "unknown")
+            if [ "$STATUS" = "Running" ]; then
+              echo "VM is running after ${i}s"
+              break
+            fi
+            sleep 5
+          done
+          # Verify podman and runsc are available.
+          limactl shell cell -- podman --version
+          limactl shell cell -- runsc --version
+
+      - name: Start VM (cache hit)
+        if: steps.vm-cache.outputs.cache-hit == 'true'
+        timeout-minutes: 5
+        run: |
+          limactl start cell
+          for i in $(seq 1 30); do
+            STATUS=$(limactl list --json | python3 -c "import sys,json; vms=json.load(sys.stdin); print(next((v['status'] for v in vms if v['name']=='cell'), 'unknown'))" 2>/dev/null || echo "unknown")
+            if [ "$STATUS" = "Running" ]; then
+              echo "VM is running after ${i}s"
+              break
+            fi
+            sleep 3
+          done
+
+      - name: Install brig in VM
+        timeout-minutes: 5
+        run: |
+          limactl shell cell -- sudo pip3 install "$GITHUB_WORKSPACE"
+          limactl shell cell -- which brig
+          limactl shell cell -- which warden
+
+      - name: Pre-pull mitmproxy image
+        timeout-minutes: 3
+        run: |
+          limactl shell cell -- sudo podman pull docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268
+
+      - name: Start Warden
+        timeout-minutes: 3
+        run: |
+          limactl shell cell -- sudo warden start
+          for i in $(seq 1 15); do
+            if limactl shell cell -- sudo podman ps --filter name=^warden$ --format '{{.Names}}' | grep -q warden; then
+              echo "Warden is running"
+              break
+            fi
+            sleep 2
+          done
+
+      # Test suites (continue-on-error to run all, check results after).
+      - name: "Test: VM Foundation"
+        id: test_vm_foundation
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_vm_foundation.sh
+
+      - name: "Test: Subnet Allocator"
+        id: test_subnet_allocator
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_subnet_allocator.sh
+
+      - name: "Test: Proxy Policy"
+        id: test_proxy_policy
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_proxy_policy.sh
+
+      - name: "Test: Cell Lifecycle"
+        id: test_cell_lifecycle
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_cell_lifecycle.sh
+
+      - name: "Test: Secrets"
+        id: test_secrets
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_secrets.sh
+
+      - name: "Test: Observability"
+        id: test_observability
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_observability.sh
+
+      - name: "Test: Hardening"
+        id: test_hardening
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_hardening.sh
+
+      - name: "Test: Per-Cell Policy"
+        id: test_per_cell_policy
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_per_cell_policy.sh
+
+      - name: "Test: Warden Features"
+        id: test_warden_features
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_warden_features.sh
+
+      - name: Check results
+        run: |
+          FAILED=0
+          for step in \
+            "${{ steps.test_vm_foundation.outcome }}" \
+            "${{ steps.test_subnet_allocator.outcome }}" \
+            "${{ steps.test_proxy_policy.outcome }}" \
+            "${{ steps.test_cell_lifecycle.outcome }}" \
+            "${{ steps.test_secrets.outcome }}" \
+            "${{ steps.test_observability.outcome }}" \
+            "${{ steps.test_hardening.outcome }}" \
+            "${{ steps.test_per_cell_policy.outcome }}" \
+            "${{ steps.test_warden_features.outcome }}"
+          do
+            if [ "$step" = "failure" ]; then
+              FAILED=$((FAILED + 1))
+            fi
+          done
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::$FAILED test suite(s) failed"
+            exit 1
+          fi
+          echo "All test suites passed"
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p /tmp/e2e-logs
+          limactl shell cell -- sudo journalctl --no-pager -n 500 > /tmp/e2e-logs/journalctl.log 2>&1 || true
+          limactl shell cell -- sudo podman ps -a > /tmp/e2e-logs/podman-ps.log 2>&1 || true
+          limactl shell cell -- sudo podman network ls > /tmp/e2e-logs/podman-networks.log 2>&1 || true
+          limactl shell cell -- sudo podman logs warden > /tmp/e2e-logs/warden.log 2>&1 || true
+          limactl shell cell -- cat /state/system/subnets.json > /tmp/e2e-logs/subnets.json 2>&1 || true
+          cp ~/.lima/cell/ha.stderr.log /tmp/e2e-logs/lima-stderr.log 2>/dev/null || true
+          cp ~/.lima/cell/serial.log /tmp/e2e-logs/lima-serial.log 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: e2e-logs
+          path: /tmp/e2e-logs/
+          retention-days: 7

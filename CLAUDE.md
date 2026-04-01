@@ -125,8 +125,8 @@ def validate_path(path):
 ```
 ~/.brig/
 ├── lima.yaml           # VM config
-├── network-policy.yaml # Warden allowlist
 ├── cells/              # Cell definitions
+│   ├── network-policy.json  # Warden allowlist
 │   └── addons/        # Warden addons
 ├── secrets/            # One file per secret
 └── state/              # Cell workspaces and logs

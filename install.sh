@@ -2,7 +2,7 @@
 # Brig Installation Script
 # Installs brig CLI and initializes the environment
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -40,10 +40,10 @@ check_python() {
     fi
 
     PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    REQUIRED_VERSION="3.9"
+    REQUIRED_VERSION="3.10"
 
     if [[ "$(printf '%s\n' "$REQUIRED_VERSION" "$PYTHON_VERSION" | sort -V | head -n1)" != "$REQUIRED_VERSION" ]]; then
-        log_error "Python 3.9+ is required. Found: Python $PYTHON_VERSION"
+        log_error "Python 3.10+ is required. Found: Python $PYTHON_VERSION"
         exit 1
     fi
     log_info "Found Python $PYTHON_VERSION"
@@ -190,7 +190,7 @@ main() {
         esac
     done
 
-    install_brig $DEV_MODE
+    install_brig "$DEV_MODE"
 
     if [[ -z "$SKIP_INIT" ]]; then
         echo ""

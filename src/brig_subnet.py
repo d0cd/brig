@@ -27,6 +27,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,15 @@ SUBNET_PREFIX = "10.60"
 MIN_INDEX = 1
 MAX_INDEX = 254
 
+# Cell name pattern imported from shared config.
+from brig.config import CELL_NAME_PATTERN
+
+
+def validate_cell_name(name: str) -> None:
+    """Validate cell name or exit with error."""
+    if not CELL_NAME_PATTERN.match(name):
+        error(f"Invalid cell name '{name}': must match {CELL_NAME_PATTERN.pattern}")
+
 
 def error(msg: str) -> None:
     """Print error message and exit."""
@@ -50,14 +60,31 @@ def error(msg: str) -> None:
 
 def load_state() -> dict:
     """Load subnet allocation state from file."""
+    default = {"next_index": 1, "allocated": {}, "freed": []}
     if not SUBNETS_FILE.exists():
-        return {"next_index": 1, "allocated": {}, "freed": []}
+        return default
 
     try:
         with open(SUBNETS_FILE, "r") as f:
-            return json.load(f)
+            state = json.load(f)
     except (json.JSONDecodeError, IOError) as e:
         error(f"Failed to load {SUBNETS_FILE}: {e}")
+
+    # Validate state schema and apply defaults for missing keys.
+    if not isinstance(state, dict):
+        error(f"Corrupted state file: expected JSON object, got {type(state).__name__}")
+    for key in ("next_index", "allocated", "freed"):
+        if key not in state:
+            state[key] = default[key]
+    if not isinstance(state["next_index"], int) or state["next_index"] < MIN_INDEX:
+        state["next_index"] = default["next_index"]
+    if not isinstance(state["allocated"], dict):
+        state["allocated"] = default["allocated"]
+    if not isinstance(state["freed"], list):
+        state["freed"] = default["freed"]
+    # Filter out invalid freed indices.
+    state["freed"] = [i for i in state["freed"] if isinstance(i, int) and validate_index(i)]
+    return state
 
 
 def save_state(state: dict) -> None:
@@ -69,6 +96,8 @@ def save_state(state: dict) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(state, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.rename(tmp_path, SUBNETS_FILE)
     except Exception as e:
         os.unlink(tmp_path)
@@ -90,6 +119,8 @@ def update_subnet_map(state: dict) -> None:
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(mapping, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.rename(tmp_path, SUBNET_MAP_FILE)
     except Exception as e:
         os.unlink(tmp_path)
@@ -122,15 +153,18 @@ def with_lock(func):
 @with_lock
 def cmd_allocate(cell_name: str) -> None:
     """Allocate a subnet for a cell."""
+    validate_cell_name(cell_name)
     state = load_state()
 
     # Check if cell already has allocation
     if cell_name in state["allocated"]:
         error(f"Cell '{cell_name}' already has subnet allocated")
 
-    # Get next index (prefer freed, then next_index)
+    # Get next index (prefer freed, then next_index).
     if state["freed"]:
         index = state["freed"].pop(0)
+        if not validate_index(index):
+            error(f"Corrupted state: freed index {index} out of range")
     else:
         index = state["next_index"]
         if not validate_index(index):
@@ -153,6 +187,7 @@ def cmd_allocate(cell_name: str) -> None:
 @with_lock
 def cmd_free(cell_name: str) -> None:
     """Free a cell's subnet allocation."""
+    validate_cell_name(cell_name)
     state = load_state()
 
     if cell_name not in state["allocated"]:
@@ -174,6 +209,7 @@ def cmd_free(cell_name: str) -> None:
 @with_lock
 def cmd_get(cell_name: str) -> None:
     """Get subnet for a cell."""
+    validate_cell_name(cell_name)
     state = load_state()
 
     if cell_name not in state["allocated"]:
@@ -214,6 +250,7 @@ def cmd_validate_index(index: int) -> None:
 @with_lock
 def cmd_create_network(cell_name: str) -> None:
     """Create a podman network for a cell."""
+    validate_cell_name(cell_name)
     state = load_state()
 
     if cell_name not in state["allocated"]:
@@ -251,6 +288,7 @@ def cmd_create_network(cell_name: str) -> None:
 @with_lock
 def cmd_remove_network(cell_name: str) -> None:
     """Remove a cell's podman network and free subnet."""
+    validate_cell_name(cell_name)
     state = load_state()
     network_name = f"brig-{cell_name}"
 

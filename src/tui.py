@@ -26,19 +26,23 @@ Keyboard shortcuts:
 """
 
 import json
+import re
 import socket
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
 
+from brig.config import CELL_NAME_PATTERN
+
 # Check for textual availability.
 try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+    from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
     from textual.reactive import reactive
     from textual.screen import Screen
+    from textual.timer import Timer
     from textual.widgets import (
         DataTable,
         Footer,
@@ -54,7 +58,6 @@ try:
         TabPane,
         Tree,
     )
-    from textual.timer import Timer
     TEXTUAL_AVAILABLE = True
 except ImportError:
     TEXTUAL_AVAILABLE = False
@@ -103,8 +106,15 @@ def get_cells() -> list[dict]:
         return []
 
 
+def _validate_tui_cell_name(cell_name: str) -> bool:
+    """Validate cell name before use in subprocess calls."""
+    return bool(cell_name and CELL_NAME_PATTERN.match(cell_name))
+
+
 def get_cell_stats(cell_name: str) -> dict:
     """Fetch resource stats for a specific cell."""
+    if not _validate_tui_cell_name(cell_name):
+        return {}
     try:
         result = subprocess.run(
             ["podman", "stats", "--no-stream", "--format", "json",
@@ -127,21 +137,45 @@ def get_metrics() -> dict:
     if not METRICS_SOCKET.exists():
         return {}
 
+    # Cap response at 10MB to prevent unbounded memory use.
+    max_response = 10 * 1024 * 1024
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(5.0)
         sock.connect(str(METRICS_SOCKET))
-        sock.send(b"all")
-        response = sock.recv(65536).decode("utf-8")
-        sock.close()
+        sock.sendall(b"all")
+        # Read response in loop to handle payloads larger than buffer.
+        chunks = []
+        total = 0
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_response:
+                return {}
+            chunks.append(chunk)
+        response = b"".join(chunks).decode("utf-8")
         return json.loads(response)
     except Exception:
         return {}
+    finally:
+        sock.close()
 
 
 def get_cell_policy(cell_name: str) -> dict:
     """Load policy for a specific cell."""
+    # Validate cell name to prevent path traversal.
+    if not re.match(r"^[a-z0-9][a-z0-9._-]{0,62}$", cell_name):
+        return {"allow": [], "deny": []}
+
     policy_file = POLICY_DIR / f"{cell_name}.json"
+    # Ensure resolved path stays under POLICY_DIR.
+    try:
+        policy_file.resolve().relative_to(POLICY_DIR.resolve())
+    except ValueError:
+        return {"allow": [], "deny": []}
+
     if not policy_file.exists():
         return {"allow": [], "deny": []}
 
@@ -152,8 +186,25 @@ def get_cell_policy(cell_name: str) -> dict:
         return {"allow": [], "deny": []}
 
 
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape sequences and other terminal control codes."""
+    # Remove ANSI CSI sequences (e.g., colors, cursor movement).
+    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    # Remove OSC sequences (e.g., title setting, hyperlinks).
+    text = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', text)
+    # Remove other escape sequences (SS2, SS3, DCS, PM, APC).
+    text = re.sub(r'\x1b[NOPXn^_][^\x1b]*(?:\x1b\\)?', '', text)
+    # Remove bare escape + single char sequences.
+    text = re.sub(r'\x1b[^[\]NOPXn^_]', '', text)
+    # Remove remaining control characters except newline and tab.
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    return text
+
+
 def get_cell_logs(cell_name: str, tail: int = 50) -> str:
     """Fetch recent logs for a cell."""
+    if not _validate_tui_cell_name(cell_name):
+        return ""
     try:
         result = subprocess.run(
             ["podman", "logs", "--tail", str(tail), f"{CONTAINER_PREFIX}{cell_name}"],
@@ -162,7 +213,8 @@ def get_cell_logs(cell_name: str, tail: int = 50) -> str:
             timeout=10,
         )
         if result.returncode == 0:
-            return result.stdout + result.stderr
+            # Sanitize to prevent terminal escape injection from untrusted containers.
+            return _strip_ansi(result.stdout + result.stderr)
     except Exception:
         pass
     return ""
@@ -184,6 +236,8 @@ def is_warden_running() -> bool:
 
 def run_cell_action(cell_name: str, action: str) -> tuple[bool, str]:
     """Execute an action on a cell. Returns (success, message)."""
+    if not _validate_tui_cell_name(cell_name):
+        return False, f"Invalid cell name: {cell_name}"
     cmd_map = {
         "stop": ["podman", "stop", f"{CONTAINER_PREFIX}{cell_name}"],
         "start": ["podman", "start", f"{CONTAINER_PREFIX}{cell_name}"],
@@ -248,16 +302,6 @@ if TEXTUAL_AVAILABLE:
                 m = cell_metrics.get(name, {})
                 requests = str(m.get("total_requests", 0))
                 blocked = str(m.get("blocked_requests", 0))
-
-                # Style based on status.
-                if status == "running":
-                    style = "green"
-                elif status == "paused":
-                    style = "yellow"
-                elif status == "exited":
-                    style = "red"
-                else:
-                    style = "dim"
 
                 self.add_row(name, status, image, requests, blocked, key=name)
                 # Color the status cell.
@@ -767,6 +811,9 @@ def run_tui(view: str = "dashboard", cell: Optional[str] = None) -> int:
     # Handle shell action.
     if isinstance(result, tuple) and result[0] == "shell":
         cell_name = result[1]
+        if not _validate_tui_cell_name(cell_name):
+            print(f"ERROR: Invalid cell name: {cell_name}", file=sys.stderr)
+            return 1
         subprocess.run(
             ["podman", "exec", "-it", f"{CONTAINER_PREFIX}{cell_name}", "/bin/sh"],
         )

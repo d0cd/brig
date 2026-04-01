@@ -411,7 +411,7 @@ class TestLoadCellDefinitionFuzzing(unittest.TestCase):
                 f.flush()
                 try:
                     # May return the parsed value or may fail - both OK.
-                    result = brig.load_cell_definition(f.name)
+                    brig.load_cell_definition(f.name)
                     # If it returns, that's fine - validation is separate.
                 except SystemExit:
                     pass  # Also acceptable.

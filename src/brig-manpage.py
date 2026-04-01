@@ -10,6 +10,8 @@ Usage:
 import datetime
 
 COMMANDS = [
+    ("init", "Initialize brig directory structure", []),
+    ("upgrade", "Upgrade brig state to current schema version", []),
     ("run", "Run a new cell", [
         ("-n, --name NAME", "Cell name (required unless in definition file)"),
         ("-f, --file FILE", "Cell definition file (YAML or JSON)"),
@@ -23,11 +25,25 @@ COMMANDS = [
         ("--pids-limit N", "PID limit (default: 512)"),
         ("--policy-allow DOMAIN", "Allow domain (adds to global policy)"),
         ("--policy-deny DOMAIN", "Deny domain (overrides global policy)"),
+        ("--verify-image", "Verify image signature before running"),
+        ("--seccomp-profile FILE", "Apply seccomp profile (path to JSON file)"),
+        ("--timeout DURATION", "Kill cell after duration (e.g., 30m, 2h, 1d)"),
+        ("--output FORMAT", "Output format: text (default) or json"),
+        ("--network MODE", "Network mode: default or none (air-gapped)"),
+        ("--profile PROFILE", "Trust profile (untrusted, supervised, dev, airgapped, honeypot)"),
+        ("--label KEY=VALUE", "Add label for orchestration metadata"),
+        ("--workdir PATH", "Working directory inside the cell"),
+        ("--image-digest DIGEST", "Expected OCI image digest (e.g., sha256:abc123...)"),
     ]),
     ("stop", "Gracefully stop a cell", [
         ("NAME", "Cell name"),
     ]),
     ("kill", "Immediately kill a cell", [
+        ("NAME", "Cell name"),
+    ]),
+    ("wait", "Block until a cell exits and return its exit code", [
+        ("--timeout DURATION", "Maximum time to wait (e.g., 30s, 5m, 2h)"),
+        ("--output FORMAT", "Output format: text (default) or json"),
         ("NAME", "Cell name"),
     ]),
     ("rm", "Remove a cell and clean up resources", [
@@ -58,6 +74,14 @@ COMMANDS = [
         ("NAME", "Cell name"),
         ("COMMAND...", "Command to execute"),
     ]),
+    ("shell", "Open interactive shell in cell", [
+        ("--sh SHELL", "Shell to use (default: /bin/sh)"),
+        ("NAME", "Cell name"),
+    ]),
+    ("rename", "Rename a cell", [
+        ("OLD_NAME", "Current cell name"),
+        ("NEW_NAME", "New cell name"),
+    ]),
     ("attach", "Attach to cell's console", [
         ("NAME", "Cell name"),
     ]),
@@ -71,6 +95,7 @@ COMMANDS = [
     ]),
     ("stats", "Show cell resource usage", [
         ("--no-stream", "Disable live updates"),
+        ("--output FORMAT", "Output format: text (default) or json"),
         ("NAME", "Cell name (optional, shows all if omitted)"),
     ]),
     ("top", "Show processes in cell", [
@@ -93,24 +118,79 @@ COMMANDS = [
     ]),
     ("cp", "Copy files to/from workspace", [
         ("--sanitize", "Block unsafe file types"),
+        ("--allow-scripts", "Allow script files in sanitize mode"),
+        ("--allow-office", "Allow office files in sanitize mode"),
         ("SRC", "Source path (cell:path or local path)"),
         ("DST", "Destination path (cell:path or local path)"),
     ]),
     ("network", "View cell network activity", [
         ("-f, --follow", "Follow log output"),
+        ("--blocked", "Show only blocked requests"),
         ("--json", "Output raw JSONL"),
         ("--tail N", "Number of lines to show (default: 20)"),
         ("NAME", "Cell name"),
     ]),
+    ("events", "Stream cell lifecycle events", [
+        ("--output FORMAT", "Output format: text or json (default: json)"),
+        ("--since TIMESTAMP", "Show events since timestamp"),
+        ("NAME", "Cell name (optional, all cells if omitted)"),
+    ]),
+    ("pull", "Pull and cache a container image", [
+        ("IMAGE", "Container image to pull"),
+    ]),
+    ("warmup", "Pre-pull images for a profile", [
+        ("--profile PROFILE", "Pull images commonly used with this profile"),
+        ("IMAGES...", "Additional images to pull"),
+    ]),
+    ("checkpoint", "Checkpoint a running cell (CRIU)", [
+        ("--keep", "Keep cell running after checkpoint"),
+        ("--export-name NAME", "Checkpoint name (default: <cell>-checkpoint)"),
+        ("NAME", "Cell name"),
+    ]),
+    ("restore", "Restore a cell from checkpoint", [
+        ("--name NAME", "Name for restored cell"),
+        ("CHECKPOINT", "Checkpoint name"),
+    ]),
     ("diagnose", "Run diagnostic checks on a cell", [
         ("NAME", "Cell name"),
     ]),
-    ("verify", "Verify security invariants across all cells", []),
+    ("health", "Check system health", [
+        ("--format FORMAT", "Output format: table (default) or json"),
+    ]),
+    ("preflight", "Run preflight validation checks", [
+        ("--format FORMAT", "Output format: table (default) or json"),
+    ]),
+    ("metrics", "Output Prometheus metrics", [
+        ("--serve", "Serve metrics via HTTP for Prometheus scraping"),
+        ("--port PORT", "Port for HTTP server (default: 9090)"),
+    ]),
+    ("verify", "Verify security invariants across all cells", [
+        ("--fix", "Attempt to auto-fix common issues"),
+    ]),
     ("history", "Show operation history", [
         ("--format FORMAT", "Output format: table (default) or json"),
         ("-n, --tail N", "Show last N entries (default: 20)"),
         ("--cell NAME", "Filter by cell name"),
     ]),
+    ("config show", "Show brig configuration", [
+        ("KEY", "Config key (optional, shows all if omitted)"),
+        ("--keys", "List available config keys with types and defaults"),
+    ]),
+    ("config set", "Set configuration value", [
+        ("KEY", "Config key (e.g., operation_logging.level)"),
+        ("VALUE", "Value to set (JSON or string)"),
+    ]),
+    ("config reset", "Reset configuration to defaults", []),
+    ("tui", "Launch interactive terminal UI", [
+        ("--view VIEW", "Initial view: dashboard, logs, metrics, or policy"),
+        ("--cell NAME", "Focus on specific cell"),
+    ]),
+    ("vm create", "Create the brig Lima VM", []),
+    ("vm start", "Start the brig VM", []),
+    ("vm stop", "Stop the brig VM", []),
+    ("vm status", "Show VM status", []),
+    ("vm shell", "Open shell in VM or run command", []),
+    ("vm delete", "Delete the brig VM", []),
     ("policy show", "Show cell's effective network policy", [
         ("NAME", "Cell name"),
     ]),
@@ -120,6 +200,16 @@ COMMANDS = [
         ("--remove-allow DOMAIN", "Remove allowed domain"),
         ("--remove-deny DOMAIN", "Remove denied domain"),
         ("NAME", "Cell name"),
+    ]),
+    ("policy validate", "Validate policy file syntax", [
+        ("FILE", "Policy file (optional, default: /cells/network-policy.json)"),
+    ]),
+    ("policy test", "Test if a domain is allowed for a cell", [
+        ("NAME", "Cell name"),
+        ("DOMAIN", "Domain to test"),
+        ("--path PATH", "Path to test (default: /)"),
+        ("--method METHOD", "HTTP method (default: GET)"),
+        ("-v, --verbose", "Show detailed evaluation"),
     ]),
 ]
 
@@ -166,7 +256,7 @@ Disable colored output.
         for opt, opt_desc in opts:
             opt_escaped = opt.replace("-", "\\-")
             print(f"[\\fB{opt_escaped}\\fR]")
-        print(f".PP")
+        print(".PP")
         print(f"{desc}.")
         if opts:
             print(".TP")
@@ -231,11 +321,11 @@ Run \\fBbrig verify\\fR to check all security invariants.
 .I ~/.brig/lima.yaml
 Lima VM configuration
 .TP
-.I ~/.brig/network-policy.yaml
-Global proxy policy
-.TP
 .I ~/.brig/cells/
 Cell definition files
+.TP
+.I ~/.brig/cells/network-policy.json
+Global proxy policy
 .TP
 .I ~/.brig/secrets/
 Secret files (one per secret)

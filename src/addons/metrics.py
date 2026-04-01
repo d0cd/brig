@@ -14,6 +14,7 @@ Usage:
     mitmdump -s metrics.py
 """
 
+import collections
 import json
 import os
 import socket
@@ -23,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from mitmproxy import http, ctx
+from mitmproxy import ctx, http
 
 # Metrics socket path.
 METRICS_SOCKET = Path("/var/run/cells/metrics.sock")
@@ -73,7 +74,7 @@ class HistogramLatencyBuffer:
 
     def _decay(self) -> None:
         """Halve all bucket counts to decay old samples."""
-        self.buckets = [max(1, c // 2) if c > 0 else 0 for c in self.buckets]
+        self.buckets = [c // 2 for c in self.buckets]
         self.total_count = sum(self.buckets)
 
     def percentile(self, p: float) -> float:
@@ -197,7 +198,7 @@ class MetricsCollector:
     """mitmproxy addon for metrics collection."""
 
     def __init__(self):
-        self.metrics: dict[str, CellMetrics] = {}
+        self.metrics: collections.OrderedDict[str, CellMetrics] = collections.OrderedDict()
         self.metrics_lock = threading.Lock()
         self.server_thread: Optional[threading.Thread] = None
         self.running = False
@@ -298,9 +299,11 @@ class MetricsCollector:
         if METRICS_SOCKET.exists():
             METRICS_SOCKET.unlink()
 
+        sock = None
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.bind(str(METRICS_SOCKET))
+            os.chmod(str(METRICS_SOCKET), 0o600)
             sock.listen(5)
             sock.settimeout(1.0)  # Allow periodic check for shutdown.
 
@@ -316,10 +319,8 @@ class MetricsCollector:
         except Exception as e:
             ctx.log.error(f"MetricsCollector: Failed to start server: {e}")
         finally:
-            try:
+            if sock:
                 sock.close()
-            except Exception:
-                pass
             if METRICS_SOCKET.exists():
                 METRICS_SOCKET.unlink()
 
@@ -334,8 +335,11 @@ class MetricsCollector:
                 response = self._get_all_metrics()
             elif data.startswith("cell:"):
                 # Return specific cell metrics.
-                cell_name = data[5:]
-                response = self._get_cell_metrics(cell_name)
+                cell_name = data[5:].strip()
+                if len(cell_name) > 64:
+                    response = {"error": "Cell name too long"}
+                else:
+                    response = self._get_cell_metrics(cell_name)
             else:
                 response = {"error": "Unknown command"}
 
@@ -376,23 +380,27 @@ class MetricsCollector:
                 }
             return {"error": f"Cell not found: {cell_name}"}
 
-    def _get_or_create_metrics(self, cell_name: str) -> CellMetrics:
-        """Get or create metrics for a cell.
+    def _get_or_create_metrics_unlocked(self, cell_name: str) -> CellMetrics:
+        """Get or create metrics for a cell. Caller must hold metrics_lock.
 
         Applies LRU eviction when exceeding MAX_TRACKED_CELLS to bound memory.
+        Uses OrderedDict for O(1) eviction instead of O(n) min() scan.
         """
-        with self.metrics_lock:
-            if cell_name not in self.metrics:
-                # Evict oldest cell if at capacity.
-                if len(self.metrics) >= MAX_TRACKED_CELLS:
-                    oldest = min(
-                        self.metrics.keys(),
-                        key=lambda k: self.metrics[k].last_request_ts
-                    )
-                    del self.metrics[oldest]
-                    ctx.log.debug(f"MetricsCollector: Evicted metrics for '{oldest}'")
-                self.metrics[cell_name] = CellMetrics()
+        if cell_name in self.metrics:
+            # Move to end (most recently used).
+            self.metrics.move_to_end(cell_name)
             return self.metrics[cell_name]
+        # Evict least recently used if at capacity.
+        if len(self.metrics) >= MAX_TRACKED_CELLS:
+            oldest_key, _ = self.metrics.popitem(last=False)
+            ctx.log.debug(f"MetricsCollector: Evicted metrics for '{oldest_key}'")
+        self.metrics[cell_name] = CellMetrics()
+        return self.metrics[cell_name]
+
+    def _get_or_create_metrics(self, cell_name: str) -> CellMetrics:
+        """Get or create metrics for a cell (acquires lock)."""
+        with self.metrics_lock:
+            return self._get_or_create_metrics_unlocked(cell_name)
 
     def request(self, flow: http.HTTPFlow) -> None:
         """Record request start time."""
@@ -401,7 +409,6 @@ class MetricsCollector:
     def response(self, flow: http.HTTPFlow) -> None:
         """Record completed request metrics."""
         cell_name = flow.metadata.get("cell", "unknown")
-        metrics = self._get_or_create_metrics(cell_name)
 
         # Calculate latency.
         start_time = flow.metadata.get("metrics_start", time.time())
@@ -411,20 +418,21 @@ class MetricsCollector:
         request_bytes = len(flow.request.content) if flow.request.content else 0
         response_bytes = len(flow.response.content) if flow.response.content else 0
 
-        # Record metrics.
-        metrics.record_request(
-            blocked=flow.metadata.get("blocked", False),
-            rate_limited=flow.metadata.get("rate_limited", False),
-            error=False,
-            request_bytes=request_bytes,
-            response_bytes=response_bytes,
-            latency_ms=latency_ms
-        )
+        # Hold lock for get-or-create + record to avoid torn reads from socket thread.
+        with self.metrics_lock:
+            metrics = self._get_or_create_metrics_unlocked(cell_name)
+            metrics.record_request(
+                blocked=flow.metadata.get("blocked", False),
+                rate_limited=flow.metadata.get("rate_limited", False),
+                error=False,
+                request_bytes=request_bytes,
+                response_bytes=response_bytes,
+                latency_ms=latency_ms
+            )
 
     def error(self, flow: http.HTTPFlow) -> None:
         """Record error metrics."""
         cell_name = flow.metadata.get("cell", "unknown")
-        metrics = self._get_or_create_metrics(cell_name)
 
         # Calculate latency.
         start_time = flow.metadata.get("metrics_start", time.time())
@@ -433,15 +441,17 @@ class MetricsCollector:
         # Get request size.
         request_bytes = len(flow.request.content) if flow.request and flow.request.content else 0
 
-        # Record error metrics.
-        metrics.record_request(
-            blocked=flow.metadata.get("blocked", False),
-            rate_limited=flow.metadata.get("rate_limited", False),
-            error=True,
-            request_bytes=request_bytes,
-            response_bytes=0,
-            latency_ms=latency_ms
-        )
+        # Hold lock for get-or-create + record to avoid torn reads from socket thread.
+        with self.metrics_lock:
+            metrics = self._get_or_create_metrics_unlocked(cell_name)
+            metrics.record_request(
+                blocked=flow.metadata.get("blocked", False),
+                rate_limited=flow.metadata.get("rate_limited", False),
+                error=True,
+                request_bytes=request_bytes,
+                response_bytes=0,
+                latency_ms=latency_ms
+            )
 
 
 addons = [MetricsCollector()]

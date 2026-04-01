@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from mitmproxy import http, ctx, connection
+from mitmproxy import connection, ctx, http
 
 # Import shared SIGHUP dispatcher from enforce addon.
 try:
@@ -102,8 +102,22 @@ _SECRET_PARAM_RE = re.compile(
 
 
 def _redact_path(path: str) -> str:
-    """Redact sensitive query string parameters from a request path."""
-    return _SECRET_PARAM_RE.sub(r'\1\2=REDACTED', path)
+    """Redact sensitive query string parameters from a request path.
+
+    URL-decodes the path in a loop until stable to prevent double-encoding
+    bypass (e.g., %2561pi%255Fkey=secret). Limited to 5 iterations to
+    prevent pathological inputs from causing excessive CPU use.
+    """
+    from urllib.parse import unquote
+    # Decode until stable to prevent double-encoding bypass.
+    prev = None
+    decoded = path
+    for _ in range(5):
+        prev = decoded
+        decoded = unquote(decoded)
+        if decoded == prev:
+            break
+    return _SECRET_PARAM_RE.sub(r'\1\2=REDACTED', decoded)
 
 
 class AsyncLogWriter:
@@ -171,7 +185,10 @@ class AsyncLogWriter:
                 )
 
                 if should_flush:
-                    self._flush_batch(batch)
+                    try:
+                        self._flush_batch(batch)
+                    except Exception as e:
+                        ctx.log.error(f"AsyncLogWriter: flush failed: {e}")
                     batch = []
                     last_flush = now
 
@@ -179,13 +196,19 @@ class AsyncLogWriter:
                 # Timeout - check if we should flush due to time.
                 now = time.time()
                 if batch and (now - last_flush) >= self.flush_interval:
-                    self._flush_batch(batch)
+                    try:
+                        self._flush_batch(batch)
+                    except Exception as e:
+                        ctx.log.error(f"AsyncLogWriter: flush failed: {e}")
                     batch = []
                     last_flush = now
 
         # Final flush on shutdown.
         if batch:
-            self._flush_batch(batch)
+            try:
+                self._flush_batch(batch)
+            except Exception as e:
+                ctx.log.error(f"AsyncLogWriter: final flush failed: {e}")
 
     def _flush_batch(self, batch: list) -> None:
         """Write a batch of entries to their respective files."""
@@ -204,7 +227,10 @@ class AsyncLogWriter:
             self._write_batch(entries, log_file)
 
     def _rotate_log(self, log_file: Path) -> None:
-        """Rotate log file when size limit exceeded."""
+        """Rotate log file when size limit exceeded.
+
+        Caller must hold self._lock for _file_sizes access.
+        """
         try:
             # Remove oldest rotated file if it exists.
             for i in range(MAX_ROTATED_FILES, 0, -1):
@@ -218,27 +244,34 @@ class AsyncLogWriter:
             if log_file.exists():
                 log_file.rename(log_file.with_suffix(".1.jsonl"))
 
-            # Reset cached size.
+            # Reset cached size (caller holds self._lock).
             self._file_sizes[log_file] = 0
         except (IOError, OSError) as e:
             # Log rotation is best-effort; continue even on failure.
             ctx.log.warn(f"RequestLogger: Failed to rotate log {log_file}: {e}")
 
     def _check_rotation(self, log_file: Path, bytes_to_write: int) -> None:
-        """Check if log file needs rotation before writing."""
-        # Get current file size (cached or from disk).
-        if log_file not in self._file_sizes:
-            try:
-                self._file_sizes[log_file] = log_file.stat().st_size if log_file.exists() else 0
-            except (IOError, OSError):
-                self._file_sizes[log_file] = 0
+        """Check if log file needs rotation before writing.
 
-        # Rotate if adding these bytes would exceed limit.
-        if self._file_sizes[log_file] + bytes_to_write > self.max_log_size:
-            self._rotate_log(log_file)
+        Caller must hold the file lock (fcntl.flock) to prevent races.
+        """
+        # Get current file size (cached or from disk).
+        with self._lock:
+            if log_file not in self._file_sizes:
+                try:
+                    self._file_sizes[log_file] = log_file.stat().st_size if log_file.exists() else 0
+                except (IOError, OSError):
+                    self._file_sizes[log_file] = 0
+
+            # Rotate if adding these bytes would exceed limit.
+            if self._file_sizes[log_file] + bytes_to_write > self.max_log_size:
+                self._rotate_log(log_file)
 
     def _write_batch(self, entries: list, log_file: Path) -> None:
-        """Write multiple entries to a file with locking and rotation."""
+        """Write multiple entries to a file with locking and rotation.
+
+        Acquires file lock before rotation check to ensure atomicity.
+        """
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -246,19 +279,26 @@ class AsyncLogWriter:
             encoded = [_json_encode(entry) + "\n" for entry in entries]
             total_bytes = sum(len(e.encode("utf-8")) for e in encoded)
 
-            # Check if rotation is needed.
-            self._check_rotation(log_file, total_bytes)
-
-            with open(log_file, "a") as f:
+            # Open and lock before rotation check to prevent races between
+            # rotation (which unlinks the file) and writes from other processes.
+            f = open(log_file, "a")
+            try:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    for line in encoded:
-                        f.write(line)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                self._check_rotation(log_file, total_bytes)
+                # After rotation, re-open the file to write to the new path.
+                if self._file_sizes.get(log_file, 0) == 0 and f.tell() > 0:
+                    f.close()
+                    f = open(log_file, "a")
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                for line in encoded:
+                    f.write(line)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                f.close()
 
-            # Update cached size.
-            self._file_sizes[log_file] = self._file_sizes.get(log_file, 0) + total_bytes
+            # Update cached size under the instance lock.
+            with self._lock:
+                self._file_sizes[log_file] = self._file_sizes.get(log_file, 0) + total_bytes
 
         except (IOError, OSError) as e:
             # Log errors go to mitmproxy log, not recursively.
@@ -272,18 +312,22 @@ class AsyncLogWriter:
             encoded = _json_encode(entry) + "\n"
             byte_len = len(encoded.encode("utf-8"))
 
-            # Check if rotation is needed.
-            self._check_rotation(log_file, byte_len)
-
-            with open(log_file, "a") as f:
+            f = open(log_file, "a")
+            try:
                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    f.write(encoded)
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                self._check_rotation(log_file, byte_len)
+                # After rotation, re-open the file to write to the new path.
+                if self._file_sizes.get(log_file, 0) == 0 and f.tell() > 0:
+                    f.close()
+                    f = open(log_file, "a")
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                f.write(encoded)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                f.close()
 
-            # Update cached size.
-            self._file_sizes[log_file] = self._file_sizes.get(log_file, 0) + byte_len
+            with self._lock:
+                self._file_sizes[log_file] = self._file_sizes.get(log_file, 0) + byte_len
 
         except (IOError, OSError) as e:
             ctx.log.warn(f"RequestLogger: Failed to write sync to {log_file}: {e}")
@@ -362,6 +406,7 @@ class RequestLogger:
 
     def __init__(self):
         self.subnet_map: dict[str, str] = {}
+        self._subnet_index: dict[int, str] = {}  # Third-octet index for O(1) /24 lookup.
         self.subnet_map_mtime = 0.0
         self.log_filter = LogFilter()
         self.policy_mtime = 0.0
@@ -409,11 +454,30 @@ class RequestLogger:
             with open(SUBNET_MAP_FILE, "r") as f:
                 self.subnet_map = json.load(f)
             self.subnet_map_mtime = mtime
+            self._build_subnet_index()
 
             ctx.log.info(f"RequestLogger: Loaded subnet map - {len(self.subnet_map)} cells")
 
         except (json.JSONDecodeError, IOError, OSError) as e:
             ctx.log.error(f"RequestLogger: Failed to load subnet map: {e}")
+
+    def _build_subnet_index(self) -> None:
+        """Build O(1) lookup index for /24 subnets keyed by top 24 bits.
+
+        Uses the network prefix (top 24 bits) as key to avoid collisions
+        between subnets in different /16 ranges.
+        """
+        import ipaddress
+        index = {}
+        for subnet_str, cell_name in self.subnet_map.items():
+            try:
+                net = ipaddress.ip_network(subnet_str, strict=False)
+                if net.version == 4 and net.prefixlen == 24:
+                    prefix = int(net.network_address) >> 8
+                    index[prefix] = cell_name
+            except ValueError:
+                continue
+        self._subnet_index = index
 
     def _reload_log_filter(self) -> None:
         """Load log filter and quota configuration from policy file."""
@@ -448,10 +512,21 @@ class RequestLogger:
             ctx.log.error(f"RequestLogger: Failed to load log filter: {e}")
 
     def _get_cell_name(self, client_ip: str) -> Optional[str]:
-        """Resolve client IP to cell name via subnet map."""
+        """Resolve client IP to cell name via subnet map.
+
+        Fast path: O(1) dict lookup by third octet for /24 IPv4 subnets.
+        Slow path: linear scan for non-/24 or IPv6 subnets.
+        """
         import ipaddress
         try:
             ip = ipaddress.ip_address(client_ip)
+            # Fast path: IPv4 with /24 index.
+            if isinstance(ip, ipaddress.IPv4Address) and self._subnet_index:
+                prefix = int(ip) >> 8
+                result = self._subnet_index.get(prefix)
+                if result is not None:
+                    return result
+            # Slow path: linear scan for non-indexed subnets.
             for subnet_str, cell_name in self.subnet_map.items():
                 try:
                     subnet = ipaddress.ip_network(subnet_str, strict=False)
@@ -520,7 +595,7 @@ class RequestLogger:
     def _write_log(self, cell_name: str, entry: dict) -> None:
         """Queue log entry for async writing."""
         # Validate cell name to prevent path traversal.
-        if cell_name and ("/" in cell_name or ".." in cell_name):
+        if cell_name and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', cell_name):
             cell_name = None  # Fall back to unknown log.
         if cell_name:
             log_file = LOG_DIR / f"{cell_name}.jsonl"

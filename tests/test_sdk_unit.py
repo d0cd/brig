@@ -27,14 +27,35 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from brig.sdk import (
-    Brig, Cell, BrigError, CellResult, CellInfo, CellRunResult,
-    CellEvent, CellStats, WardenStatus, WardenHandle, _run_sync,
+    Brig,
+    BrigError,
+    Cell,
+    CellEvent,
+    CellInfo,
+    CellNotFoundError,
+    CellResult,
+    CellRunResult,
+    CellStats,
+    ImageVerificationError,
+    ProfileError,
+    SecretNotFoundError,
+    WardenHandle,
+    WardenStatus,
+    _run_sync,
 )
 
 
 def _async_run(coro):
     """Run an async coroutine for testing."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(coro)
 
 
 class TestCellResult(unittest.TestCase):
@@ -129,7 +150,7 @@ class TestBrigRunCmdBuildsCli(unittest.TestCase):
                 stdout='{"cell":"test","cell_id":"x","image":"alpine","status":"running","network":"n","runtime":"runsc"}',
                 returncode=0,
             )
-            cell = _async_run(b.run(name="test", image="alpine"))
+            _async_run(b.run(name="test", image="alpine"))
 
             # Verify the command was built correctly.
             args = mock_cmd.call_args[0][0]
@@ -260,7 +281,7 @@ class TestCellWait(unittest.TestCase):
     """Tests for Cell.wait()."""
 
     def test_wait_returns_result(self):
-        """wait() returns CellResult with exit code."""
+        """wait() returns int exit code."""
         b = Brig()
         c = Cell("test", b)
         with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
@@ -269,8 +290,8 @@ class TestCellWait(unittest.TestCase):
                 returncode=0,
             )
             result = _async_run(c.wait())
-            self.assertIsInstance(result, CellResult)
-            self.assertEqual(result.exit_code, 0)
+            self.assertIsInstance(result, int)
+            self.assertEqual(result, 0)
 
     def test_wait_with_timeout(self):
         """wait() passes timeout to CLI."""
@@ -446,7 +467,7 @@ class TestSDKInputValidation(unittest.TestCase):
         b = Brig()
         with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
             mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
-            for good_name in ["myapp", "my-app", "App1", "a1b2c3"]:
+            for good_name in ["myapp", "my-app", "app1", "a1b2c3"]:
                 _run_sync(b.run(name=good_name, image="alpine"))
 
     def test_image_starting_with_dash_rejected(self):
@@ -474,6 +495,31 @@ class TestSDKInputValidation(unittest.TestCase):
         with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
             mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
             _run_sync(b.run(name="test", image="alpine", env={"FOO": "bar", "_BAR": "baz"}))
+
+    def test_env_secret_values_rejected(self):
+        """Env values that look like secrets are rejected."""
+        b = Brig()
+        secret_values = [
+            ("API_KEY", "sk-proj-abc123"),
+            ("TOKEN", "ghp_xxxxxxxxxxxxxxxxxxxx"),
+            ("AWS_KEY", "AKIAIOSFODNN7EXAMPLE"),
+            ("SLACK", "xoxb-fake-token"),
+            ("GITLAB", "glpat-xxxxxxxxxxxx"),
+        ]
+        for key, val in secret_values:
+            with self.assertRaises(BrigError, msg=f"Env {key}={val!r} should be rejected"):
+                _run_sync(b.run(name="test", image="alpine", env={key: val}))
+
+    def test_env_nonsecret_values_accepted(self):
+        """Env values that are not secrets pass validation."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+            _run_sync(b.run(name="test", image="alpine", env={
+                "TASK_ID": "550e8400",
+                "LOG_LEVEL": "debug",
+                "WORKERS": "4",
+            }))
 
     def test_double_dash_separator_in_command(self):
         """run() inserts -- before image to prevent flag injection."""
@@ -512,6 +558,484 @@ class TestSDKTimeout(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertNotIn("mysecret", msg)
         self.assertIn("false subcommand", msg)
+
+
+class TestExceptionSubclasses(unittest.TestCase):
+    """Tests for SDK exception subclasses."""
+
+    def test_cell_not_found_inherits(self):
+        """CellNotFoundError inherits from BrigError."""
+        self.assertTrue(issubclass(CellNotFoundError, BrigError))
+
+    def test_image_verification_inherits(self):
+        """ImageVerificationError inherits from BrigError."""
+        self.assertTrue(issubclass(ImageVerificationError, BrigError))
+
+    def test_profile_error_inherits(self):
+        """ProfileError inherits from BrigError."""
+        self.assertTrue(issubclass(ProfileError, BrigError))
+
+    def test_secret_not_found_inherits(self):
+        """SecretNotFoundError inherits from BrigError."""
+        self.assertTrue(issubclass(SecretNotFoundError, BrigError))
+
+    def test_exceptions_are_catchable_as_brig_error(self):
+        """All subclasses are catchable as BrigError."""
+        for exc_cls in (CellNotFoundError, ImageVerificationError,
+                        ProfileError, SecretNotFoundError):
+            with self.assertRaises(BrigError):
+                raise exc_cls("test")
+
+    def test_exceptions_carry_fields(self):
+        """Subclasses carry returncode and stderr from BrigError."""
+        e = CellNotFoundError("gone", returncode=1, stderr="not found")
+        self.assertEqual(e.returncode, 1)
+        self.assertEqual(e.stderr, "not found")
+
+
+class TestErrorPatternMatching(unittest.TestCase):
+    """Tests for _run_cmd raising correct exception subclass."""
+
+    def test_not_found_raises_cell_not_found(self):
+        """stderr containing 'not found' raises CellNotFoundError."""
+        b = Brig()
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.communicate.return_value = (b"", b"cell does not exist")
+            proc.returncode = 1
+            proc.kill = AsyncMock()
+            proc.wait = AsyncMock()
+            mock_exec.return_value = proc
+            with self.assertRaises(CellNotFoundError):
+                _async_run(b._run_cmd(["brig", "inspect", "missing"]))
+
+    def test_unknown_profile_raises_profile_error(self):
+        """stderr containing 'Unknown profile' raises ProfileError."""
+        b = Brig()
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.communicate.return_value = (b"", b"Unknown profile: badprofile")
+            proc.returncode = 1
+            proc.kill = AsyncMock()
+            proc.wait = AsyncMock()
+            mock_exec.return_value = proc
+            with self.assertRaises(ProfileError):
+                _async_run(b._run_cmd(["brig", "run", "--profile", "badprofile"]))
+
+    def test_secret_not_found_raises(self):
+        """stderr containing 'not found in secrets' raises SecretNotFoundError."""
+        b = Brig()
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.communicate.return_value = (b"", b"Secret 'mykey' not found in secrets")
+            proc.returncode = 1
+            proc.kill = AsyncMock()
+            proc.wait = AsyncMock()
+            mock_exec.return_value = proc
+            with self.assertRaises(SecretNotFoundError):
+                _async_run(b._run_cmd(["brig", "run", "--secret", "mykey"]))
+
+    def test_digest_mismatch_raises_image_verification(self):
+        """stderr containing 'digest mismatch' raises ImageVerificationError."""
+        b = Brig()
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.communicate.return_value = (b"", b"Image digest mismatch: expected sha256:abc")
+            proc.returncode = 1
+            proc.kill = AsyncMock()
+            proc.wait = AsyncMock()
+            mock_exec.return_value = proc
+            with self.assertRaises(ImageVerificationError):
+                _async_run(b._run_cmd(["brig", "run", "alpine"]))
+
+    def test_generic_error_still_raises_brig_error(self):
+        """Unrecognized stderr raises generic BrigError."""
+        b = Brig()
+        with patch('asyncio.create_subprocess_exec', new_callable=AsyncMock) as mock_exec:
+            proc = AsyncMock()
+            proc.communicate.return_value = (b"", b"some unknown error")
+            proc.returncode = 1
+            proc.kill = AsyncMock()
+            proc.wait = AsyncMock()
+            mock_exec.return_value = proc
+            with self.assertRaises(BrigError) as ctx:
+                _async_run(b._run_cmd(["brig", "run"]))
+            # Should not be a subclass.
+            self.assertEqual(type(ctx.exception), BrigError)
+
+
+class TestErrorPatternSync(unittest.TestCase):
+    """Verify SDK error patterns match actual CLI error messages.
+
+    Guards against the CLI changing error messages without updating the
+    SDK pattern list, which would cause the wrong exception subclass.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        """Load brig CLI source (including command modules) for pattern matching."""
+        src_dir = Path(__file__).parent.parent / "src"
+        # Read brig.py and all command modules.
+        sources = [src_dir / "brig.py"]
+        commands_dir = src_dir / "brig" / "commands"
+        if commands_dir.exists():
+            sources.extend(sorted(commands_dir.glob("*.py")))
+        cls.cli_source = "\n".join(p.read_text() for p in sources if p.exists())
+
+    def test_cli_has_does_not_exist_message(self):
+        """CLI contains 'does not exist' for CellNotFoundError."""
+        self.assertIn("does not exist", self.cli_source)
+
+    def test_cli_has_unknown_profile_message(self):
+        """CLI contains 'Unknown profile' for ProfileError."""
+        self.assertIn("Unknown profile", self.cli_source)
+
+    def test_cli_has_secret_not_found_message(self):
+        """CLI contains 'Secret not found' for SecretNotFoundError."""
+        self.assertIn("Secret not found", self.cli_source)
+
+    def test_cli_has_digest_mismatch_message(self):
+        """CLI contains 'digest mismatch' for ImageVerificationError."""
+        self.assertIn("digest mismatch", self.cli_source)
+
+
+class TestBrigGet(unittest.TestCase):
+    """Tests for Brig.get() method."""
+
+    def test_get_existing_cell(self):
+        """get() returns Cell for existing cell."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(
+                stdout='[{"Name":"brig-myapp","State":{"Running":true}}]',
+                returncode=0,
+            )
+            cell = _async_run(b.get("myapp"))
+            self.assertIsInstance(cell, Cell)
+            self.assertEqual(cell.name, "myapp")
+
+    def test_get_nonexistent_cell(self):
+        """get() returns None for nonexistent cell."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='', returncode=1)
+            cell = _async_run(b.get("nosuch"))
+            self.assertIsNone(cell)
+
+    def test_get_passes_check_false(self):
+        """get() calls _run_cmd with check=False."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='', returncode=1)
+            _async_run(b.get("test"))
+            _, kwargs = mock_cmd.call_args
+            self.assertFalse(kwargs.get("check", True))
+
+
+class TestCellIsAlive(unittest.TestCase):
+    """Tests for Cell.is_alive() method."""
+
+    def test_is_alive_running(self):
+        """is_alive() returns True for running cell."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(
+                stdout='[{"State":{"Running":true}}]',
+                returncode=0,
+            )
+            self.assertTrue(_async_run(c.is_alive()))
+
+    def test_is_alive_stopped(self):
+        """is_alive() returns False for stopped cell."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(
+                stdout='[{"State":{"Running":false}}]',
+                returncode=0,
+            )
+            self.assertFalse(_async_run(c.is_alive()))
+
+    def test_is_alive_removed(self):
+        """is_alive() returns False for removed cell."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='', returncode=1)
+            self.assertFalse(_async_run(c.is_alive()))
+
+    def test_is_alive_bad_json(self):
+        """is_alive() returns False for malformed JSON."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='not json', returncode=0)
+            self.assertFalse(_async_run(c.is_alive()))
+
+
+class TestCellRmIdempotent(unittest.TestCase):
+    """Tests for Cell.rm() idempotency."""
+
+    def test_rm_idempotent_second_call(self):
+        """rm() does not raise when cell is already gone."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.side_effect = CellNotFoundError("not found")
+            # Should not raise.
+            _async_run(c.rm())
+
+    def test_rm_propagates_non_notfound_error(self):
+        """rm() propagates non-CellNotFoundError errors."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.side_effect = BrigError("connection timed out")
+            with self.assertRaises(BrigError):
+                _async_run(c.rm())
+
+
+class TestCellWaitReturnsInt(unittest.TestCase):
+    """Tests for Cell.wait() returning int."""
+
+    def test_wait_returns_int(self):
+        """wait() returns int exit code."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(
+                stdout='{"cell":"test","exit_code":42}',
+                returncode=0,
+            )
+            result = _async_run(c.wait())
+            self.assertIsInstance(result, int)
+            self.assertEqual(result, 42)
+
+    def test_wait_returns_zero(self):
+        """wait() returns 0 for successful cell."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(
+                stdout='{"cell":"test","exit_code":0}',
+                returncode=0,
+            )
+            result = _async_run(c.wait())
+            self.assertEqual(result, 0)
+
+    def test_wait_fallback_returncode(self):
+        """wait() raises BrigError when JSON parsing fails with non-zero exit."""
+        from brig.utils import BrigError
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(
+                stdout='not json',
+                stderr='',
+                returncode=137,
+            )
+            with self.assertRaises(BrigError):
+                _async_run(c.wait())
+
+
+class TestBrigRunNewParams(unittest.TestCase):
+    """Tests for Brig.run() new parameters."""
+
+    def test_egress_allow_maps_to_policy_allow(self):
+        """egress_allow maps to --policy-allow flags."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+            _async_run(b.run(
+                name="test", image="alpine",
+                command=["echo", "hi"],
+                egress_allow=["api.openai.com", "github.com"],
+            ))
+            args = mock_cmd.call_args[0][0]
+            allow_indices = [i for i, a in enumerate(args) if a == "--policy-allow"]
+            self.assertEqual(len(allow_indices), 2)
+
+    def test_workdir_flag(self):
+        """workdir adds --workdir flag."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+            _async_run(b.run(
+                name="test", image="alpine",
+                command=["echo", "hi"],
+                workdir="/app",
+            ))
+            args = mock_cmd.call_args[0][0]
+            self.assertIn("--workdir", args)
+            self.assertIn("/app", args)
+
+    def test_image_digest_flag(self):
+        """image_digest adds --image-digest flag."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+            _async_run(b.run(
+                name="test", image="alpine",
+                command=["echo", "hi"],
+                image_digest="sha256:abc123",
+            ))
+            args = mock_cmd.call_args[0][0]
+            self.assertIn("--image-digest", args)
+            self.assertIn("sha256:abc123", args)
+
+    def test_canary_tokens_written_to_tempfile(self):
+        """canary_tokens are written to a tempfile, not in CLI args."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+            _async_run(b.run(
+                name="test", image="alpine",
+                command=["echo", "hi"],
+                canary_tokens={"aws_key": "AKIAFAKETOKEN123"},
+            ))
+            args = mock_cmd.call_args[0][0]
+            # Canary value must NOT appear in CLI args.
+            args_str = " ".join(args)
+            self.assertNotIn("AKIAFAKETOKEN123", args_str)
+            # --canary-file flag must be present.
+            self.assertIn("--canary-file", args)
+
+    def test_unknown_profile_raises_profile_error(self):
+        """Unknown profile raises ProfileError before calling CLI."""
+        b = Brig()
+        with self.assertRaises(ProfileError):
+            _async_run(b.run(
+                name="test", image="alpine",
+                command=["echo", "hi"],
+                profile="nonexistent",
+            ))
+
+    def test_known_profile_accepted(self):
+        """Known profiles pass validation."""
+        b = Brig()
+        for profile in ("untrusted", "supervised", "dev", "airgapped", "honeypot"):
+            with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+                mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+                _async_run(b.run(
+                    name="test", image="alpine",
+                    command=["echo", "hi"],
+                    profile=profile,
+                ))
+
+    def test_command_required(self):
+        """command parameter is accepted (backward compat: still optional)."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+            _async_run(b.run(name="test", image="alpine", command=["ls"]))
+
+    def test_egress_allow_and_policy_allow_combined(self):
+        """egress_allow and policy_allow are combined."""
+        b = Brig()
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
+            _async_run(b.run(
+                name="test", image="alpine",
+                command=["echo", "hi"],
+                policy_allow=["a.com"],
+                egress_allow=["b.com"],
+            ))
+            args = mock_cmd.call_args[0][0]
+            allow_indices = [i for i, a in enumerate(args) if a == "--policy-allow"]
+            self.assertEqual(len(allow_indices), 2)
+
+    def test_image_digest_flag_injection_rejected(self):
+        """image_digest starting with - is rejected."""
+        b = Brig()
+        with self.assertRaises(BrigError):
+            _async_run(b.run(
+                name="test", image="alpine",
+                image_digest="--some-flag",
+            ))
+
+    def test_image_digest_bad_format_rejected(self):
+        """image_digest not starting with sha256: is rejected."""
+        b = Brig()
+        with self.assertRaises(BrigError):
+            _async_run(b.run(
+                name="test", image="alpine",
+                image_digest="md5:abc123",
+            ))
+
+    def test_secret_flag_injection_rejected(self):
+        """Secret names starting with - are rejected."""
+        b = Brig()
+        with self.assertRaises(BrigError):
+            _async_run(b.run(
+                name="test", image="alpine",
+                secrets=["--exec=malicious"],
+            ))
+
+
+class TestLogsStreaming(unittest.TestCase):
+    """Tests for Cell.logs() streaming behavior."""
+
+    def test_logs_follow_false_returns_string(self):
+        """logs(follow=False) returns str."""
+        b = Brig()
+        c = Cell("test", b)
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(
+                stdout='line1\nline2\n', returncode=0,
+            )
+            result = _async_run(c.logs(follow=False))
+            self.assertIsInstance(result, str)
+            self.assertIn("line1", result)
+
+    def test_logs_follow_true_returns_async_iterator(self):
+        """logs(follow=True) returns an async iterator."""
+        b = Brig()
+        c = Cell("test", b)
+
+        class MockStdout:
+            """Mock async iterable for subprocess stdout."""
+            def __init__(self, data):
+                self._data = data
+                self._index = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index >= len(self._data):
+                    raise StopAsyncIteration
+                val = self._data[self._index]
+                self._index += 1
+                return val
+
+        async def collect_logs():
+            lines = []
+            mock_proc = MagicMock()
+            mock_proc.stdout = MockStdout([b"line1\n", b"line2\n"])
+            mock_proc.stderr = MockStdout([])
+            mock_proc.kill = MagicMock()
+            mock_proc.wait = AsyncMock()
+            with patch('asyncio.create_subprocess_exec',
+                       new_callable=AsyncMock, return_value=mock_proc):
+                # logs(follow=True) is an async method returning an async generator.
+                stream = await c.logs(follow=True)
+                async for line in stream:
+                    lines.append(line)
+                # Generator is fully consumed; finally block runs cleanly.
+            return lines
+
+        lines = _async_run(collect_logs())
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], "line1")
+        self.assertEqual(lines[1], "line2")
+
+    def test_logs_sync_follow_raises(self):
+        """logs_sync(follow=True) raises BrigError."""
+        b = Brig()
+        c = Cell("test", b)
+        with self.assertRaises(BrigError):
+            c.logs_sync(follow=True)
 
 
 # ========== Signer addon tests ==========
@@ -624,6 +1148,14 @@ class TestHMACKeyNaming(unittest.TestCase):
         self.assertTrue(self.signer.verify_batch(batch_path, str(self.signer.PRIVKEY_PATH)))
 
 
+try:
+    import cryptography  # noqa: F401
+    _HAS_CRYPTOGRAPHY = True
+except ImportError:
+    _HAS_CRYPTOGRAPHY = False
+
+
+@unittest.skipUnless(_HAS_CRYPTOGRAPHY, "requires cryptography package")
 class TestSignerInit(unittest.TestCase):
     """Tests for signer addon initialization."""
 
@@ -661,6 +1193,7 @@ class TestSignerInit(unittest.TestCase):
                 signer.PRIVKEY_PATH = orig_privkey
 
 
+@unittest.skipUnless(_HAS_CRYPTOGRAPHY, "requires cryptography package")
 class TestSignerBatchOperations(unittest.TestCase):
     """Tests for signer batch add/flush operations."""
 
@@ -805,6 +1338,7 @@ class TestSignerBatchOperations(unittest.TestCase):
             self.signer.BATCH_SIZE = orig_size
 
 
+@unittest.skipUnless(_HAS_CRYPTOGRAPHY, "requires cryptography package")
 class TestSignerThreadSafety(unittest.TestCase):
     """Tests for signer thread safety."""
 
@@ -888,6 +1422,7 @@ class TestSignerThreadSafety(unittest.TestCase):
         self.assertEqual(len(self.signer._batch_entries), 0)
 
 
+@unittest.skipUnless(_HAS_CRYPTOGRAPHY, "requires cryptography package")
 class TestSignerAlgorithmTracking(unittest.TestCase):
     """Tests for signer algorithm tracking."""
 
@@ -910,6 +1445,692 @@ class TestSignerAlgorithmTracking(unittest.TestCase):
             finally:
                 signer.AUDIT_DIR, signer.SIGNED_DIR, \
                     signer.PUBKEY_PATH, signer.PRIVKEY_PATH = orig
+
+
+# ========== brig/utils.py tests ==========
+
+from brig import utils as brig_utils
+
+
+class TestUtilsCheckRateLimit(unittest.TestCase):
+    """Tests for brig/utils.py check_rate_limit function."""
+
+    def setUp(self):
+        """Create temp directory and redirect rate limit file."""
+        self.temp_dir = tempfile.mkdtemp()
+        self._orig_file = brig_utils.RATE_LIMIT_FILE
+        self._orig_max = brig_utils.RATE_LIMIT_MAX
+        self._orig_window = brig_utils.RATE_LIMIT_WINDOW
+        brig_utils.RATE_LIMIT_FILE = Path(self.temp_dir) / "rate_limit.json"
+
+    def tearDown(self):
+        """Restore originals and clean up."""
+        import shutil
+        brig_utils.RATE_LIMIT_FILE = self._orig_file
+        brig_utils.RATE_LIMIT_MAX = self._orig_max
+        brig_utils.RATE_LIMIT_WINDOW = self._orig_window
+        shutil.rmtree(self.temp_dir)
+
+    def test_first_request_allowed(self):
+        """Fresh file returns True."""
+        self.assertTrue(brig_utils.check_rate_limit())
+
+    def test_within_limit_allowed(self):
+        """N-1 requests within window pass."""
+        for _ in range(brig_utils.RATE_LIMIT_MAX - 1):
+            self.assertTrue(brig_utils.check_rate_limit())
+
+    def test_at_limit_blocked(self):
+        """RATE_LIMIT_MAX requests, next returns False."""
+        for _ in range(brig_utils.RATE_LIMIT_MAX):
+            brig_utils.check_rate_limit()
+        self.assertFalse(brig_utils.check_rate_limit())
+
+    def test_window_expiry_resets(self):
+        """Old timestamps expire, new requests allowed."""
+        for _ in range(brig_utils.RATE_LIMIT_MAX):
+            brig_utils.check_rate_limit()
+        # Manually expire timestamps.
+        with open(brig_utils.RATE_LIMIT_FILE, "r") as f:
+            data = json.load(f)
+        data["timestamps"] = [time.time() - brig_utils.RATE_LIMIT_WINDOW - 1]
+        with open(brig_utils.RATE_LIMIT_FILE, "w") as f:
+            json.dump(data, f)
+        self.assertTrue(brig_utils.check_rate_limit())
+
+    def test_corrupted_file_allows(self):
+        """JSONDecodeError falls back to allow (fail-open)."""
+        brig_utils.RATE_LIMIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(brig_utils.RATE_LIMIT_FILE, "w") as f:
+            f.write("not json{{{")
+        self.assertTrue(brig_utils.check_rate_limit())
+
+    def test_missing_directory_created(self):
+        """Parent dir created on first call."""
+        brig_utils.RATE_LIMIT_FILE = Path(self.temp_dir) / "subdir" / "rate.json"
+        self.assertTrue(brig_utils.check_rate_limit())
+        self.assertTrue(brig_utils.RATE_LIMIT_FILE.parent.exists())
+
+    def test_io_error_allows(self):
+        """IOError returns True (fail-open)."""
+        # Point to unwritable location.
+        brig_utils.RATE_LIMIT_FILE = Path("/proc/nonexistent/rate.json")
+        self.assertTrue(brig_utils.check_rate_limit())
+
+
+class TestUtilsRedactCmd(unittest.TestCase):
+    """Tests for brig/utils.py _redact_cmd function."""
+
+    def test_flag_value_pair(self):
+        """--secret mysecret is redacted."""
+        result = brig_utils._redact_cmd(["cmd", "--secret", "mysecret"])
+        self.assertIn("***", result)
+        self.assertNotIn("mysecret", result)
+
+    def test_equals_form(self):
+        """--token=abc is redacted."""
+        result = brig_utils._redact_cmd(["cmd", "--token=abc"])
+        self.assertIn("--token=***", result)
+        self.assertNotIn("abc", result)
+
+    def test_normal_args_unchanged(self):
+        """--name myapp is unchanged."""
+        result = brig_utils._redact_cmd(["cmd", "--name", "myapp"])
+        self.assertIn("myapp", result)
+
+    def test_flag_at_end(self):
+        """--secret at end does not crash."""
+        result = brig_utils._redact_cmd(["cmd", "--secret"])
+        self.assertIn("--secret", result)
+
+
+class TestUtilsLogOperation(unittest.TestCase):
+    """Tests for brig/utils.py log_operation function."""
+
+    def setUp(self):
+        """Redirect history file to temp."""
+        self.temp_dir = tempfile.mkdtemp()
+        self._orig = brig_utils.HISTORY_FILE
+        brig_utils.HISTORY_FILE = Path(self.temp_dir) / "history.jsonl"
+
+    def tearDown(self):
+        """Restore and clean up."""
+        import shutil
+        brig_utils.HISTORY_FILE = self._orig
+        shutil.rmtree(self.temp_dir)
+
+    def test_writes_jsonl(self):
+        """Valid JSONL written with timestamp and operation."""
+        brig_utils.log_operation("test_op")
+        lines = brig_utils.HISTORY_FILE.read_text().strip().split("\n")
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["operation"], "test_op")
+        self.assertIn("timestamp", entry)
+
+    def test_with_cell_and_details(self):
+        """Includes optional fields."""
+        brig_utils.log_operation("run", cell_name="myapp", details={"image": "alpine"})
+        entry = json.loads(brig_utils.HISTORY_FILE.read_text().strip())
+        self.assertEqual(entry["cell"], "myapp")
+        self.assertEqual(entry["details"]["image"], "alpine")
+
+    def test_io_error_no_crash(self):
+        """IOError silently caught."""
+        brig_utils.HISTORY_FILE = Path("/proc/nonexistent/history.jsonl")
+        brig_utils.log_operation("test")  # Should not raise.
+
+
+class TestUtilsColorize(unittest.TestCase):
+    """Tests for brig/utils.py colorize and status_color functions."""
+
+    def setUp(self):
+        """Enable colors for testing."""
+        self._orig = brig_utils.COLOR_ENABLED
+        brig_utils.COLOR_ENABLED = True
+
+    def tearDown(self):
+        """Restore color state."""
+        brig_utils.COLOR_ENABLED = self._orig
+
+    def test_colorize_known_color(self):
+        """Returns ANSI-wrapped string."""
+        result = brig_utils.colorize("hello", "green")
+        self.assertIn("\033[32m", result)
+        self.assertIn("hello", result)
+
+    def test_colorize_unknown_color(self):
+        """Returns plain string."""
+        result = brig_utils.colorize("hello", "purple")
+        self.assertEqual(result, "hello")
+
+    def test_status_color_all_states(self):
+        """All status states return a string."""
+        for status in ("running", "paused", "exited", "stopped", "dead", "created", "unknown"):
+            result = brig_utils.status_color(status)
+            self.assertIsInstance(result, str)
+            self.assertIn(status, result.lower().replace("\033[0m", "").replace("\033[32m", "").replace("\033[33m", "").replace("\033[31m", "").replace("\033[34m", ""))
+
+
+class TestUtilsCache(unittest.TestCase):
+    """Tests for brig/utils.py cache functions."""
+
+    def setUp(self):
+        """Clear cache."""
+        brig_utils._cache.clear()
+
+    def test_set_and_get_within_ttl(self):
+        """Returns (True, value)."""
+        brig_utils._set_cache("k", "v")
+        hit, val = brig_utils._cached("k")
+        self.assertTrue(hit)
+        self.assertEqual(val, "v")
+
+    def test_expired_returns_miss(self):
+        """Returns (False, None)."""
+        brig_utils._cache["k"] = (time.time() - 100, "v")
+        hit, val = brig_utils._cached("k", ttl=1.0)
+        self.assertFalse(hit)
+        self.assertIsNone(val)
+
+    def test_invalidate_cell_cache(self):
+        """Removes both exists and running keys."""
+        brig_utils._set_cache("cell_exists:app", True)
+        brig_utils._set_cache("cell_running:app", True)
+        brig_utils._set_cache("other", "val")
+        brig_utils.invalidate_cell_cache("app")
+        self.assertNotIn("cell_exists:app", brig_utils._cache)
+        self.assertNotIn("cell_running:app", brig_utils._cache)
+        self.assertIn("other", brig_utils._cache)
+
+
+# ========== brig/container.py tests ==========
+
+from brig import container
+
+
+class TestContainerNames(unittest.TestCase):
+    """Tests for container.py naming functions."""
+
+    def test_container_name_format(self):
+        """container_name adds brig- prefix."""
+        self.assertEqual(container.container_name("x"), "brig-x")
+
+    def test_network_name_format(self):
+        """network_name adds brig- prefix."""
+        self.assertEqual(container.network_name("x"), "brig-x")
+
+    def test_valid_cell_names(self):
+        """Valid DNS labels accepted."""
+        for name in ["myapp", "my-app", "a1b2c3", "app.v2"]:
+            self.assertTrue(container.CELL_NAME_PATTERN.match(name), f"{name} should be valid")
+
+    def test_invalid_cell_names(self):
+        """Rejects -start, empty, >63 chars, special chars."""
+        for name in ["-start", "", "a" * 64, "has space", "has;semi"]:
+            self.assertIsNone(container.CELL_NAME_PATTERN.match(name), f"{name} should be invalid")
+
+
+class TestContainerCellPolicy(unittest.TestCase):
+    """Tests for container.py policy file operations."""
+
+    def setUp(self):
+        """Redirect POLICY_DIR to temp."""
+        self.temp_dir = tempfile.mkdtemp()
+        self._orig = container.POLICY_DIR
+        container.POLICY_DIR = Path(self.temp_dir)
+
+    def tearDown(self):
+        """Restore and clean up."""
+        import shutil
+        container.POLICY_DIR = self._orig
+        shutil.rmtree(self.temp_dir)
+
+    def test_save_load_roundtrip(self):
+        """Save dict, load it back, equal."""
+        policy = {"allow": ["example.com"], "deny": ["evil.com"]}
+        container.save_cell_policy("testcell", policy)
+        loaded = container.load_cell_policy("testcell")
+        self.assertEqual(loaded, policy)
+
+    def test_load_nonexistent_returns_default(self):
+        """Returns default empty policy."""
+        result = container.load_cell_policy("nosuch")
+        self.assertEqual(result, {"allow": [], "deny": []})
+
+    def test_load_corrupted_json_returns_default(self):
+        """Invalid JSON returns default."""
+        policy_file = Path(self.temp_dir) / "bad.json"
+        policy_file.write_text("not json{{{")
+        result = container.load_cell_policy("bad")
+        self.assertEqual(result, {"allow": [], "deny": []})
+
+    def test_save_invalid_name_raises(self):
+        """ValueError for path traversal."""
+        with self.assertRaises(ValueError):
+            container.save_cell_policy("../evil", {"allow": []})
+
+    def test_delete_policy_exists(self):
+        """File removed."""
+        container.save_cell_policy("delme", {"allow": []})
+        policy_file = Path(self.temp_dir) / "delme.json"
+        self.assertTrue(policy_file.exists())
+        container.delete_cell_policy("delme")
+        self.assertFalse(policy_file.exists())
+
+    def test_delete_policy_missing_no_error(self):
+        """No crash when file missing."""
+        container.delete_cell_policy("nonexistent")  # Should not raise.
+
+
+# ========== Step 1a: Spinner context manager ==========
+
+
+class TestSpinnerLifecycle(unittest.TestCase):
+    """Tests for Spinner context manager lifecycle."""
+
+    @patch.object(container, 'DEBUG', False)
+    @patch('sys.stderr')
+    def test_enter_starts_thread_on_tty(self, mock_stderr):
+        """__enter__ starts spinner thread when stderr is a TTY."""
+        mock_stderr.isatty.return_value = True
+        spinner = container.Spinner("Loading")
+        spinner.__enter__()
+        self.assertTrue(spinner.running)
+        self.assertIsNotNone(spinner.thread)
+        spinner.__exit__(None, None, None)
+
+    @patch.object(container, 'DEBUG', False)
+    @patch('sys.stderr')
+    def test_enter_no_thread_on_pipe(self, mock_stderr):
+        """__enter__ skips thread when stderr is not a TTY."""
+        mock_stderr.isatty.return_value = False
+        spinner = container.Spinner("Loading")
+        spinner.__enter__()
+        self.assertFalse(spinner.running)
+        self.assertIsNone(spinner.thread)
+        spinner.__exit__(None, None, None)
+
+    @patch.object(container, 'DEBUG', False)
+    @patch('sys.stderr')
+    def test_exit_clears_line_on_tty(self, mock_stderr):
+        """__exit__ writes blanks to clear spinner on TTY."""
+        mock_stderr.isatty.return_value = True
+        spinner = container.Spinner("Test")
+        spinner.__enter__()
+        spinner.__exit__(None, None, None)
+        self.assertFalse(spinner.running)
+        # Should have written clear sequence.
+        mock_stderr.write.assert_called()
+
+    @patch('sys.stderr')
+    def test_success_tty(self, mock_stderr):
+        """success() prints green checkmark on TTY."""
+        mock_stderr.isatty.return_value = True
+        spinner = container.Spinner("Test")
+        spinner.success("Done")
+        self.assertFalse(spinner.running)
+        written = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Done", written)
+
+    @patch('sys.stderr')
+    def test_success_no_output_on_pipe(self, mock_stderr):
+        """success() produces no output when stderr is not a TTY."""
+        mock_stderr.isatty.return_value = False
+        spinner = container.Spinner("Test")
+        spinner.success("Done")
+        mock_stderr.write.assert_not_called()
+
+    @patch('sys.stderr')
+    def test_fail_tty(self, mock_stderr):
+        """fail() prints red X on TTY."""
+        mock_stderr.isatty.return_value = True
+        spinner = container.Spinner("Test")
+        spinner.fail("Failed")
+        self.assertFalse(spinner.running)
+        written = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+        self.assertIn("Failed", written)
+
+    @patch('sys.stderr')
+    def test_fail_no_output_on_pipe(self, mock_stderr):
+        """fail() produces no output when stderr is not a TTY."""
+        mock_stderr.isatty.return_value = False
+        spinner = container.Spinner("Test")
+        spinner.fail("Failed")
+        mock_stderr.write.assert_not_called()
+
+
+# ========== Step 1b: cell_exists / cell_running / proxy_running ==========
+
+
+class TestContainerCellExists(unittest.TestCase):
+    """Tests for cell_exists, cell_running, proxy_running."""
+
+    def setUp(self):
+        """Clear cache between tests."""
+        from brig import utils as brig_utils
+        brig_utils._cache.clear()
+
+    @patch('brig.container.run')
+    def test_cell_exists_true(self, mock_run):
+        """Returns True when container name is in stdout."""
+        mock_run.return_value = MagicMock(stdout="brig-myapp\n", returncode=0)
+        self.assertTrue(container.cell_exists("myapp"))
+
+    @patch('brig.container.run')
+    def test_cell_exists_false(self, mock_run):
+        """Returns False when stdout is empty."""
+        mock_run.return_value = MagicMock(stdout="", returncode=0)
+        self.assertFalse(container.cell_exists("myapp"))
+
+    def test_cell_exists_invalid_name(self):
+        """Returns False for names that fail regex."""
+        self.assertFalse(container.cell_exists("../evil"))
+        self.assertFalse(container.cell_exists("HAS_UPPER"))
+        self.assertFalse(container.cell_exists(""))
+
+    @patch('brig.container.run')
+    def test_cell_running_true(self, mock_run):
+        """Returns True when container is running."""
+        mock_run.return_value = MagicMock(stdout="brig-myapp\n", returncode=0)
+        self.assertTrue(container.cell_running("myapp"))
+
+    @patch('brig.container.run')
+    def test_cell_running_false(self, mock_run):
+        """Returns False when container is not running."""
+        mock_run.return_value = MagicMock(stdout="", returncode=0)
+        self.assertFalse(container.cell_running("myapp"))
+
+    @patch('brig.container.run')
+    def test_proxy_running_true(self, mock_run):
+        """Returns True when proxy container is running."""
+        mock_run.return_value = MagicMock(
+            stdout=f"{container.PROXY_NAME}\n", returncode=0
+        )
+        self.assertTrue(container.proxy_running())
+
+    @patch('brig.container.run')
+    def test_proxy_running_false(self, mock_run):
+        """Returns False when proxy is not running."""
+        mock_run.return_value = MagicMock(stdout="", returncode=0)
+        self.assertFalse(container.proxy_running())
+
+    @patch('brig.container.run')
+    def test_cache_hit_skips_command(self, mock_run):
+        """Second call returns cached value without running command."""
+        mock_run.return_value = MagicMock(stdout="brig-myapp\n", returncode=0)
+        container.cell_exists("myapp")
+        container.cell_exists("myapp")
+        # Only one subprocess call.
+        mock_run.assert_called_once()
+
+
+# ========== Step 1c: get_proxy_ip ==========
+
+
+class TestContainerGetProxyIp(unittest.TestCase):
+    """Tests for get_proxy_ip."""
+
+    @patch('brig.container.run')
+    def test_valid_network_returns_ip(self, mock_run):
+        """Returns IP address for valid network."""
+        mock_run.return_value = MagicMock(stdout="10.60.0.1\n", returncode=0)
+        result = container.get_proxy_ip("brig-myapp")
+        self.assertEqual(result, "10.60.0.1")
+
+    def test_invalid_network_name_returns_empty(self):
+        """Returns empty string for invalid network names."""
+        self.assertEqual(container.get_proxy_ip("has/slash"), "")
+        self.assertEqual(container.get_proxy_ip("has.dot"), "")
+        self.assertEqual(container.get_proxy_ip(""), "")
+
+    @patch('brig.container.run')
+    def test_empty_stdout(self, mock_run):
+        """Returns empty string when no IP found."""
+        mock_run.return_value = MagicMock(stdout="", returncode=0)
+        result = container.get_proxy_ip("brig-myapp")
+        self.assertEqual(result, "")
+
+
+# ========== Step 1d: verify_image_signature ==========
+
+
+class TestVerifyImageSignature(unittest.TestCase):
+    """Tests for verify_image_signature."""
+
+    @patch('brig.container.run')
+    def test_cosign_success(self, mock_run):
+        """Returns (True, msg) when cosign verifies."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # which cosign
+            MagicMock(returncode=0, stdout="verified"),  # cosign verify
+        ]
+        ok, msg = container.verify_image_signature("alpine:latest")
+        self.assertTrue(ok)
+        self.assertIn("cosign", msg)
+
+    @patch('brig.container.run')
+    def test_cosign_no_signatures(self, mock_run):
+        """Returns (False, msg) when cosign finds no signatures."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # which cosign
+            MagicMock(returncode=1, stderr="no matching signatures"),
+        ]
+        ok, msg = container.verify_image_signature("alpine:latest")
+        self.assertFalse(ok)
+        self.assertIn("no signature", msg.lower())
+
+    @patch('brig.container.run')
+    def test_cosign_unavailable_podman_accept(self, mock_run):
+        """Falls back to podman trust, returns True if accept found."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1),  # which cosign → not found
+            MagicMock(returncode=0, stdout="default  accept"),  # podman trust
+        ]
+        ok, msg = container.verify_image_signature("alpine:latest")
+        self.assertTrue(ok)
+        self.assertIn("trusted", msg.lower())
+
+    @patch('brig.container.run')
+    def test_cosign_unavailable_podman_reject(self, mock_run):
+        """Falls back to podman trust, returns False if no accept."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1),  # which cosign → not found
+            MagicMock(returncode=0, stdout="default  reject"),  # podman trust
+        ]
+        ok, msg = container.verify_image_signature("alpine:latest")
+        self.assertFalse(ok)
+
+    @patch('brig.container.run')
+    def test_cosign_unavailable_podman_fails(self, mock_run):
+        """Returns (False, msg) when both cosign and podman trust fail."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1),  # which cosign
+            MagicMock(returncode=1, stdout=""),  # podman trust fails
+        ]
+        ok, msg = container.verify_image_signature("alpine:latest")
+        self.assertFalse(ok)
+
+
+# ========== Step 5g: SDK path validation and JSON parsing ==========
+
+
+class TestSdkPathValidation(unittest.TestCase):
+    """Tests for SDK cp_in/cp_out path traversal checks."""
+
+    def setUp(self):
+        """Create test Brig and Cell."""
+        from brig.sdk import Brig, Cell
+        self.brig = Brig()
+        self.cell = Cell("testcell", self.brig)
+
+    def test_cp_in_local_traversal(self):
+        """cp_in rejects .. in local_path."""
+        from brig.utils import BrigError
+        with self.assertRaises(BrigError):
+            _async_run(self.cell.cp_in("../../etc/passwd", "/workspace/file"))
+
+    def test_cp_in_cell_traversal(self):
+        """cp_in rejects .. in cell_path."""
+        from brig.utils import BrigError
+        with self.assertRaises(BrigError):
+            _async_run(self.cell.cp_in("/tmp/file", "../../../etc/shadow"))
+
+    def test_cp_out_local_traversal(self):
+        """cp_out rejects .. in local_path."""
+        from brig.utils import BrigError
+        with self.assertRaises(BrigError):
+            _async_run(self.cell.cp_out("/workspace/file", "../../etc/passwd"))
+
+    def test_cp_out_cell_traversal(self):
+        """cp_out rejects .. in cell_path."""
+        from brig.utils import BrigError
+        with self.assertRaises(BrigError):
+            _async_run(self.cell.cp_out("../../../etc/shadow", "/tmp/file"))
+
+
+class TestSdkListJsonParsing(unittest.TestCase):
+    """Tests for Brig.list() JSON parsing."""
+
+    def setUp(self):
+        """Create test Brig instance."""
+        from brig.sdk import Brig
+        self.brig = Brig()
+
+    def test_list_json_parse_success(self):
+        """Valid JSON produces CellInfo list."""
+        mock_result = MagicMock(
+            stdout=json.dumps([
+                {"name": "app1", "status": "running", "image": "alpine"},
+                {"name": "app2", "status": "exited", "image": "python:3.12"},
+            ]),
+            returncode=0,
+        )
+        with patch.object(self.brig, '_run_cmd', new_callable=AsyncMock,
+                          return_value=mock_result):
+            cells = _async_run(self.brig.list())
+        self.assertEqual(len(cells), 2)
+        self.assertEqual(cells[0].name, "app1")
+        self.assertEqual(cells[1].status, "exited")
+
+    def test_list_json_parse_failure(self):
+        """Invalid JSON returns empty list."""
+        mock_result = MagicMock(stdout="not json{{{", returncode=0)
+        with patch.object(self.brig, '_run_cmd', new_callable=AsyncMock,
+                          return_value=mock_result):
+            cells = _async_run(self.brig.list())
+        self.assertEqual(cells, [])
+
+
+class TestSdkStatsFieldMapping(unittest.TestCase):
+    """Tests for Brig.stats() field name resolution."""
+
+    def setUp(self):
+        """Create test Brig instance."""
+        from brig.sdk import Brig
+        self.brig = Brig()
+
+    def test_stats_standard_fields(self):
+        """Standard field names parsed correctly."""
+        mock_result = MagicMock(
+            stdout=json.dumps([{
+                "cell": "app1",
+                "cpu_percent": "5.2%",
+                "mem_usage": "128MB",
+                "mem_percent": "12%",
+                "pids": "3",
+            }]),
+            returncode=0,
+        )
+        with patch.object(self.brig, '_run_cmd', new_callable=AsyncMock,
+                          return_value=mock_result):
+            stats = _async_run(self.brig.stats())
+        self.assertEqual(len(stats), 1)
+        self.assertEqual(stats[0].cell, "app1")
+        self.assertEqual(stats[0].cpu_percent, "5.2%")
+
+    def test_stats_alternate_fields(self):
+        """Alternate field names (CPUPerc, MemUsage) resolved."""
+        mock_result = MagicMock(
+            stdout=json.dumps([{
+                "Name": "app1",
+                "CPUPerc": "5.2%",
+                "MemUsage": "128MB",
+                "MemPerc": "12%",
+                "PIDs": "3",
+            }]),
+            returncode=0,
+        )
+        with patch.object(self.brig, '_run_cmd', new_callable=AsyncMock,
+                          return_value=mock_result):
+            stats = _async_run(self.brig.stats())
+        self.assertEqual(stats[0].cell, "app1")
+        self.assertEqual(stats[0].cpu_percent, "5.2%")
+        self.assertEqual(stats[0].pids, "3")
+
+
+# ========== Phase 11 Step 5c: brig_subnet.py state operations ==========
+
+
+class TestBrigSubnetStateOps(unittest.TestCase):
+    """Tests for brig_subnet.py pure state operations."""
+
+    def setUp(self):
+        """Set up temp directories for subnet state."""
+        self.temp_dir = Path(tempfile.mkdtemp())
+        import importlib.util
+        subnet_path = Path(__file__).parent.parent / "src" / "brig_subnet.py"
+        spec = importlib.util.spec_from_file_location("brig_subnet", subnet_path)
+        self.subnet = importlib.util.module_from_spec(spec)
+        # Override paths before exec_module to avoid touching real state.
+        self.subnet.SUBNETS_FILE = self.temp_dir / "subnets.json"
+        self.subnet.SUBNET_MAP_FILE = self.temp_dir / "subnet-map.json"
+        self.subnet.LOCK_FILE = self.temp_dir / "allocator.lock"
+        spec.loader.exec_module(self.subnet)
+        # Re-override after exec (module-level constants may reset).
+        self.subnet.SUBNETS_FILE = self.temp_dir / "subnets.json"
+        self.subnet.SUBNET_MAP_FILE = self.temp_dir / "subnet-map.json"
+        self.subnet.LOCK_FILE = self.temp_dir / "allocator.lock"
+
+    def tearDown(self):
+        """Clean up."""
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_index_to_subnet(self):
+        """Index converts to subnet string."""
+        self.assertEqual(self.subnet.index_to_subnet(1), "10.60.1.0/24")
+        self.assertEqual(self.subnet.index_to_subnet(254), "10.60.254.0/24")
+
+    def test_validate_index_valid(self):
+        """Valid indices return True."""
+        self.assertTrue(self.subnet.validate_index(1))
+        self.assertTrue(self.subnet.validate_index(127))
+        self.assertTrue(self.subnet.validate_index(254))
+
+    def test_validate_index_invalid(self):
+        """Invalid indices return False."""
+        self.assertFalse(self.subnet.validate_index(0))
+        self.assertFalse(self.subnet.validate_index(255))
+        self.assertFalse(self.subnet.validate_index(-1))
+
+    def test_load_state_missing_file(self):
+        """Missing state file returns default state."""
+        state = self.subnet.load_state()
+        self.assertEqual(state["next_index"], 1)
+        self.assertEqual(state["allocated"], {})
+        self.assertEqual(state["freed"], [])
+
+    def test_validate_cell_name_valid(self):
+        """Valid cell names do not raise."""
+        for name in ["myapp", "my-app", "a1b2c3"]:
+            self.subnet.validate_cell_name(name)  # Should not raise.
+
+    def test_validate_cell_name_invalid(self):
+        """Invalid cell names cause SystemExit."""
+        for name in ["-bad", "../etc", "HAS SPACE"]:
+            with self.assertRaises(SystemExit):
+                self.subnet.validate_cell_name(name)
 
 
 if __name__ == "__main__":

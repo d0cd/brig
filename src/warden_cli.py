@@ -4,9 +4,9 @@
 
 def main():
     """Entry point for warden CLI."""
+    import os
     import runpy
     import sys
-    import os
 
     src_dir = os.path.dirname(os.path.abspath(__file__))
     warden_script = os.path.join(src_dir, "warden.py")

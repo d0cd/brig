@@ -2,7 +2,11 @@
 Configuration constants for Brig.
 """
 
+import re
 from pathlib import Path
+
+# Canonical cell name pattern: lowercase alphanumeric start, max 63 chars.
+CELL_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9._-]{0,62}$')
 
 # Container naming prefix for cells.
 CONTAINER_PREFIX = "brig-"

@@ -24,6 +24,7 @@ Usage:
     mitmdump -s ratelimit.py
 """
 
+import collections
 import json
 import math
 import signal
@@ -31,9 +32,8 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
-from mitmproxy import http, ctx
+from mitmproxy import ctx, http
 
 # Import shared SIGHUP dispatcher from enforce addon.
 try:
@@ -137,7 +137,7 @@ class RateLimiter:
     def __init__(self):
         self.default_config = RateLimitConfig(rate=DEFAULT_RATE, burst=DEFAULT_BURST)
         self.cell_configs: dict[str, RateLimitConfig] = {}
-        self.buckets: dict[str, TokenBucket] = {}
+        self.buckets: collections.OrderedDict[str, TokenBucket] = collections.OrderedDict()
         self.buckets_lock = threading.Lock()
         self.policy_mtime = 0.0
         self._reload_pending = False  # Deferred reload flag for signal safety.
@@ -251,19 +251,19 @@ class RateLimiter:
         """Get or create token bucket for a cell.
 
         Applies LRU eviction when exceeding MAX_TRACKED_CELLS to bound memory.
+        Uses OrderedDict for O(1) eviction instead of O(n) min() scan.
         """
         with self.buckets_lock:
-            if cell_name not in self.buckets:
-                # Evict oldest bucket if at capacity.
-                if len(self.buckets) >= MAX_TRACKED_CELLS:
-                    oldest = min(
-                        self.buckets.keys(),
-                        key=lambda k: self.buckets[k].last_update
-                    )
-                    del self.buckets[oldest]
-                    ctx.log.debug(f"RateLimiter: Evicted bucket for '{oldest}'")
-                config = self.cell_configs.get(cell_name, self.default_config)
-                self.buckets[cell_name] = TokenBucket(config.rate, config.burst)
+            if cell_name in self.buckets:
+                # Move to end (most recently used).
+                self.buckets.move_to_end(cell_name)
+                return self.buckets[cell_name]
+            # Evict least recently used if at capacity.
+            if len(self.buckets) >= MAX_TRACKED_CELLS:
+                oldest_key, _ = self.buckets.popitem(last=False)
+                ctx.log.debug(f"RateLimiter: Evicted bucket for '{oldest_key}'")
+            config = self.cell_configs.get(cell_name, self.default_config)
+            self.buckets[cell_name] = TokenBucket(config.rate, config.burst)
             return self.buckets[cell_name]
 
     def request(self, flow: http.HTTPFlow) -> None:

@@ -17,13 +17,13 @@ if os.path.exists(readme_path):
 
 setup(
     name="brig",
-    version="0.1.0",
+    version="0.2.0",
     description="Secure workload harness for running untrusted code on macOS",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Brig Authors",
     license="MIT",
-    python_requires=">=3.9",
+    python_requires=">=3.10",
     keywords=["security", "containers", "sandbox", "gvisor", "lima"],
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -32,7 +32,6 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: MacOS",
         "Programming Language :: Python :: 3",
-        "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
@@ -41,7 +40,7 @@ setup(
     ],
     package_dir={"": "src"},
     packages=find_packages(where="src", include=["brig*", "addons*"]),
-    py_modules=["brig_cli", "warden_cli", "brig_subnet_cli"],
+    py_modules=["brig_cli", "warden_cli", "brig_subnet_cli", "tui", "brig_subnet", "warden"],
     entry_points={
         "console_scripts": [
             "brig=brig_cli:main",
@@ -51,8 +50,8 @@ setup(
     },
     install_requires=["pyyaml>=6.0"],
     extras_require={
-        "yaml": ["pyyaml>=6.0"],
-        "dev": ["pytest>=7.0", "ruff>=0.1.0"],
+        "tui": ["textual>=0.40"],
+        "dev": ["pytest>=7.0", "pytest-cov>=4.0", "ruff>=0.1.0", "mypy>=1.0"],
     },
     url="https://github.com/d0cd/brig",
     project_urls={

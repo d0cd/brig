@@ -31,7 +31,7 @@ command: ["python", "/work/agent.py"]
 ### Network Policy
 
 ```yaml
-# network-policy.yaml
+# network-policy.json
 default: deny
 
 allow:
@@ -477,3 +477,60 @@ watch -n 5 'brig stats api-server'
 # Network summary
 brig network api-server --json | jq -s 'group_by(.host) | map({host: .[0].host, count: length})'
 ```
+
+---
+
+## Using Tor
+
+Route all cell traffic through the Tor network for anonymous egress.
+
+### Architecture
+
+```
+Cell → Warden (policy enforcement :8080)
+         → Privoxy (HTTP→SOCKS5 bridge :8118)
+            → Tor (SOCKS5 proxy :9050)
+               → Internet (via Tor network)
+```
+
+Cells cannot reach Privoxy or Tor directly — all traffic passes through Warden's policy engine first.
+
+### Quick Start
+
+```bash
+# 1. Start the Tor stack (Tor + Privoxy bridge).
+warden tor start
+
+# 2. Restart Warden to activate upstream routing.
+warden restart
+
+# 3. Verify Tor is active.
+warden tor status
+
+# 4. Run a cell — all egress goes through Tor.
+brig run --name anon --image python:3.11-slim --tor -- \
+  curl -s https://check.torproject.org/api/ip
+
+# 5. Stop Tor when done and restart Warden.
+warden tor stop
+warden restart
+```
+
+### Cell Definition
+
+```yaml
+# cells/tor-agent.yaml
+name: tor-agent
+image: python:3.11-slim
+tor: true
+command: ["python", "/work/agent.py"]
+```
+
+The `tor: true` field adds a pre-flight check that the Tor stack and Warden upstream mode are active before the cell starts.
+
+### Notes
+
+- Tor routing is global — when active, all cells route through Tor.
+- The `--tor` flag and `tor:` YAML field only add a pre-flight check; they do not selectively enable Tor per cell.
+- Network policy enforcement still applies. Blocked domains remain blocked.
+- Expect higher latency through the Tor network.

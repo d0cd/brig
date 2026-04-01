@@ -4,9 +4,9 @@
 
 def main():
     """Entry point for brig-subnet CLI."""
+    import os
     import runpy
     import sys
-    import os
 
     src_dir = os.path.dirname(os.path.abspath(__file__))
     subnet_script = os.path.join(src_dir, "brig_subnet.py")

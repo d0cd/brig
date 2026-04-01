@@ -1,15 +1,20 @@
 """
-Container management functions for Brig.
+Container management functions for the Brig SDK package.
+
+Note: src/brig.py (the CLI monolith) has its own copies of several functions
+defined here (Spinner, cell_exists, etc.). The brig.py versions include QUIET
+mode support and strip-based output parsing. Shared constants live in
+brig.config to avoid duplication.
 """
 
 import json
 import re
-import time
-import threading
 import sys
+import threading
+import time
 
-from .config import CONTAINER_PREFIX, PROXY_NAME, STATE_DIR, POLICY_DIR
-from .utils import run, debug, _cached, _set_cache, colorize, COLOR_ENABLED, DEBUG
+from .config import CELL_NAME_PATTERN, CONTAINER_PREFIX, POLICY_DIR, PROXY_NAME
+from .utils import DEBUG, _cached, _set_cache, colorize, debug, run
 
 
 class Spinner:
@@ -81,6 +86,8 @@ def network_name(cell_name: str) -> str:
 
 def cell_exists(cell_name: str) -> bool:
     """Check if a cell container exists (running or stopped)."""
+    if not CELL_NAME_PATTERN.match(cell_name):
+        return False  # Invalid names can't exist.
     hit, value = _cached(f"cell_exists:{cell_name}")
     if hit:
         return value
@@ -96,6 +103,8 @@ def cell_exists(cell_name: str) -> bool:
 
 def cell_running(cell_name: str) -> bool:
     """Check if a cell container is running."""
+    if not CELL_NAME_PATTERN.match(cell_name):
+        return False  # Invalid names can't exist.
     hit, value = _cached(f"cell_running:{cell_name}")
     if hit:
         return value
@@ -140,6 +149,8 @@ def get_proxy_ip(network: str) -> str:
 
 def load_cell_policy(cell_name: str) -> dict:
     """Load per-cell network policy if it exists."""
+    if not CELL_NAME_PATTERN.match(cell_name):
+        raise ValueError(f"Invalid cell name: {cell_name}")
     policy_file = POLICY_DIR / f"{cell_name}.json"
     if policy_file.exists():
         try:
@@ -152,6 +163,8 @@ def load_cell_policy(cell_name: str) -> dict:
 
 def save_cell_policy(cell_name: str, policy: dict) -> None:
     """Save per-cell network policy using atomic write."""
+    if not CELL_NAME_PATTERN.match(cell_name):
+        raise ValueError(f"Invalid cell name: {cell_name}")
     POLICY_DIR.mkdir(parents=True, exist_ok=True)
     policy_file = POLICY_DIR / f"{cell_name}.json"
     tmp_file = policy_file.with_suffix(".tmp")
@@ -162,6 +175,9 @@ def save_cell_policy(cell_name: str, policy: dict) -> None:
 
 def delete_cell_policy(cell_name: str) -> None:
     """Delete per-cell network policy if it exists."""
+    if not CELL_NAME_PATTERN.match(cell_name):
+        debug(f"Invalid cell name for policy deletion: {cell_name}")
+        return
     policy_file = POLICY_DIR / f"{cell_name}.json"
     try:
         policy_file.unlink()

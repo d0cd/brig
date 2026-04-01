@@ -154,7 +154,7 @@ Even if a cell ignores `HTTP_PROXY` environment variables, it still can't reach 
 ### Policy Enforcement
 
 ```yaml
-# network-policy.yaml
+# network-policy.json
 default: deny
 
 allow:

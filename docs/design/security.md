@@ -21,23 +21,23 @@ These are the rules that must hold for the security model to work. Violations br
 **Cell creation (what `brig run` does internally):**
 
 ```bash
-CELL_NAME="cell-abc123"
+CELL_NAME="my-agent"
 
 # 1. Create isolated network for this cell
-podman network create --internal "cell-${CELL_NAME}"
+podman network create --internal "brig-${CELL_NAME}"
 
 # 2. Connect proxy to this cell's network
-podman network connect "cell-${CELL_NAME}" proxy
+podman network connect "brig-${CELL_NAME}" warden
 
 # 3. Run cell on its own network (proxy DNS name resolves)
-podman run --runtime=runsc --name "$CELL_NAME" \
-  --network "cell-${CELL_NAME}" \
-  -e HTTP_PROXY=http://proxy:8080 \
+podman run --runtime=runsc --name "brig-${CELL_NAME}" \
+  --network "brig-${CELL_NAME}" \
+  -e HTTP_PROXY=http://warden:8080 \
   ...
 
 # 4. On cell removal, disconnect and delete network
-podman network disconnect "cell-${CELL_NAME}" proxy
-podman network rm "cell-${CELL_NAME}"
+podman network disconnect "brig-${CELL_NAME}" warden
+podman network rm "brig-${CELL_NAME}"
 ```
 
 **Inter-cell coordination:** Goes out through proxy to external services:
@@ -165,19 +165,20 @@ fi
 
 ---
 
-### Invariant 6: Only Proxy May Attach to `proxy-external`
+### Invariant 6: Only Infrastructure Containers May Attach to `proxy-external`
 
-**Rule:** No container other than `proxy` may attach to `proxy-external`.
+**Rule:** Only `warden` (and optionally `warden-tor` and `warden-privoxy` when Tor is active) may attach to `proxy-external`. No cell containers.
 
 **Why this matters:** The `proxy-external` network has outbound internet access. Any container attached to it inherits the VM-level egress rules but bypasses per-cell isolation.
 
 **Enforcement:**
 
 ```bash
-# Verify only proxy is on proxy-external:
+# Verify only infrastructure containers are on proxy-external:
+ALLOWED="warden warden-tor warden-privoxy"
 containers=$(podman network inspect proxy-external --format '{{range .Containers}}{{.Name}} {{end}}')
 for c in $containers; do
-  if [[ "$c" != "proxy" ]]; then
+  if ! echo "$ALLOWED" | grep -qw "$c"; then
     echo "FATAL: Unexpected container '$c' on proxy-external network"
     exit 1
   fi
@@ -202,7 +203,7 @@ done
 
 ### Invariant 8: Cells Must Be Single-Homed (One Network Only)
 
-**Rule:** Each cell container must be attached to exactly one network (its own `cell-<name>` network). Cells must never be attached to multiple networks.
+**Rule:** Each cell container must be attached to exactly one network (its own `brig-<name>` network). Cells must never be attached to multiple networks.
 
 **Why this matters:** Attribution relies on source subnet. If a container joins multiple networks, it may have multiple IP addresses. The proxy cannot reliably attribute traffic to the correct cell.
 
@@ -295,7 +296,7 @@ brig kill cell-a && brig rm cell-a
 ```bash
 # Run inside VM:
 brig vm shell -- bash -c '
-for net in $(podman network ls --format "{{.Name}}" | grep "^cell-"); do
+for net in $(podman network ls --format "{{.Name}}" | grep "^brig-"); do
   echo "== $net =="
   podman network inspect "$net" --format "{{json .Containers}}"
 done
@@ -423,12 +424,12 @@ brig kill test-identity && brig rm test-identity
 
 1. Verify network is `--internal`:
    ```bash
-   brig vm shell -- podman network inspect cell-xxx | grep -i internal
+   brig vm shell -- podman network inspect brig-xxx | grep -i internal
    ```
 
 2. Verify no gateway is set:
    ```bash
-   brig vm shell -- podman network inspect cell-xxx | grep -i gateway
+   brig vm shell -- podman network inspect brig-xxx | grep -i gateway
    ```
 
 3. Recreate the network:
@@ -458,7 +459,7 @@ brig kill test-identity && brig rm test-identity
 
 2. Disconnect the container:
    ```bash
-   brig vm shell -- podman network disconnect cell-xxx unexpected-container
+   brig vm shell -- podman network disconnect brig-xxx unexpected-container
    ```
 
 ---
@@ -478,7 +479,7 @@ brig start --all
 ```bash
 brig kill --all
 warden stop
-brig vm shell -- 'for net in $(podman network ls -q | grep "^cell-"); do podman network rm "$net" 2>/dev/null; done'
+brig vm shell -- 'for net in $(podman network ls -q | grep "^brig-"); do podman network rm "$net" 2>/dev/null; done'
 warden start
 brig start --all
 ```
@@ -521,6 +522,47 @@ brig test isolation
 
 ---
 
+## Tor Integration
+
+### Architecture
+
+When Tor is enabled, traffic flows through a Privoxy bridge that converts HTTP proxy requests to SOCKS5 for the Tor daemon:
+
+```
+Cell → Warden (mitmproxy :8080, policy enforcement)
+         → Privoxy (:8118, HTTP→SOCKS5 bridge)
+            → Tor (:9050, SOCKS5 proxy)
+               → Internet (via Tor network)
+```
+
+### Why Privoxy?
+
+mitmproxy cannot chain to a SOCKS5 upstream proxy — it only supports HTTP upstream mode. Privoxy bridges the gap by accepting HTTP proxy connections from mitmproxy and forwarding them as SOCKS5 to Tor.
+
+### Network Topology
+
+All three containers (Warden, Privoxy, Tor) run on the `proxy-external` network. Cells remain on their isolated `brig-<cell>` networks and can only reach Warden. This preserves all security invariants:
+
+- **Policy enforcement is preserved.** Every request passes through Warden's mitmproxy before reaching Privoxy/Tor.
+- **No direct Tor access.** Cells cannot reach Privoxy or Tor directly (different networks).
+- **No east-west bypass.** Cell network isolation is unchanged.
+- **Invariant 6 holds.** Only Warden, Privoxy, and Tor attach to `proxy-external` — all are infrastructure containers, not cells.
+
+### Container Hardening
+
+Both Privoxy and Tor containers run with:
+- `--read-only` filesystem
+- `--cap-drop ALL`
+- `--security-opt no-new-privileges`
+- `--tmpfs` for writable directories (noexec, nosuid)
+- Strict resource limits (128MB RAM, 0.25 CPU for Privoxy)
+
+### Activation
+
+Tor routing is global. When active, all cell traffic routes through Tor. The `--tor` flag on `brig run` is a pre-flight safety check, not a per-cell toggle.
+
+---
+
 ## Optional Hardening (Future Roadmap)
 
 ### AppArmor/Seccomp Profiles
@@ -542,7 +584,7 @@ network: none  # No network at all
 ### Egress Rate Limits
 
 ```yaml
-# Future: in network-policy.yaml
+# Future: in network-policy.json
 rate_limits:
   per_cell:
     requests_per_minute: 1000

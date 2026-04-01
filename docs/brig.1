@@ -1,0 +1,775 @@
+.TH BRIG 1 "February 2026" "Brig 1.0" "User Commands"
+.SH NAME
+brig \- secure workload harness for running untrusted code
+.SH SYNOPSIS
+.B brig
+[\fB\-\-debug\fR] [\fB\-\-no\-color\fR]
+.I command
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B brig
+runs untrusted code in isolated cells with gVisor sandboxing.
+Each cell gets its own network, and all egress traffic goes through the
+Warden policy-enforcing proxy.
+.PP
+Cells provide defense-in-depth through multiple isolation layers:
+.IP \(bu 2
+Lima VM provides hardware-level isolation from macOS
+.IP \(bu 2
+gVisor (runsc) provides syscall-level sandboxing
+.IP \(bu 2
+Per-cell networks prevent east-west traffic between cells
+.IP \(bu 2
+Warden proxy enforces domain allowlists on egress traffic
+.SH GLOBAL OPTIONS
+.TP
+.B \-\-debug
+Enable debug output showing command execution details.
+.TP
+.B \-\-no\-color
+Disable colored output.
+.SH COMMANDS
+.SS init
+.B brig init
+.PP
+Initialize brig directory structure.
+.SS upgrade
+.B brig upgrade
+.PP
+Upgrade brig state to current schema version.
+.SS run
+.B brig run
+[\fB\-n, \-\-name NAME\fR]
+[\fB\-f, \-\-file FILE\fR]
+[\fB\-d, \-\-detach\fR]
+[\fB\-\-rm\fR]
+[\fB\-\-dry\-run\fR]
+[\fB\-e, \-\-env VAR=VALUE\fR]
+[\fB\-\-secret NAME\fR]
+[\fB\-\-memory SIZE\fR]
+[\fB\-\-cpus N\fR]
+[\fB\-\-pids\-limit N\fR]
+[\fB\-\-policy\-allow DOMAIN\fR]
+[\fB\-\-policy\-deny DOMAIN\fR]
+[\fB\-\-verify\-image\fR]
+[\fB\-\-seccomp\-profile FILE\fR]
+[\fB\-\-timeout DURATION\fR]
+[\fB\-\-output FORMAT\fR]
+[\fB\-\-network MODE\fR]
+[\fB\-\-profile PROFILE\fR]
+[\fB\-\-label KEY=VALUE\fR]
+[\fB\-\-workdir PATH\fR]
+[\fB\-\-image\-digest DIGEST\fR]
+.PP
+Run a new cell.
+.TP
+.B \-n, \-\-name NAME
+Cell name (required unless in definition file)
+.TP
+.B \-f, \-\-file FILE
+Cell definition file (YAML or JSON)
+.TP
+.B \-d, \-\-detach
+Run in background
+.TP
+.B \-\-rm
+Remove container when it exits
+.TP
+.B \-\-dry\-run
+Show what would be done without executing
+.TP
+.B \-e, \-\-env VAR=VALUE
+Set environment variable
+.TP
+.B \-\-secret NAME
+Mount secret file at /run/secrets/
+.TP
+.B \-\-memory SIZE
+Memory limit (default: 2g)
+.TP
+.B \-\-cpus N
+CPU limit (default: 2)
+.TP
+.B \-\-pids\-limit N
+PID limit (default: 512)
+.TP
+.B \-\-policy\-allow DOMAIN
+Allow domain (adds to global policy)
+.TP
+.B \-\-policy\-deny DOMAIN
+Deny domain (overrides global policy)
+.TP
+.B \-\-verify\-image
+Verify image signature before running
+.TP
+.B \-\-seccomp\-profile FILE
+Apply seccomp profile (path to JSON file)
+.TP
+.B \-\-timeout DURATION
+Kill cell after duration (e.g., 30m, 2h, 1d)
+.TP
+.B \-\-output FORMAT
+Output format: text (default) or json
+.TP
+.B \-\-network MODE
+Network mode: default or none (air-gapped)
+.TP
+.B \-\-profile PROFILE
+Trust profile (untrusted, supervised, dev, airgapped, honeypot)
+.TP
+.B \-\-label KEY=VALUE
+Add label for orchestration metadata
+.TP
+.B \-\-workdir PATH
+Working directory inside the cell
+.TP
+.B \-\-image\-digest DIGEST
+Expected OCI image digest (e.g., sha256:abc123...)
+.SS stop
+.B brig stop
+[\fBNAME\fR]
+.PP
+Gracefully stop a cell.
+.TP
+.B NAME
+Cell name
+.SS kill
+.B brig kill
+[\fBNAME\fR]
+.PP
+Immediately kill a cell.
+.TP
+.B NAME
+Cell name
+.SS wait
+.B brig wait
+[\fB\-\-timeout DURATION\fR]
+[\fB\-\-output FORMAT\fR]
+[\fBNAME\fR]
+.PP
+Block until a cell exits and return its exit code.
+.TP
+.B \-\-timeout DURATION
+Maximum time to wait (e.g., 30s, 5m, 2h)
+.TP
+.B \-\-output FORMAT
+Output format: text (default) or json
+.TP
+.B NAME
+Cell name
+.SS rm
+.B brig rm
+[\fB\-f, \-\-force\fR]
+[\fB\-\-purge\fR]
+[\fBNAME\fR]
+.PP
+Remove a cell and clean up resources.
+.TP
+.B \-f, \-\-force
+Force remove running cell
+.TP
+.B \-\-purge
+Also remove workspace
+.TP
+.B NAME
+Cell name
+.SS start
+.B brig start
+[\fBNAME\fR]
+.PP
+Start a stopped cell.
+.TP
+.B NAME
+Cell name
+.SS pause
+.B brig pause
+[\fBNAME\fR]
+.PP
+Pause a running cell.
+.TP
+.B NAME
+Cell name
+.SS unpause
+.B brig unpause
+[\fBNAME\fR]
+.PP
+Unpause a paused cell.
+.TP
+.B NAME
+Cell name
+.SS list
+.B brig list
+[\fB\-\-format FORMAT\fR]
+.PP
+List all cells.
+.TP
+.B \-\-format FORMAT
+Output format: table (default) or json
+.SS logs
+.B brig logs
+[\fB\-f, \-\-follow\fR]
+[\fB\-\-tail N\fR]
+[\fBNAME\fR]
+.PP
+View cell logs.
+.TP
+.B \-f, \-\-follow
+Follow log output
+.TP
+.B \-\-tail N
+Number of lines to show
+.TP
+.B NAME
+Cell name
+.SS exec
+.B brig exec
+[\fB\-i, \-\-interactive\fR]
+[\fB\-t, \-\-tty\fR]
+[\fBNAME\fR]
+[\fBCOMMAND...\fR]
+.PP
+Execute command in cell.
+.TP
+.B \-i, \-\-interactive
+Interactive mode
+.TP
+.B \-t, \-\-tty
+Allocate pseudo-TTY
+.TP
+.B NAME
+Cell name
+.TP
+.B COMMAND...
+Command to execute
+.SS shell
+.B brig shell
+[\fB\-\-sh SHELL\fR]
+[\fBNAME\fR]
+.PP
+Open interactive shell in cell.
+.TP
+.B \-\-sh SHELL
+Shell to use (default: /bin/sh)
+.TP
+.B NAME
+Cell name
+.SS rename
+.B brig rename
+[\fBOLD_NAME\fR]
+[\fBNEW_NAME\fR]
+.PP
+Rename a cell.
+.TP
+.B OLD_NAME
+Current cell name
+.TP
+.B NEW_NAME
+New cell name
+.SS attach
+.B brig attach
+[\fBNAME\fR]
+.PP
+Attach to cell's console.
+.TP
+.B NAME
+Cell name
+.SS inspect
+.B brig inspect
+[\fB\-\-format FORMAT\fR]
+[\fBNAME\fR]
+.PP
+Show cell details.
+.TP
+.B \-\-format FORMAT
+Output format: table (default) or json
+.TP
+.B NAME
+Cell name
+.SS export
+.B brig export
+[\fB\-\-format FORMAT\fR]
+[\fBNAME\fR]
+.PP
+Export cell as YAML definition.
+.TP
+.B \-\-format FORMAT
+Output format: yaml (default) or json
+.TP
+.B NAME
+Cell name
+.SS stats
+.B brig stats
+[\fB\-\-no\-stream\fR]
+[\fB\-\-output FORMAT\fR]
+[\fBNAME\fR]
+.PP
+Show cell resource usage.
+.TP
+.B \-\-no\-stream
+Disable live updates
+.TP
+.B \-\-output FORMAT
+Output format: text (default) or json
+.TP
+.B NAME
+Cell name (optional, shows all if omitted)
+.SS top
+.B brig top
+[\fBNAME\fR]
+.PP
+Show processes in cell.
+.TP
+.B NAME
+Cell name
+.SS diff
+.B brig diff
+[\fB\-\-format FORMAT\fR]
+[\fBNAME\fR]
+.PP
+Show filesystem changes from base image.
+.TP
+.B \-\-format FORMAT
+Output format: text (default) or json
+.TP
+.B NAME
+Cell name
+.SS files
+.B brig files
+[\fBNAME\fR]
+[\fBPATH\fR]
+.PP
+List workspace contents.
+.TP
+.B NAME
+Cell name
+.TP
+.B PATH
+Path within workspace (optional)
+.SS cat
+.B brig cat
+[\fB\-n, \-\-lines N\fR]
+[\fB\-\-max\-size MB\fR]
+[\fB\-\-force\fR]
+[\fBNAME\fR]
+[\fBPATH\fR]
+.PP
+View file in workspace.
+.TP
+.B \-n, \-\-lines N
+Show only first N lines
+.TP
+.B \-\-max\-size MB
+Max file size in MB (default: 1)
+.TP
+.B \-\-force
+Show binary files
+.TP
+.B NAME
+Cell name
+.TP
+.B PATH
+Path to file within workspace
+.SS cp
+.B brig cp
+[\fB\-\-sanitize\fR]
+[\fB\-\-allow\-scripts\fR]
+[\fB\-\-allow\-office\fR]
+[\fBSRC\fR]
+[\fBDST\fR]
+.PP
+Copy files to/from workspace.
+.TP
+.B \-\-sanitize
+Block unsafe file types
+.TP
+.B \-\-allow\-scripts
+Allow script files in sanitize mode
+.TP
+.B \-\-allow\-office
+Allow office files in sanitize mode
+.TP
+.B SRC
+Source path (cell:path or local path)
+.TP
+.B DST
+Destination path (cell:path or local path)
+.SS network
+.B brig network
+[\fB\-f, \-\-follow\fR]
+[\fB\-\-blocked\fR]
+[\fB\-\-json\fR]
+[\fB\-\-tail N\fR]
+[\fBNAME\fR]
+.PP
+View cell network activity.
+.TP
+.B \-f, \-\-follow
+Follow log output
+.TP
+.B \-\-blocked
+Show only blocked requests
+.TP
+.B \-\-json
+Output raw JSONL
+.TP
+.B \-\-tail N
+Number of lines to show (default: 20)
+.TP
+.B NAME
+Cell name
+.SS events
+.B brig events
+[\fB\-\-output FORMAT\fR]
+[\fB\-\-since TIMESTAMP\fR]
+[\fBNAME\fR]
+.PP
+Stream cell lifecycle events.
+.TP
+.B \-\-output FORMAT
+Output format: text or json (default: json)
+.TP
+.B \-\-since TIMESTAMP
+Show events since timestamp
+.TP
+.B NAME
+Cell name (optional, all cells if omitted)
+.SS pull
+.B brig pull
+[\fBIMAGE\fR]
+.PP
+Pull and cache a container image.
+.TP
+.B IMAGE
+Container image to pull
+.SS warmup
+.B brig warmup
+[\fB\-\-profile PROFILE\fR]
+[\fBIMAGES...\fR]
+.PP
+Pre-pull images for a profile.
+.TP
+.B \-\-profile PROFILE
+Pull images commonly used with this profile
+.TP
+.B IMAGES...
+Additional images to pull
+.SS checkpoint
+.B brig checkpoint
+[\fB\-\-keep\fR]
+[\fB\-\-export\-name NAME\fR]
+[\fBNAME\fR]
+.PP
+Checkpoint a running cell (CRIU).
+.TP
+.B \-\-keep
+Keep cell running after checkpoint
+.TP
+.B \-\-export\-name NAME
+Checkpoint name (default: <cell>-checkpoint)
+.TP
+.B NAME
+Cell name
+.SS restore
+.B brig restore
+[\fB\-\-name NAME\fR]
+[\fBCHECKPOINT\fR]
+.PP
+Restore a cell from checkpoint.
+.TP
+.B \-\-name NAME
+Name for restored cell
+.TP
+.B CHECKPOINT
+Checkpoint name
+.SS diagnose
+.B brig diagnose
+[\fBNAME\fR]
+.PP
+Run diagnostic checks on a cell.
+.TP
+.B NAME
+Cell name
+.SS health
+.B brig health
+[\fB\-\-format FORMAT\fR]
+.PP
+Check system health.
+.TP
+.B \-\-format FORMAT
+Output format: table (default) or json
+.SS preflight
+.B brig preflight
+[\fB\-\-format FORMAT\fR]
+.PP
+Run preflight validation checks.
+.TP
+.B \-\-format FORMAT
+Output format: table (default) or json
+.SS metrics
+.B brig metrics
+[\fB\-\-serve\fR]
+[\fB\-\-port PORT\fR]
+.PP
+Output Prometheus metrics.
+.TP
+.B \-\-serve
+Serve metrics via HTTP for Prometheus scraping
+.TP
+.B \-\-port PORT
+Port for HTTP server (default: 9090)
+.SS verify
+.B brig verify
+[\fB\-\-fix\fR]
+.PP
+Verify security invariants across all cells.
+.TP
+.B \-\-fix
+Attempt to auto-fix common issues
+.SS history
+.B brig history
+[\fB\-\-format FORMAT\fR]
+[\fB\-n, \-\-tail N\fR]
+[\fB\-\-cell NAME\fR]
+.PP
+Show operation history.
+.TP
+.B \-\-format FORMAT
+Output format: table (default) or json
+.TP
+.B \-n, \-\-tail N
+Show last N entries (default: 20)
+.TP
+.B \-\-cell NAME
+Filter by cell name
+.SS config show
+.B brig config show
+[\fBKEY\fR]
+[\fB\-\-keys\fR]
+.PP
+Show brig configuration.
+.TP
+.B KEY
+Config key (optional, shows all if omitted)
+.TP
+.B \-\-keys
+List available config keys with types and defaults
+.SS config set
+.B brig config set
+[\fBKEY\fR]
+[\fBVALUE\fR]
+.PP
+Set configuration value.
+.TP
+.B KEY
+Config key (e.g., operation_logging.level)
+.TP
+.B VALUE
+Value to set (JSON or string)
+.SS config reset
+.B brig config reset
+.PP
+Reset configuration to defaults.
+.SS tui
+.B brig tui
+[\fB\-\-view VIEW\fR]
+[\fB\-\-cell NAME\fR]
+.PP
+Launch interactive terminal UI.
+.TP
+.B \-\-view VIEW
+Initial view: dashboard, logs, metrics, or policy
+.TP
+.B \-\-cell NAME
+Focus on specific cell
+.SS vm create
+.B brig vm create
+.PP
+Create the brig Lima VM.
+.SS vm start
+.B brig vm start
+.PP
+Start the brig VM.
+.SS vm stop
+.B brig vm stop
+.PP
+Stop the brig VM.
+.SS vm status
+.B brig vm status
+.PP
+Show VM status.
+.SS vm shell
+.B brig vm shell
+.PP
+Open shell in VM or run command.
+.SS vm delete
+.B brig vm delete
+.PP
+Delete the brig VM.
+.SS policy show
+.B brig policy show
+[\fBNAME\fR]
+.PP
+Show cell's effective network policy.
+.TP
+.B NAME
+Cell name
+.SS policy set
+.B brig policy set
+[\fB\-\-allow DOMAIN\fR]
+[\fB\-\-deny DOMAIN\fR]
+[\fB\-\-remove\-allow DOMAIN\fR]
+[\fB\-\-remove\-deny DOMAIN\fR]
+[\fBNAME\fR]
+.PP
+Update cell's network policy.
+.TP
+.B \-\-allow DOMAIN
+Add allowed domain
+.TP
+.B \-\-deny DOMAIN
+Add denied domain
+.TP
+.B \-\-remove\-allow DOMAIN
+Remove allowed domain
+.TP
+.B \-\-remove\-deny DOMAIN
+Remove denied domain
+.TP
+.B NAME
+Cell name
+.SS policy validate
+.B brig policy validate
+[\fBFILE\fR]
+.PP
+Validate policy file syntax.
+.TP
+.B FILE
+Policy file (optional, default: /cells/network-policy.json)
+.SS policy test
+.B brig policy test
+[\fBNAME\fR]
+[\fBDOMAIN\fR]
+[\fB\-\-path PATH\fR]
+[\fB\-\-method METHOD\fR]
+[\fB\-v, \-\-verbose\fR]
+.PP
+Test if a domain is allowed for a cell.
+.TP
+.B NAME
+Cell name
+.TP
+.B DOMAIN
+Domain to test
+.TP
+.B \-\-path PATH
+Path to test (default: /)
+.TP
+.B \-\-method METHOD
+HTTP method (default: GET)
+.TP
+.B \-v, \-\-verbose
+Show detailed evaluation
+.SH CELL DEFINITIONS
+Cells can be defined in YAML or JSON files and run with \fBbrig run -f\fR.
+.PP
+Example cell definition:
+.PP
+.nf
+.RS
+name: my-worker
+image: python:3.11-slim
+command: ["python", "-m", "http.server"]
+env:
+  PORT: "8000"
+secrets:
+  - api-key
+resources:
+  memory: 2g
+  cpus: 2
+  pids_limit: 512
+policy:
+  allow:
+    - "*.example.com"
+  deny:
+    - "internal.example.com"
+detach: true
+.RE
+.fi
+.SH SECURITY
+.SS Isolation Layers
+.IP 1. 4
+\fBLima VM\fR: Hardware boundary protecting macOS (primary security boundary)
+.IP 2. 4
+\fBgVisor\fR: Syscall interception providing defense-in-depth
+.IP 3. 4
+\fBPer-cell networks\fR: Internal networks with no direct internet access
+.IP 4. 4
+\fBWarden proxy\fR: Domain-based egress filtering
+.SS Security Invariants
+.IP \(bu 2
+No east-west traffic between cells
+.IP \(bu 2
+Cells cannot bypass the proxy
+.IP \(bu 2
+gVisor must be active (no silent downgrade)
+.IP \(bu 2
+Cells are single-homed (one network only)
+.IP \(bu 2
+Proxy must be running before cells start
+.PP
+Run \fBbrig verify\fR to check all security invariants.
+.SH FILES
+.TP
+.I ~/.brig/lima.yaml
+Lima VM configuration
+.TP
+.I ~/.brig/cells/
+Cell definition files
+.TP
+.I ~/.brig/cells/network-policy.json
+Global proxy policy
+.TP
+.I ~/.brig/secrets/
+Secret files (one per secret)
+.TP
+.I ~/.brig/state/
+Cell workspaces and logs
+.SH EXAMPLES
+.SS Run a cell interactively
+.PP
+.nf
+brig run --name test alpine sh
+.fi
+.SS Run a cell in background
+.PP
+.nf
+brig run -d --name worker python:3.11 python -m http.server
+.fi
+.SS Run from definition file
+.PP
+.nf
+brig run -f cells/my-worker.yaml
+.fi
+.SS View network activity
+.PP
+.nf
+brig network my-cell -f
+.fi
+.SS Check security
+.PP
+.nf
+brig verify
+.fi
+.SH EXIT STATUS
+.TP
+.B 0
+Success
+.TP
+.B 1
+Error occurred
+.SH SEE ALSO
+.BR warden (1),
+.BR podman (1),
+.BR lima (1)
+.SH AUTHORS
+Brig is developed as part of the Cell secure workload harness project.

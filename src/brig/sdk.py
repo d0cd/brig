@@ -4,7 +4,7 @@ Brig Python SDK - Programmatic cell management.
 Thin async wrapper over the brig CLI. Uses subprocess to call the brig
 binary and parses JSON output. No new daemon or server process needed.
 
-Compatible with Python 3.9+.
+Compatible with Python 3.10+.
 
 Usage:
     from brig.sdk import Brig
@@ -21,13 +21,13 @@ Usage:
             secrets=["openai-key"],
             timeout="2h",
         )
-        result = await cell.wait()
-        print(f"Exit code: {result.exit_code}")
+        exit_code = await cell.wait()
+        print(f"Exit code: {exit_code}")
 
     # Sync usage
     b = Brig()
     cell = b.run_sync(name="test", image="alpine", command=["echo", "hello"])
-    result = cell.wait_sync()
+    exit_code = cell.wait_sync()
 """
 
 from __future__ import annotations
@@ -40,14 +40,28 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # Validation patterns for SDK inputs.
-_CELL_NAME_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_-]{0,62}$')
+from brig.config import CELL_NAME_PATTERN
+from brig.utils import BrigError
+_CELL_NAME_RE = CELL_NAME_PATTERN
 _ENV_KEY_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]*$')
 _DEFAULT_TIMEOUT = 300  # Default subprocess timeout in seconds.
+
+# Common secret value prefixes. Env vars must not carry secrets (use secrets parameter instead).
+_SECRET_PREFIXES = (
+    "sk-", "sk_", "ghp_", "gho_", "ghs_", "ghu_", "github_pat_",
+    "AKIA", "xoxb-", "xoxp-", "xapp-",
+    "glpat-", "eyJ",  # JWT-style base64 tokens.
+)
 
 
 @dataclass
 class CellResult:
-    """Result of a cell execution."""
+    """Result of a cell execution.
+
+    .. deprecated::
+        wait() now returns int directly. This class is retained for
+        backward compatibility and will be removed in a future release.
+    """
     cell: str
     exit_code: int
 
@@ -98,23 +112,55 @@ class CellStats:
     pids: str
 
 
-class BrigError(Exception):
-    """Error from a brig CLI command."""
-    def __init__(self, message: str, returncode: int = 1, stderr: str = ""):
-        super().__init__(message)
-        self.returncode = returncode
-        self.stderr = stderr
+# BrigError is imported from brig.utils and re-exported here for public API.
+
+
+class CellNotFoundError(BrigError):
+    """Raised when a cell does not exist."""
+    ...
+
+
+class ImageVerificationError(BrigError):
+    """Raised when image digest verification fails."""
+    ...
+
+
+class ProfileError(BrigError):
+    """Raised when an unknown or invalid profile is specified."""
+    ...
+
+
+class SecretNotFoundError(BrigError):
+    """Raised when a referenced secret does not exist."""
+    ...
+
+
+# Patterns for mapping CLI stderr to specific exception subclasses.
+# More specific patterns must come before generic ones.
+_ERROR_PATTERNS = [
+    (re.compile(r"Unknown profile", re.IGNORECASE), ProfileError),
+    (re.compile(r"Secret.*not found|not found in secrets", re.IGNORECASE), SecretNotFoundError),
+    (re.compile(r"digest mismatch|verification failed", re.IGNORECASE), ImageVerificationError),
+    (re.compile(r"not found|does not exist", re.IGNORECASE), CellNotFoundError),
+]
+
+# Known profile names for SDK-side validation.
+_KNOWN_PROFILES = frozenset({"untrusted", "supervised", "dev", "airgapped", "honeypot"})
 
 
 class Cell:
     """Handle to a running or completed cell."""
 
-    def __init__(self, name: str, brig: "Brig", run_result: CellRunResult = None):
+    def __init__(self, name: str, brig: "Brig", run_result: Optional[CellRunResult] = None):
+        if not _CELL_NAME_RE.match(name):
+            raise BrigError(
+                f"Invalid cell name '{name}': must match {_CELL_NAME_RE.pattern}"
+            )
         self.name = name
         self._brig = brig
         self.run_result = run_result
 
-    async def wait(self, timeout: str = None) -> CellResult:
+    async def wait(self, timeout: str = None) -> int:
         """Block until cell exits, returning its exit code."""
         cmd = [self._brig._bin, "wait", "--output", "json", self.name]
         if timeout:
@@ -129,12 +175,16 @@ class Cell:
 
         try:
             data = json.loads(result.stdout)
-            return CellResult(cell=data["cell"], exit_code=data["exit_code"])
+            return data["exit_code"]
         except (json.JSONDecodeError, KeyError):
-            # If JSON parsing fails, the return code is the cell exit code.
-            return CellResult(cell=self.name, exit_code=result.returncode)
+            if result.returncode != 0:
+                raise BrigError(
+                    f"Failed to parse wait output for cell {self.name}",
+                    result.returncode, result.stderr
+                )
+            return result.returncode
 
-    def wait_sync(self, timeout: str = None) -> CellResult:
+    def wait_sync(self, timeout: str = None) -> int:
         """Synchronous version of wait()."""
         return _run_sync(self.wait(timeout))
 
@@ -156,6 +206,14 @@ class Cell:
 
     async def cp_in(self, local_path: str, cell_path: str) -> None:
         """Copy a file from local filesystem into the cell workspace."""
+        from pathlib import Path as _Path
+        # Validate local_path: resolve and check no traversal.
+        lp = _Path(local_path)
+        if ".." in lp.parts:
+            raise BrigError("Path traversal not allowed in local_path")
+        # Validate cell_path: no traversal components.
+        if ".." in cell_path.split("/"):
+            raise BrigError("Path traversal not allowed in cell_path")
         await self._brig._run_cmd([
             self._brig._bin, "cp", local_path, f"{self.name}:{cell_path}"
         ])
@@ -166,6 +224,14 @@ class Cell:
 
     async def cp_out(self, cell_path: str, local_path: str) -> None:
         """Copy a file from cell workspace to local filesystem."""
+        from pathlib import Path as _Path
+        # Validate local_path: resolve and check no traversal.
+        lp = _Path(local_path)
+        if ".." in lp.parts:
+            raise BrigError("Path traversal not allowed in local_path")
+        # Validate cell_path: no traversal components.
+        if ".." in cell_path.split("/"):
+            raise BrigError("Path traversal not allowed in cell_path")
         await self._brig._run_cmd([
             self._brig._bin, "cp", f"{self.name}:{cell_path}", local_path
         ])
@@ -174,20 +240,45 @@ class Cell:
         """Synchronous version of cp_out()."""
         _run_sync(self.cp_out(cell_path, local_path))
 
-    async def logs(self, follow: bool = False, tail: int = None) -> str:
-        """Get cell logs. Returns log text."""
-        cmd = [self._brig._bin, "logs"]
+    async def logs(self, follow: bool = False, tail: int = None):
+        """Get cell logs.
+
+        When follow=False, returns log text as str (awaitable).
+        When follow=True, returns an async iterator yielding lines.
+        """
         if follow:
-            cmd.append("-f")
+            return self._logs_stream(tail=tail)
+
+        cmd = [self._brig._bin, "logs"]
         if tail:
             cmd.extend(["--tail", str(tail)])
         cmd.append(self.name)
         result = await self._brig._run_cmd(cmd)
         return result.stdout
 
+    async def _logs_stream(self, tail: int = None):
+        """Async generator yielding log lines. Used by logs(follow=True)."""
+        cmd = [self._brig._bin, "logs", "-f"]
+        if tail:
+            cmd.extend(["--tail", str(tail)])
+        cmd.append(self.name)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            async for line in proc.stdout:
+                yield line.decode("utf-8", errors="replace").rstrip("\n")
+        finally:
+            proc.kill()
+            await proc.wait()
+
     def logs_sync(self, follow: bool = False, tail: int = None) -> str:
-        """Synchronous version of logs()."""
-        return _run_sync(self.logs(follow=follow, tail=tail))
+        """Synchronous version of logs(). Only supports follow=False."""
+        if follow:
+            raise BrigError("logs_sync() does not support follow=True; use async logs()")
+        return _run_sync(self.logs(follow=False, tail=tail))
 
     async def stats(self) -> list[CellStats]:
         """Get resource usage stats for this cell."""
@@ -196,6 +287,19 @@ class Cell:
     def stats_sync(self) -> list[CellStats]:
         """Synchronous version of stats()."""
         return _run_sync(self.stats())
+
+    async def is_alive(self) -> bool:
+        """Check if the cell is still running."""
+        result = await self._brig._run_cmd(
+            [self._brig._bin, "inspect", "--format", "json", self.name], check=False
+        )
+        if result.returncode != 0:
+            return False
+        try:
+            data = json.loads(result.stdout)
+            return data[0].get("State", {}).get("Running", False)
+        except (json.JSONDecodeError, IndexError, KeyError):
+            return False
 
     async def events(self):
         """Async generator yielding lifecycle events for this cell.
@@ -261,14 +365,17 @@ class Cell:
             await proc.wait()
 
     async def rm(self, force: bool = False, purge: bool = False) -> None:
-        """Remove the cell."""
-        cmd = [self._brig._bin, "rm"]
-        if force:
-            cmd.append("-f")
-        if purge:
-            cmd.append("--purge")
-        cmd.append(self.name)
-        await self._brig._run_cmd(cmd)
+        """Remove the cell. Idempotent: does not raise if already gone."""
+        try:
+            cmd = [self._brig._bin, "rm"]
+            if force:
+                cmd.append("-f")
+            if purge:
+                cmd.append("--purge")
+            cmd.append(self.name)
+            await self._brig._run_cmd(cmd)
+        except CellNotFoundError:
+            pass  # Cell already gone — idempotent.
 
     def rm_sync(self, force: bool = False, purge: bool = False) -> None:
         """Synchronous version of rm()."""
@@ -354,10 +461,13 @@ class Brig:
         if check and result.returncode != 0:
             # Only include binary + subcommand to avoid leaking secrets.
             cmd_summary = ' '.join(cmd[:2]) if len(cmd) >= 2 else cmd[0]
-            raise BrigError(
-                f"Command failed: {cmd_summary}\n{result.stderr.strip()}",
-                result.returncode, result.stderr
-            )
+            msg = f"Command failed: {cmd_summary}\n{result.stderr.strip()}"
+            stderr = result.stderr
+            # Match stderr against known patterns for specific exceptions.
+            for pattern, exc_cls in _ERROR_PATTERNS:
+                if pattern.search(stderr):
+                    raise exc_cls(msg, result.returncode, stderr)
+            raise BrigError(msg, result.returncode, stderr)
         return result
 
     @staticmethod
@@ -371,9 +481,11 @@ class Brig:
         name: str,
         image: str,
         command: list[str] = None,
+        *,
         profile: str = None,
         policy_allow: list[str] = None,
         policy_deny: list[str] = None,
+        egress_allow: list[str] = None,
         secrets: list[str] = None,
         env: dict[str, str] = None,
         memory: str = None,
@@ -384,6 +496,9 @@ class Brig:
         labels: dict[str, str] = None,
         detach: bool = True,
         rm: bool = False,
+        workdir: str = None,
+        image_digest: str = None,
+        canary_tokens: dict[str, str] = None,
     ) -> Cell:
         """Launch a new cell.
 
@@ -392,9 +507,12 @@ class Brig:
         """
         # Validate inputs to prevent CLI flag injection.
         if not name or not _CELL_NAME_RE.match(name):
-            raise BrigError(f"Invalid cell name: {name!r}")
+            raise BrigError(
+                f"Invalid cell name: {name!r}. "
+                "Names must start with a letter/digit and contain only [a-zA-Z0-9_-]."
+            )
         if not image:
-            raise BrigError("Image is required")
+            raise BrigError("Image is required. Example: run('mycel', 'alpine:latest')")
         self._validate_no_flag(image, "image")
         if profile:
             self._validate_no_flag(profile, "profile")
@@ -413,9 +531,39 @@ class Brig:
             for d in policy_deny:
                 self._validate_no_flag(d, "policy_deny domain")
         if env:
-            for k in env:
+            for k, v in env.items():
                 if not _ENV_KEY_RE.match(k):
-                    raise BrigError(f"Invalid env key: {k!r}")
+                    raise BrigError(
+                        f"Invalid env key: {k!r}. "
+                        "Keys must match [A-Za-z_][A-Za-z0-9_]*."
+                    )
+                # Block values that look like secrets. Use the secrets parameter instead.
+                if any(str(v).startswith(prefix) for prefix in _SECRET_PREFIXES):
+                    raise BrigError(
+                        f"Env var '{k}' value looks like a secret. "
+                        "Use the secrets parameter to mount secrets as files."
+                    )
+        # Validate profile against known names.
+        if profile and profile not in _KNOWN_PROFILES:
+            raise ProfileError(f"Unknown profile: {profile!r}")
+        if egress_allow:
+            for d in egress_allow:
+                self._validate_no_flag(d, "egress_allow domain")
+        if workdir:
+            self._validate_no_flag(workdir, "workdir")
+        if image_digest:
+            self._validate_no_flag(image_digest, "image_digest")
+            if not image_digest.startswith("sha256:"):
+                raise BrigError(
+                    "Invalid image_digest: must start with 'sha256:'"
+                )
+        if secrets:
+            for s in secrets:
+                self._validate_no_flag(s, "secret name")
+
+        # Merge egress_allow into policy_allow.
+        if egress_allow:
+            policy_allow = list(policy_allow or []) + list(egress_allow)
 
         cmd = [self._bin, "run", "--output", "json", "--name", name]
 
@@ -449,14 +597,39 @@ class Brig:
                 cmd.extend(["-e", f"{k}={v}"])
         if labels:
             for k, v in labels.items():
+                if k.startswith("-"):
+                    raise BrigError(f"Label key must not start with '-': {k}")
                 cmd.extend(["--label", f"{k}={v}"])
+        if workdir:
+            cmd.extend(["--workdir", workdir])
+        if image_digest:
+            cmd.extend(["--image-digest", image_digest])
+
+        # Canary tokens: write to tempfile to avoid ps exposure.
+        canary_tmpfile = None
+        if canary_tokens:
+            import os
+            import tempfile
+            fd, canary_tmpfile = tempfile.mkstemp(prefix="brig_canary_", suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                json.dump({"canary_tokens": canary_tokens}, f)
+            cmd.extend(["--canary-file", canary_tmpfile])
 
         cmd.append("--")  # Prevent image/command flag injection.
         cmd.append(image)
         if command:
             cmd.extend(command)
 
-        result = await self._run_cmd(cmd)
+        try:
+            result = await self._run_cmd(cmd)
+        finally:
+            # Clean up canary tempfile if CLI didn't consume it.
+            if canary_tmpfile:
+                import os as _os
+                try:
+                    _os.unlink(canary_tmpfile)
+                except OSError:
+                    pass
 
         # Parse structured JSON output.
         run_result = None
@@ -532,6 +705,19 @@ class Brig:
 
     async def cell(self, name: str) -> Cell:
         """Get a handle to an existing cell by name."""
+        if not _CELL_NAME_RE.match(name):
+            raise BrigError(f"Invalid cell name: {name}")
+        return Cell(name, self)
+
+    async def get(self, name: str) -> Optional[Cell]:
+        """Look up an existing cell by name. Returns Cell or None."""
+        if not _CELL_NAME_RE.match(name):
+            raise BrigError(f"Invalid cell name: {name}")
+        result = await self._run_cmd(
+            [self._bin, "inspect", "--format", "json", name], check=False
+        )
+        if result.returncode != 0:
+            return None
         return Cell(name, self)
 
     async def pipe(
@@ -576,6 +762,8 @@ def _run_sync(coro):
 
     if loop and loop.is_running():
         # Already in an async context; create a new thread.
+        import warnings
+        warnings.warn("Calling *_sync from an async context may deadlock", RuntimeWarning, stacklevel=3)
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             return pool.submit(asyncio.run, coro).result()

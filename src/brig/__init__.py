@@ -9,17 +9,30 @@ SDK usage:
 
     b = Brig()
     cell = b.run_sync(name="test", image="alpine", command=["echo", "hi"])
-    result = cell.wait_sync()
+    exit_code = cell.wait_sync()
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from brig.sdk import (
-    Brig, Cell, BrigError, CellResult, CellInfo, CellRunResult, CellEvent,
-    CellStats, WardenStatus, WardenHandle,
+    Brig,
+    BrigError,
+    Cell,
+    CellEvent,
+    CellInfo,
+    CellNotFoundError,
+    CellResult,
+    CellRunResult,
+    CellStats,
+    ImageVerificationError,
+    ProfileError,
+    SecretNotFoundError,
+    WardenHandle,
+    WardenStatus,
 )
 
 __all__ = [
-    "Brig", "Cell", "BrigError", "CellResult", "CellInfo", "CellRunResult",
-    "CellEvent", "CellStats", "WardenStatus", "WardenHandle",
+    "Brig", "Cell", "BrigError", "CellNotFoundError", "ImageVerificationError",
+    "ProfileError", "SecretNotFoundError", "CellResult", "CellInfo",
+    "CellRunResult", "CellEvent", "CellStats", "WardenStatus", "WardenHandle",
 ]

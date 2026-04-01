@@ -72,14 +72,14 @@ def _generate_keypair():
     global _signing_key, _algorithm
 
     try:
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
         private_key = Ed25519PrivateKey.generate()
         _signing_key = private_key
         _algorithm = "ed25519"
 
-        # Write public key.
+        # Write public key (needed for offline verification).
         verify_key = private_key.public_key()
         pubkey_pem = verify_key.public_bytes(
             serialization.Encoding.PEM,
@@ -87,53 +87,32 @@ def _generate_keypair():
         )
         _write_atomic(PUBKEY_PATH, pubkey_pem)
 
-        # Write private key (restricted permissions).
-        privkey_pem = private_key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        )
-        _write_atomic(PRIVKEY_PATH, privkey_pem, mode=0o600)
+        # Private key stays in memory only. Ed25519 verification uses only the
+        # public key, so there is no need to persist the private key to disk.
+        # This prevents key theft if the container filesystem is compromised.
 
         return True
 
     except ImportError:
-        # Fallback: Use HMAC-SHA256 for signing when cryptography is unavailable.
-        logger.warning(
-            "cryptography package not available; using HMAC-SHA256 fallback. "
-            "Install 'cryptography' for Ed25519 signatures."
+        # Fail hard: HMAC fallback would write shared secret to disk, which
+        # violates the security model. Require 'cryptography' package for
+        # Ed25519 signatures that keep the private key in memory only.
+        logger.error(
+            "SECURITY: 'cryptography' package is required for log signing. "
+            "Install with: pip install cryptography"
         )
-        secret = os.urandom(32)
-        _signing_key = secret
-        _algorithm = "hmac-sha256"
-
-        key_b64 = base64.b64encode(secret).decode()
-        key_data = json.dumps({
-            "algorithm": "hmac-sha256",
-            "key": key_b64,
-            "note": "Fallback mode - install 'cryptography' package for Ed25519",
-        }).encode()
-        # HMAC uses a shared secret; write only to private key path.
-        _write_atomic(PRIVKEY_PATH, key_data, mode=0o600)
-        # Public key path gets a note; HMAC has no separate public key.
-        _write_atomic(
-            PUBKEY_PATH,
-            b"HMAC mode: verification uses the private key. "
-            b"Do not distribute this file.\n",
-            mode=0o600
-        )
-
-        return True
+        return False
 
 
 def _write_atomic(path: Path, data: bytes, mode: int = 0o644):
     """Write data atomically to a file."""
     tmp_path = path.with_suffix(".tmp")
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(str(tmp_path), mode)
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
     tmp_path.rename(path)
 
 
@@ -153,6 +132,8 @@ def _flush_batch():
     global _batch_entries, _batch_start_time, _batch_counter
 
     if not _batch_entries:
+        # Reset start time to prevent immediate re-flush on next entry.
+        _batch_start_time = None
         return
 
     _batch_counter += 1
@@ -221,10 +202,25 @@ def add_entry(entry: dict):
             _flush_batch()
 
 
+def _cleanup_old_batches(max_age_days: int = 7):
+    """Remove batch files older than max_age_days."""
+    if not SIGNED_DIR.exists():
+        return
+    cutoff = time.time() - (max_age_days * 86400)
+    for f in SIGNED_DIR.glob("batch_*"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
 def flush():
     """Force flush any pending entries (thread-safe). Called on Warden stop."""
     with _lock:
         _flush_batch()
+    # Clean up old batch files (keep last 7 days).
+    _cleanup_old_batches()
 
 
 def verify_batch(batch_path: str, pubkey_path: str) -> bool:

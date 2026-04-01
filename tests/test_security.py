@@ -55,15 +55,13 @@ class TestPathTraversal(unittest.TestCase):
         self.assertTrue(any("traversal" in e.lower() for e in errors))
 
     def test_encoded_traversal(self):
-        """URL-encoded traversal attempts are rejected."""
-        # %2e = '.', %2f = '/'
+        """URL-encoded traversal attempts pass validation (literal names, not decoded)."""
+        # %2e = '.', %2f = '/' — these are not decoded by validation.
+        # The literal string "%2e%2e%2fetc%2fpasswd" contains no .. or /,
+        # so it passes. The actual file won't exist with this name.
         cell_def = {"image": "alpine", "secrets": ["%2e%2e%2fetc%2fpasswd"]}
-        # If not decoded, this would pass. Verify behavior.
-        # Note: validation might not URL-decode, which is actually OK since
-        # the literal string doesn't contain .. or /
         errors = brig.validate_cell_definition(cell_def)
-        # This specific test shows encoded strings pass (expected - files are literal names).
-        # The actual file won't exist with this name.
+        self.assertEqual(errors, [], "Encoded strings should pass (they are literal filenames)")
 
     def test_absolute_path_secret(self):
         """Absolute paths in secret names are rejected."""
@@ -207,7 +205,8 @@ class TestPolicyBypass(unittest.TestCase):
             "example.com.evil.com",
             "evil.example.com.evil.com",
             "notexample.com",
-            "example.com.",  # Trailing dot.
+            # Note: "example.com." (trailing dot) is DNS-equivalent to "example.com"
+            # and is correctly normalized and matched after the trailing dot fix.
         ]
         for domain in test_domains:
             allowed, _, _ = policy.is_allowed(domain, "/", "GET")
@@ -266,10 +265,10 @@ class TestInputValidation(unittest.TestCase):
 
     def test_very_long_strings(self):
         """Very long strings don't cause issues."""
-        # Long name is rejected (>63 chars).
+        # Long name is rejected (>63 chars via pattern {0,62}).
         cell_def = {"name": "a" * 100, "image": "alpine"}
         errors = brig.validate_cell_definition(cell_def)
-        self.assertTrue(any("63" in e for e in errors))
+        self.assertTrue(len(errors) > 0, "Name exceeding 63 chars must be rejected")
 
     def test_special_characters_in_name(self):
         """Special characters in name are rejected."""
@@ -362,7 +361,7 @@ class TestRateLimitSecurity(unittest.TestCase):
         try:
             os.chmod(self.temp_dir, 0o444)
             # Should not crash.
-            result = brig.check_rate_limit()
+            brig.check_rate_limit()
             # Result might be True (fail open) or False depending on impl.
         finally:
             os.chmod(self.temp_dir, 0o755)
@@ -688,7 +687,7 @@ class TestCircuitBreakerRecovery(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Import notifier with mocked dependencies."""
-        from notifier import CircuitBreakerState, CircuitBreakerConfig
+        from notifier import CircuitBreakerConfig, CircuitBreakerState
         cls.CircuitBreakerState = CircuitBreakerState
         cls.CircuitBreakerConfig = CircuitBreakerConfig
 
@@ -980,43 +979,39 @@ class TestDNSRebindingPostResolution(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Import PolicyEnforcer with mocked mitmproxy."""
-        from enforce import PolicyEnforcer, BLOCKED_NETWORKS
+        from enforce import BLOCKED_NETWORKS, PolicyEnforcer
         cls.PolicyEnforcer = PolicyEnforcer
         cls.BLOCKED_NETWORKS = BLOCKED_NETWORKS
 
-    def test_serverconnect_blocks_internal_ip(self):
-        """serverconnect hook blocks connections to internal IPs."""
+    def test_server_connected_blocks_internal_ip(self):
+        """server_connected hook blocks connections to internal IPs."""
         enforcer = self.PolicyEnforcer()
-        server_conn = MagicMock()
-        server_conn.address = ("127.0.0.1", 80)
-        server_conn.error = None
+        data = MagicMock()
+        data.server.peername = ("127.0.0.1", 80)
 
-        enforcer.serverconnect(server_conn)
+        enforcer.server_connected(data)
 
-        self.assertIsNotNone(server_conn.error)
-        self.assertIn("blocked IP", server_conn.error)
+        data.server.close.assert_called_once()
 
-    def test_serverconnect_allows_public_ip(self):
-        """serverconnect hook allows connections to public IPs."""
+    def test_server_connected_allows_public_ip(self):
+        """server_connected hook allows connections to public IPs."""
         enforcer = self.PolicyEnforcer()
-        server_conn = MagicMock()
-        server_conn.address = ("93.184.216.34", 443)
-        server_conn.error = None
+        data = MagicMock()
+        data.server.peername = ("93.184.216.34", 443)
 
-        enforcer.serverconnect(server_conn)
+        enforcer.server_connected(data)
 
-        # error should remain None (not set).
-        self.assertIsNone(server_conn.error)
+        # close should NOT have been called.
+        data.server.close.assert_not_called()
 
-    def test_serverconnect_blocks_rfc1918(self):
-        """serverconnect blocks RFC1918 addresses after DNS resolution."""
+    def test_server_connected_blocks_rfc1918(self):
+        """server_connected blocks RFC1918 addresses after DNS resolution."""
         enforcer = self.PolicyEnforcer()
         for ip in ["10.0.0.1", "172.16.0.1", "192.168.1.1"]:
-            server_conn = MagicMock()
-            server_conn.address = (ip, 80)
-            server_conn.error = None
-            enforcer.serverconnect(server_conn)
-            self.assertIsNotNone(server_conn.error, f"Should block {ip}")
+            data = MagicMock()
+            data.server.peername = (ip, 80)
+            enforcer.server_connected(data)
+            data.server.close.assert_called_once()
 
 
 class TestCellPolicyIsolationSecurity(unittest.TestCase):
@@ -1075,6 +1070,145 @@ class TestIDNNormalization(unittest.TestCase):
         """Punycode domain matches regardless of encoding form."""
         rule = self.PolicyRule("xn--mnchen-3ya.de")
         self.assertTrue(rule.matches_domain("xn--mnchen-3ya.de"))
+
+
+class TestSecurityInvariants(unittest.TestCase):
+    """Tests that security invariants documented in CLAUDE.md are enforced.
+
+    Each test verifies a specific invariant from the security model.
+    """
+
+    def setUp(self):
+        """Create temp directory for workspace."""
+        self.temp_dir = tempfile.mkdtemp()
+        self._original_state_dir = brig.STATE_DIR
+        brig.STATE_DIR = Path(self.temp_dir)
+
+    def tearDown(self):
+        """Clean up."""
+        import shutil
+        shutil.rmtree(self.temp_dir)
+        brig.STATE_DIR = self._original_state_dir
+
+    def _make_args(self, **overrides):
+        """Create default args for _build_run_command."""
+        defaults = {
+            "workdir": None, "name": "test", "image": "alpine",
+            "container_cmd": [], "memory": "2g", "cpus": "2",
+            "pids_limit": 512, "detach": True, "rm": False,
+            "env": None, "secret": None, "label": None,
+            "seccomp_profile": None, "timeout": None,
+            "network": "default", "profile": None,
+        }
+        defaults.update(overrides)
+        args = MagicMock()
+        for k, v in defaults.items():
+            setattr(args, k, v)
+        return args
+
+    def test_invariant_gvisor_runtime_always_set(self):
+        """Invariant 5: gVisor must be active — --runtime=runsc always present."""
+        args = self._make_args()
+        cmd = brig._build_run_command(
+            args, "test", False, "brig-test", "10.60.1.1", None,
+            lambda msg, s=None: None,
+        )
+        self.assertIn("--runtime", cmd)
+        idx = cmd.index("--runtime")
+        self.assertEqual(cmd[idx + 1], "runsc")
+
+    def test_invariant_gvisor_runtime_airgapped(self):
+        """Invariant 5: gVisor runtime enforced even for airgapped cells."""
+        args = self._make_args()
+        cmd = brig._build_run_command(
+            args, "test", True, "brig-test", "10.60.1.1", None,
+            lambda msg, s=None: None,
+        )
+        self.assertIn("--runtime", cmd)
+        idx = cmd.index("--runtime")
+        self.assertEqual(cmd[idx + 1], "runsc")
+
+    def test_invariant_single_homed_cell(self):
+        """Invariant 8: Cells must be single-homed (only one --network flag)."""
+        args = self._make_args()
+        cmd = brig._build_run_command(
+            args, "test", False, "brig-test", "10.60.1.1", None,
+            lambda msg, s=None: None,
+        )
+        network_count = cmd.count("--network")
+        self.assertEqual(network_count, 1, "Cell must have exactly one --network flag")
+
+    def test_invariant_cell_never_on_proxy_external(self):
+        """Invariant 6: Only Warden may attach to proxy-external network."""
+        args = self._make_args()
+        cmd = brig._build_run_command(
+            args, "test", False, "brig-test", "10.60.1.1", None,
+            lambda msg, s=None: None,
+        )
+        for arg in cmd:
+            self.assertNotIn("proxy-external", str(arg),
+                             "Cell must never be on proxy-external network")
+
+    def test_invariant_warden_before_cells(self):
+        """Invariant 9: Warden must be running before cells start."""
+        # cmd_run checks proxy_running() and errors if warden is down.
+        with patch.object(brig, 'proxy_running', return_value=False), \
+             patch.object(brig, 'cell_exists', return_value=False), \
+             patch.object(brig, 'run') as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="")
+            args = MagicMock()
+            args.name = "test"
+            args.image = "alpine"
+            args.container_cmd = []
+            args.profile = None
+            args.cell_def = None
+            args.network = "default"
+            args.timeout = None
+            args.dry_run = False
+            args.airgap = False
+            args.canary_file = None
+            with self.assertRaises(SystemExit):
+                brig.cmd_run(args)
+
+    def test_invariant_secrets_as_files_not_env(self):
+        """Invariant: Secrets mounted as files at /run/secrets/, not env values."""
+        secrets_dir = Path(self.temp_dir) / "secrets"
+        secrets_dir.mkdir()
+        secret_file = secrets_dir / "api-key.txt"
+        secret_file.write_text("sk-supersecret-12345")
+
+        args = self._make_args(secret=["api-key.txt"])
+        # Patch _build_run_command's Path("/secrets") to use our temp dir.
+        original_path = Path
+
+        def patched_path(p, *a, **kw):
+            if p == "/secrets":
+                return secrets_dir
+            return original_path(p, *a, **kw)
+
+        with patch.object(brig, 'Path', side_effect=patched_path):
+            cmd = brig._build_run_command(
+                args, "test", False, "brig-test", "10.60.1.1", None,
+                lambda msg, s=None: None,
+            )
+
+        # Secret must be mounted as a volume, not inlined in env.
+        has_volume_mount = any(
+            "/run/secrets/api-key.txt:ro" in arg for arg in cmd
+        )
+        self.assertTrue(has_volume_mount,
+                        "Secret must be mounted as read-only volume at /run/secrets/")
+
+        # Env var must point to file path, not contain the secret value.
+        secret_value = "sk-supersecret-12345"
+        for i, arg in enumerate(cmd):
+            if arg == "-e" and i + 1 < len(cmd):
+                self.assertNotIn(secret_value, cmd[i + 1],
+                                 "Secret values must not appear in env vars")
+                # The FILE env var should point to the path, not the value.
+                if "API_KEY" in cmd[i + 1]:
+                    self.assertIn("/run/secrets/", cmd[i + 1],
+                                  "Secret env var must point to file path")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ import http.server
 import json
 import os
 import socketserver
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -37,8 +38,13 @@ from pathlib import Path
 from mitmproxy import ctx
 
 # Health server configuration.
-HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8089"))
-POLICY_FILE = Path(os.environ.get("POLICY_FILE", "/cells/network-policy.json"))
+try:
+    HEALTH_PORT = int(os.environ.get("HEALTH_PORT", "8089"))
+    if not (1 <= HEALTH_PORT <= 65535):
+        HEALTH_PORT = 8089
+except (ValueError, TypeError):
+    HEALTH_PORT = 8089
+POLICY_FILE = Path(os.environ.get("POLICY_FILE", "/policy.json"))
 LOG_DIR = Path("/var/log/brig/network")
 
 # Global health state (updated by addon).
@@ -59,11 +65,11 @@ def _update_health_state():
         # Check policy file.
         _health_state["policy_loaded"] = POLICY_FILE.exists()
 
-        # Check logging.
+        # Check logging directory is writable using unpredictable temp file.
         try:
-            test_file = LOG_DIR / ".health_check"
-            test_file.touch()
-            test_file.unlink()
+            fd, path = tempfile.mkstemp(dir=str(LOG_DIR), prefix=".health_")
+            os.close(fd)
+            os.unlink(path)
             _health_state["logging_available"] = True
         except Exception:
             _health_state["logging_available"] = False
@@ -144,7 +150,7 @@ class HealthHandler(http.server.BaseHTTPRequestHandler):
             status_code, response = _get_health_response("live")
         else:
             status_code = 404
-            response = {"error": "not_found", "path": self.path}
+            response = {"error": "not_found"}
 
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
@@ -173,7 +179,7 @@ class HealthAddon:
         """Called when addon is loaded."""
         # Start health server in background.
         try:
-            self.server = ThreadedHTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
+            self.server = ThreadedHTTPServer(("127.0.0.1", HEALTH_PORT), HealthHandler)
             self.server_thread = threading.Thread(
                 target=self.server.serve_forever,
                 daemon=True
