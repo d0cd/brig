@@ -1243,20 +1243,9 @@ class TestWardenCmdLogsCompactAi(unittest.TestCase):
             "ai_enabled": True,
             "ai_error": None,
         }
-        with unittest.mock.patch.dict('sys.modules', {'summarizer': mock_summarizer}):
-            # Need to also patch the sys.path.insert to find the mock module.
-            with unittest.mock.patch('importlib.import_module', return_value=mock_summarizer):
-                # The function uses `from summarizer import compact_cell_logs`.
-                # We need to patch at the import level.
-                original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
-
-                def mock_import(name, *args, **kwargs):
-                    if name == 'summarizer':
-                        return mock_summarizer
-                    return original_import(name, *args, **kwargs)
-
-                with unittest.mock.patch('builtins.__import__', side_effect=mock_import):
-                    result = self.warden.cmd_logs_compact_ai("cell", older_than="24h")
+        # Inject mock into sys.modules so `from summarizer import compact_cell_logs` works.
+        with unittest.mock.patch.dict(sys.modules, {"summarizer": mock_summarizer}):
+            result = self.warden.cmd_logs_compact_ai("cell", older_than="24h")
         self.assertEqual(result, 0)
 
 

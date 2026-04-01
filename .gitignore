@@ -33,6 +33,7 @@ coverage.json
 *.py,cover
 .hypothesis/
 tests/benchmarks/baseline.json
+tests/benchmarks/results/*.json
 
 # Type checking
 .mypy_cache/

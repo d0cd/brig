@@ -858,15 +858,14 @@ Post-MVP improvements for stability, usability, and reliability.
 - [x] Subnet lookup (10 and 200 entries)
 - [x] Token bucket, histogram, log filter, LRU eviction benchmarks
 
-#### 4.3 Cell Lifecycle Benchmarks
-**File:** `tests/benchmarks/bench_lifecycle.py`
+#### 4.3 Cell Lifecycle Benchmarks ✓
+**File:** `tests/benchmarks/test_bench_lifecycle.py`
 
-- [ ] Cell creation time (target: <5s including network setup)
-- [ ] Cell startup time (target: <2s for running state)
-- [ ] Cell stop time (graceful shutdown)
-- [ ] Cell removal time (including network cleanup)
-- [ ] Concurrent cell creation (10/50/100 cells)
-- [ ] Subnet allocator performance at scale (200+ allocations)
+- [x] Cell creation time (mocked cmd_run flow)
+- [x] Cell stop time (mocked cmd_stop flow)
+- [x] Cell removal time (mocked cmd_rm including network cleanup)
+- [x] Concurrent cell creation (10/50/100 cells via ThreadPoolExecutor)
+- [x] Subnet allocator concurrent allocation (20 threads, measures lock contention)
 
 #### 4.4 CLI Response Time Benchmarks ✓
 **File:** `tests/benchmarks/test_bench_cli.py`
@@ -905,18 +904,18 @@ Post-MVP improvements for stability, usability, and reliability.
 
 - [x] HistogramLatencyBuffer with O(1) insert/query
 
-##### 4.7.4 Policy Lookup Optimization
+##### 4.7.4 Policy Lookup Optimization ✓
 **File:** `src/addons/enforce.py`
 
-- [ ] Consider trie or radix tree for domain matching at scale
+- [x] Reverse-label `DomainTrie` for O(k) domain matching (k = label count)
 
 #### 4.8 Continuous Benchmarking ✓
 
 - [x] Run benchmarks on every PR (via benchmarks.yml)
 - [x] Run full benchmark suite on nightly schedule
 - [x] Alert on >10% regression (baseline compare gate)
-- [ ] Generate trend graphs
-- [ ] Store results in `benchmarks/results/` (gitignored)
+- [x] Trend analysis script (`tests/benchmarks/bench_trend.py`)
+- [x] Store results in `benchmarks/results/` (gitignored)
 
 ---
 

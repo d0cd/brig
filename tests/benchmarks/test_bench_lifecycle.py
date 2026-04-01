@@ -232,3 +232,225 @@ def test_bench_subnet_load_state(benchmark, subnet_mod, subnet_temp):
 def test_bench_network_name(benchmark, brig_mod):
     """network_name() string construction."""
     benchmark(brig_mod.network_name, "my-benchmark-cell")
+
+
+# ---------------------------------------------------------------------------
+# Cell lifecycle command benchmarks
+# ---------------------------------------------------------------------------
+
+def _make_cmd_run_args(**overrides):
+    """Build a full args namespace for cmd_run."""
+    defaults = dict(
+        name="bench-cell",
+        image="alpine:latest",
+        container_cmd=["echo", "hello"],
+        memory="2g",
+        cpus="2",
+        pids_limit=512,
+        detach=False,
+        rm=False,
+        env=None,
+        secret=None,
+        label=None,
+        seccomp_profile=None,
+        workdir=None,
+        file=None,
+        profile=None,
+        network="default",
+        timeout=None,
+        verify_image=False,
+        tor=False,
+        policy_allow=None,
+        policy_deny=None,
+        dry_run=False,
+        canary=None,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def _make_stop_args(name="bench-cell"):
+    """Build args namespace for cmd_stop."""
+    return SimpleNamespace(name=name)
+
+
+def _make_rm_args(name="bench-cell", force=True, purge=False):
+    """Build args namespace for cmd_rm."""
+    return SimpleNamespace(name=name, force=force, purge=purge)
+
+
+def _mock_run_success(*args, **kwargs):
+    """Return a successful subprocess result."""
+    return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+def _patch_lifecycle(monkeypatch, patches: dict):
+    """Patch names in both _helpers and lifecycle modules.
+
+    Since lifecycle.py does `from _helpers import proxy_running, ...`,
+    we must patch the name in the lifecycle module's namespace.
+    """
+    import brig.commands._helpers as _helpers
+    import brig.commands.lifecycle as _lifecycle
+
+    for name, val in patches.items():
+        for mod in (_helpers, _lifecycle):
+            if hasattr(mod, name):
+                monkeypatch.setattr(mod, name, val)
+
+
+def _patch_lifecycle_for_run(monkeypatch):
+    """Patch functions for cmd_run benchmark."""
+    _patch_lifecycle(monkeypatch, {
+        "proxy_running": lambda: True,
+        "cell_exists": lambda name: False,
+        "check_rate_limit": lambda: True,
+        "get_proxy_ip": lambda net: "10.60.1.1",
+        "run": _mock_run_success,
+        "invalidate_cell_cache": lambda name: None,
+        "log_operation": lambda *a, **kw: None,
+        "log_lifecycle": lambda *a, **kw: None,
+        "save_cell_policy": lambda *a, **kw: True,
+        "load_cell_policy": lambda *a, **kw: {},
+        "allocate_subnet": lambda name: ("10.60.1.0/24", 1),
+    })
+
+
+def _patch_lifecycle_for_stop(monkeypatch):
+    """Patch functions for cmd_stop benchmark."""
+    _patch_lifecycle(monkeypatch, {
+        "cell_exists": lambda name: True,
+        "cell_running": lambda name: True,
+        "run": _mock_run_success,
+        "invalidate_cell_cache": lambda name: None,
+        "log_operation": lambda *a, **kw: None,
+        "log_lifecycle": lambda *a, **kw: None,
+    })
+
+
+def _patch_lifecycle_for_rm(monkeypatch):
+    """Patch functions for cmd_rm benchmark."""
+    _patch_lifecycle(monkeypatch, {
+        "cell_exists": lambda name: True,
+        "cell_running": lambda name: False,
+        "run": _mock_run_success,
+        "invalidate_cell_cache": lambda name: None,
+        "delete_cell_policy": lambda name: None,
+        "log_operation": lambda *a, **kw: None,
+        "log_lifecycle": lambda *a, **kw: None,
+    })
+
+
+@pytest.mark.bench
+def test_bench_cmd_run(benchmark, brig_mod, brig_temp, monkeypatch):
+    """Cell creation time — mock the full cmd_run flow."""
+    _patch_lifecycle_for_run(monkeypatch)
+    counter = [0]
+
+    def run_cell():
+        counter[0] += 1
+        args = _make_cmd_run_args(name=f"bench-cell-{counter[0]}")
+        brig_mod.cmd_run(args)
+
+    benchmark(run_cell)
+
+
+@pytest.mark.bench
+def test_bench_cmd_stop(benchmark, brig_mod, brig_temp, monkeypatch):
+    """Cell stop time — mock cmd_stop flow."""
+    _patch_lifecycle_for_stop(monkeypatch)
+
+    def stop_cell():
+        args = _make_stop_args("bench-cell")
+        brig_mod.cmd_stop(args)
+
+    benchmark(stop_cell)
+
+
+@pytest.mark.bench
+def test_bench_cmd_rm(benchmark, brig_mod, brig_temp, monkeypatch):
+    """Cell removal time including network cleanup."""
+    _patch_lifecycle_for_rm(monkeypatch)
+
+    def rm_cell():
+        args = _make_rm_args("bench-cell")
+        brig_mod.cmd_rm(args)
+
+    benchmark(rm_cell)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent cell creation benchmarks
+# ---------------------------------------------------------------------------
+
+def _run_concurrent_creation(brig_mod, n_cells):
+    """Create n_cells concurrently using ThreadPoolExecutor."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def create_cell(i):
+        args = _make_cmd_run_args(name=f"concurrent-cell-{i}")
+        return brig_mod.cmd_run(args)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(create_cell, range(n_cells)))
+
+
+@pytest.mark.bench
+def test_bench_concurrent_creation_10(benchmark, brig_mod, brig_temp, monkeypatch):
+    """Concurrent creation of 10 cells."""
+    _patch_lifecycle_for_run(monkeypatch)
+
+    def create_10():
+        _run_concurrent_creation(brig_mod, 10)
+
+    benchmark(create_10)
+
+
+@pytest.mark.bench
+def test_bench_concurrent_creation_50(benchmark, brig_mod, brig_temp, monkeypatch):
+    """Concurrent creation of 50 cells."""
+    _patch_lifecycle_for_run(monkeypatch)
+
+    def create_50():
+        _run_concurrent_creation(brig_mod, 50)
+
+    benchmark(create_50)
+
+
+@pytest.mark.bench
+def test_bench_concurrent_creation_100(benchmark, brig_mod, brig_temp, monkeypatch):
+    """Concurrent creation of 100 cells."""
+    _patch_lifecycle_for_run(monkeypatch)
+
+    def create_100():
+        _run_concurrent_creation(brig_mod, 100)
+
+    benchmark(create_100)
+
+
+# ---------------------------------------------------------------------------
+# Subnet allocator concurrent allocation benchmark
+# ---------------------------------------------------------------------------
+
+@pytest.mark.bench
+def test_bench_subnet_concurrent_allocate(benchmark, subnet_mod, subnet_temp):
+    """Concurrent subnet allocation — measures lock contention."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    counter = [0]
+
+    def allocate_batch():
+        # Reset state for each benchmark iteration.
+        subnet_mod.SUBNETS_FILE.unlink(missing_ok=True)
+        counter[0] += 1
+        base = counter[0] * 1000
+
+        def allocate_one(i):
+            f = io.StringIO()
+            with contextlib.redirect_stdout(f):
+                subnet_mod.cmd_allocate(f"concurrent-{base}-{i}")
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(allocate_one, range(20)))
+
+    benchmark(allocate_batch)

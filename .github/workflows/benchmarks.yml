@@ -30,6 +30,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Restore benchmark history
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: tests/benchmarks/results/
+          key: benchmark-history-${{ runner.os }}
+          restore-keys: benchmark-history-
+
       - name: Run benchmarks
         run: |
           pytest tests/benchmarks/ -m bench --benchmark-enable \
@@ -51,6 +58,20 @@ jobs:
             echo "No baseline found, skipping comparison"
           fi
 
+      - name: Check for regressions
+        run: |
+          if [ -f tests/benchmarks/baseline.json ]; then
+            python tests/benchmarks/bench_trend.py check results.json --threshold 10
+          else
+            echo "No baseline found, skipping regression check"
+          fi
+
+      - name: Save trend data
+        if: github.ref == 'refs/heads/main'
+        run: |
+          python tests/benchmarks/bench_trend.py save results.json \
+            --label "${{ github.sha }}"
+
       - name: Run memory tests
         run: |
           pytest tests/benchmarks/test_bench_memory.py -v
@@ -60,4 +81,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: benchmark-results
-          path: results.json
+          path: |
+            results.json
+            tests/benchmarks/results/
