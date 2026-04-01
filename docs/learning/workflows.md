@@ -2,6 +2,84 @@
 
 Common use cases and example configurations.
 
+## Getting Started (End-to-End)
+
+Walk through install, run a cell, observe it, and extract output.
+
+### 1. Install and Set Up
+
+```bash
+# Install brig.
+git clone https://github.com/d0cd/brig.git && cd brig
+./install.sh
+
+# Create the VM (one-time, takes a few minutes).
+brig init
+brig vm create
+brig vm start
+
+# Start the Warden proxy inside the VM.
+brig vm shell -- warden start --detach
+
+# Verify everything is healthy.
+brig health
+```
+
+### 2. Run Your First Cell
+
+```bash
+# Run a simple cell that fetches an IP address.
+brig run --name demo --image alpine -- wget -qO- https://httpbin.org/ip
+```
+
+Expected output: your public IP (routed through Warden).
+
+### 3. Run a Detached Cell and Observe
+
+```bash
+# Start a long-running cell in the background.
+brig run --name worker --image python:3.11-slim -d \
+  -- python -c "import time; [print(f'tick {i}', flush=True) or time.sleep(2) for i in range(30)]"
+
+# Watch its logs live.
+brig logs worker -f
+
+# Check network activity.
+brig network worker
+
+# See resource usage.
+brig stats worker
+
+# List all cells.
+brig list
+```
+
+### 4. Copy Output and Clean Up
+
+```bash
+# Copy a file out of the cell workspace.
+brig cp worker:/work/output.txt ./output.txt
+
+# Stop and remove the cell.
+brig stop worker
+brig rm worker
+```
+
+### 5. Network Policy
+
+Edit `~/.brig/cells/network-policy.json` to control which domains cells can reach:
+
+```json
+{
+  "allow": ["api.github.com", "*.amazonaws.com"],
+  "deny": ["pastebin.com"]
+}
+```
+
+Reload without restarting: `brig vm shell -- warden policy reload`
+
+---
+
 ## AI Agent Sandbox
 
 Run AI agents that execute arbitrary code safely.

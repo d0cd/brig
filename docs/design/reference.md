@@ -107,6 +107,63 @@ brig vm recreate     Destroy and recreate VM (preserves macOS state)
 brig vm logs         Show VM provisioning logs
 ```
 
+---
+
+## Warden CLI Reference
+
+Warden is the egress proxy. All commands run inside the Lima VM (prefix with `brig vm shell --` from macOS).
+
+### Lifecycle
+
+```
+warden start             Start the proxy container
+warden stop              Stop the proxy container
+warden restart           Stop then start (picks up config changes)
+warden status            Show proxy status and IP addresses
+```
+
+### Policy
+
+```
+warden policy validate   Validate network-policy.json syntax
+warden policy reload     Hot-reload policy without restarting proxy
+warden policy show       Display current policy
+```
+
+### Monitoring
+
+```
+warden stats             Show request metrics (total, blocked, rate limited)
+warden stats --json      JSON output for scripting
+warden stats CELL        Filter metrics to a single cell
+warden health            Health check (exit 0 = healthy)
+warden logs [-f]         View proxy logs (follow with -f)
+```
+
+### Diagnostics
+
+```
+warden preflight         Run pre-start validation checks
+warden watchdog          Auto-restart proxy on failure (used by systemd)
+```
+
+### Tor (Anonymous Egress)
+
+```
+warden tor start         Start Tor + Privoxy bridge
+warden tor stop          Stop Tor + Privoxy, remove config
+warden tor status        Show Tor routing chain and component status
+```
+
+After `warden tor start`, restart Warden to activate upstream routing: `warden restart`.
+
+### Network Management
+
+```
+warden connect CELL      Connect proxy to a cell's network
+warden reconnect         Reconnect proxy to all cell networks
+```
+
 ### Workspace Commands
 
 ```
