@@ -1097,7 +1097,7 @@ class TestSecurityInvariants(unittest.TestCase):
             "container_cmd": [], "memory": "2g", "cpus": "2",
             "pids_limit": 512, "detach": True, "rm": False,
             "env": None, "secret": None, "label": None,
-            "seccomp_profile": None, "timeout": None,
+            "seccomp_profile": None, "no_seccomp": False, "timeout": None,
             "network": "default", "profile": None,
         }
         defaults.update(overrides)

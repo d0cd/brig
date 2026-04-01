@@ -92,7 +92,7 @@ class IntegrationBase(unittest.TestCase):
             "rm": False, "env": [], "secret": [], "label": [],
             "policy_allow": None, "policy_deny": None, "timeout": None,
             "verify_image": False, "image_digest": None, "dry_run": False,
-            "seccomp_profile": None, "workdir": None, "output": "text",
+            "seccomp_profile": None, "no_seccomp": False, "workdir": None, "output": "text",
             "canary_file": None, "tor": False,
         }
         defaults.update(kwargs)

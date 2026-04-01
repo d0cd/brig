@@ -9,6 +9,7 @@ Or without pytest:
     python3 tests/test_brig_unit.py
 """
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -1816,6 +1817,94 @@ class TestCellDefMergeTor(unittest.TestCase):
         self.assertTrue(args.tor)
 
 
+class TestWorkspaceQuota(unittest.TestCase):
+    """Tests for workspace quota helpers."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self._original_state_dir = brig.STATE_DIR
+        brig.STATE_DIR = Path(self.temp_dir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir)
+        brig.STATE_DIR = self._original_state_dir
+
+    def test_parse_size_megabytes(self):
+        self.assertEqual(brig.parse_size("500m"), 500 * 1024 * 1024)
+
+    def test_parse_size_gigabytes(self):
+        self.assertEqual(brig.parse_size("2g"), 2 * 1024 * 1024 * 1024)
+
+    def test_parse_size_kilobytes(self):
+        self.assertEqual(brig.parse_size("512k"), 512 * 1024)
+
+    def test_parse_size_plain_bytes(self):
+        self.assertEqual(brig.parse_size("1048576"), 1048576)
+
+    def test_parse_size_invalid(self):
+        with self.assertRaises(ValueError):
+            brig.parse_size("abc")
+
+    def test_parse_size_empty(self):
+        with self.assertRaises(ValueError):
+            brig.parse_size("")
+
+    def test_save_and_get_quota(self):
+        cell = "test-quota"
+        (Path(self.temp_dir) / cell).mkdir()
+        brig.save_workspace_quota(cell, 1024 * 1024)
+        self.assertEqual(brig.get_workspace_quota(cell), 1024 * 1024)
+
+    def test_get_quota_unset(self):
+        cell = "no-quota"
+        (Path(self.temp_dir) / cell).mkdir()
+        self.assertIsNone(brig.get_workspace_quota(cell))
+
+    def test_check_quota_within(self):
+        cell = "within"
+        ws = Path(self.temp_dir) / cell / "workspace"
+        ws.mkdir(parents=True)
+        (ws / "file.txt").write_text("hello")
+        brig.save_workspace_quota(cell, 1024 * 1024)
+        within, current, max_b = brig.check_workspace_quota(cell)
+        self.assertTrue(within)
+        self.assertEqual(max_b, 1024 * 1024)
+        self.assertGreater(current, 0)
+
+    def test_check_quota_exceeded(self):
+        cell = "exceeded"
+        ws = Path(self.temp_dir) / cell / "workspace"
+        ws.mkdir(parents=True)
+        (ws / "bigfile.bin").write_bytes(b"x" * 2000)
+        brig.save_workspace_quota(cell, 100)
+        within, current, max_b = brig.check_workspace_quota(cell)
+        self.assertFalse(within)
+
+    def test_check_quota_no_limit(self):
+        cell = "nolimit"
+        ws = Path(self.temp_dir) / cell / "workspace"
+        ws.mkdir(parents=True)
+        within, current, max_b = brig.check_workspace_quota(cell)
+        self.assertTrue(within)
+        self.assertIsNone(max_b)
+
+    def test_format_size(self):
+        self.assertEqual(brig.format_size(0), "0B")
+        self.assertEqual(brig.format_size(1024), "1KB")
+        self.assertIn("MB", brig.format_size(1024 * 1024))
+
+    def test_cell_def_workspace_quota_valid(self):
+        cell_def = {"image": "alpine", "workspace_quota": "500m"}
+        errors = brig.validate_cell_definition(cell_def)
+        self.assertEqual(errors, [])
+
+    def test_cell_def_workspace_quota_invalid(self):
+        cell_def = {"image": "alpine", "workspace_quota": "xyz"}
+        errors = brig.validate_cell_definition(cell_def)
+        self.assertTrue(any("workspace_quota" in e for e in errors))
+
+
 class TestValidatePolicyRule(unittest.TestCase):
     """Tests for _validate_policy_rule function."""
 
@@ -2327,45 +2416,170 @@ class TestVerifyImageSignature(unittest.TestCase):
     """Tests for brig.verify_image_signature."""
 
     @patch.object(brig, 'run')
-    def test_cosign_verify_success(self, mock_run):
-        """cosign returns 0 → (True, msg)."""
+    def test_verify_default_cosign_found(self, mock_run):
+        """cosign exists, default verify returns success with details."""
+        cosign_json = json.dumps([{"optional": {"Subject": "user@example.com", "Issuer": "https://accounts.google.com"}}])
         mock_run.side_effect = [
             MagicMock(returncode=0),  # which cosign.
-            MagicMock(returncode=0, stdout="verified"),  # cosign verify.
+            MagicMock(returncode=0, stdout=cosign_json),  # cosign verify.
         ]
-        ok, msg = brig.verify_image_signature("alpine:latest")
+        ok, msg, details = brig.verify_image_signature("alpine:latest")
         self.assertTrue(ok)
         self.assertIn("cosign", msg)
+        # Default command should not include --key or --certificate-identity.
+        call_args = mock_run.call_args_list[1][0][0]
+        self.assertEqual(call_args, ["cosign", "verify", "alpine:latest"])
 
     @patch.object(brig, 'run')
-    def test_cosign_verify_fail(self, mock_run):
-        """cosign returns 1 → (False, msg)."""
+    def test_verify_cosign_key_based(self, mock_run):
+        """Key-based verification passes --key to cosign."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # which cosign.
+            MagicMock(returncode=0, stdout="[]"),  # cosign verify.
+        ]
+        ok, msg, details = brig.verify_image_signature("alpine:latest", key="/tmp/cosign.pub")
+        self.assertTrue(ok)
+        call_args = mock_run.call_args_list[1][0][0]
+        self.assertIn("--key", call_args)
+        self.assertIn("/tmp/cosign.pub", call_args)
+
+    @patch.object(brig, 'run')
+    def test_verify_cosign_keyless(self, mock_run):
+        """Keyless verification passes certificate-identity and oidc-issuer."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # which cosign.
+            MagicMock(returncode=0, stdout="[]"),  # cosign verify.
+        ]
+        ok, msg, details = brig.verify_image_signature(
+            "alpine:latest",
+            keyless=True,
+            certificate_identity="user@example.com",
+            certificate_oidc_issuer="https://accounts.google.com",
+        )
+        self.assertTrue(ok)
+        call_args = mock_run.call_args_list[1][0][0]
+        self.assertIn("--certificate-identity", call_args)
+        self.assertIn("user@example.com", call_args)
+        self.assertIn("--certificate-oidc-issuer", call_args)
+        self.assertIn("https://accounts.google.com", call_args)
+
+    @patch.object(brig, 'run')
+    def test_verify_cosign_not_installed(self, mock_run):
+        """cosign not installed, podman trust fails → fail closed."""
+        mock_run.side_effect = [
+            MagicMock(returncode=1),  # which cosign → not found.
+            MagicMock(returncode=1, stdout=""),  # podman trust fails.
+        ]
+        ok, msg, details = brig.verify_image_signature("alpine:latest")
+        self.assertFalse(ok)
+        self.assertIn("cosign is not installed", msg)
+        self.assertEqual(details, {})
+
+    @patch.object(brig, 'run')
+    def test_verify_cosign_no_signature(self, mock_run):
+        """cosign reports no matching signatures → False."""
         mock_run.side_effect = [
             MagicMock(returncode=0),  # which cosign.
             MagicMock(returncode=1, stderr="no matching signatures"),
         ]
-        ok, msg = brig.verify_image_signature("alpine:latest")
+        ok, msg, details = brig.verify_image_signature("alpine:latest")
         self.assertFalse(ok)
+        self.assertIn("no signature", msg)
 
     @patch.object(brig, 'run')
-    def test_cosign_not_found_podman_accept(self, mock_run):
-        """cosign missing, podman trust shows accept → (True, msg)."""
+    def test_verify_cosign_invalid_signature(self, mock_run):
+        """cosign returns error for invalid signature → False."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0),  # which cosign.
+            MagicMock(returncode=1, stderr="invalid signature"),
+        ]
+        ok, msg, details = brig.verify_image_signature("alpine:latest")
+        self.assertFalse(ok)
+        self.assertIn("invalid signature", msg)
+
+    @patch.object(brig, 'run')
+    def test_verify_podman_fallback(self, mock_run):
+        """cosign absent, podman trust accept → True."""
         mock_run.side_effect = [
             MagicMock(returncode=1),  # which cosign → not found.
             MagicMock(returncode=0, stdout="default  accept"),  # podman trust.
         ]
-        ok, msg = brig.verify_image_signature("alpine:latest")
+        ok, msg, details = brig.verify_image_signature("alpine:latest")
         self.assertTrue(ok)
+        self.assertIn("trusted registry", msg)
 
     @patch.object(brig, 'run')
-    def test_cosign_not_found_podman_reject(self, mock_run):
-        """cosign missing, podman trust shows reject → (False, msg)."""
+    def test_verify_details_parsed(self, mock_run):
+        """cosign JSON stdout is parsed into details dict."""
+        cosign_json = json.dumps([
+            {
+                "optional": {"Subject": "bot@ci.example.com", "Issuer": "https://token.actions.githubusercontent.com"},
+                "bundle": {"sigContent": "..."},
+            },
+            {"optional": {}},
+        ])
         mock_run.side_effect = [
-            MagicMock(returncode=1),  # which cosign.
-            MagicMock(returncode=0, stdout="default  reject"),  # podman trust.
+            MagicMock(returncode=0),  # which cosign.
+            MagicMock(returncode=0, stdout=cosign_json),
         ]
-        ok, msg = brig.verify_image_signature("alpine:latest")
-        self.assertFalse(ok)
+        ok, msg, details = brig.verify_image_signature("alpine:latest")
+        self.assertTrue(ok)
+        self.assertEqual(details["signatures"], 2)
+        self.assertEqual(details["certificate_identity"], "bot@ci.example.com")
+        self.assertEqual(details["issuer"], "https://token.actions.githubusercontent.com")
+        self.assertTrue(details["bundle"])
+
+    @patch.object(brig, 'output')
+    @patch.object(brig, 'verify_image_signature')
+    def test_cmd_verify_text_output(self, mock_verify, mock_output):
+        """cmd_verify_image returns 0 on success with text output."""
+        mock_verify.return_value = (True, "Signature verified with cosign", {"signatures": 1})
+        args = MagicMock()
+        args.image = "alpine:latest"
+        args.key = None
+        args.keyless = False
+        args.certificate_identity = None
+        args.certificate_oidc_issuer = None
+        args.output = "text"
+        result = brig.cmd_verify_image(args)
+        self.assertEqual(result, 0)
+        # Should have printed VERIFIED.
+        mock_output.assert_any_call("VERIFIED: Signature verified with cosign")
+
+    @patch.object(brig, 'output')
+    @patch.object(brig, 'verify_image_signature')
+    def test_cmd_verify_json_output(self, mock_verify, mock_output):
+        """cmd_verify_image with --output json."""
+        mock_verify.return_value = (True, "Signature verified with cosign", {"signatures": 2})
+        args = MagicMock()
+        args.image = "alpine:latest"
+        args.key = None
+        args.keyless = False
+        args.certificate_identity = None
+        args.certificate_oidc_issuer = None
+        args.output = "json"
+        result = brig.cmd_verify_image(args)
+        self.assertEqual(result, 0)
+        # Parse the JSON that was output.
+        call_arg = mock_output.call_args[0][0]
+        data = json.loads(call_arg)
+        self.assertTrue(data["verified"])
+        self.assertEqual(data["details"]["signatures"], 2)
+
+    @patch.object(brig, 'print_error')
+    @patch.object(brig, 'verify_image_signature')
+    def test_cmd_verify_failure(self, mock_verify, mock_print_error):
+        """cmd_verify_image returns 1 on verification failure."""
+        mock_verify.return_value = (False, "Image has no signature", {})
+        args = MagicMock()
+        args.image = "alpine:latest"
+        args.key = None
+        args.keyless = False
+        args.certificate_identity = None
+        args.certificate_oidc_issuer = None
+        args.output = "text"
+        result = brig.cmd_verify_image(args)
+        self.assertEqual(result, 1)
 
 
 # ========== Phase 11 Step 4: brig.py Policy Commands ==========
@@ -2666,7 +2880,7 @@ class TestBuildRunCommandSeccomp(unittest.TestCase):
             "container_cmd": [], "memory": "2g", "cpus": "2",
             "pids_limit": 512, "detach": True, "rm": False,
             "env": None, "secret": None, "label": None,
-            "seccomp_profile": None, "timeout": None,
+            "seccomp_profile": None, "no_seccomp": False, "timeout": None,
             "network": "default", "profile": None,
         }
         defaults.update(overrides)
@@ -2697,6 +2911,50 @@ class TestBuildRunCommandSeccomp(unittest.TestCase):
                 args, "test", False, "brig-test", "10.60.1.1", None,
                 lambda msg, s=None: (_ for _ in ()).throw(SystemExit(1)),
             )
+
+    def test_default_seccomp_applied(self):
+        """Default seccomp profile is applied when none specified."""
+        args = self._make_args()
+        cmd = brig._build_run_command(
+            args, "test", False, "brig-test", "10.60.1.1", None,
+            lambda msg, s=None: None,
+        )
+        # Default profile should be applied.
+        seccomp_args = [c for c in cmd if "seccomp=" in c]
+        self.assertEqual(len(seccomp_args), 1)
+        self.assertIn("default.json", seccomp_args[0])
+
+    def test_no_seccomp_flag_skips_profile(self):
+        """--no-seccomp disables default seccomp profile."""
+        args = self._make_args(no_seccomp=True)
+        cmd = brig._build_run_command(
+            args, "test", False, "brig-test", "10.60.1.1", None,
+            lambda msg, s=None: None,
+        )
+        seccomp_args = [c for c in cmd if "seccomp=" in c]
+        self.assertEqual(len(seccomp_args), 0)
+
+    def test_custom_seccomp_overrides_default(self):
+        """Custom profile overrides default."""
+        profile = Path(self.temp_dir) / "custom.json"
+        profile.write_text('{"defaultAction": "SCMP_ACT_ALLOW"}')
+        args = self._make_args(seccomp_profile=str(profile))
+        cmd = brig._build_run_command(
+            args, "test", False, "brig-test", "10.60.1.1", None,
+            lambda msg, s=None: None,
+        )
+        seccomp_args = [c for c in cmd if "seccomp=" in c]
+        self.assertEqual(len(seccomp_args), 1)
+        self.assertIn("custom.json", seccomp_args[0])
+
+    def test_default_seccomp_is_valid_json(self):
+        """Built-in default.json is valid JSON."""
+        default_profile = Path(__file__).parent.parent / "src" / "seccomp" / "default.json"
+        self.assertTrue(default_profile.exists(), "default.json must exist")
+        with open(default_profile) as f:
+            data = json.load(f)
+        self.assertIn("defaultAction", data)
+        self.assertIn("syscalls", data)
 
     def test_secret_path_traversal_rejected(self):
         """Secret name with .. is rejected."""
@@ -3251,6 +3509,113 @@ class TestCmdHealth(unittest.TestCase):
         # Should not raise regardless of overall health value.
         result = brig.cmd_health(args)
         self.assertIn(result, (0, 1))
+
+
+class TestCmdDoctor(unittest.TestCase):
+    """Tests for brig.cmd_doctor."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self._orig = brig.STATE_DIR
+        brig.STATE_DIR = Path(self.temp_dir)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir)
+        brig.STATE_DIR = self._orig
+
+    def _mock_doctor(self, proxy=True, vm_running=True, **run_kw):
+        """Common mock setup for doctor tests."""
+        return (
+            patch.object(brig, 'proxy_running', return_value=proxy),
+            patch.object(brig, 'run', return_value=MagicMock(
+                returncode=0, stdout="runsc\n", stderr="", **run_kw)),
+            patch('brig.commands.vm._lima_installed', return_value=True),
+            patch('brig.commands.vm._vm_status',
+                  return_value={"status": "Running" if vm_running else "Stopped"}),
+        )
+
+    def test_doctor_all_pass(self):
+        """All checks pass returns 0."""
+        with contextlib.ExitStack() as stack:
+            for m in self._mock_doctor():
+                stack.enter_context(m)
+            args = MagicMock(fix=False, format="text")
+            result = brig.cmd_doctor(args)
+            self.assertEqual(result, 0)
+
+    def test_doctor_unhealthy_returns_1(self):
+        """Failing checks return 1."""
+        with contextlib.ExitStack() as stack:
+            for m in self._mock_doctor(proxy=False, vm_running=False):
+                stack.enter_context(m)
+            # Override run to return failures.
+            stack.enter_context(patch.object(brig, 'run',
+                return_value=MagicMock(returncode=1, stdout="", stderr="")))
+            args = MagicMock(fix=False, format="text")
+            result = brig.cmd_doctor(args)
+            self.assertEqual(result, 1)
+
+    def test_doctor_json_output(self):
+        """JSON format produces valid JSON with checks array."""
+        with contextlib.ExitStack() as stack:
+            for m in self._mock_doctor():
+                stack.enter_context(m)
+            args = MagicMock(fix=False, format="json")
+            import io
+            captured = io.StringIO()
+            with patch('builtins.print', side_effect=lambda *a, **k: captured.write(str(a[0]) + "\n")):
+                brig.cmd_doctor(args)
+            data = json.loads(captured.getvalue())
+            self.assertIn("checks", data)
+            self.assertIn("all_passed", data)
+            self.assertIsInstance(data["checks"], list)
+
+    def test_doctor_fix_flag(self):
+        """--fix flag is accepted without error."""
+        with contextlib.ExitStack() as stack:
+            for m in self._mock_doctor():
+                stack.enter_context(m)
+            args = MagicMock(fix=True, format="text")
+            result = brig.cmd_doctor(args)
+            self.assertEqual(result, 0)
+
+    @patch.object(brig, 'proxy_running', return_value=True)
+    @patch.object(brig, 'run')
+    def test_doctor_detects_over_quota(self, mock_run, mock_proxy):
+        """Doctor detects cells over workspace quota."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="runsc\n", stderr="")
+        # Create a cell with small quota and large workspace.
+        cell = "over-quota"
+        ws = Path(self.temp_dir) / cell / "workspace"
+        ws.mkdir(parents=True)
+        (ws / "big.bin").write_bytes(b"x" * 5000)
+        brig.save_workspace_quota(cell, 100)
+
+        args = MagicMock(fix=False, format="json")
+        import io
+        captured = io.StringIO()
+        with patch('builtins.print', side_effect=lambda *a, **k: captured.write(str(a[0]) + "\n")):
+            brig.cmd_doctor(args)
+        data = json.loads(captured.getvalue())
+        quota_check = next((c for c in data["checks"] if c["name"] == "Workspace quotas"), None)
+        self.assertIsNotNone(quota_check)
+        self.assertFalse(quota_check["passed"])
+
+    @patch.object(brig, 'proxy_running', return_value=True)
+    @patch.object(brig, 'run')
+    def test_doctor_seccomp_check(self, mock_run, mock_proxy):
+        """Doctor checks for default seccomp profile."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="runsc\n", stderr="")
+        args = MagicMock(fix=False, format="json")
+        import io
+        captured = io.StringIO()
+        with patch('builtins.print', side_effect=lambda *a, **k: captured.write(str(a[0]) + "\n")):
+            brig.cmd_doctor(args)
+        data = json.loads(captured.getvalue())
+        seccomp_check = next((c for c in data["checks"] if c["name"] == "Seccomp profile"), None)
+        self.assertIsNotNone(seccomp_check)
+        self.assertTrue(seccomp_check["passed"])
 
 
 class TestCmdPreflight(unittest.TestCase):

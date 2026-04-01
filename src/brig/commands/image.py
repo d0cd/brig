@@ -1,5 +1,6 @@
-"""Image management commands: pull, warmup."""
+"""Image management commands: pull, warmup, verify."""
 
+import json
 import re
 
 from brig.commands._helpers import (
@@ -8,6 +9,7 @@ from brig.commands._helpers import (
     output,
     print_error,
     run,
+    verify_image_signature,
 )
 
 # Valid image reference: registry/repo:tag or registry/repo@sha256:digest.
@@ -97,3 +99,47 @@ def cmd_warmup(args) -> int:
 
     output(f"Warmed up {len(unique_images)} image(s)")
     return 0
+
+
+def cmd_verify_image(args) -> int:
+    """Verify container image signature using cosign or podman trust."""
+    image = args.image
+
+    if not _validate_image_name(image):
+        error(
+            f"Invalid image name: {image}",
+            "Image must be in format: [registry/]name[:tag][@sha256:digest]"
+        )
+
+    verified, message, details = verify_image_signature(
+        image,
+        key=getattr(args, "key", None),
+        keyless=getattr(args, "keyless", False),
+        certificate_identity=getattr(args, "certificate_identity", None),
+        certificate_oidc_issuer=getattr(args, "certificate_oidc_issuer", None),
+    )
+
+    output_format = getattr(args, "output", "text")
+
+    if output_format == "json":
+        result = {
+            "image": image,
+            "verified": verified,
+            "message": message,
+        }
+        if details:
+            result["details"] = details
+        output(json.dumps(result, indent=2))
+    else:
+        if verified:
+            output(f"VERIFIED: {message}")
+            if details.get("signatures"):
+                output(f"  Signatures: {details['signatures']}")
+            if details.get("certificate_identity"):
+                output(f"  Identity: {details['certificate_identity']}")
+            if details.get("issuer"):
+                output(f"  Issuer: {details['issuer']}")
+        else:
+            print_error(message, "Use --key or --keyless with identity options for verification")
+
+    return 0 if verified else 1

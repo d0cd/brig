@@ -271,6 +271,23 @@ def cmd_cp(args) -> int:
                     )
                     return 1
 
+    # Enforce workspace quota when copying INTO a cell.
+    if dst_cell:
+        within, current, max_bytes = _helpers.check_workspace_quota(dst_cell)
+        if max_bytes is not None:
+            # Estimate copy size.
+            if src_full.is_dir():
+                copy_size = sum(
+                    f.stat().st_size for f in src_full.rglob("*") if f.is_file()
+                )
+            else:
+                copy_size = src_full.stat().st_size
+            if current + copy_size > max_bytes:
+                error(
+                    f"Copy would exceed workspace quota ({_helpers.format_size(current + copy_size)} / {_helpers.format_size(max_bytes)})",
+                    f"Free space with: brig workspace clean {dst_cell}"
+                )
+
     # Perform copy.
     import shutil
     try:

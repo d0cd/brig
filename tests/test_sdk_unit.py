@@ -1055,11 +1055,14 @@ class TestSDKEdgeCases(unittest.TestCase):
         with self.assertRaises(BrigError):
             _run_sync(b.run(name="test", image=""))
 
-    def test_empty_profile_rejected(self):
-        """Empty string profile is rejected."""
+    def test_empty_profile_treated_as_none(self):
+        """Empty string profile is treated as no profile (falsy)."""
         b = Brig()
-        with self.assertRaises(BrigError):
+        with patch.object(b, '_run_cmd', new_callable=AsyncMock) as mock_cmd:
+            mock_cmd.return_value = MagicMock(stdout='{}', returncode=0)
             _run_sync(b.run(name="test", image="alpine", profile=""))
+            args = mock_cmd.call_args[0][0]
+            self.assertNotIn("--profile", args)
 
     def test_double_dash_without_command(self):
         """run() inserts -- before image even without a command list."""

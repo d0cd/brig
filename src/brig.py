@@ -85,11 +85,12 @@ import brig.commands.network as _network
 import brig.commands.config_cmd as _config_cmd
 import brig.commands.image as _image
 import brig.commands.tui_cmd as _tui_cmd
+import brig.commands.dashboard_cmd as _dashboard_cmd
 
 # Command modules to search for underscore-prefixed names.
 _COMMAND_MODULES = (
     _helpers, _lifecycle, _policy, _system, _vm,
-    _workspace, _inspect_mod, _network, _config_cmd, _image, _tui_cmd,
+    _workspace, _inspect_mod, _network, _config_cmd, _image, _tui_cmd, _dashboard_cmd,
 )
 
 # Mutable globals live in _helpers.py.  Functions in _helpers read them
@@ -227,7 +228,18 @@ def main():
     p_run.add_argument("--policy-allow", action="append", help="Allow domain (adds to global policy)")
     p_run.add_argument("--policy-deny", action="append", help="Deny domain (overrides global policy)")
     p_run.add_argument("--verify-image", action="store_true", help="Verify image signature before running")
+    p_run.add_argument("--verify-key", help="Path to cosign public key for image verification")
+    p_run.add_argument("--verify-keyless", action="store_true",
+                        help="Use Fulcio/Rekor keyless verification")
+    p_run.add_argument("--certificate-identity",
+                        help="Expected certificate identity for keyless verification (email/URI)")
+    p_run.add_argument("--certificate-oidc-issuer",
+                        help="Expected OIDC issuer URL for keyless verification")
     p_run.add_argument("--seccomp-profile", help="Apply seccomp profile (path to JSON file)")
+    p_run.add_argument("--no-seccomp", action="store_true",
+                        help="Disable default seccomp profile")
+    p_run.add_argument("--workspace-quota",
+                        help="Workspace size limit (e.g., 500m, 2g)")
     p_run.add_argument("--timeout", help="Kill cell after duration (e.g., 30m, 2h, 1d)")
     p_run.add_argument("--output", choices=["text", "json"], default="text",
                          help="Output format")
@@ -434,6 +446,19 @@ is relative to the workspace (/work inside the cell).
     p_warmup.add_argument("--profile", help="Pull images commonly used with this profile")
     p_warmup.add_argument("images", nargs="*", help="Additional images to pull")
 
+    # image-verify
+    p_verify_image = subparsers.add_parser("image-verify", help="Verify container image signature")
+    p_verify_image.add_argument("image", help="Container image to verify")
+    p_verify_image.add_argument("--key", help="Path to cosign public key")
+    p_verify_image.add_argument("--keyless", action="store_true",
+                                 help="Use Fulcio/Rekor keyless verification")
+    p_verify_image.add_argument("--certificate-identity",
+                                 help="Expected certificate identity (email/URI)")
+    p_verify_image.add_argument("--certificate-oidc-issuer",
+                                 help="Expected OIDC issuer URL")
+    p_verify_image.add_argument("--output", choices=["text", "json"], default="text",
+                                 help="Output format")
+
     # checkpoint
     p_checkpoint = subparsers.add_parser("checkpoint", help="Checkpoint a running cell")
     p_checkpoint.add_argument("--keep", dest="keep_running", action="store_true",
@@ -454,6 +479,11 @@ is relative to the workspace (/work inside the cell).
     # health
     p_health = subparsers.add_parser("health", help="Check system health")
     p_health.add_argument("--format", choices=["table", "json"], default="table", help="Output format")
+
+    # doctor
+    p_doctor = subparsers.add_parser("doctor", help="Comprehensive system diagnostic")
+    p_doctor.add_argument("--fix", action="store_true", help="Auto-fix issues where safe")
+    p_doctor.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
 
     # preflight
     p_preflight = subparsers.add_parser("preflight", help="Run preflight validation checks")
@@ -513,6 +543,11 @@ is relative to the workspace (/work inside the cell).
     p_tui.add_argument("--view", choices=["dashboard", "logs", "metrics", "policy"],
                        default="dashboard", help="Initial view to display")
     p_tui.add_argument("--cell", metavar="NAME", help="Focus on specific cell")
+
+    # dashboard
+    p_dashboard = subparsers.add_parser("dashboard", help="Launch web dashboard")
+    p_dashboard.add_argument("--port", type=int, default=8080,
+                              help="Port to listen on (default: 8080)")
 
     # policy
     p_policy = subparsers.add_parser("policy", help="Manage cell network policies")
@@ -598,15 +633,18 @@ Deny rules take precedence over allow rules.
         "events": cmd_events,
         "pull": cmd_pull,
         "warmup": cmd_warmup,
+        "image-verify": cmd_verify_image,
         "checkpoint": cmd_checkpoint,
         "restore": cmd_restore,
         "diagnose": cmd_diagnose,
         "health": cmd_health,
+        "doctor": cmd_doctor,
         "preflight": cmd_preflight,
         "metrics": cmd_metrics,
         "verify": cmd_verify,
         "history": cmd_history,
         "tui": cmd_tui,
+        "dashboard": cmd_dashboard,
     }
 
     # Policy subcommands.

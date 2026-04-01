@@ -534,44 +534,93 @@ def check_rate_limit() -> bool:
         return False  # Fail closed on error.
 
 
-def verify_image_signature(image: str) -> tuple[bool, str]:
+def verify_image_signature(
+    image: str,
+    key: str = None,
+    keyless: bool = False,
+    certificate_identity: str = None,
+    certificate_oidc_issuer: str = None,
+) -> tuple[bool, str, dict]:
     """Verify image signature using cosign or podman trust.
 
-    Returns (success, message) tuple.
+    Returns (success, message, details) tuple. Details dict contains parsed
+    verification metadata when available.
     """
     # Try cosign first (preferred for sigstore signatures).
     result = run(
         ["which", "cosign"],
         check=False, capture=True
     )
-    if result.returncode == 0:
-        debug(f"Verifying image with cosign: {image}")
+    if result.returncode != 0:
+        # Fall back to podman image trust.
+        debug(f"Verifying image with podman trust: {image}")
         result = run(
-            ["cosign", "verify", "--output", "text", image],
+            ["podman", "image", "trust", "show"],
             check=False, capture=True
         )
         if result.returncode == 0:
-            return True, "Signature verified with cosign"
-        else:
-            # Check if it's unsigned vs invalid signature.
-            stderr = result.stderr or ""
-            if "no matching signatures" in stderr.lower():
-                return False, "Image has no signature"
-            return False, f"Signature verification failed: {stderr.strip()}"
+            # Check if image registry is in trusted list.
+            if "accept" in result.stdout.lower():
+                return True, "Image from trusted registry", {}
 
-    # Fall back to podman image trust.
-    debug(f"Verifying image with podman trust: {image}")
-    result = run(
-        ["podman", "image", "trust", "show"],
-        check=False, capture=True
-    )
+        return (
+            False,
+            "cosign is not installed. Install from https://docs.sigstore.dev/cosign/",
+            {},
+        )
+
+    # Build cosign verify command.
+    cmd = ["cosign", "verify"]
+    if key:
+        cmd.extend(["--key", key])
+    elif keyless:
+        if certificate_identity:
+            cmd.extend(["--certificate-identity", certificate_identity])
+        if certificate_oidc_issuer:
+            cmd.extend(["--certificate-oidc-issuer", certificate_oidc_issuer])
+    cmd.append(image)
+
+    debug(f"Verifying image with cosign: {image}")
+    result = run(cmd, check=False, capture=True)
+
     if result.returncode == 0:
-        # Check if image registry is in trusted list.
-        # This is a simplified check - real implementation would parse output.
-        if "accept" in result.stdout.lower():
-            return True, "Image from trusted registry"
+        # Parse cosign JSON output for verification details.
+        details = _parse_cosign_output(result.stdout)
+        return True, "Signature verified with cosign", details
 
-    return False, "No signature verification tool available (install cosign for full support)"
+    # Check if it's unsigned vs invalid signature.
+    stderr = result.stderr or ""
+    if "no matching signatures" in stderr.lower():
+        return False, "Image has no signature", {}
+    return False, f"Signature verification failed: {stderr.strip()}", {}
+
+
+def _parse_cosign_output(stdout: str) -> dict:
+    """Parse cosign verification JSON output into a details dict."""
+    details = {}
+    if not stdout:
+        return details
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, list):
+            details["signatures"] = len(data)
+            # Extract certificate info from the first entry if present.
+            if data:
+                first = data[0]
+                optional = first.get("optional", {})
+                bundle = first.get("bundle", {})
+                if optional.get("Subject"):
+                    details["certificate_identity"] = optional["Subject"]
+                if optional.get("Issuer"):
+                    details["issuer"] = optional["Issuer"]
+                if bundle:
+                    details["bundle"] = True
+        elif isinstance(data, dict):
+            details["signatures"] = 1
+    except (json.JSONDecodeError, TypeError, KeyError):
+        # Cosign output may not always be JSON (e.g., --output text).
+        pass
+    return details
 
 
 def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, Any]:
@@ -1190,6 +1239,16 @@ def validate_cell_definition(cell_def: dict, file_path: str = "") -> list[str]:
         if not isinstance(cell_def["tor"], bool):
             errors.append(f"'tor' must be a boolean{context}")
 
+    # Check workspace_quota format.
+    if "workspace_quota" in cell_def:
+        if not isinstance(cell_def["workspace_quota"], str):
+            errors.append(f"'workspace_quota' must be a string like '500m' or '2g'{context}")
+        else:
+            try:
+                parse_size(cell_def["workspace_quota"])
+            except ValueError:
+                errors.append(f"Invalid workspace_quota value: {cell_def['workspace_quota']}{context}")
+
     # Check detach format.
     if "detach" in cell_def:
         if not isinstance(cell_def["detach"], bool):
@@ -1507,3 +1566,94 @@ SCHEMA_VERSION = "1.0.0"
 
 # Version file lives on macOS side so it survives VM recreation.
 VERSION_FILE = BRIG_HOME / "state" / "version"
+
+
+# ---------------------------------------------------------------------------
+# Workspace quota helpers
+# ---------------------------------------------------------------------------
+
+_SIZE_UNITS = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
+
+
+def parse_size(size_str: str) -> int:
+    """Parse a human-readable size string to bytes.
+
+    Accepts: '500m', '2g', '512k', '1t', or plain bytes like '1048576'.
+    """
+    size_str = size_str.strip().lower()
+    if not size_str:
+        raise ValueError("Empty size string")
+    if size_str[-1] in _SIZE_UNITS:
+        try:
+            return int(float(size_str[:-1]) * _SIZE_UNITS[size_str[-1]])
+        except ValueError:
+            raise ValueError(f"Invalid size: {size_str}")
+    try:
+        return int(size_str)
+    except ValueError:
+        raise ValueError(f"Invalid size: {size_str}")
+
+
+def format_size(size_bytes: int) -> str:
+    """Format bytes as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(size_bytes) < 1024:
+            return f"{size_bytes:.1f}{unit}" if size_bytes != int(size_bytes) else f"{int(size_bytes)}{unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f}PB"
+
+
+def get_workspace_size(cell_name: str) -> int:
+    """Get workspace directory size in bytes."""
+    workspace = STATE_DIR / cell_name / "workspace"
+    if not workspace.exists():
+        return 0
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(workspace):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                total += os.path.getsize(fp)
+            except OSError:
+                pass
+    return total
+
+
+def _quota_file(cell_name: str) -> Path:
+    """Path to a cell's quota metadata file."""
+    return STATE_DIR / cell_name / "quota.json"
+
+
+def save_workspace_quota(cell_name: str, max_bytes: int) -> None:
+    """Save workspace quota for a cell."""
+    qf = _quota_file(cell_name)
+    qf.parent.mkdir(parents=True, exist_ok=True)
+    tmp = qf.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump({"max_bytes": max_bytes}, f)
+    tmp.rename(qf)
+
+
+def get_workspace_quota(cell_name: str) -> int | None:
+    """Get workspace quota for a cell. Returns max_bytes or None if unset."""
+    qf = _quota_file(cell_name)
+    if not qf.exists():
+        return None
+    try:
+        with open(qf) as f:
+            return json.load(f).get("max_bytes")
+    except (json.JSONDecodeError, IOError):
+        return None
+
+
+def check_workspace_quota(cell_name: str) -> tuple[bool, int, int | None]:
+    """Check workspace against quota.
+
+    Returns (within_quota, current_bytes, max_bytes).
+    max_bytes is None if no quota is set.
+    """
+    current = get_workspace_size(cell_name)
+    max_bytes = get_workspace_quota(cell_name)
+    if max_bytes is None:
+        return True, current, None
+    return current <= max_bytes, current, max_bytes

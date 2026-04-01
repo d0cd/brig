@@ -1270,3 +1270,207 @@ def cmd_history(args) -> int:
             print(f"{ts:<22} {op:<12} {cell:<15} {detail_str:<30}")
 
     return 0
+
+
+def cmd_doctor(args) -> int:
+    """Comprehensive system diagnostic with actionable suggestions."""
+    from brig.commands.vm import _lima_installed, _vm_status
+
+    checks = []
+    fixes_applied = 0
+    do_fix = getattr(args, "fix", False)
+
+    def check(name, passed, detail, suggestion=None, fixable=False):
+        checks.append({
+            "name": name, "passed": passed, "detail": detail,
+            "suggestion": suggestion, "fixable": fixable,
+        })
+
+    # --- Infrastructure ---
+
+    # VM status.
+    if _lima_installed():
+        vm = _vm_status()
+        vm_ok = vm.get("status") == "Running"
+        check("VM", vm_ok, f"status: {vm.get('status', 'unknown')}",
+              "Start with: brig vm start" if not vm_ok else None)
+
+    # Warden proxy.
+    warden_ok = proxy_running()
+    check("Warden", warden_ok, "running" if warden_ok else "not running",
+          "Start with: warden start" if not warden_ok else None, fixable=True)
+    if do_fix and not warden_ok:
+        result = run(["warden", "start"], check=False, capture=True)
+        if result.returncode == 0:
+            fixes_applied += 1
+
+    # proxy-external network.
+    net_result = run(["podman", "network", "exists", "proxy-external"], check=False, capture=True)
+    check("Network", net_result.returncode == 0, "proxy-external exists" if net_result.returncode == 0 else "missing",
+          "Recreate with: brig vm recreate" if net_result.returncode != 0 else None)
+
+    # gVisor runtime.
+    rt_result = run(["podman", "info", "--format", "{{.Host.OCIRuntime.Name}}"], check=False, capture=True)
+    runtime = rt_result.stdout.strip()
+    check("Runtime", "runsc" in runtime, runtime or "unknown",
+          "Install gVisor: https://gvisor.dev/docs/user_guide/install/" if "runsc" not in runtime else None)
+
+    # --- State ---
+
+    # State directory writable.
+    state_ok = False
+    try:
+        _helpers.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tf = _helpers.STATE_DIR / ".doctor_test"
+        tf.write_text("test")
+        tf.unlink()
+        state_ok = True
+    except (IOError, OSError):
+        pass
+    check("State directory", state_ok, str(_helpers.STATE_DIR),
+          "Check permissions on ~/.brig/state/" if not state_ok else None)
+
+    # Disk space.
+    import shutil
+    try:
+        usage = shutil.disk_usage(str(_helpers.STATE_DIR))
+        pct_used = (usage.used / usage.total) * 100
+        disk_ok = pct_used < 90
+        check("Disk space", disk_ok, f"{pct_used:.0f}% used ({_helpers.format_size(usage.free)} free)",
+              "Free disk space — state directory is nearly full" if not disk_ok else None)
+    except OSError:
+        check("Disk space", False, "could not check", None)
+
+    # Schema version.
+    from brig.commands._helpers import SCHEMA_VERSION, VERSION_FILE
+    version_ok = True
+    if VERSION_FILE.exists():
+        try:
+            current = VERSION_FILE.read_text().strip()
+            version_ok = current == SCHEMA_VERSION
+            check("Schema version", version_ok, f"{current} (expected {SCHEMA_VERSION})",
+                  "Run: brig upgrade" if not version_ok else None)
+        except IOError:
+            check("Schema version", False, "cannot read", None)
+    else:
+        check("Schema version", True, f"{SCHEMA_VERSION} (no version file, assumed current)")
+
+    # --- Security tools ---
+
+    # Cosign availability.
+    cosign_result = run(["which", "cosign"], check=False, capture=True)
+    cosign_ok = cosign_result.returncode == 0
+    check("Cosign", cosign_ok, "installed" if cosign_ok else "not installed",
+          "Install from https://docs.sigstore.dev/cosign/ for image verification" if not cosign_ok else None)
+
+    # Default seccomp profile.
+    seccomp_path = Path(__file__).parent.parent.parent / "seccomp" / "default.json"
+    check("Seccomp profile", seccomp_path.exists(), str(seccomp_path) if seccomp_path.exists() else "not found",
+          "Reinstall brig to restore default seccomp profile" if not seccomp_path.exists() else None)
+
+    # --- Cell hygiene ---
+
+    # Stale cells (exited > 7 days ago).
+    stale_cells = []
+    try:
+        result = run(
+            ["podman", "ps", "-a", "--format", "json", "--filter", f"name={CONTAINER_PREFIX}",
+             "--filter", "status=exited"],
+            check=False, capture=True
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import datetime
+            exited = json.loads(result.stdout)
+            for c in exited:
+                name = c.get("Names", [""])[0] if isinstance(c.get("Names"), list) else c.get("Names", "")
+                if name.startswith(CONTAINER_PREFIX) and name != PROXY_NAME:
+                    # Check age from ExitedAt or Created.
+                    created = c.get("Created", "")
+                    if created:
+                        try:
+                            ts = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+                            age = datetime.datetime.now(datetime.timezone.utc) - ts
+                            if age.days > 7:
+                                stale_cells.append(name[len(CONTAINER_PREFIX):])
+                        except (ValueError, TypeError):
+                            pass
+    except Exception:
+        pass
+
+    stale_ok = len(stale_cells) == 0
+    stale_detail = f"{len(stale_cells)} stale" if stale_cells else "none"
+    check("Stale cells", stale_ok, stale_detail,
+          f"Clean up with: brig rm {' '.join(stale_cells[:3])}" if stale_cells else None,
+          fixable=True)
+    if do_fix and stale_cells:
+        for cell in stale_cells:
+            run(["podman", "rm", "-f", f"{CONTAINER_PREFIX}{cell}"], check=False, capture=True)
+            fixes_applied += 1
+
+    # Orphan networks.
+    orphan_nets = []
+    try:
+        net_list = run(["podman", "network", "ls", "--format", "{{.Name}}"], check=False, capture=True)
+        cell_list = run(["podman", "ps", "-a", "--format", "{{.Names}}"], check=False, capture=True)
+        active_cells = set(cell_list.stdout.strip().split("\n")) if cell_list.stdout.strip() else set()
+
+        for net in net_list.stdout.strip().split("\n"):
+            if net.startswith(CONTAINER_PREFIX) and net != "proxy-external":
+                expected_container = net  # Network name = container name.
+                if expected_container not in active_cells:
+                    orphan_nets.append(net)
+    except Exception:
+        pass
+
+    orphan_ok = len(orphan_nets) == 0
+    check("Orphan networks", orphan_ok, f"{len(orphan_nets)} orphaned" if orphan_nets else "none",
+          "Clean with: brig verify --fix" if orphan_nets else None, fixable=True)
+    if do_fix and orphan_nets:
+        for net in orphan_nets:
+            run(["podman", "network", "rm", net], check=False, capture=True)
+            fixes_applied += 1
+
+    # Workspace quota status.
+    cells_over_quota = []
+    try:
+        for cell_dir in _helpers.STATE_DIR.iterdir():
+            if cell_dir.is_dir() and (cell_dir / "workspace").exists():
+                cell_name = cell_dir.name
+                within, current, max_b = _helpers.check_workspace_quota(cell_name)
+                if not within:
+                    cells_over_quota.append(f"{cell_name} ({_helpers.format_size(current)}/{_helpers.format_size(max_b)})")
+    except OSError:
+        pass
+
+    quota_ok = len(cells_over_quota) == 0
+    check("Workspace quotas", quota_ok,
+          f"{len(cells_over_quota)} over quota" if cells_over_quota else "all within limits",
+          f"Over quota: {', '.join(cells_over_quota[:3])}" if cells_over_quota else None)
+
+    # --- Output ---
+
+    fmt = getattr(args, "format", "text")
+    if fmt == "json":
+        print(json.dumps({
+            "checks": checks,
+            "all_passed": all(c["passed"] for c in checks),
+            "fixes_applied": fixes_applied,
+        }, indent=2))
+    else:
+        passed = sum(1 for c in checks if c["passed"])
+        total = len(checks)
+        print(f"Brig Doctor: {passed}/{total} checks passed")
+        print()
+        for c in checks:
+            icon = colorize("[OK]", "green") if c["passed"] else colorize("[FAIL]", "red")
+            print(f"  {icon}  {c['name']}: {c['detail']}")
+            if not c["passed"] and c.get("suggestion"):
+                print(f"         {c['suggestion']}")
+        if fixes_applied:
+            print(f"\nApplied {fixes_applied} fix(es)")
+        elif not all(c["passed"] for c in checks):
+            fixable = sum(1 for c in checks if not c["passed"] and c.get("fixable"))
+            if fixable:
+                print(f"\n{fixable} issue(s) auto-fixable. Run: brig doctor --fix")
+
+    return 0 if all(c["passed"] for c in checks) else 1

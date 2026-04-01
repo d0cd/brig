@@ -62,6 +62,7 @@ def _make_run_args(**overrides):
         secret=None,
         label=None,
         seccomp_profile=None,
+        no_seccomp=True,
         workdir=None,
     )
     defaults.update(overrides)
@@ -253,6 +254,7 @@ def _make_cmd_run_args(**overrides):
         secret=None,
         label=None,
         seccomp_profile=None,
+        no_seccomp=True,
         workdir=None,
         file=None,
         profile=None,

@@ -85,6 +85,8 @@ def _merge_cell_def_into_args(args, cell_def: dict) -> None:
             args.policy_deny = (args.policy_deny or []) + policy["deny"]
     if "tor" in cell_def and not getattr(args, "tor", False):
         args.tor = cell_def["tor"]
+    if "workspace_quota" in cell_def and not getattr(args, "workspace_quota", None):
+        args.workspace_quota = cell_def["workspace_quota"]
     if "detach" in cell_def and not getattr(args, "detach", False):
         args.detach = cell_def["detach"]
     if "timeout" in cell_def and not getattr(args, "timeout", None):
@@ -150,18 +152,25 @@ def _build_run_command(args, cell_name: str, airgapped: bool, net_name: str,
             cmd.extend(["--label", label])
 
     # Seccomp profile (defense-in-depth on top of gVisor).
-    if getattr(args, "seccomp_profile", None):
-        profile_path = Path(args.seccomp_profile)
-        if not profile_path.exists():
-            cleanup_on_failure(f"Seccomp profile not found: {args.seccomp_profile}")
-        # Validate it's valid JSON.
-        try:
-            with open(profile_path, "r") as f:
-                json.load(f)
-        except json.JSONDecodeError as e:
-            cleanup_on_failure(f"Invalid seccomp profile JSON: {e}")
-        cmd.extend(["--security-opt", f"seccomp={profile_path.absolute()}"])
-        debug(f"Applying seccomp profile: {profile_path}")
+    if not getattr(args, "no_seccomp", False):
+        seccomp_profile = getattr(args, "seccomp_profile", None)
+        if seccomp_profile is None:
+            # Use built-in default profile.
+            default_profile = Path(__file__).parent.parent.parent / "seccomp" / "default.json"
+            if default_profile.exists():
+                seccomp_profile = str(default_profile)
+        if seccomp_profile:
+            profile_path = Path(seccomp_profile)
+            if not profile_path.exists():
+                cleanup_on_failure(f"Seccomp profile not found: {seccomp_profile}")
+            # Validate it's valid JSON.
+            try:
+                with open(profile_path, "r") as f:
+                    json.load(f)
+            except json.JSONDecodeError as e:
+                cleanup_on_failure(f"Invalid seccomp profile JSON: {e}")
+            cmd.extend(["--security-opt", f"seccomp={profile_path.absolute()}"])
+            debug(f"Applying seccomp profile: {profile_path}")
 
     # Detach mode.
     if args.detach:
@@ -343,7 +352,13 @@ def cmd_run(args) -> int:
     # Optional image signature verification.
     if getattr(args, "verify_image", False):
         with Spinner(f"Verifying image signature for {args.image}") as spinner:
-            verified, message = verify_image_signature(args.image)
+            verified, message, details = verify_image_signature(
+                args.image,
+                key=getattr(args, "verify_key", None),
+                keyless=getattr(args, "verify_keyless", False),
+                certificate_identity=getattr(args, "certificate_identity", None),
+                certificate_oidc_issuer=getattr(args, "certificate_oidc_issuer", None),
+            )
             if verified:
                 spinner.success(message)
             else:
@@ -409,6 +424,15 @@ def cmd_run(args) -> int:
         if resources_allocated["policy"]:
             delete_cell_policy(cell_name)
         error(msg, suggestion)
+
+    # Save workspace quota if specified.
+    quota_str = getattr(args, "workspace_quota", None)
+    if quota_str:
+        try:
+            max_bytes = _helpers.parse_size(quota_str)
+            _helpers.save_workspace_quota(cell_name, max_bytes)
+        except ValueError as e:
+            cleanup_on_failure(f"Invalid workspace quota: {e}", "Use format like 500m or 2g")
 
     # Create per-cell policy if custom policy specified (not for air-gapped).
     if not airgapped and (args.policy_allow or args.policy_deny):

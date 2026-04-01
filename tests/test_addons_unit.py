@@ -4143,11 +4143,12 @@ class TestNotifierReloadConfig(unittest.TestCase):
         n.policy_mtime = 1000.0
         n._reload_config()
 
+    @patch('notifier._is_safe_webhook_url', return_value=True)
     @patch('builtins.open', unittest.mock.mock_open(
         read_data='{"notifications": {"webhook_url": "https://example.com/hook"}}'
     ))
     @patch('notifier.POLICY_FILE')
-    def test_reload_loads_webhook_url(self, mock_file):
+    def test_reload_loads_webhook_url(self, mock_file, _mock_safe):
         """Webhook URL loaded and notifier enabled."""
         mock_file.exists.return_value = True
         mock_file.stat.return_value = MagicMock(st_mtime=2000.0)
