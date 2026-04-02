@@ -44,7 +44,8 @@ try:
         HEALTH_PORT = 8089
 except (ValueError, TypeError):
     HEALTH_PORT = 8089
-POLICY_FILE = Path(os.environ.get("POLICY_FILE", "/policy.json"))
+# Hardcoded policy file path to prevent env-var-based path injection.
+POLICY_FILE = Path("/policy.json")
 LOG_DIR = Path("/var/log/brig/network")
 
 # Global health state (updated by addon).

@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from mitmproxy import connection, ctx, http
+from mitmproxy import ctx, http
 
 # Import shared SIGHUP dispatcher from enforce addon.
 try:
@@ -749,7 +749,7 @@ class RequestLogger:
             "request_bytes": len(flow.request.content) if flow.request and flow.request.content else 0,
             "ms": round(duration_ms, 2),
             "blocked": flow.metadata.get("blocked", False),
-            "error": str(flow.error) if flow.error else "unknown error",
+            "error": re.sub(r'\d+\.\d+\.\d+\.\d+', '<ip>', str(flow.error)) if flow.error else "unknown error",
         }
 
         # Add enhanced error details.

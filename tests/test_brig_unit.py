@@ -2289,7 +2289,7 @@ class TestLogOperation(unittest.TestCase):
         brig.log_operation("run")
         entry = json.loads(brig.HISTORY_FILE.read_text().strip())
         self.assertEqual(entry["operation"], "run")
-        self.assertIn("timestamp", entry)
+        self.assertIn("ts", entry)
 
     def test_with_cell_and_details(self):
         """Operation with cell name and details."""

@@ -181,8 +181,17 @@ def _build_run_command(args, cell_name: str, airgapped: bool, net_name: str,
         cmd.append("--rm")
 
     # Additional environment variables.
+    # Process user env vars BEFORE proxy setup would matter, but reject
+    # proxy-related overrides to prevent bypassing Warden.
+    _PROXY_ENV_NAMES = {"http_proxy", "https_proxy", "no_proxy", "all_proxy", "ftp_proxy"}
     if args.env:
         for env in args.env:
+            env_key = env.split("=", 1)[0].lower() if "=" in env else env.lower()
+            if env_key in _PROXY_ENV_NAMES:
+                cleanup_on_failure(
+                    f"Cannot override proxy environment variable: {env.split('=', 1)[0]}",
+                    "Proxy configuration is managed by Brig and cannot be overridden"
+                )
             cmd.extend(["-e", env])
 
     # Workspace mount (each cell gets its own, never shared).
@@ -205,7 +214,9 @@ def _build_run_command(args, cell_name: str, airgapped: bool, net_name: str,
             secret_path = secrets_dir / secret_name
             # Resolve symlinks and verify path stays within secrets directory.
             resolved = secret_path.resolve()
-            if not str(resolved).startswith(str(secrets_dir.resolve())):
+            try:
+                resolved.relative_to(secrets_dir.resolve())
+            except ValueError:
                 cleanup_on_failure(
                     f"Secret path escapes secrets directory: {secret_name}",
                     "Secrets must not be symlinks pointing outside the secrets directory"
@@ -276,8 +287,17 @@ def _process_canary_file(args) -> Optional[dict]:
     if not basename.startswith("brig_canary_") or ".." in str(path):
         warn(f"Ignoring canary file with unexpected path: {basename}")
         return None
+    # Resolve symlinks and verify the resolved path is within the temp directory.
+    import tempfile
+    resolved_path = path.resolve()
+    tmp_dir = Path(tempfile.gettempdir()).resolve()
     try:
-        canary_data = json.loads(path.read_text())
+        resolved_path.relative_to(tmp_dir)
+    except ValueError:
+        warn(f"Ignoring canary file outside temp directory: {basename}")
+        return None
+    try:
+        canary_data = json.loads(resolved_path.read_text())
     except (json.JSONDecodeError, OSError) as e:
         # Clean up the file on parse failure.
         try:
@@ -525,14 +545,46 @@ def cmd_run(args) -> int:
         if getattr(args, "label", None):
             print(f"Labels:       {', '.join(args.label)}")
         if args.env:
-            print(f"Environment:  {', '.join(args.env)}")
+            # Redact env var values to avoid leaking secrets.
+            redacted_env = []
+            for e in args.env:
+                if "=" in e:
+                    key = e.split("=", 1)[0]
+                    redacted_env.append(f"{key}=<REDACTED>")
+                else:
+                    redacted_env.append(e)
+            print(f"Environment:  {', '.join(redacted_env)}")
         if args.secret:
+            # Show secret names only, not mount paths.
             print(f"Secrets:      {', '.join(args.secret)}")
         if args.policy_allow or args.policy_deny:
             print(f"Policy allow: {', '.join(args.policy_allow or [])}")
             print(f"Policy deny:  {', '.join(args.policy_deny or [])}")
+        # Redact sensitive values from podman command before printing.
+        redacted_cmd = []
+        skip_next = False
+        for i, part in enumerate(cmd):
+            if skip_next:
+                # Redact the value argument following -e or -v.
+                if redacted_cmd and redacted_cmd[-1] == "-e":
+                    key = part.split("=", 1)[0] if "=" in part else part
+                    redacted_cmd.append(f"{key}=<REDACTED>")
+                elif redacted_cmd and redacted_cmd[-1] == "-v":
+                    # Redact host path in volume mounts (show container path only).
+                    parts = part.split(":")
+                    if len(parts) >= 2:
+                        redacted_cmd.append(f"<REDACTED>:{':'.join(parts[1:])}")
+                    else:
+                        redacted_cmd.append("<REDACTED>")
+                else:
+                    redacted_cmd.append(part)
+                skip_next = False
+                continue
+            if part in ("-e", "-v"):
+                skip_next = True
+            redacted_cmd.append(part)
         print("\nPodman command:")
-        print(f"  {' '.join(cmd)}")
+        print(f"  {' '.join(redacted_cmd)}")
         # Clean up resources allocated during planning.
         if resources_allocated.get("proxy_connected"):
             try:

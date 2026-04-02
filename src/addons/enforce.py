@@ -514,18 +514,18 @@ class PolicyEnforcer:
                             del self.cell_policy_mtimes[oldest_key]
                             ctx.log.debug(f"PolicyEnforcer: Evicted policy for '{oldest_key}'")
 
-                try:
-                    with open(policy_file, "r") as f:
-                        data = json.load(f)
-                    with self._cell_policy_lock:
+                    # Read and insert while still holding the lock.
+                    try:
+                        with open(policy_file, "r") as f:
+                            data = json.load(f)
                         self.cell_policies[cell_name] = Policy(
                             allow=data.get("allow", []),
                             deny=data.get("deny", [])
                         )
                         self.cell_policy_mtimes[cell_name] = mtime
-                    ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
-                except (json.JSONDecodeError, IOError) as e:
-                    ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
+                        ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
+                    except (json.JSONDecodeError, IOError) as e:
+                        ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
 
         except OSError as e:
             ctx.log.error(f"PolicyEnforcer: Failed to scan cell policies: {e}")
@@ -656,10 +656,16 @@ class PolicyEnforcer:
         )
         safe_host = re.sub(r'[\x00-\x1f\x7f]', '', flow.request.host)
         safe_path = re.sub(r'[\x00-\x1f\x7f]', '', flow.request.path)
-        ctx.log.info(f"BLOCKED: {safe_host}{safe_path} - {reason}")
+        safe_reason = re.sub(r'[\x00-\x1f\x7f]', '', reason)
+        ctx.log.info(f"BLOCKED: {safe_host}{safe_path} - {safe_reason}")
 
     def http_connect(self, flow: http.HTTPFlow) -> None:
         """Enforce port and domain policy on CONNECT tunnels."""
+        # Check for deferred SIGHUP reload (signal-safe pattern).
+        if self._reload_pending:
+            self._reload_pending = False
+            self._do_reload()
+
         host = flow.request.host
         port = flow.request.port
 
@@ -700,7 +706,10 @@ class PolicyEnforcer:
             self._block(flow, f"global policy: {reason}")
 
     def server_connected(self, data):
-        """Check resolved IP against blocked ranges after DNS resolution."""
+        """Check resolved IP against blocked ranges after DNS resolution.
+
+        Fails closed: if IP validation raises an exception, kill the connection.
+        """
         try:
             peername = data.server.peername
             if peername:
@@ -711,11 +720,19 @@ class PolicyEnforcer:
                         ctx.log.warn(f"BLOCKED: DNS rebinding detected - resolved to {ip_str}")
                         data.server.close()
                         return
-        except (ValueError, AttributeError, OSError):
-            pass
+        except Exception:
+            # Fail closed: kill the connection on any parse/validation error.
+            ctx.log.warn("BLOCKED: server_connected failed to validate IP, closing connection")
+            try:
+                data.server.close()
+            except Exception:
+                pass
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
-        """Block responses from connections that resolved to internal IPs."""
+        """Block responses from connections that resolved to internal IPs.
+
+        Fails closed: if IP validation raises an exception, block the flow.
+        """
         if not flow.server_conn or not flow.server_conn.peername:
             return
         try:
@@ -726,8 +743,9 @@ class PolicyEnforcer:
                     reason = f"DNS rebinding: resolved to {ip_str}"
                     self._block(flow, reason)
                     return
-        except (ValueError, AttributeError, OSError):
-            pass
+        except Exception:
+            # Fail closed: block on any parse/validation error.
+            self._block(flow, "IP validation failed in responseheaders")
 
 
 addons = [PolicyEnforcer()]

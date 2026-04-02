@@ -155,16 +155,10 @@ class CanaryDetector:
         parts = [flow.request.url]
         for k, v in flow.request.headers.items():
             parts.append(f"{k}: {v}")
-        # Scan head and tail of body to catch tokens placed past a junk prefix.
+        # Scan entire body to prevent evasion via tokens placed in the middle.
         content = flow.request.get_content()
         if content:
-            max_scan = 1024 * 1024  # 1MB per segment.
-            if len(content) > max_scan * 2:
-                head = content[:max_scan]
-                tail = content[-max_scan:]
-                body = head.decode("utf-8", errors="ignore") + "\n" + tail.decode("utf-8", errors="ignore")
-            else:
-                body = content.decode("utf-8", errors="ignore")
+            body = content.decode("utf-8", errors="ignore")
             parts.append(body)
         scan_text = "\n".join(parts)
 

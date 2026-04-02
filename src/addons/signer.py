@@ -24,7 +24,6 @@ This addon is optional and must be explicitly enabled.
 
 import base64
 import hashlib
-import hmac
 import json
 import logging
 import os
@@ -52,7 +51,7 @@ _batch_entries = []
 _batch_start_time = None
 _batch_counter = 0
 _signing_key = None
-_algorithm = None  # "ed25519" or "hmac-sha256"
+_algorithm = None  # "ed25519" only.
 
 
 def _ensure_dirs():
@@ -66,8 +65,8 @@ def _ensure_dirs():
 def _generate_keypair():
     """Generate an Ed25519 keypair for this session.
 
-    Prefers the cryptography library for Ed25519. Falls back to
-    HMAC-SHA256 with a warning if cryptography is not available.
+    Requires the cryptography library for Ed25519. Returns False
+    if cryptography is not available.
     """
     global _signing_key, _algorithm
 
@@ -121,10 +120,7 @@ def _sign_data(data: bytes) -> bytes:
     if _signing_key is None:
         raise RuntimeError("Signing key not initialized")
 
-    if _algorithm == "ed25519":
-        return _signing_key.sign(data)
-    else:
-        return hmac.new(_signing_key, data, hashlib.sha256).digest()
+    return _signing_key.sign(data)
 
 
 def _flush_batch():
@@ -249,30 +245,17 @@ def verify_batch(batch_path: str, pubkey_path: str) -> bool:
     if content_hash != sig_data["content_hash"]:
         return False
 
-    if algorithm == "ed25519":
-        try:
-            from cryptography.hazmat.primitives import serialization
+    # Only Ed25519 signatures are supported. Reject any other algorithm
+    # to prevent algorithm-confusion attacks from crafted .sig files.
+    if algorithm != "ed25519":
+        raise ValueError(f"Unsupported algorithm: {algorithm}")
 
-            pubkey_pem = Path(pubkey_path).read_bytes()
-            public_key = serialization.load_pem_public_key(pubkey_pem)
-            public_key.verify(signature, batch_bytes)
-            return True
-        except Exception:
-            return False
-    elif algorithm == "hmac-sha256":
-        # HMAC key is stored in the private key file, not the public key file.
-        # Try the given path first (may be the private key path).
-        raw = Path(pubkey_path).read_bytes()
-        try:
-            key_data = json.loads(raw)
-        except json.JSONDecodeError:
-            # Caller passed the public key path; try the private key alongside it.
-            privkey_path = Path(pubkey_path).parent / f".{Path(pubkey_path).stem}_privkey.pem"
-            if not privkey_path.exists():
-                privkey_path = Path(pubkey_path).with_name(".session_privkey.pem")
-            key_data = json.loads(privkey_path.read_bytes())
-        key = base64.b64decode(key_data["key"])
-        expected = hmac.new(key, batch_bytes, hashlib.sha256).digest()
-        return hmac.compare_digest(signature, expected)
-    else:
-        raise ValueError(f"Unknown algorithm: {algorithm}")
+    try:
+        from cryptography.hazmat.primitives import serialization
+
+        pubkey_pem = Path(pubkey_path).read_bytes()
+        public_key = serialization.load_pem_public_key(pubkey_pem)
+        public_key.verify(signature, batch_bytes)
+        return True
+    except Exception:
+        return False

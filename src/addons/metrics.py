@@ -113,19 +113,14 @@ class CircularLatencyBuffer:
     """
 
     def __init__(self, size: int = MAX_LATENCIES):
-        self.buffer = [0.0] * size
         self.size = size
-        self.index = 0
         self.count = 0
         # Use histogram for fast percentile queries.
         self._histogram = HistogramLatencyBuffer(size)
 
     def add(self, latency: float) -> None:
         """Add a latency value in O(1) time."""
-        self.buffer[self.index] = latency
-        self.index = (self.index + 1) % self.size
         self.count = min(self.count + 1, self.size)
-        # Also add to histogram for O(1) percentiles.
         self._histogram.add(latency)
 
     def percentile(self, p: float) -> float:
@@ -336,10 +331,12 @@ class MetricsCollector:
             elif data.startswith("cell:"):
                 # Return specific cell metrics.
                 cell_name = data[5:].strip()
-                if len(cell_name) > 64:
+                # Sanitize control characters from cell name.
+                safe_name = "".join(c for c in cell_name if c.isprintable())
+                if len(safe_name) > 64:
                     response = {"error": "Cell name too long"}
                 else:
-                    response = self._get_cell_metrics(cell_name)
+                    response = self._get_cell_metrics(safe_name)
             else:
                 response = {"error": "Unknown command"}
 
@@ -378,7 +375,9 @@ class MetricsCollector:
                     "metrics": self.metrics[cell_name].to_dict(),
                     "timestamp": time.time(),
                 }
-            return {"error": f"Cell not found: {cell_name}"}
+            # Sanitize control characters from cell name before echoing.
+            safe_name = "".join(c for c in cell_name if c.isprintable())
+            return {"error": f"Cell not found: {safe_name}"}
 
     def _get_or_create_metrics_unlocked(self, cell_name: str) -> CellMetrics:
         """Get or create metrics for a cell. Caller must hold metrics_lock.

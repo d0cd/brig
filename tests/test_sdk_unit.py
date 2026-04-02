@@ -1514,11 +1514,11 @@ class TestUtilsCheckRateLimit(unittest.TestCase):
         self.assertTrue(brig_utils.check_rate_limit())
         self.assertTrue(brig_utils.RATE_LIMIT_FILE.parent.exists())
 
-    def test_io_error_allows(self):
-        """IOError returns True (fail-open)."""
+    def test_io_error_blocks(self):
+        """IOError returns False (fail-closed)."""
         # Point to unwritable location.
         brig_utils.RATE_LIMIT_FILE = Path("/proc/nonexistent/rate.json")
-        self.assertTrue(brig_utils.check_rate_limit())
+        self.assertFalse(brig_utils.check_rate_limit())
 
 
 class TestUtilsRedactCmd(unittest.TestCase):

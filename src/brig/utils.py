@@ -217,7 +217,8 @@ def check_rate_limit() -> bool:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     except (IOError, OSError) as e:
         debug(f"Rate limit check failed: {e}")
-        return True
+        # Fail closed: deny operation when rate limit state is unreadable.
+        return False
 
 
 def _cached(key: str, ttl: float = CACHE_TTL) -> tuple[bool, Any]:

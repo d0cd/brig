@@ -89,14 +89,34 @@ METRICS_SOCKET = Path("/var/run/brig/metrics.sock")
 
 # Blocked IP ranges for policy validation.
 BLOCKED_NETWORKS = [
+    # RFC1918 private ranges.
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
+    # Localhost.
     ipaddress.ip_network("127.0.0.0/8"),
+    # Link-local.
     ipaddress.ip_network("169.254.0.0/16"),
+    # CGNAT.
     ipaddress.ip_network("100.64.0.0/10"),
+    # Benchmarking.
     ipaddress.ip_network("198.18.0.0/15"),
+    # Reserved.
     ipaddress.ip_network("240.0.0.0/4"),
+    # "This network" (used in SSRF attacks).
+    ipaddress.ip_network("0.0.0.0/8"),
+    # Multicast.
+    ipaddress.ip_network("224.0.0.0/4"),
+    # IPv6 equivalents.
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    # IPv4-mapped IPv6 (bypass for all IPv4 blocked ranges).
+    ipaddress.ip_network("::ffff:0:0/96"),
+    # Documentation prefix (should never appear in production).
+    ipaddress.ip_network("2001:db8::/32"),
+    # IPv6 multicast.
+    ipaddress.ip_network("ff00::/8"),
 ]
 
 

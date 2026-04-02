@@ -1,0 +1,6 @@
+{
+  "contextMode": "fresh",
+  "timeoutMinutes": 30,
+  "maxIterations": 25,
+  "maxCostUsd": 10.00
+}

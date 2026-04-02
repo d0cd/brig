@@ -252,7 +252,7 @@ def log_operation(operation: str, cell_name: str = None, details: dict = None) -
     """Log an operation to the history file."""
     try:
         entry = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "operation": operation,
         }
         if cell_name:
@@ -475,9 +475,9 @@ def log_operation_end(context: dict, exit_code: int = 0, error: str = None) -> N
         if args:
             entry["args"] = _redact_args(args, config)
 
-        # Add error if present.
+        # Add error if present, with path redaction.
         if error:
-            entry["error"] = error
+            entry["error"] = re.sub(r'(/[^\s:]+)', '<path>', error)
 
         _append_jsonl(OPERATIONS_FILE, entry)
 

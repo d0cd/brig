@@ -695,13 +695,16 @@ Deny rules take precedence over allow rules.
     except SystemExit as e:
         exit_code = e.code if isinstance(e.code, int) else 1
     except Exception as e:
-        error_msg = str(e)
+        # Sanitize error message to avoid leaking internal paths or secrets.
+        raw_msg = str(e)
+        sanitized = re.sub(r'(/[^\s:]+)', '<path>', raw_msg)
+        error_msg = sanitized
         exit_code = 1
         if _helpers.DEBUG:
             import traceback
             traceback.print_exc()
         else:
-            print(f"ERROR: {e}", file=sys.stderr)
+            print(f"ERROR: {sanitized}", file=sys.stderr)
     finally:
         log_operation_end(op_context, exit_code, error_msg)
 

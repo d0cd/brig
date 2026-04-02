@@ -4231,8 +4231,8 @@ class TestNotifierSendNotification(unittest.TestCase):
         n._pool_lock = threading.Lock()
         return n
 
-    @patch('notifier._is_safe_webhook_url', return_value=True)
-    def test_send_success(self, mock_safe):
+    @patch('notifier._resolve_webhook_url', return_value=(True, "93.184.216.34", "example.com", 443))
+    def test_send_success(self, mock_resolve):
         """Successful send records success."""
         n = self._make_notifier()
         n._send_http_request = MagicMock(return_value=(True, None))
@@ -4240,8 +4240,8 @@ class TestNotifierSendNotification(unittest.TestCase):
         n._send_notification({"event": "blocked"})
         n._record_success.assert_called_once()
 
-    @patch('notifier._is_safe_webhook_url', return_value=True)
-    def test_send_all_retries_fail(self, mock_safe):
+    @patch('notifier._resolve_webhook_url', return_value=(True, "93.184.216.34", "example.com", 443))
+    def test_send_all_retries_fail(self, mock_resolve):
         """All retries exhausted adds to dead letter."""
         n = self._make_notifier()
         n._send_http_request = MagicMock(return_value=(False, "HTTP 500"))
@@ -4251,16 +4251,16 @@ class TestNotifierSendNotification(unittest.TestCase):
         n._record_failure.assert_called_once()
         n._add_to_dead_letter.assert_called_once()
 
-    @patch('notifier._is_safe_webhook_url', return_value=False)
-    def test_unsafe_url_skips(self, mock_safe):
+    @patch('notifier._resolve_webhook_url', return_value=(False, "", "", 0))
+    def test_unsafe_url_skips(self, mock_resolve):
         """Internal webhook URL is skipped."""
         n = self._make_notifier()
         n._send_http_request = MagicMock()
         n._send_notification({"event": "blocked"})
         n._send_http_request.assert_not_called()
 
-    @patch('notifier._is_safe_webhook_url', return_value=True)
-    def test_circuit_breaker_open_drops(self, mock_safe):
+    @patch('notifier._resolve_webhook_url', return_value=(True, "93.184.216.34", "example.com", 443))
+    def test_circuit_breaker_open_drops(self, mock_resolve):
         """Open circuit breaker drops notification to dead letter."""
         n = self._make_notifier()
         n._check_circuit_breaker = MagicMock(return_value=False)

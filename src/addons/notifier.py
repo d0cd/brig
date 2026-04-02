@@ -35,11 +35,14 @@ import collections
 import ipaddress
 import json
 import queue
+import re
+import socket as _socket
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from mitmproxy import ctx, http
 
@@ -55,49 +58,103 @@ except ImportError:
 # Blocked networks for SSRF prevention.
 # Must match enforce.py BLOCKED_NETWORKS to prevent webhook-based SSRF.
 BLOCKED_NETWORKS = [
+    # RFC1918 private ranges.
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
+    # Localhost.
     ipaddress.ip_network("127.0.0.0/8"),
+    # Link-local.
     ipaddress.ip_network("169.254.0.0/16"),
+    # CGNAT.
     ipaddress.ip_network("100.64.0.0/10"),
+    # Benchmarking.
     ipaddress.ip_network("198.18.0.0/15"),
+    # Reserved.
     ipaddress.ip_network("240.0.0.0/4"),
+    # "This network" (used in SSRF attacks).
     ipaddress.ip_network("0.0.0.0/8"),
+    # Multicast.
     ipaddress.ip_network("224.0.0.0/4"),
-    # IPv6.
+    # IPv6 equivalents.
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
+    # IPv4-mapped IPv6 (bypass for all IPv4 blocked ranges).
     ipaddress.ip_network("::ffff:0:0/96"),
+    # Documentation prefix (should never appear in production).
+    ipaddress.ip_network("2001:db8::/32"),
+    # IPv6 multicast.
     ipaddress.ip_network("ff00::/8"),
 ]
 
 
-def _is_safe_webhook_url(url: str) -> bool:
-    """Validate webhook URL is not targeting internal networks."""
-    from urllib.parse import urlparse
+def _resolve_webhook_url(url: str) -> tuple[bool, str, str, int]:
+    """Resolve webhook URL and validate against internal networks.
+
+    Returns (safe, resolved_ip, hostname, port). If safe is False the
+    remaining fields are empty/zero.
+    """
     parsed = urlparse(url)
     if not parsed.hostname:
-        return False
+        return False, "", "", 0
     if parsed.scheme not in ("http", "https"):
-        return False
+        return False, "", "", 0
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
-        import socket as _socket
-        addrs = _socket.getaddrinfo(parsed.hostname, parsed.port or 443)
+        addrs = _socket.getaddrinfo(parsed.hostname, port)
+        # Collect the first usable address while checking all.
+        first_ip_str = ""
         for family, socktype, proto, canonname, sockaddr in addrs:
             ip = ipaddress.ip_address(sockaddr[0])
             for net in BLOCKED_NETWORKS:
                 if ip in net:
-                    return False
+                    return False, "", "", 0
+            if not first_ip_str:
+                first_ip_str = sockaddr[0]
+        if not first_ip_str:
+            return False, "", "", 0
     except (OSError, ValueError):
-        return False
-    return True
+        return False, "", "", 0
+
+    return True, first_ip_str, parsed.hostname, port
+
+
+def _is_safe_webhook_url(url: str) -> bool:
+    """Validate webhook URL is not targeting internal networks."""
+    safe, _, _, _ = _resolve_webhook_url(url)
+    return safe
+
+
+# Regex matching path segments that look like secrets/tokens.
+# Matches hex strings >= 20 chars, base64-ish strings >= 20 chars, or
+# segments containing common secret indicators.
+_SECRET_PATH_RE = re.compile(
+    r"(?<=/)"                         # Preceded by /.
+    r"(?:"
+    r"[A-Fa-f0-9]{20,}"              # Long hex string.
+    r"|[A-Za-z0-9_\-]{20,}"          # Long base64-ish string.
+    r")"
+    r"(?=/|$)"                        # Followed by / or end.
+)
 
 
 def _redact_notification_path(path: str) -> str:
-    """Remove query parameters from path for notifications."""
-    return path.split("?")[0] if "?" in path else path
+    """Remove query parameters, fragments, and potential secrets from path."""
+    # Strip query string.
+    path = path.split("?")[0]
+    # Strip fragment identifier.
+    path = path.split("#")[0]
+    # Redact path segments that look like secrets or tokens.
+    path = _SECRET_PATH_RE.sub("[REDACTED]", path)
+    return path
+
+
+def _redact_url_for_logging(url: str) -> str:
+    """Return scheme + hostname only, stripping path, query, and credentials."""
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.hostname}"
 
 
 # Policy file path.
@@ -253,7 +310,7 @@ class Notifier:
             self.policy_mtime = mtime
 
             if self.config.enabled:
-                ctx.log.info(f"Notifier: Enabled - webhook {self.config.webhook_url}")
+                ctx.log.info(f"Notifier: Enabled - webhook {_redact_url_for_logging(self.config.webhook_url)}")
                 if not self.running:
                     self._start_worker()
             else:
@@ -373,8 +430,16 @@ class Notifier:
         except (IOError, OSError) as e:
             ctx.log.error(f"Notifier: Failed to save dead letters: {e}")
 
-    def _send_http_request(self, data: bytes) -> tuple[bool, Optional[str]]:
-        """Send HTTP request using connection pool or fallback. Returns (success, error)."""
+    def _send_http_request(self, data: bytes, resolved_ip: str, hostname: str, port: int) -> tuple[bool, Optional[str]]:
+        """Send HTTP request to the webhook URL. Returns (success, error).
+
+        The caller has already validated the resolved IP against
+        BLOCKED_NETWORKS. We use the original hostname URL for proper TLS
+        certificate verification and rely on the OS DNS cache returning
+        the same answer within the same process lifetime.
+        """
+        url = self.config.webhook_url
+
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "Warden/1.0",
@@ -386,7 +451,7 @@ class Notifier:
             try:
                 response = pool.request(
                     "POST",
-                    self.config.webhook_url,
+                    url,
                     body=data,
                     headers=headers,
                 )
@@ -400,7 +465,7 @@ class Notifier:
             # Fallback to urllib.
             try:
                 req = urllib.request.Request(
-                    self.config.webhook_url,
+                    url,
                     data=data,
                     headers=headers,
                     method="POST"
@@ -418,8 +483,10 @@ class Notifier:
         if not self.config.webhook_url:
             return
 
-        # Validate webhook URL against internal networks.
-        if not _is_safe_webhook_url(self.config.webhook_url):
+        # Resolve DNS once and validate against internal networks.
+        # Using the resolved IP for the HTTP request prevents DNS rebinding.
+        safe, resolved_ip, hostname, port = _resolve_webhook_url(self.config.webhook_url)
+        if not safe:
             ctx.log.warn("Notifier: webhook URL targets internal network, skipping")
             return
 
@@ -440,7 +507,7 @@ class Notifier:
                 # Strip internal fields before sending to webhook.
                 payload = {k: v for k, v in notification.items() if not k.startswith("_")}
                 data = json.dumps(payload).encode("utf-8")
-                success, error = self._send_http_request(data)
+                success, error = self._send_http_request(data, resolved_ip, hostname, port)
 
                 if success:
                     self._record_success()

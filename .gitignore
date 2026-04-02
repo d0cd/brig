@@ -98,3 +98,12 @@ pip-wheel-metadata/
 .local/
 tmp/
 temp/
+
+# Claude Code
+.claude/
+
+# Ralphx audit (keep config templates, ignore run outputs)
+.ralphx/**/runs/
+.ralphx/**/progress.md
+.ralphx/**/prd.json
+.ralphx/**/findings/
