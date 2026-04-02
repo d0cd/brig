@@ -98,6 +98,7 @@ pip-wheel-metadata/
 .local/
 tmp/
 temp/
+uv.lock
 
 # Claude Code
 .claude/
