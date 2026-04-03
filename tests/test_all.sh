@@ -56,6 +56,7 @@ SUITES=(
     "test_hardening:Hardening"
     "test_per_cell_policy:Per-Cell Policy"
     "test_warden_features:Warden Features"
+    "test_overhead:Stack Overhead Benchmarks"
 )
 
 for suite in "${SUITES[@]}"; do

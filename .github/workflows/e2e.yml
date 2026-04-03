@@ -197,6 +197,14 @@ jobs:
         continue-on-error: true
         run: tests/test_warden_features.sh
 
+      - name: "Benchmark: Stack Overhead"
+        id: test_overhead
+        timeout-minutes: 15
+        continue-on-error: true
+        run: |
+          RESULTS_FILE=/tmp/e2e-logs/overhead-results.json \
+            tests/test_overhead.sh
+
       - name: Check results
         run: |
           FAILED=0
