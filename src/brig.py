@@ -633,7 +633,7 @@ Deny rules take precedence over allow rules.
         "events": cmd_events,
         "pull": cmd_pull,
         "warmup": cmd_warmup,
-        "image-verify": cmd_verify_image,
+        "image-verify": _image.cmd_verify_image,
         "checkpoint": cmd_checkpoint,
         "restore": cmd_restore,
         "diagnose": cmd_diagnose,
@@ -644,7 +644,7 @@ Deny rules take precedence over allow rules.
         "verify": cmd_verify,
         "history": cmd_history,
         "tui": cmd_tui,
-        "dashboard": cmd_dashboard,
+        "dashboard": _dashboard_cmd.cmd_dashboard,
     }
 
     # Policy subcommands.
