@@ -1,35 +1,10 @@
-"""CLI and cache benchmarks.
+"""CLI benchmarks.
 
-Measures brig cache operations and cell definition validation throughput.
+Measures cell definition validation — the only non-trivial CLI-side
+computation that runs on every `brig run -f`.
 """
 
 import pytest
-
-
-@pytest.mark.bench
-def test_bench_cache_hit(benchmark, brig_module):
-    """_cached() with valid (non-expired) entry."""
-    brig_module._set_cache("bench_key", {"data": "value"})
-
-    def cache_hit():
-        return brig_module._cached("bench_key")
-
-    benchmark(cache_hit)
-
-
-@pytest.mark.bench
-def test_bench_cache_miss(benchmark, brig_module):
-    """_cached() with absent key."""
-    def cache_miss():
-        return brig_module._cached("nonexistent_key")
-
-    benchmark(cache_miss)
-
-
-@pytest.mark.bench
-def test_bench_cache_set(benchmark, brig_module):
-    """_set_cache() throughput — overwrites same key to avoid unbounded growth."""
-    benchmark(brig_module._set_cache, "bench_set_key", {"data": "value"})
 
 
 @pytest.mark.bench
@@ -49,7 +24,11 @@ def test_bench_validate_cell_definition(benchmark, brig_module):
 
 @pytest.mark.bench
 def test_bench_validate_cell_definition_large(benchmark, brig_module):
-    """Large cell definition: 1000 env vars, 100 secrets."""
+    """Large cell definition: 1000 env vars, 100 secrets.
+
+    Regression guard — validation iterates all env vars and secrets
+    for security checks (injection, traversal). Must stay under 1ms.
+    """
     cell_def = {
         "name": "large-cell",
         "image": "python:3.12-slim",

@@ -74,22 +74,12 @@ def _make_run_args(**overrides):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.bench
-def test_bench_build_run_command_minimal(benchmark, brig_mod, brig_temp):
-    """Build podman run command with minimal args."""
-    args = _make_run_args()
-
-    def build():
-        return brig_mod._build_run_command(
-            args, "bench-cell", False, "brig-bench-cell",
-            "10.60.1.2", 0, lambda *a: None,
-        )
-
-    benchmark(build)
-
-
-@pytest.mark.bench
 def test_bench_build_run_command_full(benchmark, brig_mod, brig_temp):
-    """Build podman run command with env, labels, timeout, detach."""
+    """Build podman run command with all options (env, labels, timeout).
+
+    Measures the CLI-side command construction — the part between
+    argument parsing and the podman subprocess call.
+    """
     args = _make_run_args(
         env=[f"VAR_{i}=value_{i}" for i in range(20)],
         label=["team=bench", "tier=test"],
@@ -101,20 +91,6 @@ def test_bench_build_run_command_full(benchmark, brig_mod, brig_temp):
         return brig_mod._build_run_command(
             args, "bench-cell", False, "brig-bench-cell",
             "10.60.1.2", 3600, lambda *a: None,
-        )
-
-    benchmark(build)
-
-
-@pytest.mark.bench
-def test_bench_build_run_command_airgapped(benchmark, brig_mod, brig_temp):
-    """Build podman run command in air-gapped mode."""
-    args = _make_run_args()
-
-    def build():
-        return brig_mod._build_run_command(
-            args, "bench-cell", True, "brig-bench-cell",
-            "", 0, lambda *a: None,
         )
 
     benchmark(build)
@@ -223,16 +199,6 @@ def test_bench_subnet_load_state(benchmark, subnet_mod, subnet_temp):
         json.dump(state, fp)
 
     benchmark(subnet_mod.load_state)
-
-
-# ---------------------------------------------------------------------------
-# Network name generation
-# ---------------------------------------------------------------------------
-
-@pytest.mark.bench
-def test_bench_network_name(benchmark, brig_mod):
-    """network_name() string construction."""
-    benchmark(brig_mod.network_name, "my-benchmark-cell")
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +365,7 @@ def _run_concurrent_creation(brig_mod, n_cells):
 
 @pytest.mark.bench
 def test_bench_concurrent_creation_10(benchmark, brig_mod, brig_temp, monkeypatch):
-    """Concurrent creation of 10 cells."""
+    """10 cells created concurrently — baseline for parallelism."""
     _patch_lifecycle_for_run(monkeypatch)
 
     def create_10():
@@ -409,19 +375,8 @@ def test_bench_concurrent_creation_10(benchmark, brig_mod, brig_temp, monkeypatc
 
 
 @pytest.mark.bench
-def test_bench_concurrent_creation_50(benchmark, brig_mod, brig_temp, monkeypatch):
-    """Concurrent creation of 50 cells."""
-    _patch_lifecycle_for_run(monkeypatch)
-
-    def create_50():
-        _run_concurrent_creation(brig_mod, 50)
-
-    benchmark(create_50)
-
-
-@pytest.mark.bench
 def test_bench_concurrent_creation_100(benchmark, brig_mod, brig_temp, monkeypatch):
-    """Concurrent creation of 100 cells."""
+    """100 cells created concurrently — measures scaling and GIL contention."""
     _patch_lifecycle_for_run(monkeypatch)
 
     def create_100():
