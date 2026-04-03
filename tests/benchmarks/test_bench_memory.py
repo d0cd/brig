@@ -78,3 +78,82 @@ def test_memory_lru_bounded(metrics_collector_class):
     assert len(collector.metrics) <= MAX_TRACKED_CELLS, (
         f"Metrics count {len(collector.metrics)} exceeds max {MAX_TRACKED_CELLS}"
     )
+
+
+def test_memory_steady_state_10k_requests(policy_class, metrics_collector_class,
+                                           log_filter_class):
+    """Simulate 10k requests and verify memory doesn't grow unboundedly.
+
+    This catches leaks in the hot path: policy eval, metrics recording,
+    log filtering. Memory should stabilize after initial allocation.
+    """
+    import json
+
+    policy = policy_class(
+        allow=[f"svc-{i}.example.com" for i in range(100)],
+        deny=["evil.com"],
+    )
+    collector = metrics_collector_class()
+    log_filter = log_filter_class({
+        "exclude_hosts": [],
+        "exclude_paths": ["/healthz"],
+        "sample_rate": 1.0,
+    })
+
+    hosts = [f"svc-{i % 100}.example.com" for i in range(10000)]
+
+    # Warm up — let initial allocations settle.
+    for host in hosts[:100]:
+        policy.is_allowed(host, "/api", "GET")
+        collector._get_or_create_metrics("bench-cell")
+
+    tracemalloc.start()
+    baseline = tracemalloc.get_traced_memory()[0]
+
+    # Simulate 10k requests.
+    for i, host in enumerate(hosts):
+        policy.is_allowed(host, f"/api/v{i % 5}", "GET")
+        m = collector._get_or_create_metrics(f"cell-{i % 50}")
+        m.total_requests += 1
+        if log_filter.should_log(host, "/api", 200):
+            json.dumps({"host": host, "status": 200})
+
+    after = tracemalloc.get_traced_memory()[0]
+    tracemalloc.stop()
+
+    growth = after - baseline
+    growth_kb = growth / 1024
+
+    # After warmup, 10k requests should not grow memory by more than 500KB.
+    # Most allocations are transient (JSON strings, tuples) and get GC'd.
+    assert growth < 512_000, (
+        f"Memory grew by {growth_kb:.1f}KB after 10k requests (expected <500KB). "
+        f"Possible leak in hot path."
+    )
+
+
+def test_memory_policy_trie_vs_rules(policy_class):
+    """Verify DomainTrie doesn't use excessive memory vs flat rule list."""
+    # Measure just the rules (no trie).
+    tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
+    from enforce import PolicyRule
+    rules = [PolicyRule(f"svc-{i}.example.com") for i in range(1000)]
+    rules_mem = tracemalloc.get_traced_memory()[0] - before
+    tracemalloc.stop()
+
+    # Measure policy (rules + trie).
+    tracemalloc.start()
+    before = tracemalloc.get_traced_memory()[0]
+    policy = policy_class(allow=[f"svc-{i}.example.com" for i in range(1000)])
+    policy_mem = tracemalloc.get_traced_memory()[0] - before
+    tracemalloc.stop()
+
+    trie_overhead = policy_mem - rules_mem
+    # Trie adds node objects for each domain label. At 1000 rules with
+    # ~3 labels each, expect ~3000 trie nodes. Each node is ~100 bytes
+    # (dict + two lists). Total trie overhead should be under 3x raw rules.
+    assert trie_overhead < rules_mem * 3, (
+        f"Trie overhead ({trie_overhead}B) exceeds 3x raw rules ({rules_mem}B). "
+        f"DomainTrie is using too much memory."
+    )

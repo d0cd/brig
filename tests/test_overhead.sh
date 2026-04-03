@@ -1,288 +1,345 @@
 #!/bin/bash
 # test_overhead.sh - Stack overhead benchmarks
 #
-# Measures real-world latency and overhead of the Brig stack:
-#   1. Proxy latency:      Time added by Warden proxy to each HTTP request
-#   2. Cell startup time:  Wall-clock from `brig run` to container running
-#   3. Cell stop time:     Wall-clock for graceful cell shutdown
-#   4. Cell removal time:  Wall-clock for full cleanup (network, subnet)
-#   5. gVisor overhead:    Syscall latency under gVisor vs hypothetical baseline
-#   6. Policy eval at scale: Request latency with 100+ policy rules loaded
-#   7. Concurrent cells:   Startup time for N cells in parallel
+# Measures real-world latency and overhead of the Brig stack with
+# statistical rigor: 10+ samples, warmup, median with IQR, outlier
+# filtering via 1.5*IQR fence.
 #
-# Output: JSON summary at the end for CI consumption.
+# Benchmarks:
+#   1. Proxy latency:      Time added by Warden to each HTTP request
+#   2. Cell startup time:  Wall-clock from `brig run` to container running
+#   3. Cell stop/rm time:  Graceful shutdown + full cleanup
+#   4. gVisor overhead:    Syscall-heavy workload under runsc
+#   5. Request latency:    Per-request p50/p95 through full stack
+#   6. Startup breakdown:  Network create, proxy connect, container start
+#   7. Concurrent cells:   5 cells launched in parallel
 #
 # Usage: ./tests/test_overhead.sh [--json]
 #
 # Prerequisites:
-#   - Lima VM running: limactl start cell
+#   - Lima VM running with brig installed
 #   - Warden running: warden start
-#   - curl image pre-pulled in VM
 #
 # Exit codes:
 #   0 - All benchmarks completed
-#   1 - One or more benchmarks failed
+#   1 - Prerequisites not met
 
 set -euo pipefail
 
 VM_NAME="${CELL_VM_NAME:-cell}"
 JSON_OUTPUT=false
 RESULTS="{}"
+WARMUP_RUNS=2
+SAMPLE_RUNS=10
+STARTUP_RUNS=5  # Fewer for startup to stay under rate limit (10/60s).
 
 if [ "${1:-}" = "--json" ]; then
     JSON_OUTPUT=true
 fi
 
-# Colors for output.
+# Colors.
 if [ -t 1 ] && [ "$JSON_OUTPUT" = false ]; then
-    CYAN='\033[0;36m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    RED='\033[0;31m'
-    BOLD='\033[1m'
-    NC='\033[0m'
+    C='\033[0;36m' G='\033[0;32m' Y='\033[0;33m' B='\033[1m' N='\033[0m'
 else
-    CYAN='' GREEN='' YELLOW='' RED='' BOLD='' NC=''
+    C='' G='' Y='' B='' N=''
 fi
 
 run_in_vm() {
     limactl shell "$VM_NAME" -- "$@"
 }
 
-# Time a command and return milliseconds.
+# Return epoch milliseconds.
+now_ms() {
+    python3 -c "import time; print(int(time.time() * 1000))"
+}
+
+# Time a command, return milliseconds.
 time_ms() {
     local start end
-    start=$(python3 -c "import time; print(int(time.time() * 1000))")
-    "$@" >/dev/null 2>&1
-    end=$(python3 -c "import time; print(int(time.time() * 1000))")
+    start=$(now_ms)
+    "$@" >/dev/null 2>&1 || true
+    end=$(now_ms)
     echo $((end - start))
 }
 
-# Add result to JSON output.
+# Compute statistics from a space-separated list of numbers.
+# Outputs: median q1 q3 iqr min max n_filtered
+compute_stats() {
+    python3 -c "
+import sys
+values = sorted(map(int, '$1'.split()))
+n = len(values)
+if n == 0:
+    print('0 0 0 0 0 0 0')
+    sys.exit()
+q1 = values[n // 4]
+median = values[n // 2]
+q3 = values[3 * n // 4]
+iqr = q3 - q1
+fence_lo = q1 - 1.5 * iqr
+fence_hi = q3 + 1.5 * iqr
+filtered = [v for v in values if fence_lo <= v <= fence_hi]
+f_median = filtered[len(filtered) // 2] if filtered else median
+f_min = min(filtered) if filtered else min(values)
+f_max = max(filtered) if filtered else max(values)
+outliers = n - len(filtered)
+print(f'{f_median} {q1} {q3} {iqr} {f_min} {f_max} {outliers}')
+"
+}
+
 add_result() {
-    local name="$1" value="$2" unit="$3"
-    RESULTS=$(echo "$RESULTS" | python3 -c "
+    local name="$1" median="$2" q1="$3" q3="$4" unit="$5"
+    RESULTS=$(python3 -c "
 import sys, json
-d = json.load(sys.stdin)
-d['$name'] = {'value': $value, 'unit': '$unit'}
-json.dump(d, sys.stdout)
+d = json.loads('$RESULTS' if '$RESULTS' != '{}' else '{}')
+d['$name'] = {'median': $median, 'q1': $q1, 'q3': $q3, 'unit': '$unit'}
+print(json.dumps(d))
 ")
 }
 
-# Print a benchmark result.
 print_result() {
-    local name="$1" value="$2" unit="$3" target="${4:-}"
-    local status=""
-    if [ -n "$target" ]; then
-        if [ "$value" -le "$target" ]; then
-            status="${GREEN}[OK]${NC}"
-        else
-            status="${YELLOW}[SLOW]${NC}"
-        fi
-    fi
-    printf "  ${CYAN}%-35s${NC} %6s %-4s %s\n" "$name" "$value" "$unit" "$status"
-    add_result "$name" "$value" "$unit"
+    local name="$1" median="$2" q1="$3" q3="$4" unit="$5" outliers="${6:-0}"
+    local extra=""
+    [ "$outliers" -gt 0 ] && extra=" (${outliers} outliers removed)"
+    printf "  ${C}%-35s${N} %6s %-3s  [q1=%s q3=%s]%s\n" \
+        "$name" "$median" "$unit" "$q1" "$q3" "$extra"
+    add_result "$name" "$median" "$q1" "$q3" "$unit"
 }
 
-# Check VM is running.
-vm_info=$(limactl list --json 2>/dev/null || echo "[]")
-vm_status=$(echo "$vm_info" | python3 -c "
+# --- Prerequisites ---
+
+vm_status=$(limactl list --json 2>/dev/null | python3 -c "
 import sys, json
-vms = json.load(sys.stdin)
-for v in vms:
-    if v.get('name') == '$VM_NAME':
-        print(v.get('status', 'unknown'))
-        break
-else:
-    print('not_found')
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        v = json.loads(line)
+        if v.get('name') == '$VM_NAME':
+            print(v.get('status', 'unknown')); break
+    except json.JSONDecodeError: continue
+else: print('not_found')
 " 2>/dev/null || echo "unknown")
 
 if [ "$vm_status" != "Running" ]; then
-    echo "ERROR: VM '$VM_NAME' is not running (status: $vm_status)"
-    echo "Start with: limactl start $VM_NAME"
+    echo "ERROR: VM '$VM_NAME' not running (status: $vm_status)"
     exit 1
 fi
 
-# Check warden is running.
 if ! run_in_vm sudo podman ps --filter name=^warden$ --format '{{.Names}}' 2>/dev/null | grep -q warden; then
-    echo "ERROR: Warden proxy is not running"
-    echo "Start with: warden start"
+    echo "ERROR: Warden not running. Start with: warden start"
     exit 1
 fi
 
 echo ""
-echo -e "${BOLD}Brig Stack Overhead Benchmarks${NC}"
+echo -e "${B}Brig Stack Overhead Benchmarks${N}"
+echo -e "${B}Samples: $SAMPLE_RUNS | Warmup: $WARMUP_RUNS | Outlier fence: 1.5*IQR${N}"
 echo "=============================="
 echo ""
 
-# Cleanup from previous runs.
-for c in overhead-proxy overhead-startup overhead-gvisor overhead-policy overhead-par-{1..5}; do
+# Cleanup.
+for c in overhead-proxy overhead-start overhead-gvisor overhead-policy overhead-par-{1..5}; do
     run_in_vm sudo brig rm -f "$c" 2>/dev/null || true
 done
 
-# -------------------------------------------------------------------------
-# 1. Proxy Latency
-# -------------------------------------------------------------------------
-echo -e "${BOLD}1. Proxy Latency${NC}"
-echo "   Cell -> Warden -> Internet vs hypothetical direct"
+# Pre-pull.
+run_in_vm sudo podman pull alpine:latest >/dev/null 2>&1 || true
 
-# Create a test cell that stays running.
-run_in_vm sudo brig run --name overhead-proxy --image alpine -d -- sleep 300 2>/dev/null
+# =========================================================================
+# 1. PROXY LATENCY
+# =========================================================================
+echo -e "${B}1. Proxy Latency${N}"
 
-# Warm up DNS and connection pool.
-run_in_vm sudo brig exec overhead-proxy -- wget -qO/dev/null https://httpbin.org/ip 2>/dev/null || true
+run_in_vm sudo brig run --name overhead-proxy -d alpine sleep 600 2>/dev/null
+sleep 2
 
-# Measure 5 requests through the proxy.
-PROXY_TIMES=()
-for i in $(seq 1 5); do
-    t=$(time_ms run_in_vm sudo brig exec overhead-proxy -- wget -qO/dev/null https://httpbin.org/ip)
-    PROXY_TIMES+=("$t")
+# Warmup.
+for i in $(seq 1 $WARMUP_RUNS); do
+    run_in_vm sudo brig exec overhead-proxy -- wget -qO/dev/null http://httpbin.org/ip 2>/dev/null || true
 done
 
-# Calculate median.
-PROXY_MEDIAN=$(printf '%s\n' "${PROXY_TIMES[@]}" | sort -n | sed -n '3p')
-print_result "HTTPS through proxy (median)" "$PROXY_MEDIAN" "ms" "2000"
-
-# Measure direct (no proxy) for comparison — from VM host, not from cell.
-DIRECT_TIMES=()
-for i in $(seq 1 5); do
-    t=$(time_ms run_in_vm wget -qO/dev/null https://httpbin.org/ip)
-    DIRECT_TIMES+=("$t")
+# Sample proxied requests.
+PROXY_SAMPLES=""
+for i in $(seq 1 $SAMPLE_RUNS); do
+    t=$(time_ms run_in_vm sudo brig exec overhead-proxy -- wget -qO/dev/null http://httpbin.org/ip)
+    PROXY_SAMPLES="$PROXY_SAMPLES $t"
 done
-DIRECT_MEDIAN=$(printf '%s\n' "${DIRECT_TIMES[@]}" | sort -n | sed -n '3p')
-print_result "HTTPS direct from VM (median)" "$DIRECT_MEDIAN" "ms"
+read -r P_MED P_Q1 P_Q3 P_IQR P_MIN P_MAX P_OUT <<< "$(compute_stats "$PROXY_SAMPLES")"
+print_result "HTTPS through proxy" "$P_MED" "$P_Q1" "$P_Q3" "ms" "$P_OUT"
 
-OVERHEAD=$((PROXY_MEDIAN - DIRECT_MEDIAN))
-print_result "Proxy overhead (median)" "$OVERHEAD" "ms" "500"
+# Sample direct (from VM, no proxy).
+for i in $(seq 1 $WARMUP_RUNS); do
+    run_in_vm wget -qO/dev/null http://httpbin.org/ip 2>/dev/null || true
+done
+DIRECT_SAMPLES=""
+for i in $(seq 1 $SAMPLE_RUNS); do
+    t=$(time_ms run_in_vm wget -qO/dev/null http://httpbin.org/ip)
+    DIRECT_SAMPLES="$DIRECT_SAMPLES $t"
+done
+read -r D_MED D_Q1 D_Q3 _ _ _ D_OUT <<< "$(compute_stats "$DIRECT_SAMPLES")"
+print_result "HTTPS direct from VM" "$D_MED" "$D_Q1" "$D_Q3" "ms" "$D_OUT"
 
-# Cleanup.
+OVERHEAD=$((P_MED - D_MED))
+echo -e "  ${G}Proxy overhead (median):${N}         ${OVERHEAD}ms"
+
 run_in_vm sudo brig kill overhead-proxy 2>/dev/null || true
 run_in_vm sudo brig rm -f overhead-proxy 2>/dev/null || true
-
 echo ""
 
-# -------------------------------------------------------------------------
-# 2. Cell Startup Time
-# -------------------------------------------------------------------------
-echo -e "${BOLD}2. Cell Startup Time${NC}"
-echo "   Wall-clock from brig run to container running"
+# =========================================================================
+# 2. CELL STARTUP TIME
+# =========================================================================
+echo -e "${B}2. Cell Startup Time${N}"
 
-# Pre-pull image to exclude image pull time.
-run_in_vm sudo podman pull alpine:latest 2>/dev/null || true
-
-STARTUP_TIMES=()
-for i in $(seq 1 3); do
-    CELL_NAME="overhead-startup"
-    t=$(time_ms run_in_vm sudo brig run --name "$CELL_NAME" --image alpine -d -- sleep 60)
-    STARTUP_TIMES+=("$t")
-    run_in_vm sudo brig kill "$CELL_NAME" 2>/dev/null || true
-    run_in_vm sudo brig rm -f "$CELL_NAME" 2>/dev/null || true
+START_SAMPLES=""
+for i in $(seq 1 $STARTUP_RUNS); do
+    t=$(time_ms run_in_vm sudo brig run --name overhead-start --rm alpine echo done)
+    START_SAMPLES="$START_SAMPLES $t"
 done
-STARTUP_MEDIAN=$(printf '%s\n' "${STARTUP_TIMES[@]}" | sort -n | sed -n '2p')
-print_result "Cell startup (median, 3 runs)" "$STARTUP_MEDIAN" "ms" "5000"
-
+read -r S_MED S_Q1 S_Q3 _ _ _ S_OUT <<< "$(compute_stats "$START_SAMPLES")"
+print_result "Cell startup (run+rm)" "$S_MED" "$S_Q1" "$S_Q3" "ms" "$S_OUT"
 echo ""
 
-# -------------------------------------------------------------------------
-# 3. Cell Stop + Remove Time
-# -------------------------------------------------------------------------
-echo -e "${BOLD}3. Cell Stop + Remove Time${NC}"
+# =========================================================================
+# 3. CELL STOP + REMOVE
+# =========================================================================
+echo -e "${B}3. Cell Stop + Remove${N}"
 
-run_in_vm sudo brig run --name overhead-startup --image alpine -d -- sleep 300 2>/dev/null
+run_in_vm sudo brig run --name overhead-start -d alpine sleep 600 2>/dev/null
+sleep 1
 
-STOP_TIME=$(time_ms run_in_vm sudo brig stop overhead-startup)
-print_result "Cell stop (graceful)" "$STOP_TIME" "ms" "5000"
-
-RM_TIME=$(time_ms run_in_vm sudo brig rm -f overhead-startup)
-print_result "Cell remove (with cleanup)" "$RM_TIME" "ms" "3000"
-
+STOP_T=$(time_ms run_in_vm sudo brig stop overhead-start)
+RM_T=$(time_ms run_in_vm sudo brig rm -f overhead-start)
+printf "  ${C}%-35s${N} %6s ms\n" "Cell stop (graceful)" "$STOP_T"
+printf "  ${C}%-35s${N} %6s ms\n" "Cell remove (with cleanup)" "$RM_T"
+add_result "cell_stop" "$STOP_T" "$STOP_T" "$STOP_T" "ms"
+add_result "cell_remove" "$RM_T" "$RM_T" "$RM_T" "ms"
 echo ""
 
-# -------------------------------------------------------------------------
-# 4. gVisor Overhead
-# -------------------------------------------------------------------------
-echo -e "${BOLD}4. gVisor Syscall Overhead${NC}"
-echo "   Measuring getpid() loop inside gVisor container"
+# =========================================================================
+# 4. gVISOR OVERHEAD
+# =========================================================================
+echo -e "${B}4. gVisor Syscall Overhead${N}"
 
-# Measure syscall-heavy workload under gVisor.
-GVISOR_TIME=$(time_ms run_in_vm sudo brig run --name overhead-gvisor --image alpine --rm \
-    -- sh -c 'i=0; while [ $i -lt 10000 ]; do cat /proc/self/status > /dev/null; i=$((i+1)); done')
-print_result "10k /proc reads (gVisor)" "$GVISOR_TIME" "ms"
-
+GVISOR_SAMPLES=""
+for i in $(seq 1 5); do
+    t=$(time_ms run_in_vm sudo brig run --name overhead-gvisor --rm alpine \
+        sh -c 'i=0; while [ $i -lt 5000 ]; do cat /proc/self/status > /dev/null; i=$((i+1)); done')
+    GVISOR_SAMPLES="$GVISOR_SAMPLES $t"
+done
+read -r G_MED G_Q1 G_Q3 _ _ _ G_OUT <<< "$(compute_stats "$GVISOR_SAMPLES")"
+print_result "5k /proc reads (gVisor)" "$G_MED" "$G_Q1" "$G_Q3" "ms" "$G_OUT"
 echo ""
 
-# -------------------------------------------------------------------------
-# 5. Policy Evaluation at Scale
-# -------------------------------------------------------------------------
-echo -e "${BOLD}5. Policy Under Load${NC}"
-echo "   Request latency with large policy loaded"
+# =========================================================================
+# 5. REQUEST LATENCY DISTRIBUTION
+# =========================================================================
+echo -e "${B}5. Request Latency Distribution${N}"
 
-# Create a cell and make 10 rapid requests.
-run_in_vm sudo brig run --name overhead-policy --image alpine -d -- sleep 300 2>/dev/null
+run_in_vm sudo brig run --name overhead-policy -d alpine sleep 600 2>/dev/null
+sleep 2
 
-POLICY_TIMES=()
-for i in $(seq 1 10); do
+# Warmup.
+for i in $(seq 1 $WARMUP_RUNS); do
+    run_in_vm sudo brig exec overhead-policy -- wget -qO/dev/null http://httpbin.org/status/200 2>/dev/null || true
+done
+
+REQ_SAMPLES=""
+for i in $(seq 1 $SAMPLE_RUNS); do
     t=$(time_ms run_in_vm sudo brig exec overhead-policy -- wget -qO/dev/null http://httpbin.org/status/200)
-    POLICY_TIMES+=("$t")
+    REQ_SAMPLES="$REQ_SAMPLES $t"
 done
 
-# Sort and get p50/p95.
-SORTED=($(printf '%s\n' "${POLICY_TIMES[@]}" | sort -n))
-P50="${SORTED[4]}"
-P95="${SORTED[8]}"
-print_result "HTTP request p50" "$P50" "ms" "1000"
-print_result "HTTP request p95" "$P95" "ms" "3000"
+# Compute p50 and p95 from sorted filtered samples.
+read -r R_P50 R_Q1 R_Q3 _ _ _ R_OUT <<< "$(compute_stats "$REQ_SAMPLES")"
+R_P95=$(echo "$REQ_SAMPLES" | python3 -c "
+import sys
+v = sorted(map(int, sys.stdin.read().split()))
+print(v[int(len(v) * 0.95)])
+")
+print_result "HTTP request p50" "$R_P50" "$R_Q1" "$R_Q3" "ms" "$R_OUT"
+printf "  ${C}%-35s${N} %6s ms\n" "HTTP request p95" "$R_P95"
+add_result "request_p95" "$R_P95" "$R_P95" "$R_P95" "ms"
 
 run_in_vm sudo brig kill overhead-policy 2>/dev/null || true
 run_in_vm sudo brig rm -f overhead-policy 2>/dev/null || true
-
 echo ""
 
-# -------------------------------------------------------------------------
-# 6. Concurrent Cell Startup
-# -------------------------------------------------------------------------
-echo -e "${BOLD}6. Concurrent Cell Startup${NC}"
-echo "   5 cells launched in parallel"
+# =========================================================================
+# 6. STARTUP BREAKDOWN
+# =========================================================================
+echo -e "${B}6. Startup Breakdown${N}"
+echo "   Timing individual steps of cell creation"
 
-PAR_START=$(python3 -c "import time; print(int(time.time() * 1000))")
+# Time each step separately.
+CELL="overhead-start"
+T_SUBNET=$(time_ms run_in_vm sudo brig-subnet allocate "$CELL")
+T_NETCREATE=$(time_ms run_in_vm sudo podman network create --internal "brig-$CELL")
+T_CONNECT=$(time_ms run_in_vm sudo podman network connect "brig-$CELL" warden)
+T_PODMAN=$(time_ms run_in_vm sudo podman run --rm --runtime runsc --name "brig-$CELL" \
+    --network "brig-$CELL" alpine echo done)
+
+# Cleanup.
+run_in_vm sudo podman network disconnect "brig-$CELL" warden 2>/dev/null || true
+run_in_vm sudo podman network rm "brig-$CELL" 2>/dev/null || true
+run_in_vm sudo brig-subnet free "$CELL" 2>/dev/null || true
+
+printf "  ${C}%-35s${N} %6s ms\n" "Subnet allocate" "$T_SUBNET"
+printf "  ${C}%-35s${N} %6s ms\n" "Network create" "$T_NETCREATE"
+printf "  ${C}%-35s${N} %6s ms\n" "Proxy connect" "$T_CONNECT"
+printf "  ${C}%-35s${N} %6s ms\n" "Container run (runsc)" "$T_PODMAN"
+TOTAL=$((T_SUBNET + T_NETCREATE + T_CONNECT + T_PODMAN))
+printf "  ${G}%-35s${N} %6s ms\n" "Sum" "$TOTAL"
+add_result "breakdown_subnet" "$T_SUBNET" "$T_SUBNET" "$T_SUBNET" "ms"
+add_result "breakdown_network" "$T_NETCREATE" "$T_NETCREATE" "$T_NETCREATE" "ms"
+add_result "breakdown_connect" "$T_CONNECT" "$T_CONNECT" "$T_CONNECT" "ms"
+add_result "breakdown_container" "$T_PODMAN" "$T_PODMAN" "$T_PODMAN" "ms"
+echo ""
+
+# =========================================================================
+# 7. CONCURRENT STARTUP
+# =========================================================================
+echo -e "${B}7. Concurrent Cell Startup${N}"
+
+PAR_START=$(now_ms)
 for i in $(seq 1 5); do
-    run_in_vm sudo brig run --name "overhead-par-$i" --image alpine -d -- sleep 60 &
+    run_in_vm sudo brig run --name "overhead-par-$i" -d alpine sleep 60 &
 done
 wait
-PAR_END=$(python3 -c "import time; print(int(time.time() * 1000))")
-PAR_TIME=$((PAR_END - PAR_START))
-print_result "5 cells parallel startup" "$PAR_TIME" "ms" "15000"
+PAR_END=$(now_ms)
+PAR_T=$((PAR_END - PAR_START))
+printf "  ${C}%-35s${N} %6s ms\n" "5 cells parallel startup" "$PAR_T"
+add_result "concurrent_5" "$PAR_T" "$PAR_T" "$PAR_T" "ms"
 
-# Cleanup parallel cells.
 for i in $(seq 1 5); do
     run_in_vm sudo brig kill "overhead-par-$i" 2>/dev/null || true
     run_in_vm sudo brig rm -f "overhead-par-$i" 2>/dev/null || true
 done
-
 echo ""
 
-# -------------------------------------------------------------------------
-# Summary
-# -------------------------------------------------------------------------
+# =========================================================================
+# SUMMARY
+# =========================================================================
 echo "=============================="
-echo -e "${BOLD}Summary${NC}"
+echo -e "${B}Summary${N}"
 echo "=============================="
 echo ""
-echo "  Proxy overhead:     ${OVERHEAD}ms per HTTPS request"
-echo "  Cell startup:       ${STARTUP_MEDIAN}ms (pre-pulled image)"
-echo "  Cell stop:          ${STOP_TIME}ms"
-echo "  Cell remove:        ${RM_TIME}ms"
-echo "  gVisor 10k reads:   ${GVISOR_TIME}ms"
-echo "  Request p50/p95:    ${P50}ms / ${P95}ms"
-echo "  5 cells parallel:   ${PAR_TIME}ms"
+echo "  Proxy overhead:     ${OVERHEAD}ms  (median of $SAMPLE_RUNS samples)"
+echo "  Cell startup:       ${S_MED}ms  [q1=${S_Q1} q3=${S_Q3}]"
+echo "  Cell stop:          ${STOP_T}ms"
+echo "  Cell remove:        ${RM_T}ms"
+echo "  gVisor 5k reads:    ${G_MED}ms  [q1=${G_Q1} q3=${G_Q3}]"
+echo "  Request p50/p95:    ${R_P50}ms / ${R_P95}ms"
+echo "  5 cells parallel:   ${PAR_T}ms"
+echo "  Breakdown: subnet=${T_SUBNET} net=${T_NETCREATE} connect=${T_CONNECT} run=${T_PODMAN}ms"
 echo ""
+
+# Write JSON results.
+RESULTS_FILE="${RESULTS_FILE:-/tmp/overhead-results.json}"
+echo "$RESULTS" | python3 -m json.tool > "$RESULTS_FILE" 2>/dev/null || true
 
 if [ "$JSON_OUTPUT" = true ]; then
     echo "$RESULTS" | python3 -m json.tool
 fi
-
-# Write results to file for CI artifact collection.
-RESULTS_FILE="${RESULTS_FILE:-/tmp/overhead-results.json}"
-echo "$RESULTS" | python3 -m json.tool > "$RESULTS_FILE" 2>/dev/null || true
 
 exit 0

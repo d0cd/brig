@@ -28,14 +28,8 @@ def test_bench_cache_miss(benchmark, brig_module):
 
 @pytest.mark.bench
 def test_bench_cache_set(benchmark, brig_module):
-    """_set_cache() throughput."""
-    counter = [0]
-
-    def set_cache():
-        counter[0] += 1
-        brig_module._set_cache(f"key-{counter[0]}", {"n": counter[0]})
-
-    benchmark(set_cache)
+    """_set_cache() throughput — overwrites same key to avoid unbounded growth."""
+    benchmark(brig_module._set_cache, "bench_set_key", {"data": "value"})
 
 
 @pytest.mark.bench
