@@ -346,12 +346,14 @@ class AsyncLogWriter:
 
 
 class LogFilter:
-    """Log filtering configuration."""
+    """Log filtering configuration.
+
+    Patterns are pre-compiled to regex at construction time for O(1)
+    matching per pattern instead of fnmatch's per-call parsing.
+    """
 
     def __init__(self, config: dict = None):
         config = config or {}
-        self.exclude_hosts = config.get("exclude_hosts", [])
-        self.exclude_paths = config.get("exclude_paths", [])
         self.min_status = config.get("min_status", 0)
         self.sample_rate = config.get("sample_rate", 1.0)
         # Enhanced filtering options.
@@ -359,19 +361,30 @@ class LogFilter:
         self.only_errors = config.get("only_errors", False)
         self.min_latency_ms = config.get("min_latency_ms", 0)
         self.max_body_size = config.get("max_body_size", 0)  # 0 = no limit
+        # Pre-compile glob patterns to regex for fast matching.
+        self._host_patterns = [
+            re.compile(fnmatch.translate(p.lower()))
+            for p in config.get("exclude_hosts", [])
+        ]
+        self._path_patterns = [
+            re.compile(fnmatch.translate(p))
+            for p in config.get("exclude_paths", [])
+        ]
 
     def should_log(self, host: str, path: str, status: int,
                    blocked: bool = False, latency_ms: float = 0,
                    body_size: int = 0) -> bool:
         """Check if request should be logged based on filter rules."""
-        # Check host exclusions.
-        for pattern in self.exclude_hosts:
-            if fnmatch.fnmatch(host.lower(), pattern.lower()):
-                return False
+        # Check host exclusions (pre-compiled regex).
+        if self._host_patterns:
+            host_lower = host.lower()
+            for pattern in self._host_patterns:
+                if pattern.match(host_lower):
+                    return False
 
-        # Check path exclusions.
-        for pattern in self.exclude_paths:
-            if fnmatch.fnmatch(path, pattern):
+        # Check path exclusions (pre-compiled regex).
+        for pattern in self._path_patterns:
+            if pattern.match(path):
                 return False
 
         # Check minimum status.
