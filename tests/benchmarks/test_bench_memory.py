@@ -80,12 +80,13 @@ def test_memory_lru_bounded(metrics_collector_class):
     )
 
 
-def test_memory_steady_state_10k_requests(policy_class, metrics_collector_class,
+def test_memory_steady_state_50k_requests(policy_class, metrics_collector_class,
                                            log_filter_class):
-    """Simulate 10k requests and verify memory doesn't grow unboundedly.
+    """Simulate 50k requests in 5 batches, verify memory stabilizes.
 
-    This catches leaks in the hot path: policy eval, metrics recording,
-    log filtering. Memory should stabilize after initial allocation.
+    Checks two things:
+    1. Total growth stays under 500KB (no large leak).
+    2. Per-batch growth converges to near-zero (no slow leak).
     """
     import json
 
@@ -95,41 +96,52 @@ def test_memory_steady_state_10k_requests(policy_class, metrics_collector_class,
     )
     collector = metrics_collector_class()
     log_filter = log_filter_class({
-        "exclude_hosts": [],
+        "exclude_hosts": ["*.internal.corp"],
         "exclude_paths": ["/healthz"],
         "sample_rate": 1.0,
     })
 
-    hosts = [f"svc-{i % 100}.example.com" for i in range(10000)]
+    hosts = [f"svc-{i % 100}.example.com" for i in range(50)]
 
-    # Warm up — let initial allocations settle.
-    for host in hosts[:100]:
+    # Warmup — let initial allocations settle.
+    for host in hosts[:10]:
         policy.is_allowed(host, "/api", "GET")
-        collector._get_or_create_metrics("bench-cell")
+        collector._get_or_create_metrics("warmup-cell")
 
     tracemalloc.start()
     baseline = tracemalloc.get_traced_memory()[0]
+    prev = baseline
+    batch_deltas = []
 
-    # Simulate 10k requests.
-    for i, host in enumerate(hosts):
-        policy.is_allowed(host, f"/api/v{i % 5}", "GET")
-        m = collector._get_or_create_metrics(f"cell-{i % 50}")
-        m.total_requests += 1
-        if log_filter.should_log(host, "/api", 200):
-            json.dumps({"host": host, "status": 200})
+    for batch in range(5):
+        for i in range(10000):
+            h = hosts[i % len(hosts)]
+            policy.is_allowed(h, f"/api/v{i % 5}", "GET")
+            m = collector._get_or_create_metrics(f"cell-{i % 20}")
+            m.total_requests += 1
+            if log_filter.should_log(h, "/api", 200):
+                json.dumps({"host": h, "status": 200})
 
-    after = tracemalloc.get_traced_memory()[0]
+        current = tracemalloc.get_traced_memory()[0]
+        batch_deltas.append(current - prev)
+        prev = current
+
     tracemalloc.stop()
 
-    growth = after - baseline
-    growth_kb = growth / 1024
+    total_growth = prev - baseline
 
-    # After warmup, 10k requests should not grow memory by more than 500KB.
-    # Most allocations are transient (JSON strings, tuples) and get GC'd.
-    assert growth < 512_000, (
-        f"Memory grew by {growth_kb:.1f}KB after 10k requests (expected <500KB). "
+    # Total growth must be under 500KB.
+    assert total_growth < 512_000, (
+        f"Memory grew by {total_growth / 1024:.1f}KB after 50k requests. "
         f"Possible leak in hot path."
     )
+
+    # Last 3 batches should each grow less than 5KB (convergence).
+    for i, delta in enumerate(batch_deltas[2:], start=3):
+        assert delta < 5120, (
+            f"Batch {i} grew by {delta}B (expected <5KB). "
+            f"Slow leak detected in hot path."
+        )
 
 
 def test_memory_policy_trie_vs_rules(policy_class):

@@ -251,3 +251,40 @@ def test_bench_full_addon_chain(benchmark, policy_class, token_bucket_class,
         m.total_requests += 1
 
     benchmark(full_chain)
+
+
+# =========================================================================
+# Log filter scaling — the most expensive addon (47% of chain)
+# =========================================================================
+
+@pytest.mark.bench
+def test_bench_log_filter_50_patterns(benchmark, log_filter_class):
+    """LogFilter with 50 exclusion patterns — worst-case scaling.
+
+    fnmatch is O(n) per pattern. This catches regressions in the
+    most expensive addon under realistic enterprise configs.
+    """
+    log_filter = log_filter_class({
+        "exclude_hosts": [f"*.internal-{i}.corp" for i in range(25)],
+        "exclude_paths": [f"/internal/{i}/*" for i in range(25)],
+        "sample_rate": 1.0,
+    })
+    # Non-matching host/path forces full scan of all patterns.
+    benchmark(log_filter.should_log, "api.external.com", "/v1/data", 200)
+
+
+# =========================================================================
+# Policy rebuild — cost of SIGHUP reload
+# =========================================================================
+
+@pytest.mark.bench
+def test_bench_policy_rebuild_1000(benchmark, policy_class):
+    """Rebuild Policy with 1000 rules — SIGHUP reload cost.
+
+    During reload, in-flight requests use the old policy. This
+    measures how long the rebuild blocks the reload handler.
+    """
+    rules = [f"svc-{i}.example.com" for i in range(1000)]
+    deny = [f"deny-{i}.evil.com" for i in range(100)]
+
+    benchmark(policy_class, allow=rules, deny=deny)
