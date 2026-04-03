@@ -217,18 +217,94 @@ add_result "cell_remove" "$RM_T" "$RM_T" "$RM_T" "ms"
 echo ""
 
 # =========================================================================
-# 4. gVISOR OVERHEAD
+# 4. RUNTIME COMPARISON: gVisor vs crun
 # =========================================================================
-echo -e "${B}4. gVisor Syscall Overhead${N}"
+echo -e "${B}4. Runtime Comparison: gVisor (runsc) vs Native (crun)${N}"
+echo "   Measures the actual cost of gVisor's syscall interception."
+echo "   Both run inside the same Lima VM with identical isolation."
+echo ""
 
-GVISOR_SAMPLES=""
+# Pre-start persistent containers to measure steady-state (not startup).
+run_in_vm sudo podman run -d --runtime runsc --name bench-runsc alpine sleep 600 2>/dev/null
+run_in_vm sudo podman run -d --runtime crun --name bench-crun alpine sleep 600 2>/dev/null
+sleep 2
+
+# 4a. Syscall overhead (steady-state).
+echo "  Syscall-heavy (1000x open+read+close /proc/self/status):"
+SHCMD='i=0; while [ $i -lt 1000 ]; do cat /proc/self/status > /dev/null; i=$((i+1)); done'
+
+GS_SAMPLES=""
 for i in $(seq 1 5); do
-    t=$(time_ms run_in_vm sudo brig run --name overhead-gvisor --rm alpine \
-        sh -c 'i=0; while [ $i -lt 5000 ]; do cat /proc/self/status > /dev/null; i=$((i+1)); done')
-    GVISOR_SAMPLES="$GVISOR_SAMPLES $t"
+    t=$(time_ms run_in_vm sudo podman exec bench-runsc sh -c "$SHCMD")
+    GS_SAMPLES="$GS_SAMPLES $t"
 done
-read -r G_MED G_Q1 G_Q3 _ _ _ G_OUT <<< "$(compute_stats "$GVISOR_SAMPLES")"
-print_result "5k /proc reads (gVisor)" "$G_MED" "$G_Q1" "$G_Q3" "ms" "$G_OUT"
+read -r GS_MED GS_Q1 GS_Q3 _ _ _ GS_OUT <<< "$(compute_stats "$GS_SAMPLES")"
+
+CS_SAMPLES=""
+for i in $(seq 1 5); do
+    t=$(time_ms run_in_vm sudo podman exec bench-crun sh -c "$SHCMD")
+    CS_SAMPLES="$CS_SAMPLES $t"
+done
+read -r CS_MED CS_Q1 CS_Q3 _ _ _ CS_OUT <<< "$(compute_stats "$CS_SAMPLES")"
+
+print_result "  gVisor (runsc)" "$GS_MED" "$GS_Q1" "$GS_Q3" "ms" "$GS_OUT"
+print_result "  Native (crun)" "$CS_MED" "$CS_Q1" "$CS_Q3" "ms" "$CS_OUT"
+SC_RATIO=$(python3 -c "print(f'{$GS_MED / max($CS_MED, 1):.1f}')")
+echo -e "  ${G}Overhead: ${SC_RATIO}x per syscall${N}"
+add_result "runtime_syscall_gvisor" "$GS_MED" "$GS_Q1" "$GS_Q3" "ms"
+add_result "runtime_syscall_crun" "$CS_MED" "$CS_Q1" "$CS_Q3" "ms"
+echo ""
+
+# 4b. Compute overhead (steady-state, no syscalls).
+echo "  Compute-only (Python 100k iterations, no I/O):"
+
+# Copy test script to both containers.
+run_in_vm sudo bash -c 'echo "import time; s=time.perf_counter(); x=sum(i*i for i in range(100000)); print(int((time.perf_counter()-s)*1000))" > /tmp/compute.py'
+run_in_vm sudo podman cp /tmp/compute.py bench-runsc:/compute.py 2>/dev/null || true
+run_in_vm sudo podman cp /tmp/compute.py bench-crun:/compute.py 2>/dev/null || true
+
+# Only run if python3 is available in the container.
+GC_MS=$(run_in_vm sudo podman exec bench-runsc python3 /compute.py 2>/dev/null || echo "")
+CC_MS=$(run_in_vm sudo podman exec bench-crun python3 /compute.py 2>/dev/null || echo "")
+
+if [ -n "$GC_MS" ] && [ -n "$CC_MS" ]; then
+    printf "  ${C}%-35s${N} %6s ms\n" "  gVisor (runsc)" "$GC_MS"
+    printf "  ${C}%-35s${N} %6s ms\n" "  Native (crun)" "$CC_MS"
+    COMP_RATIO=$(python3 -c "print(f'{int($GC_MS) / max(int($CC_MS), 1):.1f}')")
+    echo -e "  ${G}Overhead: ${COMP_RATIO}x for pure compute${N}"
+    add_result "runtime_compute_gvisor" "$GC_MS" "$GC_MS" "$GC_MS" "ms"
+    add_result "runtime_compute_crun" "$CC_MS" "$CC_MS" "$CC_MS" "ms"
+else
+    echo "  (skipped — python3 not in alpine image)"
+fi
+echo ""
+
+# 4c. Cold startup comparison.
+echo "  Cold startup (podman run --rm echo):"
+
+GR_SAMPLES=""
+for i in $(seq 1 3); do
+    t=$(time_ms run_in_vm sudo podman run --rm --runtime runsc alpine echo done)
+    GR_SAMPLES="$GR_SAMPLES $t"
+done
+GR_MED=$(median "$GR_SAMPLES")
+
+CR_SAMPLES=""
+for i in $(seq 1 3); do
+    t=$(time_ms run_in_vm sudo podman run --rm --runtime crun alpine echo done)
+    CR_SAMPLES="$CR_SAMPLES $t"
+done
+CR_MED=$(median "$CR_SAMPLES")
+
+printf "  ${C}%-35s${N} %6s ms\n" "  gVisor (runsc)" "$GR_MED"
+printf "  ${C}%-35s${N} %6s ms\n" "  Native (crun)" "$CR_MED"
+START_RATIO=$(python3 -c "print(f'{$GR_MED / max($CR_MED, 1):.1f}')")
+echo -e "  ${G}Overhead: ${START_RATIO}x for cold start${N}"
+add_result "runtime_startup_gvisor" "$GR_MED" "$GR_MED" "$GR_MED" "ms"
+add_result "runtime_startup_crun" "$CR_MED" "$CR_MED" "$CR_MED" "ms"
+
+run_in_vm sudo podman kill bench-runsc bench-crun 2>/dev/null || true
+run_in_vm sudo podman rm -f bench-runsc bench-crun 2>/dev/null || true
 echo ""
 
 # =========================================================================

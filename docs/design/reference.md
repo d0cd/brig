@@ -311,9 +311,12 @@ CLI flags override profile defaults.
 |---------|---------|---------|-----------|----------|
 | `untrusted` | gVisor | Explicit allowlist | 512MB, 1 CPU, 256 PIDs | Unknown/hostile code |
 | `supervised` | gVisor | Broad allowlist | 2GB, 2 CPU, 512 PIDs | AI agents, CI/CD |
-| `dev` | gVisor | All egress, logged | 4GB, 4 CPU, 2048 PIDs | Your own code |
-| `airgapped` | gVisor | None (`--network none`) | 2GB, 2 CPU, 512 PIDs | Pure compute |
+| `compute` | crun + seccomp | Broad allowlist | 4GB, 4 CPU, 2048 PIDs | ML training, data processing |
+| `dev` | crun + seccomp | All egress, logged | 4GB, 4 CPU, 2048 PIDs | Your own code |
+| `airgapped` | gVisor | None (`--network none`) | 2GB, 2 CPU, 512 PIDs | Offline compute |
 | `honeypot` | gVisor | Connected, deny all | 1GB, 1 CPU, 256 PIDs | Behavior analysis |
+
+**Runtime note:** `compute` and `dev` profiles use the native container runtime (crun) with seccomp syscall filtering instead of gVisor. This eliminates the 3x syscall overhead for filesystem-heavy and compute-intensive workloads while maintaining VM-level isolation, capability dropping, and network policy enforcement. See [Security Design](security.md) for the full tradeoff analysis.
 
 Usage: `brig run --profile supervised --name agent-a python:3.12`
 
