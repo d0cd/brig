@@ -4,7 +4,6 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Nightly at 03:00 UTC.
     - cron: "0 3 * * *"
 
 permissions:
@@ -45,19 +44,6 @@ jobs:
             --benchmark-warmup=on \
             -v
 
-      - name: Compare against baseline
-        run: |
-          if [ -f tests/benchmarks/baseline.json ]; then
-            pytest tests/benchmarks/ -m bench --benchmark-enable \
-              --benchmark-compare=tests/benchmarks/baseline.json \
-              --benchmark-compare-fail=mean:10% \
-              --benchmark-min-rounds=5 \
-              --benchmark-warmup=on \
-              -v
-          else
-            echo "No baseline found, skipping comparison"
-          fi
-
       - name: Check for regressions
         run: |
           if [ -f tests/benchmarks/baseline.json ]; then
@@ -65,6 +51,16 @@ jobs:
           else
             echo "No baseline found, skipping regression check"
           fi
+
+      - name: Publish results to job summary
+        if: always()
+        run: |
+          if [ -f results.json ]; then
+            python tests/benchmarks/format_results.py results.json \
+              ${BASELINE:+--baseline "$BASELINE"} >> "$GITHUB_STEP_SUMMARY"
+          fi
+        env:
+          BASELINE: ${{ hashFiles('tests/benchmarks/baseline.json') != '' && 'tests/benchmarks/baseline.json' || '' }}
 
       - name: Save trend data
         if: github.ref == 'refs/heads/main'
