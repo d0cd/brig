@@ -147,6 +147,7 @@ Configure allowed domains in `~/.brig/cells/network-policy.json`:
 - [Workflows](docs/learning/workflows.md)
 - [CLI Reference](docs/design/reference.md)
 - [Security Design](docs/design/security.md)
+- [Performance Benchmarks](docs/BENCHMARKS.md)
 - [Troubleshooting](docs/learning/troubleshooting.md)
 
 ## License
