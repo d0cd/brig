@@ -145,6 +145,12 @@ done
 # Pre-pull.
 run_in_vm sudo podman pull alpine:latest >/dev/null 2>&1 || true
 
+# Copy container benchmark script to VM.
+BENCH_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/benchmarks/container_bench.py"
+if [ -f "$BENCH_SCRIPT" ]; then
+    limactl cp "$BENCH_SCRIPT" "$VM_NAME":/tmp/container_bench.py 2>/dev/null || true
+fi
+
 # =========================================================================
 # 1. PROXY LATENCY
 # =========================================================================
