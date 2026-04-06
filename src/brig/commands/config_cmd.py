@@ -15,7 +15,8 @@ from brig.commands._helpers import (
 def cmd_config_show(args) -> int:
     """Show current configuration."""
     # Define available configuration keys with types and defaults.
-    config_schema = {
+    from typing import Any
+    config_schema: dict[str, dict[str, Any]] = {
         "operation_logging.enabled": {
             "type": "bool",
             "default": True,
@@ -42,14 +43,14 @@ def cmd_config_show(args) -> int:
     if getattr(args, "keys", False):
         # List available keys.
         print("Available configuration keys:\n")
-        for key, info in config_schema.items():
-            type_str = info["type"]
-            if "values" in info:
-                type_str = f"{type_str} ({', '.join(info['values'])})"
+        for key, schema_info in config_schema.items():
+            type_str = schema_info["type"]
+            if "values" in schema_info:
+                type_str = f"{type_str} ({', '.join(schema_info['values'])})"
             print(f"  {key}")
             print(f"    Type:    {type_str}")
-            print(f"    Default: {info['default']}")
-            print(f"    {info['description']}")
+            print(f"    Default: {schema_info['default']}")
+            print(f"    {schema_info['description']}")
             print()
         return 0
 

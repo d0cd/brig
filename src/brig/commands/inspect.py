@@ -72,7 +72,7 @@ def cmd_exec(args) -> int:
         cmd.append("/bin/sh")
 
     result = run(cmd, check=False)
-    return result.returncode
+    return int(result.returncode)
 
 
 def cmd_shell(args) -> int:
@@ -92,7 +92,7 @@ def cmd_shell(args) -> int:
 
     try:
         result = run(cmd, check=False)
-        return result.returncode
+        return int(result.returncode)
     except KeyboardInterrupt:
         return 0
 
@@ -113,7 +113,7 @@ def cmd_attach(args) -> int:
 
     try:
         result = run(cmd, check=False)
-        return result.returncode
+        return int(result.returncode)
     except KeyboardInterrupt:
         return 0
 
@@ -131,7 +131,7 @@ def cmd_top(args) -> int:
 
     cmd = ["podman", "top", container_name(cell_name)]
     result = run(cmd, check=False)
-    return result.returncode
+    return int(result.returncode)
 
 
 def cmd_diff(args) -> int:
@@ -150,7 +150,7 @@ def cmd_diff(args) -> int:
     result = run(cmd, check=False, capture=True)
     if result.returncode != 0:
         print_error(result.stderr.strip(), "Ensure the cell exists: brig list")
-        return result.returncode
+        return int(result.returncode)
 
     if args.format == "json":
         print(result.stdout)
@@ -220,7 +220,7 @@ def cmd_stats(args) -> int:
 
     try:
         result = run(cmd, check=False)
-        return result.returncode
+        return int(result.returncode)
     except KeyboardInterrupt:
         return 0
 
@@ -388,7 +388,7 @@ def cmd_export(args) -> int:
     else:
         # YAML output.
         if _helpers.YAML_AVAILABLE:
-            import yaml
+            import yaml  # type: ignore[import-untyped]
             print(yaml.dump(cell_def, default_flow_style=False, sort_keys=False))
         else:
             # Simple YAML-like output without pyyaml.

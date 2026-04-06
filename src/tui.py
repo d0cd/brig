@@ -126,7 +126,8 @@ def get_cell_stats(cell_name: str) -> dict:
         if result.returncode == 0 and result.stdout.strip():
             stats = json.loads(result.stdout)
             if stats:
-                return stats[0]
+                result_dict: dict = stats[0]
+                return result_dict
     except Exception:
         pass
     return {}
@@ -156,7 +157,8 @@ def get_metrics() -> dict:
                 return {}
             chunks.append(chunk)
         response = b"".join(chunks).decode("utf-8")
-        return json.loads(response)
+        data: dict = json.loads(response)
+        return data
     except Exception:
         return {}
     finally:
@@ -181,7 +183,8 @@ def get_cell_policy(cell_name: str) -> dict:
 
     try:
         with open(policy_file, "r") as f:
-            return json.load(f)
+            data: dict = json.load(f)
+            return data
     except Exception:
         return {"allow": [], "deny": []}
 
@@ -722,10 +725,10 @@ if TEXTUAL_AVAILABLE:
             tabs = self.query_one(TabbedContent)
             tabs.active = "tab-policy"
 
-        def _get_selected_cell(self) -> Optional[str]:
+        def _get_selected_cell(self) -> str | None:
             """Get currently selected cell name."""
             if self.selected_cell:
-                return self.selected_cell
+                return str(self.selected_cell)
             # Try to get from table selection.
             try:
                 table = self.query_one(CellsTable)

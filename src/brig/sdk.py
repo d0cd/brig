@@ -37,7 +37,7 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, List
 
 # Validation patterns for SDK inputs.
 from brig.config import CELL_NAME_PATTERN
@@ -83,8 +83,8 @@ class CellRunResult:
     status: str
     network: str
     runtime: str
-    timeout_seconds: Optional[int] = None
-    labels: dict = field(default_factory=dict)
+    timeout_seconds: int | None = None
+    labels: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -93,7 +93,7 @@ class CellEvent:
     cell: str
     action: str
     time: str
-    raw: dict = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -137,7 +137,7 @@ class SecretNotFoundError(BrigError):
 
 # Patterns for mapping CLI stderr to specific exception subclasses.
 # More specific patterns must come before generic ones.
-_ERROR_PATTERNS = [
+_ERROR_PATTERNS: list[tuple[re.Pattern[str], type[BrigError]]] = [
     (re.compile(r"Unknown profile", re.IGNORECASE), ProfileError),
     (re.compile(r"Secret.*not found|not found in secrets", re.IGNORECASE), SecretNotFoundError),
     (re.compile(r"digest mismatch|verification failed", re.IGNORECASE), ImageVerificationError),
@@ -151,7 +151,7 @@ _KNOWN_PROFILES = frozenset({"untrusted", "supervised", "dev", "airgapped", "hon
 class Cell:
     """Handle to a running or completed cell."""
 
-    def __init__(self, name: str, brig: "Brig", run_result: Optional[CellRunResult] = None):
+    def __init__(self, name: str, brig: "Brig", run_result: CellRunResult | None = None):
         if not _CELL_NAME_RE.match(name):
             raise BrigError(
                 f"Invalid cell name '{name}': must match {_CELL_NAME_RE.pattern}"
@@ -160,7 +160,7 @@ class Cell:
         self._brig = brig
         self.run_result = run_result
 
-    async def wait(self, timeout: str = None) -> int:
+    async def wait(self, timeout: str | None = None) -> int:
         """Block until cell exits, returning its exit code."""
         cmd = [self._brig._bin, "wait", "--output", "json", self.name]
         if timeout:
@@ -175,18 +175,18 @@ class Cell:
 
         try:
             data = json.loads(result.stdout)
-            return data["exit_code"]
+            return int(data["exit_code"])
         except (json.JSONDecodeError, KeyError):
             if result.returncode != 0:
                 raise BrigError(
                     f"Failed to parse wait output for cell {self.name}",
                     result.returncode, result.stderr
                 )
-            return result.returncode
+            return int(result.returncode)
 
-    def wait_sync(self, timeout: str = None) -> int:
+    def wait_sync(self, timeout: str | None = None) -> int:
         """Synchronous version of wait()."""
-        return _run_sync(self.wait(timeout))
+        return int(_run_sync(self.wait(timeout)))
 
     async def stop(self) -> None:
         """Gracefully stop the cell."""
@@ -240,7 +240,7 @@ class Cell:
         """Synchronous version of cp_out()."""
         _run_sync(self.cp_out(cell_path, local_path))
 
-    async def logs(self, follow: bool = False, tail: int = None):
+    async def logs(self, follow: bool = False, tail: int | None = None) -> Any:
         """Get cell logs.
 
         When follow=False, returns log text as str (awaitable).
@@ -256,7 +256,7 @@ class Cell:
         result = await self._brig._run_cmd(cmd)
         return result.stdout
 
-    async def _logs_stream(self, tail: int = None):
+    async def _logs_stream(self, tail: int | None = None) -> Any:
         """Async generator yielding log lines. Used by logs(follow=True)."""
         cmd = [self._brig._bin, "logs", "-f"]
         if tail:
@@ -268,25 +268,26 @@ class Cell:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
+            assert proc.stdout is not None
             async for line in proc.stdout:
                 yield line.decode("utf-8", errors="replace").rstrip("\n")
         finally:
             proc.kill()
             await proc.wait()
 
-    def logs_sync(self, follow: bool = False, tail: int = None) -> str:
+    def logs_sync(self, follow: bool = False, tail: int | None = None) -> str:
         """Synchronous version of logs(). Only supports follow=False."""
         if follow:
             raise BrigError("logs_sync() does not support follow=True; use async logs()")
-        return _run_sync(self.logs(follow=False, tail=tail))
+        return str(_run_sync(self.logs(follow=False, tail=tail)))
 
     async def stats(self) -> list[CellStats]:
         """Get resource usage stats for this cell."""
-        return await self._brig.stats(self.name)
+        return list(await self._brig.stats(self.name))
 
     def stats_sync(self) -> list[CellStats]:
         """Synchronous version of stats()."""
-        return _run_sync(self.stats())
+        return list(_run_sync(self.stats()))
 
     async def is_alive(self) -> bool:
         """Check if the cell is still running."""
@@ -297,7 +298,7 @@ class Cell:
             return False
         try:
             data = json.loads(result.stdout)
-            return data[0].get("State", {}).get("Running", False)
+            return bool(data[0].get("State", {}).get("Running", False))
         except (json.JSONDecodeError, IndexError, KeyError):
             return False
 
@@ -333,7 +334,7 @@ class Cell:
             proc.kill()
             await proc.wait()
 
-    async def network_logs(self, follow: bool = True, tail: int = None):
+    async def network_logs(self, follow: bool = True, tail: int | None = None) -> Any:
         """Async generator yielding network activity logs for this cell.
 
         Usage:
@@ -352,12 +353,13 @@ class Cell:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            async for line in proc.stdout:
-                line = line.decode("utf-8", errors="replace").strip()
-                if not line:
+            assert proc.stdout is not None
+            async for raw_line in proc.stdout:
+                text = raw_line.decode("utf-8", errors="replace").strip()
+                if not text:
                     continue
                 try:
-                    yield json.loads(line)
+                    yield json.loads(text)
                 except json.JSONDecodeError:
                     continue
         finally:
@@ -400,7 +402,7 @@ class WardenHandle:
 
     def status_sync(self) -> WardenStatus:
         """Synchronous version of status()."""
-        return _run_sync(self.status())
+        return _run_sync(self.status())  # type: ignore[no-any-return]
 
     async def start(self) -> None:
         """Start the Warden proxy."""
@@ -454,7 +456,7 @@ class Brig:
             )
         result = subprocess.CompletedProcess(
             args=cmd,
-            returncode=proc.returncode,
+            returncode=proc.returncode or 0,
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),
         )
@@ -462,11 +464,11 @@ class Brig:
             # Only include binary + subcommand to avoid leaking secrets.
             cmd_summary = ' '.join(cmd[:2]) if len(cmd) >= 2 else cmd[0]
             msg = f"Command failed: {cmd_summary}\n{result.stderr.strip()}"
-            stderr = result.stderr
+            stderr_str = result.stderr
             # Match stderr against known patterns for specific exceptions.
             for pattern, exc_cls in _ERROR_PATTERNS:
-                if pattern.search(stderr):
-                    raise exc_cls(msg, result.returncode, stderr)
+                if pattern.search(stderr_str):
+                    raise exc_cls(msg, result.returncode, stderr_str)
             raise BrigError(msg, result.returncode, stderr)
         return result
 
@@ -480,25 +482,25 @@ class Brig:
         self,
         name: str,
         image: str,
-        command: list[str] = None,
+        command: list[str] | None = None,
         *,
-        profile: str = None,
-        policy_allow: list[str] = None,
-        policy_deny: list[str] = None,
-        egress_allow: list[str] = None,
-        secrets: list[str] = None,
-        env: dict[str, str] = None,
-        memory: str = None,
-        cpus: str = None,
-        pids_limit: int = None,
-        timeout: str = None,
-        network: str = None,
-        labels: dict[str, str] = None,
+        profile: str | None = None,
+        policy_allow: list[str] | None = None,
+        policy_deny: list[str] | None = None,
+        egress_allow: list[str] | None = None,
+        secrets: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        memory: str | None = None,
+        cpus: str | None = None,
+        pids_limit: int | None = None,
+        timeout: str | None = None,
+        network: str | None = None,
+        labels: dict[str, str] | None = None,
         detach: bool = True,
         rm: bool = False,
-        workdir: str = None,
-        image_digest: str = None,
-        canary_tokens: dict[str, str] = None,
+        workdir: str | None = None,
+        image_digest: str | None = None,
+        canary_tokens: dict[str, str] | None = None,
     ) -> Cell:
         """Launch a new cell.
 
@@ -650,11 +652,11 @@ class Brig:
 
         return Cell(name, self, run_result)
 
-    def run_sync(self, **kwargs) -> Cell:
+    def run_sync(self, **kwargs: Any) -> Cell:
         """Synchronous version of run()."""
-        return _run_sync(self.run(**kwargs))
+        return _run_sync(self.run(**kwargs))  # type: ignore[no-any-return]
 
-    async def list(self) -> list[CellInfo]:
+    async def list(self) -> List[CellInfo]:  # noqa: UP006 — `list` shadows builtin here
         """List all cells."""
         cmd = [self._bin, "list", "--format", "json"]
         result = await self._run_cmd(cmd)
@@ -673,11 +675,11 @@ class Brig:
             for c in cells_data
         ]
 
-    def list_sync(self) -> list[CellInfo]:
+    def list_sync(self) -> List[CellInfo]:
         """Synchronous version of list()."""
-        return _run_sync(self.list())
+        return _run_sync(self.list())  # type: ignore[no-any-return]
 
-    async def stats(self, name: str = None) -> list[CellStats]:
+    async def stats(self, name: str | None = None) -> List[CellStats]:
         """Get resource usage stats for cells."""
         cmd = [self._bin, "stats", "--output", "json"]
         if name:
@@ -699,9 +701,9 @@ class Brig:
         except json.JSONDecodeError:
             return []
 
-    def stats_sync(self, name: str = None) -> list[CellStats]:
+    def stats_sync(self, name: str | None = None) -> List[CellStats]:
         """Synchronous version of stats()."""
-        return _run_sync(self.stats(name=name))
+        return _run_sync(self.stats(name=name))  # type: ignore[no-any-return]
 
     async def cell(self, name: str) -> Cell:
         """Get a handle to an existing cell by name."""
@@ -709,7 +711,7 @@ class Brig:
             raise BrigError(f"Invalid cell name: {name}")
         return Cell(name, self)
 
-    async def get(self, name: str) -> Optional[Cell]:
+    async def get(self, name: str) -> Cell | None:
         """Look up an existing cell by name. Returns Cell or None."""
         if not _CELL_NAME_RE.match(name):
             raise BrigError(f"Invalid cell name: {name}")
@@ -753,7 +755,7 @@ class Brig:
         return f"Brig(bin={self._bin!r})"
 
 
-def _run_sync(coro):
+def _run_sync(coro: Any) -> Any:
     """Run an async coroutine synchronously."""
     try:
         loop = asyncio.get_running_loop()

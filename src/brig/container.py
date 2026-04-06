@@ -53,7 +53,7 @@ class Spinner:
             sys.stderr.flush()
         return False
 
-    def success(self, message: str = None):
+    def success(self, message: str | None = None):
         """Show success message and stop spinner."""
         self.running = False
         if self.thread:
@@ -63,7 +63,7 @@ class Spinner:
             sys.stderr.write(f"\r{colorize('✓', 'green')} {msg}\n")
             sys.stderr.flush()
 
-    def fail(self, message: str = None):
+    def fail(self, message: str | None = None):
         """Show failure message and stop spinner."""
         self.running = False
         if self.thread:
@@ -90,7 +90,7 @@ def cell_exists(cell_name: str) -> bool:
         return False  # Invalid names can't exist.
     hit, value = _cached(f"cell_exists:{cell_name}")
     if hit:
-        return value
+        return bool(value)
 
     result = run(
         ["podman", "ps", "-a", "--format", "{{.Names}}", "--filter", f"name={container_name(cell_name)}"],
@@ -107,7 +107,7 @@ def cell_running(cell_name: str) -> bool:
         return False  # Invalid names can't exist.
     hit, value = _cached(f"cell_running:{cell_name}")
     if hit:
-        return value
+        return bool(value)
 
     result = run(
         ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={container_name(cell_name)}"],
@@ -122,7 +122,7 @@ def proxy_running() -> bool:
     """Check if the proxy container is running."""
     hit, value = _cached("proxy_running")
     if hit:
-        return value
+        return bool(value)
 
     result = run(
         ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={PROXY_NAME}"],
@@ -144,7 +144,7 @@ def get_proxy_ip(network: str) -> str:
          "{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k \"" + network + "\"}}{{$v.IPAddress}}{{end}}{{end}}"],
         check=False, capture=True
     )
-    return result.stdout.strip()
+    return str(result.stdout.strip())
 
 
 def load_cell_policy(cell_name: str) -> dict:
@@ -155,7 +155,8 @@ def load_cell_policy(cell_name: str) -> dict:
     if policy_file.exists():
         try:
             with open(policy_file, "r") as f:
-                return json.load(f)
+                data: dict = json.load(f)
+                return data
         except (json.JSONDecodeError, IOError):
             pass
     return {"allow": [], "deny": []}
@@ -213,7 +214,7 @@ def verify_image_signature(image: str) -> tuple[bool, str]:
     return False, "No signature verification tool available (install cosign for full support)"
 
 
-def apply_quarantine(path, source_cell: str = None) -> bool:
+def apply_quarantine(path, source_cell: str | None = None) -> bool:
     """Apply macOS quarantine attribute to a file or directory."""
     import platform
     import uuid

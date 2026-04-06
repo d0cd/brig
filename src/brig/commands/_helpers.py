@@ -5,6 +5,8 @@ All command modules import from here. brig.py re-exports via wildcard
 so that tests using importlib still find every name on the module.
 """
 
+from __future__ import annotations
+
 import fcntl
 import json
 import os
@@ -15,7 +17,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 # Shared constants from canonical source.
 from brig.config import (
@@ -149,7 +151,7 @@ class Spinner:
             sys.stderr.flush()
         return False
 
-    def success(self, message: str = None):
+    def success(self, message: str | None = None):
         """Show success message and stop spinner."""
         self.running = False
         if self.thread:
@@ -159,7 +161,7 @@ class Spinner:
             sys.stderr.write(f"\r{colorize('✓', 'green')} {msg}\n")
             sys.stderr.flush()
 
-    def fail(self, message: str = None):
+    def fail(self, message: str | None = None):
         """Show failure message and stop spinner."""
         self.running = False
         if self.thread:
@@ -185,7 +187,7 @@ LOG_LEVEL_ERROR = 3
 LOG_LEVEL = LOG_LEVEL_INFO
 
 
-def log(level: int, msg: str, level_name: str = None) -> None:
+def log(level: int, msg: str, level_name: str | None = None) -> None:
     """Log a message at the specified level."""
     if level < LOG_LEVEL:
         return
@@ -205,7 +207,7 @@ def log(level: int, msg: str, level_name: str = None) -> None:
         LOG_LEVEL_ERROR: "red",
     }
     name = level_name or level_names.get(level, "INFO")
-    color = level_colors.get(level, None)
+    color = level_colors.get(level)
     if COLOR_ENABLED and color:
         prefix = colorize(f"[{name}]", color)
     else:
@@ -248,10 +250,10 @@ def _append_jsonl(path: Path, entry: dict) -> None:
         os.fsync(f.fileno())
 
 
-def log_operation(operation: str, cell_name: str = None, details: dict = None) -> None:
+def log_operation(operation: str, cell_name: str | None = None, details: dict | None = None) -> None:
     """Log an operation to the history file."""
     try:
-        entry = {
+        entry: dict[str, object] = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "operation": operation,
         }
@@ -264,7 +266,7 @@ def log_operation(operation: str, cell_name: str = None, details: dict = None) -
         debug(f"Failed to log operation: {e}")
 
 
-def log_lifecycle(event: str, cell_name: str, details: dict = None) -> None:
+def log_lifecycle(event: str, cell_name: str, details: dict | None = None) -> None:
     """Log a cell lifecycle event.
 
     Events: start, stop, kill, rm
@@ -287,8 +289,8 @@ def log_policy_change(
     cell_name: str,
     action: str,
     changes: dict,
-    old_policy: dict = None,
-    new_policy: dict = None
+    old_policy: dict | None = None,
+    new_policy: dict | None = None
 ) -> None:
     """Log a policy change for audit trail.
 
@@ -317,7 +319,7 @@ def log_policy_change(
 
 
 # Operation logging configuration cache.
-_operation_config: dict = None
+_operation_config: dict | None = None
 _operation_config_mtime: float = 0.0
 
 
@@ -412,14 +414,14 @@ def _redact_args(args, config: dict) -> dict:
     return redacted
 
 
-def _extract_cell_name(args) -> str:
+def _extract_cell_name(args) -> str | None:
     """Extract cell name from args if present."""
     # Try common attribute names for cell name.
     for attr in ["name", "cell_name", "cell"]:
         if hasattr(args, attr):
             val = getattr(args, attr)
             if val:
-                return val
+                return val  # type: ignore[no-any-return]
     return None
 
 
@@ -448,7 +450,7 @@ def log_operation_start(command: str, args) -> dict:
     }
 
 
-def log_operation_end(context: dict, exit_code: int = 0, error: str = None) -> None:
+def log_operation_end(context: dict, exit_code: int = 0, error: str | None = None) -> None:
     """Log the end of an operation with timing and result."""
     if not context.get("enabled", False):
         return
@@ -536,10 +538,10 @@ def check_rate_limit() -> bool:
 
 def verify_image_signature(
     image: str,
-    key: str = None,
+    key: str | None = None,
     keyless: bool = False,
-    certificate_identity: str = None,
-    certificate_oidc_issuer: str = None,
+    certificate_identity: str | None = None,
+    certificate_oidc_issuer: str | None = None,
 ) -> tuple[bool, str, dict]:
     """Verify image signature using cosign or podman trust.
 
@@ -597,7 +599,7 @@ def verify_image_signature(
 
 def _parse_cosign_output(stdout: str) -> dict:
     """Parse cosign verification JSON output into a details dict."""
-    details = {}
+    details: dict[str, object] = {}
     if not stdout:
         return details
     try:
@@ -663,7 +665,7 @@ def _redact_cmd(cmd: list[str]) -> list[str]:
 
 
 def run(cmd: list[str], check: bool = True, capture: bool = False,
-        timeout: int = None) -> subprocess.CompletedProcess:
+        timeout: int | None = None) -> subprocess.CompletedProcess[str]:
     """Run a command with optional timeout in seconds."""
     debug(f"Executing: {' '.join(_redact_cmd(cmd))}")
     result = subprocess.run(cmd, check=check, capture_output=capture, text=True,
@@ -673,7 +675,7 @@ def run(cmd: list[str], check: bool = True, capture: bool = False,
     return result
 
 
-def parse_duration(duration_str: str) -> int:
+def parse_duration(duration_str: str) -> int | None:
     """Parse a duration string into seconds.
 
     Supports: 30s, 5m, 2h, 1d, or plain integer (seconds).
@@ -695,20 +697,20 @@ def parse_duration(duration_str: str) -> int:
     return value * multipliers[unit]
 
 
-def print_error(msg: str, suggestion: str = None) -> None:
+def print_error(msg: str, suggestion: str | None = None) -> None:
     """Print error with optional suggestion (does not exit)."""
     print(f"ERROR: {msg}", file=sys.stderr)
     if suggestion:
         print(f"  Suggestion: {suggestion}", file=sys.stderr)
 
 
-def error(msg: str, suggestion: str = None) -> None:
+def error(msg: str, suggestion: str | None = None) -> NoReturn:
     """Print error with optional suggestion and exit."""
     print_error(msg, suggestion)
     sys.exit(1)
 
 
-def error_cell_not_found(cell_name: str) -> None:
+def error_cell_not_found(cell_name: str) -> NoReturn:
     """Error helper for cell not found."""
     error(
         f"Cell '{cell_name}' does not exist",
@@ -716,7 +718,7 @@ def error_cell_not_found(cell_name: str) -> None:
     )
 
 
-def error_cell_not_running(cell_name: str) -> None:
+def error_cell_not_running(cell_name: str) -> NoReturn:
     """Error helper for cell not running."""
     error(
         f"Cell '{cell_name}' is not running",
@@ -724,7 +726,7 @@ def error_cell_not_running(cell_name: str) -> None:
     )
 
 
-def error_proxy_not_running() -> None:
+def error_proxy_not_running() -> NoReturn:
     """Error helper for proxy not running."""
     error(
         "Warden proxy is not running",
@@ -735,7 +737,7 @@ def error_proxy_not_running() -> None:
 VM_NAME = "brig"
 
 
-def error_lima_not_installed() -> None:
+def error_lima_not_installed() -> NoReturn:
     """Error helper for Lima not installed."""
     error(
         "Lima is not installed",
@@ -743,7 +745,7 @@ def error_lima_not_installed() -> None:
     )
 
 
-def error_vm_not_running() -> None:
+def error_vm_not_running() -> NoReturn:
     """Error helper for VM not running."""
     error(
         f"VM '{VM_NAME}' is not running",
@@ -751,7 +753,7 @@ def error_vm_not_running() -> None:
     )
 
 
-def error_vm_not_created() -> None:
+def error_vm_not_created() -> NoReturn:
     """Error helper for VM not created."""
     error(
         f"VM '{VM_NAME}' does not exist",
@@ -759,7 +761,7 @@ def error_vm_not_created() -> None:
     )
 
 
-def error_lima_config_not_found() -> None:
+def error_lima_config_not_found() -> NoReturn:
     """Error helper for Lima config not found."""
     error(
         f"Lima configuration not found at {BRIG_HOME / 'lima.yaml'}",
@@ -767,7 +769,7 @@ def error_lima_config_not_found() -> None:
     )
 
 
-def error_unknown_command(command: str) -> None:
+def error_unknown_command(command: str) -> NoReturn:
     """Error helper for unknown command."""
     error(
         f"Unknown command: {command}",
@@ -775,7 +777,7 @@ def error_unknown_command(command: str) -> None:
     )
 
 
-def error_unknown_vm_command(command: str) -> None:
+def error_unknown_vm_command(command: str) -> NoReturn:
     """Error helper for unknown VM command."""
     error(
         f"Unknown vm command: {command}",
@@ -783,7 +785,7 @@ def error_unknown_vm_command(command: str) -> None:
     )
 
 
-def error_invalid_json(path: str, details: str) -> None:
+def error_invalid_json(path: str, details: str) -> NoReturn:
     """Error helper for invalid JSON file."""
     error(
         f"Invalid JSON in {path}: {details}",
@@ -791,7 +793,7 @@ def error_invalid_json(path: str, details: str) -> None:
     )
 
 
-def error_cell_already_exists(cell_name: str) -> None:
+def error_cell_already_exists(cell_name: str) -> NoReturn:
     """Error helper for cell already exists."""
     error(
         f"Cell '{cell_name}' already exists",
@@ -799,7 +801,7 @@ def error_cell_already_exists(cell_name: str) -> None:
     )
 
 
-def error_cell_running(cell_name: str) -> None:
+def error_cell_running(cell_name: str) -> NoReturn:
     """Error helper for cell is running when it shouldn't be."""
     error(
         f"Cell '{cell_name}' is running",
@@ -869,7 +871,7 @@ def proxy_running() -> bool:
     """Check if proxy is running (cached for performance)."""
     hit, value = _cached("proxy_running")
     if hit:
-        return value
+        return value  # type: ignore[no-any-return]
 
     result = run(
         ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={PROXY_NAME}"],
@@ -905,7 +907,7 @@ def cell_exists(cell_name: str) -> bool:
     cache_key = f"cell_exists:{cell_name}"
     hit, value = _cached(cache_key)
     if hit:
-        return value
+        return value  # type: ignore[no-any-return]
 
     result = run(
         ["podman", "ps", "-a", "--format", "{{.Names}}", "--filter", f"name={container_name(cell_name)}"],
@@ -921,7 +923,7 @@ def cell_running(cell_name: str) -> bool:
     cache_key = f"cell_running:{cell_name}"
     hit, value = _cached(cache_key)
     if hit:
-        return value
+        return value  # type: ignore[no-any-return]
 
     result = run(
         ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={container_name(cell_name)}"],
@@ -934,7 +936,7 @@ def cell_running(cell_name: str) -> bool:
 
 def get_cell_policy_path(cell_name: str) -> Path:
     """Get the policy file path for a cell."""
-    return POLICY_DIR / f"{cell_name}.json"
+    return POLICY_DIR / f"{cell_name}.json"  # type: ignore[no-any-return]
 
 
 def load_cell_policy(cell_name: str) -> dict:
@@ -943,7 +945,7 @@ def load_cell_policy(cell_name: str) -> dict:
     if policy_path.exists():
         try:
             with open(policy_path, "r") as f:
-                return json.load(f)
+                return json.load(f)  # type: ignore[no-any-return]
         except (json.JSONDecodeError, IOError) as e:
             debug(f"Failed to load policy for {cell_name}: {e}")
     return {"allow": [], "deny": []}
@@ -964,7 +966,7 @@ def save_cell_policy(cell_name: str, policy: dict) -> bool:
         # Verify the write succeeded by reading back.
         with open(policy_path, "r") as f:
             saved = json.load(f)
-        return saved == policy
+        return saved == policy  # type: ignore[no-any-return]
     except (IOError, OSError, json.JSONDecodeError) as e:
         debug(f"Failed to save policy: {e}")
         return False
@@ -1040,11 +1042,11 @@ def load_cell_definition(file_path: str) -> dict:
                         elif value.startswith('"') and value.endswith('"'):
                             value = value[1:-1]
                         elif value.isdigit():
-                            value = int(value)
+                            value = int(value)  # type: ignore[assignment]
                         elif value == "true":
-                            value = True
+                            value = True  # type: ignore[assignment]
                         elif value == "false":
-                            value = False
+                            value = False  # type: ignore[assignment]
                         result[key] = value
                 return result
             except Exception as e:
@@ -1054,7 +1056,7 @@ def load_cell_definition(file_path: str) -> dict:
                 )
         else:
             try:
-                return yaml.safe_load(content)
+                return yaml.safe_load(content)  # type: ignore[no-any-return]
             except yaml.YAMLError as e:
                 error(
                     f"Failed to parse YAML: {e}",
@@ -1062,7 +1064,7 @@ def load_cell_definition(file_path: str) -> dict:
                 )
     else:
         try:
-            return json.loads(content)
+            return json.loads(content)  # type: ignore[no-any-return]
         except json.JSONDecodeError as e:
             error(
                 f"Failed to parse JSON: {e}",
@@ -1594,7 +1596,7 @@ def parse_size(size_str: str) -> int:
         raise ValueError(f"Invalid size: {size_str}")
 
 
-def format_size(size_bytes: int) -> str:
+def format_size(size_bytes: int | float) -> str:
     """Format bytes as human-readable string."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if abs(size_bytes) < 1024:
@@ -1621,7 +1623,7 @@ def get_workspace_size(cell_name: str) -> int:
 
 def _quota_file(cell_name: str) -> Path:
     """Path to a cell's quota metadata file."""
-    return STATE_DIR / cell_name / "quota.json"
+    return STATE_DIR / cell_name / "quota.json"  # type: ignore[no-any-return]
 
 
 def save_workspace_quota(cell_name: str, max_bytes: int) -> None:
@@ -1641,7 +1643,7 @@ def get_workspace_quota(cell_name: str) -> int | None:
         return None
     try:
         with open(qf) as f:
-            return json.load(f).get("max_bytes")
+            return json.load(f).get("max_bytes")  # type: ignore[no-any-return]
     except (json.JSONDecodeError, IOError):
         return None
 

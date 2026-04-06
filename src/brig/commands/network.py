@@ -40,6 +40,7 @@ def cmd_network(args) -> int:
                 ["tail", "-f", str(log_file)],
                 stdout=subprocess.PIPE, text=True
             )
+            assert proc.stdout is not None
             try:
                 for line in proc.stdout:
                     line = line.rstrip("\n")
@@ -136,6 +137,7 @@ def cmd_events(args) -> int:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
+        assert proc.stdout is not None
         for line in proc.stdout:
             line = line.strip()
             if not line:

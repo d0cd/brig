@@ -37,7 +37,7 @@ def cmd_policy_show(args) -> int:
 
     # Load global policy for comparison.
     global_policy_path = Path("/cells/network-policy.json")
-    global_policy = {"allow": [], "deny": []}
+    global_policy: dict = {"allow": [], "deny": []}
     if global_policy_path.exists():
         try:
             with open(global_policy_path, "r") as f:
@@ -86,7 +86,7 @@ def cmd_policy_set(args) -> int:
     }
 
     # Track changes for audit trail.
-    changes = {
+    changes: dict[str, list[str]] = {
         "added_allow": [],
         "added_deny": [],
         "removed_allow": [],
@@ -363,7 +363,7 @@ def cmd_policy_test(args) -> int:
 
     # Load global policy.
     global_policy_path = Path("/cells/network-policy.json")
-    global_policy = {"allow": [], "deny": []}
+    global_policy: dict = {"allow": [], "deny": []}
     if global_policy_path.exists():
         try:
             with open(global_policy_path, "r") as f:

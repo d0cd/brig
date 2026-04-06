@@ -1,6 +1,6 @@
 # Brig Codebase Audit Loop
 
-Audit the brig codebase for security vulnerabilities, engineering quality issues, and correctness problems. 
+Audit the brig codebase for security vulnerabilities, engineering quality issues, and correctness problems.
 
 **You are a reviewer, not a fixer.** Do NOT modify any source code or tests. Your only output is findings written to the report file at `.ralphx/audit/findings/report.md`.
 

@@ -263,7 +263,7 @@ def _read_schema_version() -> str:
     try:
         with open(_helpers.VERSION_FILE, "r") as f:
             data = json.load(f)
-            return data.get("schema_version", "0.0.0")
+            return str(data.get("schema_version", "0.0.0"))
     except (json.JSONDecodeError, IOError, OSError):
         return "0.0.0"
 
@@ -310,7 +310,7 @@ def _backup_brig_home() -> Path:
         for f in secrets_backup.iterdir():
             f.chmod(0o600)
 
-    return backup_dir
+    return Path(backup_dir)
 
 
 # Migration registry: ordered list of (target_version, description, function).
@@ -485,7 +485,7 @@ def cmd_health(args) -> int:
         check=False, capture=True
     )
     cell_count = len([n for n in result.stdout.strip().split("\n") if n and n != PROXY_NAME])
-    details["cells_running"] = cell_count
+    details["cells_running"] = str(cell_count)
 
     all_healthy = all(checks.values())
 
@@ -516,7 +516,7 @@ def cmd_preflight(args) -> int:
     checks = []
     all_passed = True
 
-    def check(name: str, passed: bool, detail: str, suggestion: str = None):
+    def check(name: str, passed: bool, detail: str, suggestion: str | None = None):
         nonlocal all_passed
         if not passed:
             all_passed = False
@@ -659,7 +659,8 @@ def _fetch_warden_metrics() -> dict:
                 break
             chunks.append(chunk)
         response = b"".join(chunks).decode("utf-8")
-        return json.loads(response)
+        data: dict = json.loads(response)
+        return data
     except Exception as e:
         debug(f"Failed to fetch metrics from socket: {e}")
         return {}
@@ -773,7 +774,7 @@ def _generate_metrics() -> list:
     seen_help = set()
 
     def add_metric(name: str, value: float, help_text: str, metric_type: str = "gauge",
-                   labels: dict = None):
+                   labels: dict | None = None):
         # Only add HELP and TYPE once per metric name.
         if name not in seen_help:
             lines.append(f"# HELP {name} {help_text}")
@@ -1191,8 +1192,8 @@ def cmd_verify(args) -> int:
     if fix_mode:
         info("(Auto-fix mode enabled)")
     print("=" * 50)
-    issues = []
-    fixed = []
+    issues: list[str] = []
+    fixed: list[str] = []
 
     _verify_proxy_status(issues, fixed, fix_mode)
     _verify_proxy_network(issues, fixed, fix_mode)

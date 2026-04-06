@@ -24,7 +24,7 @@ class BrigError(Exception):
     CLI entry points catch this and exit with the appropriate code.
     """
     def __init__(self, message: str, returncode: int = 1, stderr: str = "",
-                 suggestion: str = None):
+                 suggestion: str | None = None):
         super().__init__(message)
         self.returncode = returncode
         self.stderr = stderr
@@ -81,7 +81,7 @@ def status_color(status: str) -> str:
         return status
 
 
-def log(level: int, msg: str, level_name: str = None) -> None:
+def log(level: int, msg: str, level_name: str | None = None) -> None:
     """Log a message at the specified level."""
     if level < LOG_LEVEL:
         return
@@ -121,7 +121,7 @@ def warn(msg: str) -> None:
     log(LOG_LEVEL_WARN, msg)
 
 
-def error(msg: str, suggestion: str = None) -> None:
+def error(msg: str, suggestion: str | None = None) -> None:
     """Raise BrigError with message and optional suggestion.
 
     SDK consumers catch BrigError; CLI entry points print and sys.exit().
@@ -153,14 +153,14 @@ def error_proxy_not_running() -> None:
     )
 
 
-def log_operation(operation: str, cell_name: str = None, details: dict = None) -> None:
+def log_operation(operation: str, cell_name: str | None = None, details: dict | None = None) -> None:
     """Log an operation to the history file.
 
     Uses file locking to prevent corruption from concurrent processes.
     """
     try:
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        entry = {
+        entry: dict[str, object] = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "operation": operation,
         }

@@ -77,7 +77,7 @@ def cmd_vm_create(args) -> int:
 
     if getattr(args, "tty", True) and sys.stdin.isatty():
         # Interactive mode - let user see progress.
-        result = subprocess.run(cmd)
+        result: subprocess.CompletedProcess[str] = subprocess.run(cmd, text=True)
     else:
         # Non-interactive.
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -107,7 +107,7 @@ def cmd_vm_start(args) -> int:
     cmd = ["limactl", "start", VM_NAME]
 
     if getattr(args, "tty", True) and sys.stdin.isatty():
-        result = subprocess.run(cmd)
+        result: subprocess.CompletedProcess[str] = subprocess.run(cmd, text=True)
     else:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -262,8 +262,9 @@ def cmd_vm(args) -> int:
         "delete": cmd_vm_delete,
     }
 
-    vm_cmd = getattr(args, "vm_command", None)
+    vm_cmd: str | None = getattr(args, "vm_command", None)
     if not vm_cmd or vm_cmd not in vm_commands:
         error_unknown_vm_command(vm_cmd or "none")
+        return 1
 
     return vm_commands[vm_cmd](args)

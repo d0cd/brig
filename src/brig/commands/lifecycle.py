@@ -99,8 +99,8 @@ def _merge_cell_def_into_args(args, cell_def: dict) -> None:
         ]
 
 
-def _build_run_command(args, cell_name: str, airgapped: bool, net_name: str,
-                       proxy_ip: str, timeout_seconds: int,
+def _build_run_command(args, cell_name: str, airgapped: bool, net_name: str | None,
+                       proxy_ip: str | None, timeout_seconds: int | None,
                        cleanup_on_failure) -> list:
     """Build the podman run command for a cell.
 
@@ -310,7 +310,8 @@ def _process_canary_file(args) -> Optional[dict]:
         path.unlink()  # Delete tempfile immediately after reading.
     except OSError:
         pass
-    return canary_data.get("canary_tokens", {})
+    result_dict: dict = canary_data.get("canary_tokens", {})
+    return result_dict
 
 
 def cmd_run(args) -> int:
@@ -431,7 +432,7 @@ def cmd_run(args) -> int:
         "proxy_connected": False,
     }
 
-    def cleanup_on_failure(msg: str, suggestion: str = None):
+    def cleanup_on_failure(msg: str, suggestion: str | None = None):
         """Clean up all allocated resources and exit with error."""
         debug(f"Cleaning up after failure: {msg}")
         if resources_allocated["proxy_connected"]:
@@ -547,12 +548,12 @@ def cmd_run(args) -> int:
         if args.env:
             # Redact env var values to avoid leaking secrets.
             redacted_env = []
-            for e in args.env:
-                if "=" in e:
-                    key = e.split("=", 1)[0]
+            for env_entry in args.env:
+                if "=" in env_entry:
+                    key = env_entry.split("=", 1)[0]
                     redacted_env.append(f"{key}=<REDACTED>")
                 else:
-                    redacted_env.append(e)
+                    redacted_env.append(env_entry)
             print(f"Environment:  {', '.join(redacted_env)}")
         if args.secret:
             # Show secret names only, not mount paths.
@@ -561,7 +562,7 @@ def cmd_run(args) -> int:
             print(f"Policy allow: {', '.join(args.policy_allow or [])}")
             print(f"Policy deny:  {', '.join(args.policy_deny or [])}")
         # Redact sensitive values from podman command before printing.
-        redacted_cmd = []
+        redacted_cmd: list[str] = []
         skip_next = False
         for i, part in enumerate(cmd):
             if skip_next:

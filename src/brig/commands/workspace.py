@@ -138,7 +138,7 @@ def cmd_cat(args) -> int:
     return 0
 
 
-def apply_quarantine(path: Path, source_cell: str = None) -> bool:
+def apply_quarantine(path: Path, source_cell: str | None = None) -> bool:
     """Apply macOS quarantine attribute to a file or directory.
 
     This marks files as coming from an untrusted source, triggering
@@ -314,3 +314,4 @@ def cmd_cp(args) -> int:
             f"Copy failed: {e}",
             "Check file permissions and disk space"
         )
+    return 1
