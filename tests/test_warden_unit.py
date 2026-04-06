@@ -1210,9 +1210,6 @@ class TestWardenCmdLogsCompactAi(unittest.TestCase):
     def test_duration_hours(self):
         """Valid hours duration is parsed correctly."""
         with unittest.mock.patch.dict('sys.modules', {'summarizer': MagicMock()}):
-            mock_compact = MagicMock(return_value={"compacted_entries": 5, "preserved_entries": 2,
-                                                    "recent_entries_kept": 10, "summary_file": "/tmp/s.json",
-                                                    "archive_file": "/tmp/a.gz", "ai_enabled": False})
             with unittest.mock.patch('builtins.__import__', side_effect=ImportError("no module")):
                 result = self.warden.cmd_logs_compact_ai("cell", older_than="24h")
             # Import error is caught.

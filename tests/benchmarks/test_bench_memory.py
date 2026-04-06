@@ -150,14 +150,14 @@ def test_memory_policy_trie_vs_rules(policy_class):
     tracemalloc.start()
     before = tracemalloc.get_traced_memory()[0]
     from enforce import PolicyRule
-    rules = [PolicyRule(f"svc-{i}.example.com") for i in range(1000)]
+    rules = [PolicyRule(f"svc-{i}.example.com") for i in range(1000)]  # noqa: F841 — held for tracemalloc
     rules_mem = tracemalloc.get_traced_memory()[0] - before
     tracemalloc.stop()
 
     # Measure policy (rules + trie).
     tracemalloc.start()
     before = tracemalloc.get_traced_memory()[0]
-    policy = policy_class(allow=[f"svc-{i}.example.com" for i in range(1000)])
+    policy = policy_class(allow=[f"svc-{i}.example.com" for i in range(1000)])  # noqa: F841 — held for tracemalloc
     policy_mem = tracemalloc.get_traced_memory()[0] - before
     tracemalloc.stop()
 

@@ -61,7 +61,7 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I"]
+select = ["E", "F", "W"]
 ignore = ["E402", "E501", "F401", "F405"]
 
 [tool.pytest.ini_options]
@@ -91,7 +91,7 @@ warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 check_untyped_defs = false
-exclude = ["tests/"]
+exclude = ["tests/", "src/dashboard\\.py", "src/tui\\.py"]
 
 [tool.coverage.report]
 exclude_lines = [

@@ -212,7 +212,7 @@ def test_soak_gc_pressure():
                 "gen2": stats[2]["collections"],
             })
 
-    print(f"\nGC collection timeline:")
+    print("\nGC collection timeline:")
     for i, s in enumerate(gc_snapshots):
         if i == 0:
             print(f"  t={s['time']:5.1f}s  gen2={s['gen2']}")

@@ -45,7 +45,6 @@ def file_io_bench(size_kb=1024, count=100):
 
 def soak_bench(duration_s=10):
     """Sustained mixed workload — syscalls + compute + memory."""
-    interval = 2
     snapshots = []
     start = time.time()
     batch = 0

@@ -80,7 +80,7 @@ jobs:
 
       - name: Run mypy
         run: |
-          mypy src/ --exclude 'src/(dashboard|tui)\.py'
+          mypy src/
 
   security:
     runs-on: ubuntu-latest

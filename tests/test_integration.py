@@ -3118,7 +3118,7 @@ class TestCmdNetwork(IntegrationBase):
                                json=True, tail=100)
 
         with patch("pathlib.Path.exists", return_value=True):
-            with patch("builtins.print") as mock_print:
+            with patch("builtins.print"):
                 result = brig.cmd_network(args)
 
         self.assertEqual(result, 0)

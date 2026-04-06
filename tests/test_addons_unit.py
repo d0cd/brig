@@ -2368,7 +2368,7 @@ class TestHistogramAddAndDecay(unittest.TestCase):
         total_before_assert = h.total_count
         self.assertLess(total_before_assert, 200)
 
-    def test_decay_halves_counts(self):
+    def test_decay_integer_division(self):
         """Counts are halved by integer division on decay."""
         h = self.Histogram()
         h.buckets[3] = 4
