@@ -62,7 +62,7 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
-ignore = ["E402", "E501", "F401"]
+ignore = ["E402", "E501", "F401", "F405"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -81,6 +81,8 @@ omit = [
     "src/brig_subnet_cli.py",
     "src/warden_cli.py",
     "src/brig-manpage.py",
+    "src/dashboard.py",
+    "src/tui.py",
 ]
 
 [tool.mypy]

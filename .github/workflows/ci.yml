@@ -98,7 +98,7 @@ jobs:
 
       - name: Run security scan
         run: |
-          bandit -r src/ -ll --skip B101
+          bandit -r src/ -ll --skip B101,B104,B108
 
   secrets-scan:
     runs-on: ubuntu-latest

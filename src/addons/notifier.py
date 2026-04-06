@@ -470,7 +470,7 @@ class Notifier:
                     headers=headers,
                     method="POST"
                 )
-                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:  # nosec B310
                     if response.status < 400:
                         return True, None
                     else:

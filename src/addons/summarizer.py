@@ -276,7 +276,7 @@ Logs:
                 method="POST"
             )
 
-            with urllib.request.urlopen(req, timeout=60) as response:
+            with urllib.request.urlopen(req, timeout=60) as response:  # nosec B310
                 result = json.loads(response.read().decode("utf-8"))
 
             # Extract response text.

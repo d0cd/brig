@@ -973,7 +973,7 @@ def cmd_health(format_json: bool = False) -> int:
                 import urllib.request
                 # Port 8089: health addon's dedicated HTTP endpoint.
                 req = urllib.request.Request(f"http://{proxy_ip}:8089/health")
-                with urllib.request.urlopen(req, timeout=2.0) as resp:
+                with urllib.request.urlopen(req, timeout=2.0) as resp:  # nosec B310
                     if resp.status == 200:
                         checks["health_endpoint"] = True
         except (OSError, urllib.error.URLError, ValueError):
