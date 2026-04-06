@@ -39,7 +39,7 @@ from brig.config import (
 VERSION = "0.2.0"
 
 try:
-    import yaml
+    import yaml  # type: ignore[import-untyped]
     YAML_AVAILABLE = True
 except ImportError:
     YAML_AVAILABLE = False
