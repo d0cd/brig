@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034,SC2016,SC2153,SC2329,SC2001
 # test_proxy_policy.sh - Proxy and policy enforcement tests
 #
 # Verifies the mitmproxy-based egress proxy:

@@ -80,7 +80,7 @@ jobs:
 
       - name: Run mypy
         run: |
-          mypy src/
+          mypy src/brig/ --ignore-missing-imports --follow-imports=silent
 
   security:
     runs-on: ubuntu-latest

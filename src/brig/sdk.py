@@ -469,7 +469,7 @@ class Brig:
             for pattern, exc_cls in _ERROR_PATTERNS:
                 if pattern.search(stderr_str):
                     raise exc_cls(msg, result.returncode, stderr_str)
-            raise BrigError(msg, result.returncode, stderr)
+            raise BrigError(msg, result.returncode, stderr_str)
         return result
 
     @staticmethod

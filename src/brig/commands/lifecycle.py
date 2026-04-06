@@ -116,6 +116,7 @@ def _build_run_command(args, cell_name: str, airgapped: bool, net_name: str | No
         # Air-gapped: no network at all.
         cmd.extend(["--network", "none"])
     else:
+        assert net_name is not None  # Guaranteed by caller for non-airgapped.
         cmd.extend([
             "--network", net_name,
 
@@ -618,7 +619,7 @@ def cmd_run(args) -> int:
         if result.returncode != 0:
             spinner.fail(f"Failed to start cell {cell_name}")
             # Clean up all allocated resources on failure.
-            if resources_allocated["proxy_connected"]:
+            if resources_allocated["proxy_connected"] and net_name:
                 run(["podman", "network", "disconnect", net_name, PROXY_NAME], check=False)
             if resources_allocated["network"]:
                 run([BRIG_SUBNET_BIN, "remove-network", cell_name], check=False)

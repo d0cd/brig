@@ -1432,14 +1432,14 @@ def cmd_doctor(args) -> int:
             fixes_applied += 1
 
     # Workspace quota status.
-    cells_over_quota = []
+    cells_over_quota: list[str] = []
     try:
         for cell_dir in _helpers.STATE_DIR.iterdir():
             if cell_dir.is_dir() and (cell_dir / "workspace").exists():
-                cell_name = cell_dir.name
-                within, current, max_b = _helpers.check_workspace_quota(cell_name)
-                if not within:
-                    cells_over_quota.append(f"{cell_name} ({_helpers.format_size(current)}/{_helpers.format_size(max_b)})")
+                cn = cell_dir.name
+                ok, cur_bytes, max_bytes = _helpers.check_workspace_quota(cn)
+                if not ok and max_bytes is not None:
+                    cells_over_quota.append(f"{cn} ({_helpers.format_size(cur_bytes)}/{_helpers.format_size(max_bytes)})")
     except OSError:
         pass
 

@@ -1,22 +1,23 @@
 """Web dashboard launcher command."""
 
+import importlib
+
 from brig.commands._helpers import error
 
 
 def cmd_dashboard(args) -> int:
     """Launch web dashboard."""
-    run_dashboard_fn = None
-    try:
-        from dashboard import run_dashboard as _run_dashboard
-        run_dashboard_fn = _run_dashboard
-    except ImportError:
+    run_dashboard = None
+    for module_name in ("dashboard", "src.dashboard"):
         try:
-            from src.dashboard import run_dashboard as _run_dashboard  # type: ignore[no-redef]
-            run_dashboard_fn = _run_dashboard
+            mod = importlib.import_module(module_name)
+            run_dashboard = getattr(mod, "run_dashboard", None)
+            if run_dashboard:
+                break
         except ImportError:
-            pass
+            continue
 
-    if run_dashboard_fn is None:
+    if run_dashboard is None:
         error(
             "Dashboard module not found",
             "Ensure brig is installed correctly"
@@ -24,4 +25,4 @@ def cmd_dashboard(args) -> int:
         return 1
 
     port = getattr(args, "port", 8080)
-    return int(run_dashboard_fn(port=port))
+    return int(run_dashboard(port=port))

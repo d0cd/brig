@@ -220,6 +220,7 @@ def cmd_cp(args) -> int:
         src_full = validate_workspace_path(workspace, src_path)
         dst_full = Path(dst_path)
     else:
+        assert dst_cell is not None  # Guaranteed by validation above.
         if not cell_exists(dst_cell):
             error_cell_not_found(dst_cell)
         workspace = _helpers.STATE_DIR / dst_cell / "workspace"

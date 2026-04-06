@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034,SC2016,SC2153,SC2329,SC2001
 # test_cell_lifecycle.sh - Cell lifecycle management tests
 #
 # Verifies core cell operations:

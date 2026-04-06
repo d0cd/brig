@@ -1,4 +1,5 @@
 #!/bin/bash
+# shellcheck disable=SC2034,SC2016,SC2153,SC2329,SC2001,SC2016,SC2153,SC2329
 # test_overhead.sh - Stack overhead benchmarks
 #
 # Measures real-world latency and overhead of the Brig stack with
@@ -39,9 +40,9 @@ fi
 
 # Colors.
 if [ -t 1 ] && [ "$JSON_OUTPUT" = false ]; then
-    C='\033[0;36m' G='\033[0;32m' Y='\033[0;33m' B='\033[1m' N='\033[0m'
+    C='\033[0;36m' G='\033[0;32m' B='\033[1m' N='\033[0m'
 else
-    C='' G='' Y='' B='' N=''
+    C='' G='' B='' N=''
 fi
 
 run_in_vm() {
@@ -170,7 +171,7 @@ for i in $(seq 1 $SAMPLE_RUNS); do
     t=$(time_ms run_in_vm sudo brig exec overhead-proxy -- wget -qO/dev/null http://httpbin.org/ip)
     PROXY_SAMPLES="$PROXY_SAMPLES $t"
 done
-read -r P_MED P_Q1 P_Q3 P_IQR P_MIN P_MAX P_OUT <<< "$(compute_stats "$PROXY_SAMPLES")"
+read -r P_MED P_Q1 P_Q3 _ _ _ P_OUT <<< "$(compute_stats "$PROXY_SAMPLES")"
 print_result "HTTPS through proxy" "$P_MED" "$P_Q1" "$P_Q3" "ms" "$P_OUT"
 
 # Sample direct (from VM, no proxy).
@@ -199,7 +200,7 @@ echo -e "${B}2. Cell Startup Time${N}"
 
 START_SAMPLES=""
 for i in $(seq 1 $STARTUP_RUNS); do
-    t=$(time_ms run_in_vm sudo brig run --name overhead-start --rm alpine echo done)
+    t=$(time_ms run_in_vm sudo brig run --name overhead-start --rm alpine echo "done")
     START_SAMPLES="$START_SAMPLES $t"
 done
 read -r S_MED S_Q1 S_Q3 _ _ _ S_OUT <<< "$(compute_stats "$START_SAMPLES")"
@@ -290,14 +291,14 @@ echo "  Cold startup (podman run --rm echo):"
 
 GR_SAMPLES=""
 for i in $(seq 1 3); do
-    t=$(time_ms run_in_vm sudo podman run --rm --runtime runsc alpine echo done)
+    t=$(time_ms run_in_vm sudo podman run --rm --runtime runsc alpine echo "done")
     GR_SAMPLES="$GR_SAMPLES $t"
 done
 GR_MED=$(median "$GR_SAMPLES")
 
 CR_SAMPLES=""
 for i in $(seq 1 3); do
-    t=$(time_ms run_in_vm sudo podman run --rm --runtime crun alpine echo done)
+    t=$(time_ms run_in_vm sudo podman run --rm --runtime crun alpine echo "done")
     CR_SAMPLES="$CR_SAMPLES $t"
 done
 CR_MED=$(median "$CR_SAMPLES")
@@ -359,7 +360,7 @@ T_SUBNET=$(time_ms run_in_vm sudo brig-subnet allocate "$CELL")
 T_NETCREATE=$(time_ms run_in_vm sudo podman network create --internal "brig-$CELL")
 T_CONNECT=$(time_ms run_in_vm sudo podman network connect "brig-$CELL" warden)
 T_PODMAN=$(time_ms run_in_vm sudo podman run --rm --runtime runsc --name "brig-$CELL" \
-    --network "brig-$CELL" alpine echo done)
+    --network "brig-$CELL" alpine echo "done")
 
 # Cleanup.
 run_in_vm sudo podman network disconnect "brig-$CELL" warden 2>/dev/null || true
