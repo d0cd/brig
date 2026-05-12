@@ -36,7 +36,6 @@ import json
 import queue
 import random
 import re
-import signal
 import threading
 import time
 from datetime import datetime, timezone
@@ -45,13 +44,6 @@ from typing import Optional
 
 from mitmproxy import ctx, http
 
-# Import shared SIGHUP dispatcher from enforce addon.
-try:
-    from enforce import register_sighup
-except ImportError:
-    # Standalone mode: register our own handler.
-    def register_sighup(callback):
-        signal.signal(signal.SIGHUP, lambda s, f: callback())
 
 # Try to use orjson for faster JSON encoding, fall back to standard json.
 try:
@@ -434,11 +426,10 @@ class RequestLogger:
         self._reload_log_filter()
         self.async_writer.start()
         # Register with shared SIGHUP dispatcher.
-        register_sighup(self._on_sighup)
-        ctx.log.info("RequestLogger: Async logging enabled, SIGHUP reload handler registered")
+        ctx.log.info("RequestLogger: Async logging enabled")
 
-    def _on_sighup(self):
-        """Set deferred reload flag on SIGHUP. Safe to call from signal context."""
+    def configure(self, updated):
+        """Reload config when files change."""
         self._reload_pending = True
 
     def _do_reload(self):

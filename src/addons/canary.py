@@ -23,12 +23,6 @@ from typing import Optional
 
 from mitmproxy import ctx, http
 
-try:
-    from enforce import register_sighup
-except ImportError:
-    # Standalone mode — no shared dispatcher.
-    def register_sighup(callback):
-        pass
 
 # Subnet map for cell identification (same as enforce.py).
 SUBNET_MAP_FILE = Path("/var/run/cells/subnet-map.json")
@@ -51,14 +45,13 @@ class CanaryDetector:
         """Called when addon is loaded."""
         self._load_subnet_map()
         self._load_canaries()
-        register_sighup(self._on_sighup)
         ctx.log.info(
             f"CanaryDetector: Loaded canary tokens for "
             f"{len(self.cell_canaries)} cells"
         )
 
-    def _on_sighup(self):
-        """Handle SIGHUP by deferring reload to next request."""
+    def configure(self, updated):
+        """Reload when files change."""
         self._reload_pending = True
 
     def _do_reload(self):
@@ -184,8 +177,9 @@ class CanaryDetector:
         Runs in a background thread to avoid blocking the mitmproxy event
         loop (which would stall traffic for all cells).
         """
-        # Validate cell name to prevent argument injection (same pattern as brig.py).
-        if not cell_name or not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$", cell_name):
+        # Validate cell name to prevent argument injection.
+        # Must match the canonical CELL_NAME_PATTERN from brig.config.
+        if not cell_name or not re.match(r"^[a-z0-9][a-z0-9._-]{0,62}$", cell_name):
             ctx.log.error(f"CanaryDetector: Invalid cell name '{cell_name}'")
             return
         # Non-daemon thread ensures kill completes even during shutdown.

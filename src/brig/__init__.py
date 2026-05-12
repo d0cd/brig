@@ -14,16 +14,14 @@ SDK usage:
 
 __version__ = "0.2.0"
 
+from brig.config import VERSION
+from brig.errors import BrigError
 from brig.sdk import (
     Brig,
-    BrigError,
     Cell,
-    CellEvent,
     CellInfo,
     CellNotFoundError,
-    CellResult,
     CellRunResult,
-    CellStats,
     ImageVerificationError,
     ProfileError,
     SecretNotFoundError,
@@ -33,6 +31,6 @@ from brig.sdk import (
 
 __all__ = [
     "Brig", "Cell", "BrigError", "CellNotFoundError", "ImageVerificationError",
-    "ProfileError", "SecretNotFoundError", "CellResult", "CellInfo",
-    "CellRunResult", "CellEvent", "CellStats", "WardenStatus", "WardenHandle",
+    "ProfileError", "SecretNotFoundError", "CellRunResult", "CellInfo",
+    "WardenStatus", "WardenHandle", "VERSION",
 ]

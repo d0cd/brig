@@ -122,6 +122,26 @@ def validate_path(path):
 
 ## Directory Structure
 
+### Source (`src/`)
+
+```
+src/
+├── brig/
+│   ├── cli.py              # CLI entry point
+│   ├── config.py           # Constants and paths
+│   ├── errors.py           # BrigError + error helpers
+│   ├── cell/               # Cell lifecycle (spec, reconciler, profiles)
+│   ├── network/            # Subnet allocator, proxy, validation
+│   ├── policy/             # Policy CRUD (JSON + YAML)
+│   ├── security/           # Secrets, image verification, invariant checks
+│   ├── ops/                # Logging, cache, rate limiting, history
+│   └── commands/           # Thin CLI handlers
+├── warden/                 # Proxy manager (lifecycle, policy, health, reconcile)
+└── addons/                 # mitmproxy addons (enforce, logger, ops)
+```
+
+### Data (`~/.brig/`)
+
 ```
 ~/.brig/
 ├── lima.yaml           # VM config
@@ -130,14 +150,14 @@ def validate_path(path):
 │   └── addons/        # Warden addons
 ├── secrets/            # One file per secret
 └── state/              # Cell workspaces and logs
-    └── system/        # Subnet allocator state
+    └── system/        # Subnet allocator state (subnets.json)
 ```
 
 ## Documentation
 
-- `docs/design/` - Architecture, security, reference
+- `docs/design/` - Architecture, security, implementation, reference
 - `docs/learning/` - Quickstart, concepts, workflows, troubleshooting
-- `docs/PLAN.md` - Implementation roadmap
+- `docs/INVARIANTS.md` - Security invariant test coverage ledger
 
 ## Testing
 

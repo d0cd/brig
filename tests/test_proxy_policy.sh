@@ -55,6 +55,48 @@ run_in_vm() {
     limactl shell "$VM_NAME" -- "$@"
 }
 
+# Check the proxy log for a matching entry. Exits 0 if found, 1 otherwise.
+# Stronger than "did wget exit 0" — proves the proxy processed the request
+# and made the expected policy decision, catching bypass attempts where the
+# request somehow reached the internet without going through the proxy.
+#
+# Args: cell_name host expect_blocked ("true" | "false")
+check_log_entry() {
+    local cell_name="$1"
+    local host="$2"
+    local expect_blocked="$3"
+    local log_file="/var/log/brig/network/${cell_name}.jsonl"
+
+    # mitmproxy's async logger batches writes; give it a moment to flush.
+    sleep 1
+
+    if ! run_in_vm sudo test -f "$log_file"; then
+        return 1
+    fi
+
+    # Pipe the log through python3 and check for a matching entry.
+    run_in_vm sudo cat "$log_file" | python3 -c "
+import sys, json
+target_host = '$host'
+expect_blocked = '$expect_blocked' == 'true'
+for line in sys.stdin:
+    try:
+        entry = json.loads(line)
+    except Exception:
+        continue
+    if entry.get('host') == target_host and bool(entry.get('blocked', False)) == expect_blocked:
+        sys.exit(0)
+sys.exit(1)
+"
+}
+
+# Clear a cell's proxy log. Tests should call this before making a request
+# so that check_log_entry sees only entries from the current test.
+clear_cell_log() {
+    local cell_name="$1"
+    run_in_vm sudo rm -f "/var/log/brig/network/${cell_name}.jsonl" 2>/dev/null || true
+}
+
 # Check VM is running.
 check_vm_running() {
     local vm_info
@@ -201,61 +243,78 @@ run_in_vm sudo podman network connect brig-policy-test warden 2>/dev/null || tru
 PROXY_IP=$(run_in_vm sudo podman inspect warden --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null | tr ' ' '\n' | grep "10.60" | head -1)
 echo "Proxy IP on test network: $PROXY_IP"
 
-# Test 7: Allowlisted domain is accessible.
+# Tests 7-11 assert on the proxy JSONL log, not just wget exit code.
+# A wget exit of 0 or non-zero doesn't prove the proxy handled the request —
+# DNS failure, a bypass route, or a crashed cell would all yield the "right"
+# exit code while silently violating the security invariant. The log entry
+# is the authoritative signal: if the proxy didn't see the request, or saw
+# it with the wrong disposition, the test fails.
+
+# Test 7: Allowlisted domain — proxy log must show blocked=false for example.com.
 echo
 echo "--- Test 7: Allowlisted domain (example.com) accessible ---"
-if run_in_vm sudo podman run --rm --network brig-policy-test \
+clear_cell_log policy-test
+run_in_vm sudo podman run --rm --network brig-policy-test \
     -e http_proxy="http://${PROXY_IP}:8080" \
     -e https_proxy="http://${PROXY_IP}:8080" \
-    alpine wget -q -O /dev/null --timeout=10 http://example.com 2>/dev/null; then
-    log_pass "Allowlisted domain accessible"
+    alpine wget -q -O /dev/null --timeout=10 http://example.com 2>/dev/null || true
+if check_log_entry policy-test example.com false; then
+    log_pass "Allowlisted domain routed through proxy and allowed (blocked=false in log)"
 else
-    log_fail "Allowlisted domain blocked (should be allowed)"
+    log_fail "No blocked=false log entry for example.com — proxy did not handle the request"
 fi
 
-# Test 8: Blocklisted domain is blocked.
+# Test 8: Non-allowlisted domain — proxy log must show blocked=true for evil.com.
 echo
 echo "--- Test 8: Non-allowlisted domain blocked ---"
-if run_in_vm sudo podman run --rm --network brig-policy-test \
+clear_cell_log policy-test
+run_in_vm sudo podman run --rm --network brig-policy-test \
     -e http_proxy="http://${PROXY_IP}:8080" \
     -e https_proxy="http://${PROXY_IP}:8080" \
-    alpine wget -q -O /dev/null --timeout=5 http://evil.com 2>/dev/null; then
-    log_fail "Non-allowlisted domain should be blocked"
+    alpine wget -q -O /dev/null --timeout=5 http://evil.com 2>/dev/null || true
+if check_log_entry policy-test evil.com true; then
+    log_pass "Non-allowlisted domain blocked at proxy (blocked=true in log)"
 else
-    log_pass "Non-allowlisted domain correctly blocked"
+    log_fail "No blocked=true log entry for evil.com — proxy may not have rejected it"
 fi
 
-# Test 9: Internal IP addresses are blocked.
+# Test 9: Internal IP — proxy log must show blocked=true.
 echo
 echo "--- Test 9: Internal IP addresses blocked ---"
-if run_in_vm sudo podman run --rm --network brig-policy-test \
+clear_cell_log policy-test
+run_in_vm sudo podman run --rm --network brig-policy-test \
     -e http_proxy="http://${PROXY_IP}:8080" \
-    alpine wget -q -O /dev/null --timeout=5 http://192.168.1.1 2>/dev/null; then
-    log_fail "Internal IP should be blocked"
+    alpine wget -q -O /dev/null --timeout=5 http://192.168.1.1 2>/dev/null || true
+if check_log_entry policy-test 192.168.1.1 true; then
+    log_pass "Internal IP blocked at proxy (blocked=true in log)"
 else
-    log_pass "Internal IP correctly blocked"
+    log_fail "No blocked=true log entry for 192.168.1.1"
 fi
 
-# Test 10: Literal IP addresses blocked (even public).
+# Test 10: Literal public IP — proxy log must show blocked=true.
 echo
 echo "--- Test 10: Literal public IP addresses blocked ---"
-if run_in_vm sudo podman run --rm --network brig-policy-test \
+clear_cell_log policy-test
+run_in_vm sudo podman run --rm --network brig-policy-test \
     -e http_proxy="http://${PROXY_IP}:8080" \
-    alpine wget -q -O /dev/null --timeout=5 http://93.184.216.34 2>/dev/null; then
-    log_fail "Literal IP should be blocked"
+    alpine wget -q -O /dev/null --timeout=5 http://93.184.216.34 2>/dev/null || true
+if check_log_entry policy-test 93.184.216.34 true; then
+    log_pass "Literal public IP blocked at proxy (blocked=true in log)"
 else
-    log_pass "Literal public IP correctly blocked"
+    log_fail "No blocked=true log entry for 93.184.216.34"
 fi
 
-# Test 11: Non-HTTP/HTTPS ports blocked.
+# Test 11: Non-HTTP port — proxy log must show blocked=true for example.com:8080.
 echo
 echo "--- Test 11: Non-HTTP ports blocked ---"
-if run_in_vm sudo podman run --rm --network brig-policy-test \
+clear_cell_log policy-test
+run_in_vm sudo podman run --rm --network brig-policy-test \
     -e http_proxy="http://${PROXY_IP}:8080" \
-    alpine wget -q -O /dev/null --timeout=5 http://example.com:8080 2>/dev/null; then
-    log_fail "Non-standard port should be blocked"
+    alpine wget -q -O /dev/null --timeout=5 http://example.com:8080 2>/dev/null || true
+if check_log_entry policy-test example.com true; then
+    log_pass "Non-standard port blocked at proxy (blocked=true in log)"
 else
-    log_pass "Non-standard port correctly blocked"
+    log_fail "No blocked=true log entry for example.com on port 8080"
 fi
 
 # Test 12: Request logged to cell log file.

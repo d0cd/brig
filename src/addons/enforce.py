@@ -35,35 +35,12 @@ import fnmatch
 import ipaddress
 import json
 import re
-import signal
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 from mitmproxy import ctx, http
-
-# Shared SIGHUP dispatcher — only one signal handler for all addons.
-_sighup_callbacks = []
-
-
-def register_sighup(callback):
-    """Register a callback to be invoked on SIGHUP."""
-    if callback not in _sighup_callbacks:
-        _sighup_callbacks.append(callback)
-    # Ensure the dispatcher is registered (idempotent after first call).
-    signal.signal(signal.SIGHUP, _sighup_dispatcher)
-
-
-def _sighup_dispatcher(signum, frame):
-    """Dispatch SIGHUP to all registered callbacks."""
-    for cb in _sighup_callbacks:
-        try:
-            cb()
-        except Exception as e:
-            # Log is not signal-safe, but flag is set for deferred handling.
-            import sys
-            print(f"SIGHUP callback error: {e}", file=sys.stderr)
 
 
 # Policy file path (mounted into container).
@@ -390,38 +367,80 @@ class PolicyEnforcer:
         self.subnet_map_mtime = 0.0
         self.cell_policy_mtimes: dict[str, float] = {}
         self.trace_config = PolicyTraceConfig()
-        self._cell_policy_lock = threading.Lock()  # Protects cell_policies access.
-        self._reload_pending = False  # Deferred reload flag for signal safety.
+        self._cell_policy_lock = threading.Lock()
+        self._reload_lock = threading.RLock()
 
     def load(self, loader):
-        """Called when addon is loaded."""
+        """Called when addon is loaded.
+
+        Startup uses strict policy load: a missing or malformed /policy.json
+        raises so warden refuses to start instead of silently running with an
+        empty allow/deny list (which defaults-deny but looks healthy).
+        """
         ctx.log.info("PolicyEnforcer: Loading...")
-        self._reload_policy()
+        self._reload_policy(strict=True)
         self._reload_subnet_map()
         self._reload_cell_policies()
-        # Register with shared SIGHUP dispatcher.
-        register_sighup(self._on_sighup)
-        ctx.log.info("PolicyEnforcer: SIGHUP reload handler registered")
+        ctx.log.info("PolicyEnforcer: Loaded")
 
-    def _on_sighup(self):
-        """Set deferred reload flag on SIGHUP. Safe to call from signal context."""
-        self._reload_pending = True
+    def configure(self, updated):
+        """Called by mitmproxy on configuration changes and periodically.
 
-    def _do_reload(self):
-        """Perform the actual reload outside of signal context."""
-        ctx.log.info("PolicyEnforcer: Reloading policies...")
-        self.policy_mtime = 0.0
-        self.subnet_map_mtime = 0.0
-        with self._cell_policy_lock:
-            self.cell_policy_mtimes.clear()
-        self._reload_policy()
-        self._reload_subnet_map()
-        self._reload_cell_policies()
+        Checks file mtimes and reloads when policy or subnet-map changes.
+        Replaces the old SIGHUP dispatcher — no signal handling needed.
+        """
+        self._check_reload()
 
-    def _reload_policy(self) -> None:
-        """Load global policy from file."""
+    _last_check_time: float = 0.0
+    _CHECK_INTERVAL: float = 1.0  # Seconds between mtime checks.
+
+    def _check_reload(self):
+        """Check file mtimes and reload if anything changed.
+
+        Throttled to at most once per second to avoid stat syscalls on
+        every HTTP request. Serialized by _reload_lock.
+        """
+        now = time.monotonic()
+        if now - self._last_check_time < self._CHECK_INTERVAL:
+            return
+        self._last_check_time = now
+
+        try:
+            policy_changed = (
+                POLICY_FILE.exists() and
+                POLICY_FILE.stat().st_mtime != self.policy_mtime
+            )
+            subnet_changed = (
+                SUBNET_MAP_FILE.exists() and
+                SUBNET_MAP_FILE.stat().st_mtime != self.subnet_map_mtime
+            )
+        except OSError:
+            return
+
+        if not policy_changed and not subnet_changed:
+            return
+
+        with self._reload_lock:
+            ctx.log.info("PolicyEnforcer: Reloading (file change detected)...")
+            if policy_changed:
+                self._reload_policy()
+            if subnet_changed:
+                self._reload_subnet_map()
+            self._reload_cell_policies()
+
+    def _reload_policy(self, strict: bool = False) -> None:
+        """Load global policy from file.
+
+        strict=True (startup): missing/malformed policy raises.
+        strict=False (SIGHUP reload): keeps the last-good policy on failure
+        so a bad edit does not break a running service.
+        """
         try:
             if not POLICY_FILE.exists():
+                if strict:
+                    raise FileNotFoundError(
+                        f"Policy file not found: {POLICY_FILE}"
+                    )
                 ctx.log.warn(f"PolicyEnforcer: Policy file not found: {POLICY_FILE}")
                 self.global_policy = Policy()
                 return
@@ -452,7 +471,13 @@ class PolicyEnforcer:
             if self.trace_config.enabled:
                 ctx.log.info("PolicyEnforcer: Policy tracing enabled")
 
-        except (json.JSONDecodeError, IOError, OSError) as e:
+        except Exception as e:
+            # Broad catch intentional: structural errors (non-dict JSON,
+            # wrong-typed rules raising from PolicyRule) must not escape
+            # into request()/http_connect() and break the mitmproxy event
+            # loop. Strict startup still propagates to fail loud.
+            if strict:
+                raise
             ctx.log.error(f"PolicyEnforcer: Failed to load policy: {e}")
             # Keep existing policy on error (fail closed for new connections).
 
@@ -578,12 +603,59 @@ class PolicyEnforcer:
         except ValueError:
             return False
 
+    @staticmethod
+    def _normalize_hostspec(hostspec: str) -> str:
+        """Strip brackets and port; lowercase. IPv6-aware.
+
+        Inputs and expected outputs:
+          "example.com"        -> "example.com"
+          "example.com:443"    -> "example.com"
+          "[::1]:443"          -> "::1"
+          "[::1]"              -> "::1"
+          "fe80::1"            -> "fe80::1"   (bare IPv6, no port)
+          "Example.COM"        -> "example.com"
+        """
+        h = (hostspec or "").strip()
+        if h.startswith("["):
+            end = h.find("]")
+            if end == -1:
+                return h.lower()
+            return h[1:end].lower()
+        # Bare IPv6 has >= 2 colons and no brackets: don't strip "port".
+        if h.count(":") > 1:
+            return h.lower()
+        return h.split(":", 1)[0].lower()
+
+    @staticmethod
+    def _host_header_mismatches(flow: "http.HTTPFlow") -> bool:
+        """Return True if the Host header is present and disagrees with the URL host.
+
+        Defends against Host header smuggling: a cell could request an allowlisted
+        URL while setting Host to a disallowed domain, hoping the upstream server
+        routes on Host. A missing Host header is allowed (HTTP/1.0 clients).
+        Port suffixes are stripped IPv6-aware, comparison is case-insensitive,
+        and any CR/LF/NUL in the Host value is treated as a smuggle attempt
+        (classic request-smuggling injection).
+        """
+        try:
+            header = flow.request.headers.get("Host")
+        except Exception:
+            return False
+        if not header:
+            return False
+        if any(c in header for c in ("\r", "\n", "\x00")):
+            return True
+        header_host = PolicyEnforcer._normalize_hostspec(header)
+        url_host = PolicyEnforcer._normalize_hostspec(flow.request.host or "")
+        if not header_host or not url_host:
+            return False
+        return header_host != url_host
+
     def request(self, flow: http.HTTPFlow) -> None:
         """Process each HTTP request."""
-        # Check for deferred SIGHUP reload (signal-safe pattern).
-        if self._reload_pending:
-            self._reload_pending = False
-            self._do_reload()
+        # Drain any deferred SIGHUP reload. Double-checked under _reload_lock
+        # so concurrent requests do not both run the reload body.
+        self._check_reload()
 
         # Extract request details.
         host = flow.request.host
@@ -612,6 +684,16 @@ class PolicyEnforcer:
         # Check 3: Literal IP addresses.
         if self._is_literal_ip(host):
             self._block(flow, f"literal IP addresses blocked: {host}")
+            return
+
+        # Check 3b: Host header smuggling — URL host must match Host header
+        # when the Host header is present. Prevents a cell from reaching a
+        # disallowed upstream by rewriting Host on an allowlisted URL.
+        if self._host_header_mismatches(flow):
+            self._block(
+                flow,
+                f"host header mismatch: URL={host} Host={flow.request.headers.get('Host')}"
+            )
             return
 
         # Check 4: Per-cell policy (if exists).
@@ -661,10 +743,7 @@ class PolicyEnforcer:
 
     def http_connect(self, flow: http.HTTPFlow) -> None:
         """Enforce port and domain policy on CONNECT tunnels."""
-        # Check for deferred SIGHUP reload (signal-safe pattern).
-        if self._reload_pending:
-            self._reload_pending = False
-            self._do_reload()
+        self._check_reload()
 
         host = flow.request.host
         port = flow.request.port
@@ -681,6 +760,15 @@ class PolicyEnforcer:
         # Block literal IP addresses.
         if self._is_literal_ip(host):
             self._block(flow, f"literal IP addresses blocked: {host}")
+            return
+
+        # Host header smuggling — CONNECT requests can also carry a Host
+        # header inside the request. Enforce the same match as in request().
+        if self._host_header_mismatches(flow):
+            self._block(
+                flow,
+                f"host header mismatch: URL={host} Host={flow.request.headers.get('Host')}"
+            )
             return
 
         # Resolve cell name for per-cell policy.

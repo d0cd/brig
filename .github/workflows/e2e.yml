@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
   pull_request:
     branches: [main]
+    # Any change under src/, tests/, install.sh, or the CI config itself
+    # runs E2E. The previous narrow allowlist let refactors that touched
+    # brig command modules (e.g. lifecycle.py, system.py) or SDK skip the
+    # only path that exercises real Lima+podman+gVisor isolation.
     paths:
-      - "src/brig/commands/_helpers.py"
-      - "src/warden.py"
-      - "src/brig_subnet.py"
-      - "src/addons/*.py"
-      - "tests/test_*.sh"
+      - "src/**"
+      - "tests/**"
       - "install.sh"
       - ".github/workflows/e2e.yml"
       - ".github/e2e/**"

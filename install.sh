@@ -110,8 +110,36 @@ init_brig() {
     if command -v brig &> /dev/null; then
         brig init
     else
-        python3 "$(dirname "${BASH_SOURCE[0]}")/src/brig.py" init
+        python3 -c "from brig.commands.system_cmd import cmd_init; import types; cmd_init(types.SimpleNamespace())"
     fi
+}
+
+# Copy addons and scripts to brig home
+install_addons() {
+    log_info "Installing addons..."
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    ADDONS_DIR="$HOME/.brig/cells/addons"
+    mkdir -p "$ADDONS_DIR"
+
+    # Required addons.
+    for addon in enforce.py logger.py ops.py; do
+        cp "$SCRIPT_DIR/src/addons/$addon" "$ADDONS_DIR/"
+    done
+
+    # Optional addons.
+    for addon in canary.py signer.py notifier.py summarizer.py; do
+        if [[ -f "$SCRIPT_DIR/src/addons/$addon" ]]; then
+            cp "$SCRIPT_DIR/src/addons/$addon" "$ADDONS_DIR/"
+        fi
+    done
+
+    # Compatibility wrapper for E2E tests.
+    if [[ -f "$SCRIPT_DIR/scripts/brig-subnet" ]]; then
+        cp "$SCRIPT_DIR/scripts/brig-subnet" "$ADDONS_DIR/../"
+        chmod +x "$HOME/.brig/cells/brig-subnet"
+    fi
+
+    log_info "Addons installed to $ADDONS_DIR"
 }
 
 # Print next steps
@@ -195,6 +223,7 @@ main() {
     if [[ -z "$SKIP_INIT" ]]; then
         echo ""
         init_brig
+        install_addons
     fi
 
     print_next_steps

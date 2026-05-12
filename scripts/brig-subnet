@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""
+Backward-compatible brig-subnet wrapper.
+
+The subnet allocator is now embedded in brig.network.subnet.
+This script provides the same CLI interface for E2E shell tests.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+# Add src to path if running from repo.
+src_dir = Path(__file__).parent.parent / "src"
+if src_dir.exists():
+    sys.path.insert(0, str(src_dir))
+
+from brig.network.subnet import (
+    allocate, free, get, list_all, index_to_subnet, validate_index,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Brig subnet allocator")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_alloc = sub.add_parser("allocate")
+    p_alloc.add_argument("cell_name")
+
+    p_free = sub.add_parser("free")
+    p_free.add_argument("cell_name")
+
+    p_get = sub.add_parser("get")
+    p_get.add_argument("cell_name")
+
+    sub.add_parser("list")
+
+    p_val = sub.add_parser("validate-index")
+    p_val.add_argument("index", type=int)
+
+    p_create = sub.add_parser("create-network")
+    p_create.add_argument("cell_name")
+
+    p_remove = sub.add_parser("remove-network")
+    p_remove.add_argument("cell_name")
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "allocate":
+            info = allocate(args.cell_name)
+            print(info.subnet)
+        elif args.command == "free":
+            free(args.cell_name)
+        elif args.command == "get":
+            info = get(args.cell_name)
+            if info is None:
+                print(f"ERROR: Cell '{args.cell_name}' has no subnet allocated", file=sys.stderr)
+                sys.exit(1)
+            print(info.subnet)
+        elif args.command == "list":
+            items = list_all()
+            if not items:
+                print("No subnets allocated")
+            else:
+                for item in items:
+                    print(f"{item.cell_name}\t{item.subnet}\t{item.allocated_at}")
+        elif args.command == "validate-index":
+            sys.exit(0 if validate_index(args.index) else 1)
+        elif args.command == "create-network":
+            import subprocess
+            info = get(args.cell_name)
+            if info is None:
+                print(f"ERROR: Cell '{args.cell_name}' has no subnet allocated", file=sys.stderr)
+                sys.exit(1)
+            network_name = f"brig-{args.cell_name}"
+            result = subprocess.run(
+                ["podman", "network", "create", "--internal", "--subnet", info.subnet, network_name],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(f"ERROR: {result.stderr}", file=sys.stderr)
+                sys.exit(1)
+            print(network_name)
+        elif args.command == "remove-network":
+            import subprocess
+            network_name = f"brig-{args.cell_name}"
+            subprocess.run(["podman", "network", "rm", network_name], capture_output=True)
+            try:
+                free(args.cell_name)
+            except ValueError:
+                pass
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

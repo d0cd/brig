@@ -1,0 +1,84 @@
+"""
+CLI handlers for image operations and checkpoint/restore.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from brig.config import CONTAINER_PREFIX
+from brig.vm.shell import vm_run
+from brig.errors import BrigError
+from brig.ops.logging import info, output
+from brig.security.image import verify_image_signature
+
+
+def cmd_pull(args: Any) -> int:
+    """Handle `brig pull` — pull and cache an image."""
+    result = vm_run(
+        ["podman", "pull", args.image],
+    )
+    if result.returncode != 0:
+        raise BrigError(f"Failed to pull image: {result.stderr.strip()}")
+    info(f"Pulled {args.image}")
+    return 0
+
+
+def cmd_warmup(args: Any) -> int:
+    """Handle `brig warmup` — pre-pull images for a profile."""
+    from brig.cell.profiles import BUILTIN_PROFILES, load_profile
+
+    profile_name = getattr(args, "profile", None)
+    if profile_name:
+        profiles = {profile_name: load_profile(profile_name)}
+    else:
+        profiles = BUILTIN_PROFILES
+
+    # Warmup just ensures the proxy image is available.
+    output("Warming up proxy image...")
+    result = vm_run(
+        ["podman", "image", "exists",
+         "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268"],
+    )
+    if result.returncode != 0:
+        output("Pulling proxy image...")
+        vm_run(
+            ["podman", "pull",
+             "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268"],
+        )
+    output("Warmup complete")
+    return 0
+
+
+def cmd_verify_image(args: Any) -> int:
+    """Handle `brig image-verify` — verify image signature."""
+    ok, msg, details = verify_image_signature(
+        args.image,
+        key=getattr(args, "key", None),
+        keyless=getattr(args, "keyless", False),
+    )
+    output(f"{'VERIFIED' if ok else 'FAILED'}: {msg}")
+    return 0 if ok else 1
+
+
+def cmd_checkpoint(args: Any) -> int:
+    """Handle `brig checkpoint` — checkpoint a running cell."""
+    cn = f"{CONTAINER_PREFIX}{args.name}"
+    result = vm_run(
+        ["podman", "container", "checkpoint", cn],
+    )
+    if result.returncode != 0:
+        raise BrigError(f"Checkpoint failed: {result.stderr.strip()}")
+    info(f"Cell '{args.name}' checkpointed")
+    return 0
+
+
+def cmd_restore(args: Any) -> int:
+    """Handle `brig restore` — restore from checkpoint."""
+    result = vm_run(
+        ["podman", "container", "restore", args.checkpoint],
+    )
+    if result.returncode != 0:
+        raise BrigError(f"Restore failed: {result.stderr.strip()}")
+    info(f"Restored from {args.checkpoint}")
+    return 0

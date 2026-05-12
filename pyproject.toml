@@ -39,9 +39,8 @@ dev = [
 ]
 
 [project.scripts]
-brig = "brig_cli:main"
-warden = "warden_cli:main"
-brig-subnet = "brig_subnet_cli:main"
+brig = "brig.cli:main"
+warden = "warden.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/d0cd/brig"
@@ -49,12 +48,15 @@ Documentation = "https://github.com/d0cd/brig/tree/main/docs"
 Repository = "https://github.com/d0cd/brig"
 
 [tool.setuptools]
-py-modules = ["brig_cli", "warden_cli", "brig_subnet_cli", "tui", "brig_subnet", "warden"]
+py-modules = ["tui"]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["brig*", "addons*"]
+include = ["brig*", "warden*", "addons*"]
+
+[tool.setuptools.package-data]
+"brig.vm" = ["*.template"]
 
 [tool.ruff]
 line-length = 100
@@ -77,9 +79,6 @@ source = ["src"]
 omit = [
     "*/tests/*",
     "*/__pycache__/*",
-    "src/brig_cli.py",
-    "src/brig_subnet_cli.py",
-    "src/warden_cli.py",
     "src/brig-manpage.py",
     "src/dashboard.py",
     "src/tui.py",
