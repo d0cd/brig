@@ -35,13 +35,7 @@ provision:
 
       # Install gVisor (runsc)
       ARCH=$(uname -m)
-      if [ "$ARCH" = "x86_64" ]; then
-        GVISOR_ARCH="amd64"
-      else
-        GVISOR_ARCH="arm64"
-      fi
-
-      curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${GVISOR_ARCH}" -o /usr/local/bin/runsc
+      curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" -o /usr/local/bin/runsc
       chmod +x /usr/local/bin/runsc
 
       # Install crun (for Warden — proxy needs raw I/O, not gVisor overhead)

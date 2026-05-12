@@ -20,8 +20,7 @@ else
     echo "  gVisor: installing..."
     $SHELL_CMD sudo bash -c '
         ARCH=$(uname -m)
-        [ "$ARCH" = "x86_64" ] && GA=amd64 || GA=arm64
-        curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/$GA" \
+        curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" \
             -o /usr/local/bin/runsc
         chmod +x /usr/local/bin/runsc
     '
