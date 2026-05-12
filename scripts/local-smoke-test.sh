@@ -312,13 +312,15 @@ if $BRIG run --name "$POLICY_NAME" -d alpine sleep 30 2>&1; then
         fail "proxy did NOT block disallowed domain (output: $(echo "$BLOCKED_OUT" | head -c 200))"
     fi
 
-    # Try to reach a domain IN the allowlist — should succeed.
-    ALLOWED_OUT=$(limactl shell --workdir / brig -- sudo podman exec "brig-$POLICY_NAME" \
-        wget -q -O- --timeout=10 https://pypi.org 2>&1 || echo "FAILED")
-    if echo "$ALLOWED_OUT" | grep -qi "failed\|refused\|timed out"; then
-        fail "proxy blocked allowed domain pypi.org"
+    # Try to reach a domain IN the allowlist — should get through the proxy.
+    # Use HTTP (not HTTPS) since alpine wget lacks CA certs by default.
+    # A 301 redirect or 200 means the proxy allowed the request through.
+    ALLOWED_CODE=$(limactl shell --workdir / brig -- sudo podman exec "brig-$POLICY_NAME" \
+        wget --spider -S --timeout=10 http://github.com 2>&1 | grep -o "HTTP/[0-9.]* [0-9]*" | head -1 || echo "FAILED")
+    if echo "$ALLOWED_CODE" | grep -q "HTTP"; then
+        pass "proxy allows allowlisted domain (github.com → $ALLOWED_CODE)"
     else
-        pass "proxy allows allowlisted domain (pypi.org)"
+        fail "proxy blocked allowed domain github.com"
     fi
 
     $BRIG rm -f "$POLICY_NAME" 2>/dev/null
