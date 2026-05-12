@@ -103,6 +103,11 @@ def start() -> bool:
         debug(f"Policy file invalid: {e}")
         return False
 
+    # Ensure proxy-external network exists in VM.
+    vm_run(["podman", "network", "create", PROXY_EXTERNAL_NETWORK], timeout=10)
+    # Ensure VM-side directories exist.
+    vm_run(["mkdir", "-p", str(VM_LOG_DIR), "/var/run/brig/policies"], timeout=5)
+
     # Build podman run command.
     cmd = [
         "podman", "run", "-d",
@@ -144,9 +149,9 @@ def start() -> bool:
         if (HostPaths.ADDONS_DIR / addon).exists():
             cmd.extend(["-s", f"/addons/{addon}"])
 
-    result = vm_run(cmd)
+    result = vm_run(cmd, timeout=120)
     if result.returncode != 0:
-        debug(f"Failed to start proxy: {result.stderr}")
+        info(f"Failed to start proxy: {result.stderr.strip()}")
         return False
 
     # Wait for container health (up to 5 seconds).

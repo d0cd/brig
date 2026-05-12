@@ -311,6 +311,9 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
 
     elif action.type == ActionType.PODMAN_RUN:
         spec = action.params["spec"]
+        # Ensure workspace directory exists inside the VM before podman mounts it.
+        workspace = VMPaths.STATE_DIR / spec.name / "workspace"
+        _run_cmd(["mkdir", "-p", str(workspace)])
         proxy_ip = None
         if not spec.is_airgapped:
             proxy_info = _podman_inspect_json(PROXY_NAME)
