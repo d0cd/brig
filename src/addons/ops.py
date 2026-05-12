@@ -5,9 +5,11 @@ Combines the functionality of metrics.py, ratelimit.py, and health.py into
 a single addon with one configure() hook for coordinated state management.
 
 This addon is loaded alongside enforce.py and logger.py.
-"""
 
-from __future__ import annotations
+Note: Do NOT use `from __future__ import annotations` here.
+mitmproxy loads addons in a way that doesn't register them in sys.modules,
+which breaks dataclass introspection with deferred annotations on Python 3.11.
+"""
 
 import collections
 import json
@@ -17,7 +19,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from mitmproxy import ctx, http
 
@@ -78,7 +80,7 @@ class CellMetrics:
 
 # --- Health Check Server ---
 
-_health_state: dict[str, Any] = {
+_health_state: Dict[str, Any] = {
     "proxy_running": True,
     "request_count": 0,
     "error_count": 0,
@@ -137,7 +139,7 @@ class OpsAddon:
     def __init__(self) -> None:
         # Rate limiting.
         self.default_rate_config = RateLimitConfig()
-        self.cell_rate_configs: dict[str, RateLimitConfig] = {}
+        self.cell_rate_configs: Dict[str, RateLimitConfig] = {}
         self.buckets: collections.OrderedDict[str, TokenBucket] = collections.OrderedDict()
         self.buckets_lock = threading.Lock()
         self.policy_mtime: float = 0.0
@@ -230,7 +232,7 @@ class OpsAddon:
         """Extract cell name from flow metadata (set by enforce.py)."""
         return flow.metadata.get("cell_name", "")
 
-    def _get_bucket(self, cell_name: str) -> TokenBucket | None:
+    def _get_bucket(self, cell_name: str) -> Optional[TokenBucket]:
         """Get or create a token bucket for a cell."""
         with self.buckets_lock:
             if cell_name in self.buckets:
