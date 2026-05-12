@@ -3,16 +3,16 @@
 #
 # Prerequisites:
 #   brew install lima
-#   pip install -e .
-#   (or run install.sh first)
+#   make install  (or: uv pip install -e .)
 #
-# This script tests the full path from CLI → Lima VM → podman → gVisor.
-# Run it and paste the output back — it's designed to give clear pass/fail
-# for each step so we can diagnose failures remotely.
-#
-# Usage: ./scripts/local-smoke-test.sh
+# Usage: make smoke
+#   or:  ./scripts/local-smoke-test.sh
 
 set -uo pipefail
+
+# Use uv run to ensure we pick up the local venv, not a stale global install.
+BRIG="uv run brig"
+WARDEN="uv run warden"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,14 +48,14 @@ else
 fi
 
 echo -n "  Checking brig CLI... "
-if brig --version 2>/dev/null; then
+if $BRIG --version 2>/dev/null; then
     pass "brig CLI"
 else
     fail "brig not on PATH (pip install -e .)"
 fi
 
 echo -n "  Checking warden CLI... "
-if warden --help >/dev/null 2>&1; then
+if $WARDEN --help >/dev/null 2>&1; then
     pass "warden CLI"
 else
     fail "warden not on PATH"
@@ -68,7 +68,7 @@ info "Phase 2: brig init"
 
 if [ ! -d "$HOME/.brig" ]; then
     echo "  Running brig init..."
-    brig init
+    $BRIG init
     if [ -f "$HOME/.brig/lima.yaml" ]; then
         pass "brig init created ~/.brig/lima.yaml"
     else
@@ -150,7 +150,7 @@ if [ "$WARDEN_STATUS" = "running" ]; then
     pass "Warden proxy is running"
 else
     echo "  Warden not running, attempting start via brig up..."
-    if brig up 2>/dev/null; then
+    if $BRIG up 2>/dev/null; then
         pass "Warden started (via brig up)"
     else
         fail "Warden failed to start — run: make up"
@@ -165,22 +165,22 @@ info "Phase 5: Cell lifecycle (the real test)"
 CELL_NAME="smoke-test-$$"
 
 # Test 1: brig run.
-echo "  Running: brig run --name $CELL_NAME -d alpine sleep 30"
-if brig run --name "$CELL_NAME" -d alpine sleep 30 2>&1; then
+echo "  Running: $BRIG run --name $CELL_NAME -d alpine sleep 30"
+if $BRIG run --name "$CELL_NAME" -d alpine sleep 30 2>&1; then
     pass "brig run"
 else
     fail "brig run"
 fi
 
 # Test 2: brig list.
-if brig list 2>/dev/null | grep -q "$CELL_NAME"; then
+if $BRIG list 2>/dev/null | grep -q "$CELL_NAME"; then
     pass "brig list shows cell"
 else
     fail "brig list does not show cell"
 fi
 
 # Test 3: brig inspect.
-if brig inspect "$CELL_NAME" >/dev/null 2>&1; then
+if $BRIG inspect "$CELL_NAME" >/dev/null 2>&1; then
     pass "brig inspect"
 else
     fail "brig inspect"
@@ -212,7 +212,7 @@ else
 fi
 
 # Test 7: brig exec.
-EXEC_OUT=$(brig exec "$CELL_NAME" echo "hello from cell" 2>/dev/null)
+EXEC_OUT=$($BRIG exec "$CELL_NAME" echo "hello from cell" 2>/dev/null)
 if echo "$EXEC_OUT" | grep -q "hello from cell"; then
     pass "brig exec"
 else
@@ -220,21 +220,21 @@ else
 fi
 
 # Test 8: brig stop.
-if brig stop "$CELL_NAME" 2>/dev/null; then
+if $BRIG stop "$CELL_NAME" 2>/dev/null; then
     pass "brig stop"
 else
     fail "brig stop"
 fi
 
 # Test 9: brig rm.
-if brig rm "$CELL_NAME" 2>/dev/null; then
+if $BRIG rm "$CELL_NAME" 2>/dev/null; then
     pass "brig rm"
 else
     fail "brig rm"
 fi
 
 # Test 10: Verify cleanup.
-if ! brig list 2>/dev/null | grep -q "$CELL_NAME"; then
+if ! $BRIG list 2>/dev/null | grep -q "$CELL_NAME"; then
     pass "cell removed from list"
 else
     fail "cell still in list after rm"
@@ -245,7 +245,7 @@ info ""
 info "Phase 6: brig verify (security invariants)"
 # ---------------------------------------------------------------------------
 
-if brig verify 2>&1; then
+if $BRIG verify 2>&1; then
     pass "brig verify — all invariants"
 else
     fail "brig verify reported issues"
@@ -258,12 +258,12 @@ info "Phase 7: Airgapped cell"
 
 AIR_NAME="smoke-air-$$"
 echo "  Running airgapped cell..."
-if brig run --name "$AIR_NAME" --network none alpine echo "isolated" 2>&1; then
+if $BRIG run --name "$AIR_NAME" --network none alpine echo "isolated" 2>&1; then
     pass "airgapped cell ran"
 else
     fail "airgapped cell failed"
 fi
-brig rm -f "$AIR_NAME" 2>/dev/null
+$BRIG rm -f "$AIR_NAME" 2>/dev/null
 
 # ---------------------------------------------------------------------------
 info ""
@@ -272,7 +272,7 @@ info "Phase 8: Profile-based run"
 
 PROF_NAME="smoke-prof-$$"
 echo "  Running with untrusted profile..."
-if brig run --name "$PROF_NAME" --profile untrusted -d alpine sleep 10 2>&1; then
+if $BRIG run --name "$PROF_NAME" --profile untrusted -d alpine sleep 10 2>&1; then
     pass "profile-based run"
     MEM=$(limactl shell brig -- podman inspect "brig-$PROF_NAME" --format '{{.HostConfig.Memory}}' 2>/dev/null)
     if [ "$MEM" = "536870912" ]; then
@@ -280,7 +280,7 @@ if brig run --name "$PROF_NAME" --profile untrusted -d alpine sleep 10 2>&1; the
     else
         fail "memory limit: $MEM (expected 536870912 for 512m)"
     fi
-    brig rm -f "$PROF_NAME" 2>/dev/null
+    $BRIG rm -f "$PROF_NAME" 2>/dev/null
 else
     fail "profile-based run"
 fi
