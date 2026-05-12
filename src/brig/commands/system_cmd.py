@@ -187,8 +187,11 @@ def cmd_metrics(args: Any) -> int:
     if result.returncode == 0 and result.stdout.strip():
         try:
             containers = json.loads(result.stdout)
+            def _name(c):
+                n = c.get("Names", "")
+                return n[0] if isinstance(n, list) else n
             running = sum(1 for c in containers
-                         if c.get("State") == "running" and c.get("Names", [""])[0] != PROXY_NAME)
+                         if c.get("State") == "running" and _name(c) != PROXY_NAME)
         except json.JSONDecodeError:
             pass
 

@@ -143,7 +143,9 @@ def cmd_list(args: Any) -> int:
         else:
             output(f"{'NAME':<25} {'STATUS':<12} {'IMAGE':<30}")
             for c in containers:
-                name = c.get("Names", [""])[0]
+                names = c.get("Names", "")
+                # Podman 4.x returns Names as a string; 5.x as a list.
+                name = names[0] if isinstance(names, list) else names
                 if name == PROXY_NAME:
                     continue
                 cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name

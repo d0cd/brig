@@ -267,7 +267,8 @@ class Brig:
 
         cells = []
         for c in containers:
-            name = c.get("Names", [""])[0]
+            names = c.get("Names", "")
+            name = names[0] if isinstance(names, list) else names
             if name == PROXY_NAME:
                 continue
             cell_name = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name

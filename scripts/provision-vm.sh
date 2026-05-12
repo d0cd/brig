@@ -43,7 +43,9 @@ runsc = ["/usr/local/bin/runsc"]
 crun = ["/usr/bin/crun"]
 CONF
     '
-    echo "  Podman config: done"
+    # Restart podman so it picks up the new runtime config.
+    $SHELL_CMD sudo systemctl restart podman 2>/dev/null || true
+    echo "  Podman config: done (restarted)"
 fi
 
 # proxy-external network.

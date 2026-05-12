@@ -44,10 +44,11 @@ def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
     except json.JSONDecodeError:
         return None
 
-    cell_names = [
-        c.get("Names", [""])[0] for c in containers
-        if c.get("Names", [""])[0] != PROXY_NAME
-    ]
+    def _name(c: dict) -> str:
+        n = c.get("Names", "")
+        return n[0] if isinstance(n, list) else n
+
+    cell_names = [_name(c) for c in containers if _name(c) != PROXY_NAME]
     if not cell_names:
         return [], []
 
