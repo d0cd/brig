@@ -125,15 +125,15 @@ else
 fi
 
 # Test podman inside VM.
-if limactl shell --workdir / brig -- podman --version >/dev/null 2>&1; then
-    PODMAN_VER=$(limactl shell --workdir / brig -- podman --version 2>/dev/null)
+if limactl shell --workdir / brig -- sudo podman --version >/dev/null 2>&1; then
+    PODMAN_VER=$(limactl shell --workdir / brig -- sudo podman --version 2>/dev/null)
     pass "podman in VM: $PODMAN_VER"
 else
     fail "podman not available in VM"
 fi
 
 # Test gVisor (use --workdir / to avoid cwd issues when host path doesn't exist in VM).
-if limactl shell --workdir / brig -- test -x /usr/local/bin/runsc; then
+if limactl shell --workdir / brig -- sudo test -x /usr/local/bin/runsc; then
     pass "gVisor (runsc) installed in VM"
 else
     fail "gVisor not found in VM (provision VM with: limactl delete brig && make vm)"
@@ -145,7 +145,7 @@ info "Phase 4: Warden proxy"
 # ---------------------------------------------------------------------------
 
 # Check if warden is running.
-WARDEN_STATUS=$(limactl shell --workdir / brig -- podman inspect warden --format '{{.State.Status}}' 2>/dev/null || echo "not found")
+WARDEN_STATUS=$(limactl shell --workdir / brig -- sudo podman inspect warden --format '{{.State.Status}}' 2>/dev/null || echo "not found")
 if [ "$WARDEN_STATUS" = "running" ]; then
     pass "Warden proxy is running"
 else
@@ -187,7 +187,7 @@ else
 fi
 
 # Test 4: Verify gVisor runtime.
-RUNTIME=$(limactl shell --workdir / brig -- podman inspect "brig-$CELL_NAME" --format '{{.HostConfig.Runtime}}' 2>/dev/null)
+RUNTIME=$(limactl shell --workdir / brig -- sudo podman inspect "brig-$CELL_NAME" --format '{{.HostConfig.Runtime}}' 2>/dev/null)
 if [ "$RUNTIME" = "runsc" ]; then
     pass "cell uses gVisor runtime (invariant 5)"
 else
@@ -195,7 +195,7 @@ else
 fi
 
 # Test 5: Verify network isolation.
-NETWORKS=$(limactl shell --workdir / brig -- podman inspect "brig-$CELL_NAME" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
+NETWORKS=$(limactl shell --workdir / brig -- sudo podman inspect "brig-$CELL_NAME" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null)
 NET_COUNT=$(echo "$NETWORKS" | wc -w)
 if [ "$NET_COUNT" -eq 1 ]; then
     pass "cell is single-homed (invariant 8): $NETWORKS"
@@ -204,7 +204,7 @@ else
 fi
 
 # Test 6: Verify proxy env vars.
-HTTP_PROXY=$(limactl shell --workdir / brig -- podman inspect "brig-$CELL_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep "^http_proxy=" || echo "")
+HTTP_PROXY=$(limactl shell --workdir / brig -- sudo podman inspect "brig-$CELL_NAME" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep "^http_proxy=" || echo "")
 if echo "$HTTP_PROXY" | grep -q "8080"; then
     pass "proxy env vars set"
 else
@@ -274,7 +274,7 @@ PROF_NAME="smoke-prof-$$"
 echo "  Running with untrusted profile..."
 if $BRIG run --name "$PROF_NAME" --profile untrusted -d alpine sleep 10 2>&1; then
     pass "profile-based run"
-    MEM=$(limactl shell --workdir / brig -- podman inspect "brig-$PROF_NAME" --format '{{.HostConfig.Memory}}' 2>/dev/null)
+    MEM=$(limactl shell --workdir / brig -- sudo podman inspect "brig-$PROF_NAME" --format '{{.HostConfig.Memory}}' 2>/dev/null)
     if [ "$MEM" = "536870912" ]; then
         pass "untrusted profile memory limit (512m)"
     else

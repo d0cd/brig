@@ -101,7 +101,7 @@ class TestVmRunRouting(unittest.TestCase):
 
         called_cmd = mock_run.call_args[0][0]
         self.assertEqual(called_cmd[:6], ["limactl", "shell", "--workdir", "/", "brig", "--"])
-        self.assertEqual(called_cmd[6:], ["podman", "ps"])
+        self.assertEqual(called_cmd[6:], ["sudo", "podman", "ps"])
 
     @patch("brig.vm.shell.subprocess.run")
     def test_vm_run_interactive_adds_prefix(self, mock_run):

@@ -316,10 +316,16 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         _run_cmd(["mkdir", "-p", str(workspace)])
         proxy_ip = None
         if not spec.is_airgapped:
-            proxy_info = _podman_inspect_json(PROXY_NAME)
-            if proxy_info:
-                proxy_ip = (proxy_info.get("NetworkSettings", {})
-                            .get("Networks", {}).get(name, {}).get("IPAddress", ""))
+            # Retry — network connect may not have propagated yet.
+            import time
+            for attempt in range(5):
+                proxy_info = _podman_inspect_json(PROXY_NAME)
+                if proxy_info:
+                    proxy_ip = (proxy_info.get("NetworkSettings", {})
+                                .get("Networks", {}).get(name, {}).get("IPAddress", ""))
+                if proxy_ip:
+                    break
+                time.sleep(1)
             if not proxy_ip:
                 raise RuntimeError(f"Could not determine proxy IP on {name}")
 
