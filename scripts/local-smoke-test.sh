@@ -302,18 +302,19 @@ info "Phase 9: Proxy enforcement (policy test)"
 POLICY_NAME="smoke-policy-$$"
 echo "  Testing proxy blocks disallowed domain..."
 if $BRIG run --name "$POLICY_NAME" -d alpine sleep 30 2>&1; then
-    # Try to reach a domain NOT in the allowlist — should fail.
+    # Try to reach a domain NOT in the allowlist — should be blocked.
+    # Use a domain that no reasonable policy would allowlist.
     BLOCKED_OUT=$(limactl shell --workdir / brig -- sudo podman exec "brig-$POLICY_NAME" \
-        wget -q -O- --timeout=5 http://example.com 2>&1 || echo "BLOCKED")
-    if echo "$BLOCKED_OUT" | grep -qi "blocked\|forbidden\|refused\|timed out\|error"; then
-        pass "proxy blocks disallowed domain"
+        wget -q -O- --timeout=5 http://neverssl.com 2>&1 || echo "BLOCKED")
+    if echo "$BLOCKED_OUT" | grep -qi "blocked\|forbidden\|refused\|timed out\|error\|403\|502"; then
+        pass "proxy blocks disallowed domain (neverssl.com)"
     else
-        fail "proxy did NOT block disallowed domain (output: $BLOCKED_OUT)"
+        fail "proxy did NOT block disallowed domain (output: $(echo "$BLOCKED_OUT" | head -c 200))"
     fi
 
     # Try to reach a domain IN the allowlist — should succeed.
     ALLOWED_OUT=$(limactl shell --workdir / brig -- sudo podman exec "brig-$POLICY_NAME" \
-        wget -q -O- --timeout=10 http://pypi.org 2>&1 || echo "FAILED")
+        wget -q -O- --timeout=10 https://pypi.org 2>&1 || echo "FAILED")
     if echo "$ALLOWED_OUT" | grep -qi "failed\|refused\|timed out"; then
         fail "proxy blocked allowed domain pypi.org"
     else
