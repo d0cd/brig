@@ -158,6 +158,13 @@ def cmd_inspect(args: Any) -> int:
     return 0
 
 
+def cmd_files(args: Any) -> int:
+    """List workspace contents inside a cell."""
+    cn = f"{CONTAINER_PREFIX}{args.name}"
+    path = getattr(args, "path", "/work")
+    return vm_run_interactive(["podman", "exec", cn, "ls", "-la", path])
+
+
 def cmd_logs(args: Any) -> int:
     cn = f"{CONTAINER_PREFIX}{args.name}"
     cmd = ["podman", "logs"]

@@ -1,119 +1,115 @@
 # Quick Start
 
-Get Brig running in 5 minutes.
+Get Brig running in under 5 minutes.
 
 ## Prerequisites
 
-- macOS with Apple Silicon or Intel
-- [Lima](https://lima-vm.io/) installed
-- Basic familiarity with containers
+- macOS (Apple Silicon or Intel)
+- Python 3.10+
+- [Lima](https://lima-vm.io/): `brew install lima`
 
-## 1. Install Lima
+## 1. Install and Start
 
 ```bash
-brew install lima
+git clone https://github.com/d0cd/brig.git
+cd brig
+make install
+make up
 ```
 
-## 2. Create the Brig VM
+`make up` handles everything: initializes `~/.brig`, creates the Lima VM,
+starts the VM, and starts the Warden proxy. First run takes a few minutes
+(VM creation + provisioning). Subsequent runs are fast.
+
+## 2. Run Your First Cell
 
 ```bash
-# Create the Brig VM using the bundled configuration
-limactl create --name=brig ~/.brig/lima.yaml
-limactl start brig
+brig run alpine echo "Hello from a secure cell!"
 ```
 
-The `lima.yaml` file is created during Brig installation.
+This creates a gVisor-sandboxed container on an isolated network with all
+egress filtered through the Warden proxy. The cell name is auto-generated.
 
-## 3. Verify gVisor
+## 3. Run a Named Cell
 
 ```bash
-limactl shell brig -- runsc --version
-# Should print version info
+brig run --name my-cell -d python:3.12 python -c "
+import urllib.request
+print(urllib.request.urlopen('https://pypi.org').status)
+"
 ```
 
-## 4. Run Your First Cell
+Check it:
 
 ```bash
-# Quick inline run
-brig run --name my-cell --image python:3.11-slim -- python -c "print('Hello from Brig!')"
-
-# Or from a config file
-brig run -f cells/example-cell.yaml
+brig list                     # see all cells
+brig logs my-cell             # view output
+brig files my-cell            # list workspace
+brig exec my-cell -- whoami   # run command inside
+brig stop my-cell             # stop
+brig rm my-cell               # remove
 ```
 
-## 5. Interact with Cells
+## 4. Use Profiles
 
 ```bash
-# Watch stdout logs
-brig logs my-cell -f
+brig profiles                 # see available profiles
 
-# Watch network activity
-brig network my-cell -f
-
-# Browse the workspace
-brig files my-cell
-
-# Stop the cell
-brig stop my-cell
+brig run --profile untrusted alpine sh        # 512m, 1 cpu, restricted
+brig run --profile dev python:3.12 bash       # 4g, 4 cpus, generous
+brig run --network none alpine sh             # fully airgapped
 ```
 
-## 6. View Network Activity
-
-All network requests are logged and attributed to their source cell:
+## 5. Manage Secrets
 
 ```bash
-# Stream network logs
-brig network my-cell -f
+brig secrets add api-key                      # interactive prompt
+brig secrets list                             # see mount paths
 
-# Filter for blocked requests
-brig network my-cell --json | jq 'select(.blocked)'
-
-# Filter for slow requests
-brig network my-cell --json | jq 'select(.ms > 1000)'
+brig run --secret api-key alpine cat /run/secrets/api-key
 ```
 
-## 7. Copy Files Out
+Secrets are mounted as read-only files at `/run/secrets/<name>`.
+An env var `<NAME>_FILE` points to the path. Values never appear in
+env vars, process listings, or container inspect output.
+
+## 6. Copy Files
 
 ```bash
-# Safe copy with validation
+# Export from cell (applies quarantine + extension blocking)
 brig cp my-cell:/work/output.json ./output.json
 
-# Copy with sanitization (blocks dangerous file types)
-brig cp --sanitize my-cell:/work/report.html ./report.html
+# Import into cell
+brig cp ./input.txt my-cell:/work/input.txt
 ```
 
-## 8. Cleanup
+## 7. Edit Policy
 
 ```bash
-# Stop the cell
-brig stop my-cell
-
-# Remove the cell and its network
-brig rm my-cell
-
-# Or remove everything including workspace
-brig rm --purge my-cell
+brig policy show                              # view global policy
+brig policy set global --allow *.example.com  # add to allowlist
+brig policy set my-cell --deny evil.com       # per-cell deny
 ```
+
+## 8. Shutdown
+
+```bash
+brig down                     # stop all cells + warden
+brig down --vm                # also stop the VM
+```
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "limactl not found" | `brew install lima` |
+| "Brig VM is not running" | `brig up` |
+| "Warden proxy is not running" | `brig up` |
+| "Rate limit exceeded" | Wait 60 seconds |
+| Cell can't reach the internet | Check `brig policy show` — domain must be in allowlist |
 
 ## Next Steps
 
-- Read [Concepts](concepts.md) to understand how Brig works
-- See [Workflows](workflows.md) for common use cases
-- Check [Troubleshooting](troubleshooting.md) if you hit issues
-
-## Quick Reference
-
-| Command | Description |
-|---------|-------------|
-| `brig run` | Create and start a cell |
-| `brig stop` | Stop a cell gracefully |
-| `brig kill` | Kill a cell immediately |
-| `brig rm` | Remove a cell |
-| `brig list` | List all cells |
-| `brig logs` | View cell stdout/stderr |
-| `brig network` | View network activity |
-| `brig files` | List workspace files |
-| `brig cp` | Copy files to/from workspace |
-| `brig exec` | Run command in cell |
-| `warden status` | Check proxy status |
-| `brig diagnose` | Debug connectivity issues |
+- [Cell Definition Reference](../design/cell-definition.md) — YAML format for cell definitions
+- [Concepts](concepts.md) — how the security model works
+- [Workflows](workflows.md) — common use cases

@@ -109,6 +109,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sr = secrets_sub.add_parser("rm", help="Remove a secret")
     p_sr.add_argument("name", help="Secret name")
 
+    p_files = sub.add_parser("files", help="List workspace contents")
+    p_files.add_argument("name", help="Cell name")
+    p_files.add_argument("path", nargs="?", default="/work", help="Path inside cell")
+
     p_logs = sub.add_parser("logs", help="View cell logs")
     p_logs.add_argument("name", help="Cell name")
     p_logs.add_argument("-f", "--follow", action="store_true", help="Follow log output")
@@ -269,6 +273,7 @@ def main() -> None:
         "list": lifecycle_cmd.cmd_list,
         "inspect": lifecycle_cmd.cmd_inspect,
         "export": lifecycle_cmd.cmd_export,
+        "files": lifecycle_cmd.cmd_files,
         "logs": lifecycle_cmd.cmd_logs,
         "top": lifecycle_cmd.cmd_top,
         "diff": lifecycle_cmd.cmd_diff,

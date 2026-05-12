@@ -2,50 +2,26 @@
 
 Secure workload harness for running untrusted code on macOS.
 
-Brig isolates workloads in **cells** - containers with gVisor sandboxing, dedicated networks, and mandatory egress filtering through the Warden proxy.
-
-## Features
-
-- **Defense in depth**: Lima VM (hardware boundary) + gVisor (syscall filtering) + network isolation
-- **Per-cell networks**: No east-west traffic between cells
-- **Policy-enforced egress**: All outbound traffic goes through Warden proxy with domain allowlists
-- **Secret management**: Mount secrets as files, never exposed in environment variables
-- **Observability**: Per-cell request logging, metrics, and rate limiting
+Brig isolates workloads in **cells** — containers with gVisor sandboxing, dedicated networks, and mandatory egress filtering through the Warden proxy.
 
 ## Quick Start
 
-### Prerequisites
-
-- macOS
-- Python 3.10+
-- [Lima](https://github.com/lima-vm/lima): `brew install lima`
-
-### Installation
-
 ```bash
+# Prerequisites: macOS, Python 3.10+, Lima (brew install lima)
+
 git clone https://github.com/d0cd/brig.git
 cd brig
-./install.sh
+make install          # install brig + addons
+make up               # init, create VM, start VM, start warden
 ```
 
-### Setup
+That's it. Run your first cell:
 
 ```bash
-# Create and start the VM
-brig vm create
-brig vm start
-
-# Start the Warden proxy (inside VM)
-brig vm shell -- warden start --detach
+brig run alpine echo "Hello from a secure cell!"
 ```
 
-### Run Your First Cell
-
-```bash
-brig run --name hello --image alpine -- echo "Hello from a secure cell!"
-```
-
-## Architecture
+## What Just Happened
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -60,7 +36,7 @@ brig run --name hello --image alpine -- echo "Hello from a secure cell!"
 │  │         └───────┬────────┘                        │  │
 │  │                 ▼                                 │  │
 │  │          ┌─────────────┐                          │  │
-│  │          │   Warden    │  (policy enforcement)   │  │
+│  │          │   Warden    │  (policy enforcement)    │  │
 │  │          │   Proxy     │                          │  │
 │  │          └──────┬──────┘                          │  │
 │  └─────────────────┼─────────────────────────────────┘  │
@@ -69,58 +45,79 @@ brig run --name hello --image alpine -- echo "Hello from a secure cell!"
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Commands
+Your code ran inside a gVisor-sandboxed container, on an isolated network, with all egress filtered through the Warden proxy. It couldn't reach other cells, couldn't access the macOS host, and could only connect to domains in the policy allowlist.
 
-### Cell Management
+## Usage
+
+### Run cells
 
 ```bash
-brig run --name myapp --image python:3.11 -- python app.py
-brig list                    # List all cells
-brig logs myapp              # View cell logs
-brig exec myapp -- sh        # Execute command in cell
-brig stop myapp              # Gracefully stop
-brig rm myapp                # Remove cell
+brig run alpine echo hello                            # quick one-off (auto-named)
+brig run --name scraper python:3.12 python scrape.py  # named cell
+brig run --profile untrusted -d alpine sleep 3600      # background, restricted profile
+brig run --file mycell.yaml                            # from definition file
 ```
 
-### VM Management
+### Manage cells
 
 ```bash
-brig vm create               # Create the Lima VM
-brig vm start                # Start the VM
-brig vm stop                 # Stop the VM
-brig vm status               # Show VM status
-brig vm shell                # Open shell in VM
+brig list                     # list all cells
+brig logs mycell -f           # follow logs
+brig exec mycell -- ls -la    # run command in cell
+brig stop mycell              # graceful stop
+brig rm mycell                # remove cell + network + subnet
 ```
 
-### Warden Proxy
+### Secrets
 
 ```bash
-warden start                 # Start the proxy
-warden status                # Check proxy status
-warden stats                 # View request metrics
-warden health                # Health check
-warden policy validate       # Validate policy file
-warden tor start             # Start Tor + Privoxy bridge
-warden tor status            # Check Tor routing status
+brig secrets add api-key                    # interactive prompt (safe)
+echo "sk-123" | brig secrets add api-key    # from pipe
+brig secrets list                           # show all secrets
+brig run --secret api-key alpine cat /run/secrets/api-key
+```
+
+### Profiles
+
+```bash
+brig profiles                               # list available profiles
+brig run --profile untrusted alpine sh      # 512m, 1 cpu, restricted
+brig run --profile dev alpine sh            # 4g, 4 cpus, generous
+brig run --network none alpine sh           # fully airgapped
+```
+
+### Policy
+
+```bash
+brig policy show                            # show global policy
+brig policy set global --allow *.example.com  # add to global allowlist
+brig policy set mycell --deny evil.com      # per-cell deny
+brig policy show mycell --effective         # merged global + per-cell
+```
+
+### System
+
+```bash
+brig up                       # start everything (VM + warden)
+brig down                     # stop everything
+brig down --vm                # also stop the VM
+brig verify                   # check all 9 security invariants
+brig health                   # system health check
+brig diagnose mycell          # debug a specific cell
 ```
 
 ## Network Policy
 
-Configure allowed domains in `~/.brig/cells/network-policy.json`:
+Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
 
 ```json
 {
   "allow": [
-    "api.github.com",
-    "*.amazonaws.com",
-    {"domain": "api.example.com", "paths": ["/v1/*"], "methods": ["GET", "POST"]}
+    "pypi.org", "*.pythonhosted.org", "github.com",
+    "api.github.com", "*.githubusercontent.com", "registry.npmjs.org"
   ],
-  "deny": [
-    "evil.com"
-  ],
-  "rate_limits": {
-    "default": {"rate": 100, "burst": 500}
-  }
+  "deny": [],
+  "rate_limits": {"default": {"rate": 100, "burst": 500}}
 }
 ```
 
@@ -133,22 +130,25 @@ Configure allowed domains in `~/.brig/cells/network-policy.json`:
 | Per-cell networks | No lateral movement between cells |
 | Warden proxy | Egress filtering, logging, rate limiting |
 
-### Security Invariants
+9 security invariants, all tested. Run `brig verify` to check.
 
-1. No east-west traffic between cells
-2. All egress goes through Warden
-3. gVisor runtime enforced (no silent downgrade)
-4. Secrets mounted as files, never in env vars
+## Development
 
-## Documentation
+```bash
+make install-dev              # install with pytest, ruff, mypy
+make test                     # run unit tests (324 tests)
+make check                    # full CI checks (lint, types, tests)
+make smoke                    # end-to-end test (requires VM)
+make bench                    # benchmarks
+```
 
-- [Installation Guide](INSTALLATION.md)
-- [Concepts](docs/learning/concepts.md)
-- [Workflows](docs/learning/workflows.md)
-- [CLI Reference](docs/design/reference.md)
+## Docs
+
+- [Cell Definition Reference](docs/design/cell-definition.md)
+- [Architecture](docs/design/architecture.md)
 - [Security Design](docs/design/security.md)
-- [Performance Benchmarks](docs/BENCHMARKS.md)
-- [Troubleshooting](docs/learning/troubleshooting.md)
+- [SDK Specification](docs/sdk-spec.md)
+- [Security Invariants](docs/INVARIANTS.md)
 
 ## License
 

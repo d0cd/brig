@@ -64,10 +64,8 @@ def cmd_init(args: Any) -> int:
     output(f"Initialized brig at {BRIG_HOME}")
     output("")
     output("Next steps:")
-    output(f"  1. Review VM config:    {lima_yaml}")
-    output(f"  2. Create the VM:       limactl create --name=brig {lima_yaml}")
-    output(f"  3. Start the VM:        limactl start brig")
-    output(f"  4. Start the proxy:     warden start")
+    output(f"  brig up                 # create VM, start VM, start warden")
+    output(f"  brig run alpine echo hi # run your first cell")
     return 0
 
 
