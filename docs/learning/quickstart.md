@@ -13,8 +13,7 @@ Get Brig running in under 5 minutes.
 ```bash
 git clone https://github.com/d0cd/brig.git
 cd brig
-make install
-make up
+make setup
 ```
 
 `make up` handles everything: initializes `~/.brig`, creates the Lima VM,
@@ -87,7 +86,7 @@ brig cp ./input.txt my-cell:/work/input.txt
 
 ```bash
 brig policy show                              # view global policy
-brig policy set global --allow *.example.com  # add to allowlist
+brig policy set global --allow '*.example.com'  # add to allowlist
 brig policy set my-cell --deny evil.com       # per-cell deny
 ```
 

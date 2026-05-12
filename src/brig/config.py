@@ -44,7 +44,7 @@ RATE_LIMIT_WINDOW = 60
 MUTATION_COMMANDS = {"run", "stop", "kill", "rm", "start", "pause", "unpause", "cp", "policy"}
 
 # Sensitive argument patterns for redaction.
-SENSITIVE_PATTERNS = {"password", "secret", "key", "token", "credential", "auth"}
+SENSITIVE_PATTERNS = {"password", "secret", "key", "token", "credential", "auth", "value"}
 
 # Valid memory suffixes.
 MEMORY_PATTERN = r"^\d+[kmgKMG]?[bB]?$"

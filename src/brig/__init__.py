@@ -12,9 +12,9 @@ SDK usage:
     exit_code = cell.wait_sync()
 """
 
-__version__ = "0.2.0"
-
 from brig.config import VERSION
+
+__version__ = VERSION
 from brig.errors import BrigError
 from brig.sdk import (
     Brig,

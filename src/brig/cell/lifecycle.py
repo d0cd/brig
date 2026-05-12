@@ -51,7 +51,7 @@ def run_cell(
     if not spec.is_airgapped and not proxy_check():
         raise BrigError(
             "Warden proxy is not running",
-            suggestion="Start the proxy with: warden start",
+            suggestion="Start with: brig up",
         )
 
     if not check_rate_limit():

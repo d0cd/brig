@@ -18,7 +18,7 @@ from brig.config import VM_NAME
 from brig.ops.logging import debug
 
 # Sensitive flags whose following argument should be redacted in logs.
-_SENSITIVE_FLAGS = {"--secret", "--password", "--token", "--key"}
+_SENSITIVE_FLAGS = {"--secret", "--password", "--token", "--key", "--value"}
 
 
 def _redact_cmd(cmd: list[str]) -> str:

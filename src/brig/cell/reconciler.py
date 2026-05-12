@@ -212,6 +212,9 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         cmd.extend(["--label", label])
 
     if spec.seccomp_profile:
+        # Block "unconfined" which disables seccomp entirely.
+        if spec.seccomp_profile.lower() == "unconfined":
+            raise ValueError("seccomp_profile='unconfined' is not allowed — it disables seccomp")
         cmd.extend(["--security-opt", f"seccomp={spec.seccomp_profile}"])
 
     if spec.detach:

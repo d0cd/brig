@@ -47,5 +47,5 @@ def error_proxy_not_running() -> None:
     """Error helper for proxy not running."""
     raise BrigError(
         "Warden proxy is not running",
-        suggestion="Start the proxy with: warden start",
+        suggestion="Start with: brig up",
     )

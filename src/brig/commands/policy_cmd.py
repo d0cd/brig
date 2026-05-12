@@ -110,15 +110,31 @@ def _edit_global_policy(args: Any) -> int:
     return 0
 
 
+def _validate_domains(domains: list[str]) -> None:
+    """Validate domain patterns. Raises BrigError on suspicious/invalid domains."""
+    import re
+    from brig.config import DOMAIN_PATTERN
+    from brig.network.validation import is_suspicious_domain
+
+    for domain in domains:
+        if not re.match(DOMAIN_PATTERN, domain):
+            raise BrigError(f"Invalid domain pattern: {domain}")
+        suspicious = is_suspicious_domain(domain)
+        if suspicious:
+            raise BrigError(f"Rejected: {suspicious}")
+
+
 def _apply_policy_changes(args: Any, policy: dict) -> dict:
     """Apply --allow/--deny/--remove-allow/--remove-deny to a policy dict."""
     changes: dict[str, list[str]] = {}
 
     if getattr(args, "allow", None):
+        _validate_domains(args.allow)
         policy.setdefault("allow", []).extend(args.allow)
         changes["add_allow"] = args.allow
 
     if getattr(args, "deny", None):
+        _validate_domains(args.deny)
         policy.setdefault("deny", []).extend(args.deny)
         changes["add_deny"] = args.deny
 

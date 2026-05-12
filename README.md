@@ -11,8 +11,7 @@ Brig isolates workloads in **cells** — containers with gVisor sandboxing, dedi
 
 git clone https://github.com/d0cd/brig.git
 cd brig
-make install          # install brig + addons
-make up               # init, create VM, start VM, start warden
+make setup            # install, create VM, provision gVisor, start warden
 ```
 
 That's it. Run your first cell:
@@ -90,7 +89,7 @@ brig run --network none alpine sh           # fully airgapped
 
 ```bash
 brig policy show                            # show global policy
-brig policy set global --allow *.example.com  # add to global allowlist
+brig policy set global --allow '*.example.com'  # add to global allowlist
 brig policy set mycell --deny evil.com      # per-cell deny
 brig policy show mycell --effective         # merged global + per-cell
 ```
@@ -135,8 +134,8 @@ Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
 ## Development
 
 ```bash
-make install-dev              # install with pytest, ruff, mypy
-make test                     # run unit tests (324 tests)
+make setup                    # install with dev deps, create VM, start
+make test                     # run unit tests (352 tests)
 make check                    # full CI checks (lint, types, tests)
 make smoke                    # end-to-end test (requires VM)
 make bench                    # benchmarks

@@ -229,12 +229,19 @@ def cmd_attach(args: Any) -> int:
 
 
 def cmd_start(args: Any) -> int:
+    # Invariant 9: proxy must be running before starting cells.
+    from brig.network.proxy import proxy_running
+    if not proxy_running():
+        raise BrigError(
+            "Warden proxy is not running",
+            suggestion="Start with: brig up",
+        )
     cn = f"{CONTAINER_PREFIX}{args.name}"
     result = vm_run(["podman", "start", cn])
     if result.returncode != 0:
         raise BrigError(
             f"Failed to start cell '{args.name}': {result.stderr.strip()}",
-            suggestion=f"Check if cell exists with: brig list",
+            suggestion="Check if cell exists with: brig list",
         )
     info(f"Cell '{args.name}' started")
     return 0
@@ -272,6 +279,12 @@ def cmd_unpause(args: Any) -> int:
 
 
 def cmd_rename(args: Any) -> int:
+    from brig.config import CELL_NAME_PATTERN
+    if not CELL_NAME_PATTERN.match(args.new_name):
+        raise BrigError(
+            f"Invalid cell name '{args.new_name}': must match {CELL_NAME_PATTERN.pattern}",
+            suggestion="Cell names: lowercase alphanumeric, hyphens, dots, max 63 chars",
+        )
     old_cn = f"{CONTAINER_PREFIX}{args.old_name}"
     new_cn = f"{CONTAINER_PREFIX}{args.new_name}"
     result = vm_run(["podman", "rename", old_cn, new_cn])
