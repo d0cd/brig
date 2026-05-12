@@ -56,7 +56,7 @@ def vm_run(
         capture: Capture stdout/stderr.
         timeout: Timeout in seconds (None for no timeout).
     """
-    full_cmd = ["limactl", "shell", VM_NAME, "--"] + cmd
+    full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
     debug(f"VM exec: {_redact_cmd(cmd)}")
     try:
         return subprocess.run(
@@ -74,7 +74,7 @@ def vm_run_interactive(cmd: list[str]) -> int:
     Used for: brig exec -it, brig shell, brig attach.
     Returns the exit code.
     """
-    full_cmd = ["limactl", "shell", VM_NAME, "--"] + cmd
+    full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
     debug(f"VM interactive: {_redact_cmd(cmd)}")
     try:
         return subprocess.run(full_cmd).returncode

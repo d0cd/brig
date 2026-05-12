@@ -19,9 +19,12 @@ MEMORY_LIMIT = "1g"
 CPU_LIMIT = "1"
 PIDS_LIMIT = "256"
 
-POLICY_FILE = Path("/cells/network-policy.json")
-LOG_DIR = Path("/var/log/brig/network")
-ADDONS_DIR = Path("/cells/addons")
+from brig.config import HostPaths
+
+# VM-side paths (used in podman volume mounts).
+VM_POLICY_FILE = Path("/cells/network-policy.json")
+VM_LOG_DIR = Path("/var/log/brig/network")
+VM_ADDONS_DIR = Path("/cells/addons")
 
 
 def _podman_ps(all_states: bool = False) -> list[str]:
@@ -80,19 +83,21 @@ def start() -> bool:
             ["podman", "rm", PROXY_NAME],
         )
 
-    # Pre-flight: check required files.
+    # Pre-flight: check host-side files (these get mounted into the VM).
     required_addons = ["enforce.py", "logger.py"]
     for addon in required_addons:
-        if not (ADDONS_DIR / addon).exists():
-            debug(f"Required addon missing: {ADDONS_DIR / addon}")
+        if not (HostPaths.ADDONS_DIR / addon).exists():
+            debug(f"Required addon missing: {HostPaths.ADDONS_DIR / addon}")
+            info(f"Run: make install (to copy addons)")
             return False
 
-    if not POLICY_FILE.exists():
-        debug(f"Policy file missing: {POLICY_FILE}")
+    if not HostPaths.NETWORK_POLICY.exists():
+        debug(f"Policy file missing: {HostPaths.NETWORK_POLICY}")
+        info("Run: brig init")
         return False
 
     try:
-        with open(POLICY_FILE) as f:
+        with open(HostPaths.NETWORK_POLICY) as f:
             json.load(f)
     except (json.JSONDecodeError, IOError) as e:
         debug(f"Policy file invalid: {e}")
@@ -116,11 +121,11 @@ def start() -> bool:
         "--pids-limit", PIDS_LIMIT,
     ]
 
-    # Volume mounts.
-    cmd.extend(["-v", f"{LOG_DIR}:/logs:rw"])
+    # Volume mounts (VM-side paths — podman runs inside the VM).
+    cmd.extend(["-v", f"{VM_LOG_DIR}:/logs:rw"])
     cmd.extend(["-v", "/var/run/brig:/var/run/cells:rw"])
-    cmd.extend(["-v", f"{ADDONS_DIR}:/addons:ro"])
-    cmd.extend(["-v", f"{POLICY_FILE}:/policy.json:ro"])
+    cmd.extend(["-v", f"{VM_ADDONS_DIR}:/addons:ro"])
+    cmd.extend(["-v", f"{VM_POLICY_FILE}:/policy.json:ro"])
 
     # Image.
     cmd.append(IMAGE)
@@ -134,10 +139,9 @@ def start() -> bool:
         "-s", "/addons/logger.py",
     ])
 
-    # Optional addons.
-    for addon in ["ops.py", "ratelimit.py", "metrics.py", "health.py",
-                   "notifier.py", "canary.py", "signer.py"]:
-        if (ADDONS_DIR / addon).exists():
+    # Optional addons (check host-side, mount VM-side).
+    for addon in ["ops.py", "notifier.py", "canary.py", "signer.py"]:
+        if (HostPaths.ADDONS_DIR / addon).exists():
             cmd.extend(["-s", f"/addons/{addon}"])
 
     result = vm_run(cmd)

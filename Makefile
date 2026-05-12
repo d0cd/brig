@@ -1,17 +1,20 @@
-.PHONY: install install-dev init vm test check smoke clean help up down bench
+.PHONY: install install-dev init vm test check smoke clean reset help up down bench
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-install: ## Install brig + copy addons
+install: .venv ## Install brig + copy addons
 	uv pip install -e .
 	@$(MAKE) _copy-addons
-	@echo "Installed. Run: make init"
+	@echo "Installed. Run: make up"
 
-install-dev: ## Install with dev dependencies (pytest, ruff, mypy)
+install-dev: .venv ## Install with dev dependencies (pytest, ruff, mypy)
 	uv pip install -e ".[dev]"
 	@$(MAKE) _copy-addons
-	@echo "Installed (dev). Run: make init"
+	@echo "Installed (dev). Run: make up"
+
+.venv:
+	uv venv
 
 init: ## Initialize brig (~/.brig, lima.yaml, default policy)
 	uv run brig init
@@ -48,9 +51,16 @@ smoke: ## Run end-to-end smoke test (requires VM)
 bench: ## Run benchmarks
 	uv run pytest tests/benchmarks/ -m bench --benchmark-enable -q
 
-clean: ## Remove build artifacts
-	rm -rf build/ dist/ *.egg-info src/*.egg-info .venv
+clean: ## Remove caches (keeps venv)
+	rm -rf build/ dist/ *.egg-info src/*.egg-info
+	rm -rf .pytest_cache .mypy_cache .ruff_cache
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+reset: clean ## Full reset: remove venv, caches, stale global installs
+	rm -rf .venv .venv-linux
+	pip uninstall brig -y 2>/dev/null || true
+	pip3 uninstall brig -y 2>/dev/null || true
+	@echo "Reset. Run: make install"
 
 _copy-addons:
 	@mkdir -p ~/.brig/cells/addons

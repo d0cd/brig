@@ -88,6 +88,11 @@ def cmd_run(args: Any) -> int:
     if args.policy_deny:
         spec_kwargs["policy_deny"] = args.policy_deny
 
+    # Filter to CellSpec fields only — profiles may add extra keys like 'runtime'.
+    import dataclasses
+    valid_fields = {f.name for f in dataclasses.fields(CellSpec)}
+    spec_kwargs = {k: v for k, v in spec_kwargs.items() if k in valid_fields}
+
     spec = CellSpec(**spec_kwargs)
 
     from brig.ops.logging import Spinner

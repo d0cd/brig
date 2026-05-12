@@ -100,8 +100,8 @@ class TestVmRunRouting(unittest.TestCase):
         vm_run(["podman", "ps"])
 
         called_cmd = mock_run.call_args[0][0]
-        self.assertEqual(called_cmd[:4], ["limactl", "shell", "brig", "--"])
-        self.assertEqual(called_cmd[4:], ["podman", "ps"])
+        self.assertEqual(called_cmd[:6], ["limactl", "shell", "--workdir", "/", "brig", "--"])
+        self.assertEqual(called_cmd[6:], ["podman", "ps"])
 
     @patch("brig.vm.shell.subprocess.run")
     def test_vm_run_interactive_adds_prefix(self, mock_run):
@@ -111,7 +111,7 @@ class TestVmRunRouting(unittest.TestCase):
         vm_run_interactive(["podman", "exec", "-it", "brig-test", "/bin/sh"])
 
         called_cmd = mock_run.call_args[0][0]
-        self.assertEqual(called_cmd[:4], ["limactl", "shell", "brig", "--"])
+        self.assertEqual(called_cmd[:6], ["limactl", "shell", "--workdir", "/", "brig", "--"])
 
 
 class TestReconcilerPlanToApply(unittest.TestCase):
