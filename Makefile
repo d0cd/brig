@@ -17,6 +17,7 @@ setup: .venv ## Install brig, create VM, start everything
 		echo "Starting VM..."; \
 		limactl start brig; \
 	fi
+	./scripts/provision-vm.sh
 	uv run brig up
 	@echo ""
 	@echo "Ready. Try: uv run brig run alpine echo hello"
