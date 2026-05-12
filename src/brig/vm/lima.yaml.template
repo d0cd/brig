@@ -33,10 +33,13 @@ provision:
       apt-get update
       apt-get install -y podman uidmap slirp4netns fuse-overlayfs
 
-      # Install gVisor (runsc)
+      # Install gVisor (runsc) with integrity verification.
       ARCH=$(uname -m)
       curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" -o /usr/local/bin/runsc
+      curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc.sha512" -o /tmp/runsc.sha512
+      cd /usr/local/bin && sha512sum -c /tmp/runsc.sha512
       chmod +x /usr/local/bin/runsc
+      rm -f /tmp/runsc.sha512
 
       # Install crun (for Warden — proxy needs raw I/O, not gVisor overhead)
       apt-get install -y crun

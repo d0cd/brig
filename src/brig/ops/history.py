@@ -26,16 +26,38 @@ from brig.config import (
 from brig.ops.logging import debug
 
 
+MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB per log file.
+
+
 def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
     """Append a JSON line to a log file with file locking.
 
-    No fsync — these are append-only audit logs where losing the last
-    line on crash is acceptable. The flock provides ordering.
+    Rotates when file exceeds MAX_LOG_SIZE: current → .1, .1 → .2 (max 3).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    _maybe_rotate(path)
     with open(path, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.write(json.dumps(entry) + "\n")
+
+
+def _maybe_rotate(path: Path) -> None:
+    """Rotate log file if it exceeds MAX_LOG_SIZE."""
+    try:
+        if not path.exists() or path.stat().st_size < MAX_LOG_SIZE:
+            return
+    except OSError:
+        return
+
+    # Rotate: .2 → delete, .1 → .2, current → .1.
+    for i in range(2, 0, -1):
+        src = path.with_suffix(f"{path.suffix}.{i}")
+        dst = path.with_suffix(f"{path.suffix}.{i + 1}")
+        if i == 2 and src.exists():
+            src.unlink()
+        elif src.exists():
+            src.rename(dst)
+    path.rename(path.with_suffix(f"{path.suffix}.1"))
 
 
 def log_operation(

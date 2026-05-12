@@ -7,8 +7,10 @@ import unittest
 from pathlib import Path
 
 from brig.ops.history import (
+    MAX_LOG_SIZE,
     _append_jsonl,
     _extract_cell_name,
+    _maybe_rotate,
     _redact_args,
     _redact_sensitive_value,
     log_lifecycle,
@@ -206,3 +208,46 @@ class TestOperationStartEnd(unittest.TestCase):
             ops_file = Path(tmpdir) / "ops.jsonl"
             log_operation_end({"enabled": False}, operations_file=ops_file)
             self.assertFalse(ops_file.exists())
+
+
+class TestLogRotation(unittest.TestCase):
+    """Test _maybe_rotate() rotates logs at MAX_LOG_SIZE."""
+
+    def test_no_rotation_under_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.jsonl"
+            path.write_text("small\n")
+            _maybe_rotate(path)
+            self.assertTrue(path.exists())
+            self.assertFalse(path.with_suffix(".jsonl.1").exists())
+
+    def test_rotates_at_limit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.jsonl"
+            # Write more than MAX_LOG_SIZE.
+            path.write_text("x" * (MAX_LOG_SIZE + 1))
+            _maybe_rotate(path)
+            # Current file should be gone (renamed to .1).
+            self.assertFalse(path.exists())
+            self.assertTrue(path.with_suffix(".jsonl.1").exists())
+
+    def test_cascading_rotation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.jsonl"
+            path.with_suffix(".jsonl.1").write_text("old-1")
+            path.write_text("x" * (MAX_LOG_SIZE + 1))
+            _maybe_rotate(path)
+            # .1 should have moved to .2, current to .1.
+            self.assertTrue(path.with_suffix(".jsonl.2").exists())
+            self.assertEqual(path.with_suffix(".jsonl.2").read_text(), "old-1")
+
+    def test_max_3_rotations(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test.jsonl"
+            path.with_suffix(".jsonl.1").write_text("old-1")
+            path.with_suffix(".jsonl.2").write_text("old-2-should-be-deleted")
+            path.write_text("x" * (MAX_LOG_SIZE + 1))
+            _maybe_rotate(path)
+            # .2 was the oldest, should be deleted. .1 → .2, current → .1.
+            self.assertFalse(path.with_suffix(".jsonl.3").exists())
+            self.assertEqual(path.with_suffix(".jsonl.2").read_text(), "old-1")

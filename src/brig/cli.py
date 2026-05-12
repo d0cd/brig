@@ -165,6 +165,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_down = sub.add_parser("down", help="Stop all cells + warden")
     p_down.add_argument("--vm", action="store_true", help="Also stop the VM")
     sub.add_parser("profiles", help="List available trust profiles")
+    p_watch = sub.add_parser("watchdog", help="Monitor warden, restart on failure")
+    p_watch.add_argument("--interval", type=int, default=30, help="Check interval (seconds)")
+    p_watch.add_argument("--max-restarts", type=int, default=5, help="Max restart attempts")
 
     # --- System ---
     p_init = sub.add_parser("init", help="Initialize brig")
@@ -254,7 +257,7 @@ def main() -> None:
     from brig.commands import (
         lifecycle_cmd, system_cmd, policy_cmd,
         network_cmd, config_cmd, image_cmd, convenience_cmd,
-        secrets_cmd,
+        secrets_cmd, watchdog_cmd,
     )
 
     dispatch = {
@@ -297,6 +300,7 @@ def main() -> None:
         "up": convenience_cmd.cmd_up,
         "down": convenience_cmd.cmd_down,
         "profiles": convenience_cmd.cmd_profiles,
+        "watchdog": watchdog_cmd.cmd_watchdog,
     }
 
     policy_dispatch = {

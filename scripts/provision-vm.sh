@@ -22,7 +22,12 @@ else
         ARCH=$(uname -m)
         curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" \
             -o /usr/local/bin/runsc
+        curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc.sha512" \
+            -o /tmp/runsc.sha512
+        # Verify download integrity.
+        cd /usr/local/bin && sha512sum -c /tmp/runsc.sha512
         chmod +x /usr/local/bin/runsc
+        rm -f /tmp/runsc.sha512
     '
     echo "  gVisor: installed"
 fi

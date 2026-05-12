@@ -296,6 +296,37 @@ fi
 
 # ---------------------------------------------------------------------------
 info ""
+info "Phase 9: Proxy enforcement (policy test)"
+# ---------------------------------------------------------------------------
+
+POLICY_NAME="smoke-policy-$$"
+echo "  Testing proxy blocks disallowed domain..."
+if $BRIG run --name "$POLICY_NAME" -d alpine sleep 30 2>&1; then
+    # Try to reach a domain NOT in the allowlist — should fail.
+    BLOCKED_OUT=$(limactl shell --workdir / brig -- sudo podman exec "brig-$POLICY_NAME" \
+        wget -q -O- --timeout=5 http://example.com 2>&1 || echo "BLOCKED")
+    if echo "$BLOCKED_OUT" | grep -qi "blocked\|forbidden\|refused\|timed out\|error"; then
+        pass "proxy blocks disallowed domain"
+    else
+        fail "proxy did NOT block disallowed domain (output: $BLOCKED_OUT)"
+    fi
+
+    # Try to reach a domain IN the allowlist — should succeed.
+    ALLOWED_OUT=$(limactl shell --workdir / brig -- sudo podman exec "brig-$POLICY_NAME" \
+        wget -q -O- --timeout=10 http://pypi.org 2>&1 || echo "FAILED")
+    if echo "$ALLOWED_OUT" | grep -qi "failed\|refused\|timed out"; then
+        fail "proxy blocked allowed domain pypi.org"
+    else
+        pass "proxy allows allowlisted domain (pypi.org)"
+    fi
+
+    $BRIG rm -f "$POLICY_NAME" 2>/dev/null
+else
+    fail "policy test cell failed to start"
+fi
+
+# ---------------------------------------------------------------------------
+info ""
 info "=========================================="
 info "Results: ${GREEN}$PASSED passed${NC}, ${RED}$FAILED failed${NC}, ${YELLOW}$SKIPPED skipped${NC}"
 info "=========================================="
