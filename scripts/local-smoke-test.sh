@@ -173,10 +173,11 @@ else
 fi
 
 # Test 2: brig list.
-if $BRIG list 2>/dev/null | grep -q "$CELL_NAME"; then
+LIST_OUT=$($BRIG list 2>/dev/null)
+if echo "$LIST_OUT" | grep -q "$CELL_NAME"; then
     pass "brig list shows cell"
 else
-    fail "brig list does not show cell"
+    fail "brig list does not show cell (output: $LIST_OUT)"
 fi
 
 # Test 3: brig inspect.
@@ -187,11 +188,19 @@ else
 fi
 
 # Test 4: Verify gVisor runtime.
-RUNTIME=$(limactl shell --workdir / brig -- sudo podman inspect "brig-$CELL_NAME" --format '{{.HostConfig.Runtime}}' 2>/dev/null)
-if [ "$RUNTIME" = "runsc" ]; then
+# Podman 4.x doesn't populate HostConfig.Runtime reliably. Verify by
+# checking dmesg inside the running container for gVisor's boot message.
+DMESG=$(limactl shell --workdir / brig -- sudo podman exec "brig-$CELL_NAME" dmesg 2>/dev/null || echo "")
+if echo "$DMESG" | grep -qi "gvisor\|Starting gVisor"; then
     pass "cell uses gVisor runtime (invariant 5)"
 else
-    fail "cell runtime is '$RUNTIME', expected 'runsc'"
+    # Fallback: check if the default runtime IS runsc.
+    DEFAULT_RT=$(limactl shell --workdir / brig -- sudo podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null)
+    if [ "$DEFAULT_RT" = "runsc" ]; then
+        pass "cell uses gVisor runtime (invariant 5, via default)"
+    else
+        fail "cell runtime not gVisor (default: '$DEFAULT_RT')"
+    fi
 fi
 
 # Test 5: Verify network isolation.

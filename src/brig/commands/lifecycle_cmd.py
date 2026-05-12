@@ -13,7 +13,7 @@ from typing import Any
 from brig.cell.lifecycle import kill_cell, rm_cell, run_cell, stop_cell
 from brig.cell.profiles import apply_profile, load_profile
 from brig.cell.spec import CellSpec, load_cell_definition, validate_cell_definition
-from brig.config import CONTAINER_PREFIX
+from brig.config import CONTAINER_PREFIX, PROXY_NAME
 from brig.errors import BrigError
 from brig.ops.logging import info, output
 from brig.vm.shell import vm_run, vm_run_interactive
