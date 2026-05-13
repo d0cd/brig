@@ -153,12 +153,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_imgverify.add_argument("--key", help="Cosign public key")
     p_imgverify.add_argument("--keyless", action="store_true", help="Keyless verification")
 
-    # --- Checkpoint ---
-    p_checkpoint = sub.add_parser("checkpoint", help="Checkpoint running cell")
-    p_checkpoint.add_argument("name", help="Cell name")
-
-    p_restore = sub.add_parser("restore", help="Restore from checkpoint")
-    p_restore.add_argument("checkpoint", help="Checkpoint ID")
 
     # --- Convenience ---
     sub.add_parser("up", help="Ensure VM + warden are running (init if needed)")
@@ -212,14 +206,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cset.add_argument("value", help="Value")
     config_sub.add_parser("reset", help="Reset to defaults")
 
-    # --- TUI/Dashboard ---
-    p_tui = sub.add_parser("tui", help="Launch interactive terminal UI")
-    p_tui.add_argument("--view", choices=["dashboard", "logs", "metrics", "policy"],
-                       default="dashboard", help="Initial view")
-    p_tui.add_argument("--cell", help="Focus on specific cell")
-
-    p_dash = sub.add_parser("dashboard", help="Launch web dashboard")
-    p_dash.add_argument("--port", type=int, default=8080, help="Port")
 
     return parser
 
@@ -287,8 +273,6 @@ def main() -> None:
         "pull": image_cmd.cmd_pull,
         "warmup": image_cmd.cmd_warmup,
         "image-verify": image_cmd.cmd_verify_image,
-        "checkpoint": image_cmd.cmd_checkpoint,
-        "restore": image_cmd.cmd_restore,
         "init": system_cmd.cmd_init,
         "verify": system_cmd.cmd_verify,
         "health": system_cmd.cmd_health,
@@ -329,14 +313,6 @@ def main() -> None:
     elif args.command == "secrets":
         cmd_func = secrets_dispatch.get(args.secrets_command)
         cmd_name = f"secrets.{args.secrets_command}"
-    elif args.command == "tui":
-        from tui import main as tui_main
-        tui_main()
-        return
-    elif args.command == "dashboard":
-        from dashboard import main as dash_main  # type: ignore[attr-defined]
-        dash_main()
-        return
     else:
         cmd_func = dispatch.get(args.command)
         cmd_name = args.command

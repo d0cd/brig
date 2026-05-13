@@ -136,13 +136,6 @@ class TestBrigCliParsing(unittest.TestCase):
         args = self.parser.parse_args(["image-verify", "myimage:latest"])
         self.assertEqual(args.command, "image-verify")
 
-    def test_checkpoint(self):
-        args = self.parser.parse_args(["checkpoint", "mycell"])
-        self.assertEqual(args.command, "checkpoint")
-
-    def test_restore(self):
-        args = self.parser.parse_args(["restore", "chk-123"])
-        self.assertEqual(args.checkpoint, "chk-123")
 
     # --- System ---
 

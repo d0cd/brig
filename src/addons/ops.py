@@ -230,7 +230,7 @@ class OpsAddon:
 
     def _cell_from_flow(self, flow: http.HTTPFlow) -> str:
         """Extract cell name from flow metadata (set by enforce.py)."""
-        return flow.metadata.get("cell_name", "")
+        return flow.metadata.get("cell", "")
 
     def _get_bucket(self, cell_name: str) -> Optional[TokenBucket]:
         """Get or create a token bucket for a cell."""

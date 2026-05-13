@@ -40,13 +40,15 @@ Returned by `Brig.list()` / `Brig.list_sync()`.
 
 ### `CellRunResult`
 
-Returned by `Brig.run()` / `Brig.run_sync()`.
+Returned by `Brig.execute()` / `Brig.execute_sync()`.
 
-| Field          | Type  | Description         |
-|----------------|-------|---------------------|
-| `name`         | `str` | Cell name           |
-| `container_id` | `str` | Container ID        |
-| `success`      | `bool`| Whether run succeeded|
+| Field       | Type   | Description              |
+|-------------|--------|--------------------------|
+| `name`      | `str`  | Cell name                |
+| `exit_code` | `int`  | Process exit code        |
+| `stdout`    | `str`  | Standard output          |
+| `stderr`    | `str`  | Standard error           |
+| `success`   | `bool` | True if exit_code == 0   |
 
 ### `WardenStatus`
 

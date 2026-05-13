@@ -7,7 +7,9 @@ Brig isolates workloads in **cells** — containers with gVisor sandboxing, dedi
 ## Quick Start
 
 ```bash
-# Prerequisites: macOS, Python 3.10+, Lima (brew install lima)
+# Prerequisites: macOS, Python 3.10+, uv, Lima
+# brew install lima
+# curl -LsSf https://astral.sh/uv/install.sh | sh
 
 git clone https://github.com/d0cd/brig.git
 cd brig

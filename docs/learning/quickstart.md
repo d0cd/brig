@@ -6,6 +6,7 @@ Get Brig running in under 5 minutes.
 
 - macOS (Apple Silicon or Intel)
 - Python 3.10+
+- [uv](https://docs.astral.sh/uv/): `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - [Lima](https://lima-vm.io/): `brew install lima`
 
 ## 1. Install and Start
@@ -16,7 +17,7 @@ cd brig
 make setup
 ```
 
-`make up` handles everything: initializes `~/.brig`, creates the Lima VM,
+`make setup` handles everything: initializes `~/.brig`, creates the Lima VM,
 starts the VM, and starts the Warden proxy. First run takes a few minutes
 (VM creation + provisioning). Subsequent runs are fast.
 

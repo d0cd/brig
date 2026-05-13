@@ -212,10 +212,13 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         cmd.extend(["--label", label])
 
     if spec.seccomp_profile:
-        # Block "unconfined" which disables seccomp entirely.
         if spec.seccomp_profile.lower() == "unconfined":
-            raise ValueError("seccomp_profile='unconfined' is not allowed — it disables seccomp")
-        cmd.extend(["--security-opt", f"seccomp={spec.seccomp_profile}"])
+            raise ValueError("seccomp_profile='unconfined' is not allowed")
+        if "/" in spec.seccomp_profile or ".." in spec.seccomp_profile:
+            raise ValueError("seccomp_profile must be a filename, not a path")
+        # Resolve against a known profiles directory.
+        profile_path = VMPaths.CELLS_DIR / "seccomp" / spec.seccomp_profile
+        cmd.extend(["--security-opt", f"seccomp={profile_path}"])
 
     if spec.detach:
         cmd.append("-d")

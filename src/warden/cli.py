@@ -72,12 +72,16 @@ def main() -> None:
         "restart": lambda: (proxy.stop(), _cmd_start(proxy))[1],
         "status": lambda: _cmd_status(proxy),
         "reload": lambda: (0 if proxy.reload_policy() else 1),
+        "preflight": lambda: _cmd_preflight(),
+        "health": lambda: _cmd_health(args, health),
     }
 
     if args.command == "policy":
         exit_code = _handle_policy(args, brig_policy)
     elif args.command == "tor":
         exit_code = _handle_tor(args, tor)
+    elif args.command == "logs":
+        exit_code = _handle_logs(args)
     elif args.command in dispatch:
         exit_code = dispatch[args.command]()
     else:
@@ -157,3 +161,48 @@ def _handle_tor(args: object, tor_mod: object) -> int:
         print(f"Tor: {'running' if running else 'not running'}")
         return 0
     return 1
+
+
+def _cmd_preflight() -> int:
+    """Run preflight checks."""
+    from warden.reconcile import reconcile_subnet_state
+    errors = reconcile_subnet_state()
+    if errors:
+        print("Preflight FAILED:")
+        for e in errors:
+            print(f"  - {e}")
+        return 1
+    print("Preflight checks passed")
+    return 0
+
+
+def _cmd_health(args: object, health_mod: object) -> int:
+    """Run health checks."""
+    from pathlib import Path
+    checks = health_mod.run_all_checks(  # type: ignore[attr-defined]
+        policy_file=Path("/cells/network-policy.json"),
+        log_dir=Path("/var/log/brig/network"),
+    )
+    ok = True
+    for check in checks:
+        status = "[OK]" if check.passed else "[FAIL]"
+        print(f"  {status} {check.message}")
+        if not check.passed:
+            ok = False
+    return 0 if ok else 1
+
+
+def _handle_logs(args: object) -> int:
+    """Handle logs subcommands."""
+    from pathlib import Path
+    from warden.logs import prune_logs
+    cmd = getattr(args, "logs_command", None)
+    if cmd == "prune":
+        days = getattr(args, "days", 7)
+        size = getattr(args, "size", None)
+        stats = prune_logs(Path("/var/log/brig/network"), days=days, size_mb=size)
+        print(f"Removed {stats['removed']} files, compressed {stats['compressed']}")
+        return 0
+    # Default: tail proxy logs.
+    from brig.vm.shell import vm_run_interactive
+    return vm_run_interactive(["podman", "logs", "-f", "warden"])

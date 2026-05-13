@@ -48,16 +48,6 @@ class CellInfo:
     image: str
 
 
-@dataclass
-class CellStats:
-    """Resource usage stats for a cell."""
-    name: str
-    cpu_percent: float = 0.0
-    memory_usage: str = ""
-    memory_limit: str = ""
-    net_io: str = ""
-    block_io: str = ""
-
 
 @dataclass
 class WardenStatus:
