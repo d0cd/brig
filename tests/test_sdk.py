@@ -117,3 +117,54 @@ class TestCell(unittest.TestCase):
         cell = Cell("test")
         logs = cell.logs_sync()
         self.assertIn("hello world", logs)
+
+
+class TestExecuteSync(unittest.TestCase):
+    """Test Brig.execute_sync() — the single-call agent API."""
+
+    @patch("brig.sdk.vm_run")
+    @patch("brig.sdk.run_cell")
+    @patch("brig.sdk.rm_cell")
+    def test_execute_returns_result(self, mock_rm, mock_run, mock_vm_run):
+        import subprocess
+        from brig.cell.reconciler import ReconcileResult
+        mock_run.return_value = ReconcileResult(success=True, container_id="abc")
+        mock_vm_run.side_effect = [
+            # wait
+            subprocess.CompletedProcess([], 0, "0\n", ""),
+            # logs (stdout)
+            subprocess.CompletedProcess([], 0, "hello\n", ""),
+            # logs (stderr)
+            subprocess.CompletedProcess([], 0, "", "some warning\n"),
+        ]
+
+        b = Brig()
+        result = b.execute_sync("alpine", ["echo", "hello"], timeout="30s")
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.success)
+        self.assertIn("hello", result.stdout)
+        mock_rm.assert_called_once()
+
+    @patch("brig.sdk.vm_run")
+    @patch("brig.sdk.run_cell")
+    @patch("brig.sdk.rm_cell")
+    def test_execute_cleans_up_on_failure(self, mock_rm, mock_run, mock_vm_run):
+        import subprocess
+        from brig.cell.reconciler import ReconcileResult
+        mock_run.return_value = ReconcileResult(success=True, container_id="abc")
+        mock_vm_run.side_effect = [
+            # wait — non-zero exit
+            subprocess.CompletedProcess([], 0, "1\n", ""),
+            # logs
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", "error\n"),
+        ]
+
+        b = Brig()
+        result = b.execute_sync("alpine", ["false"], timeout="10s")
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(result.success)
+        # Cell cleaned up even on failure.
+        mock_rm.assert_called_once()

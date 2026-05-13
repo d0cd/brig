@@ -5,11 +5,11 @@ Each cell runs in an isolated network with gVisor sandboxing.
 All egress traffic goes through the Warden policy-enforcing proxy.
 
 SDK usage:
-    from brig.sdk import Brig
+    from brig import Brig
 
     b = Brig()
-    cell = b.run_sync(name="test", image="alpine", command=["echo", "hi"])
-    exit_code = cell.wait_sync()
+    result = b.execute_sync("python:3.12", ["python", "-c", "print('hello')"])
+    print(result.exit_code, result.stdout)
 """
 
 from brig.config import VERSION

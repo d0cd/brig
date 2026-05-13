@@ -108,6 +108,26 @@ def cell(name: str) -> Cell
 
 Get a handle to an existing cell. Raises `CellNotFoundError` if it doesn't exist.
 
+### `Brig.execute()` / `Brig.execute_sync()` — Agent API
+
+Single-call method: runs code, waits for completion, collects output, cleans up.
+
+```python
+async def execute(
+    image: str,
+    command: list[str],
+    name: str | None = None,       # auto-generated if omitted
+    timeout: str = "5m",
+    network: str = "default",      # or "none" for air-gap
+    env: list[str] | None = None,
+    secrets: list[str] | None = None,
+    profile: str | None = None,
+) -> CellRunResult
+```
+
+Returns `CellRunResult(name, exit_code, stdout, stderr, success)`.
+Cell is automatically removed after execution.
+
 ### `Brig.warden`
 
 A `WardenHandle` for proxy management:
@@ -133,29 +153,52 @@ All methods have both async and sync variants (e.g., `wait()` / `wait_sync()`).
 | `rm(force=False)` | `None` | Remove cell and resources      |
 | `logs(tail=None)` | `str`  | Get container logs             |
 | `is_alive()`  | `bool`      | Check if still running         |
+| `copy_in(src, dst)` | `None` | Copy file into cell workspace |
+| `copy_out(src, dst)` | `None` | Copy file from cell (sanitized) |
 
-## Example
+## Examples
+
+### Agent use (single call)
 
 ```python
-from brig.sdk import Brig
+from brig import Brig
 
 b = Brig()
+result = b.execute_sync(
+    "python:3.12",
+    ["python", "-c", "print('hello from sandbox')"],
+    timeout="30s",
+    network="none",  # air-gapped
+)
+print(result.exit_code)  # 0
+print(result.stdout)     # "hello from sandbox\n"
+# Cell is automatically cleaned up.
+```
 
-# Run a cell.
+### Long-running cell with file I/O
+
+```python
+from brig import Brig
+
+b = Brig()
 cell = b.run_sync(
-    name="my-scraper",
+    name="scraper",
     image="python:3.12",
     command=["python", "scrape.py"],
     profile="supervised",
     secrets=["api-key"],
 )
 
+# Copy input file into cell.
+cell.copy_in("./urls.txt", "scraper:/work/urls.txt")
+
 # Wait for completion.
 exit_code = cell.wait_sync(timeout=300)
-print(f"Exited with code {exit_code}")
 
-# Get logs and clean up.
-print(cell.logs_sync())
+# Copy results out (sanitized — unsafe extensions blocked, quarantine applied).
+cell.copy_out("scraper:/work/results.json", "./results.json")
+
+# Clean up.
 cell.rm_sync()
 ```
 

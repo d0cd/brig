@@ -32,9 +32,11 @@ from brig.errors import BrigError
 
 @dataclass
 class CellRunResult:
-    """Result of running a cell."""
+    """Result of running a cell to completion."""
     name: str
-    container_id: str
+    exit_code: int
+    stdout: str
+    stderr: str
     success: bool
 
 
@@ -142,6 +144,16 @@ class Cell:
         state = observe(self.name)
         return state.running
 
+    def copy_in(self, src: str, dst: str) -> None:
+        """Copy a file from host into the cell workspace."""
+        from brig.workspace.workspace import copy_in
+        copy_in(self.name, src, dst)
+
+    def copy_out(self, src: str, dst: str) -> None:
+        """Copy a file from cell workspace to host (with sanitization)."""
+        from brig.workspace.workspace import copy_out
+        copy_out(self.name, src, dst, sanitize=True)
+
 
 class WardenHandle:
     """Handle to the Warden proxy."""
@@ -246,6 +258,83 @@ class Brig:
         spec = CellSpec(**spec_kwargs)
         run_cell(spec)
         return Cell(name)
+
+    async def execute(
+        self,
+        image: str,
+        command: list[str],
+        name: str | None = None,
+        timeout: str = "5m",
+        network: str = "default",
+        env: list[str] | None = None,
+        secrets: list[str] | None = None,
+        profile: str | None = None,
+    ) -> CellRunResult:
+        """Execute code and return the result. Single-call API for agents.
+
+        Runs the command, waits for completion, collects output, cleans up.
+        Returns a CellRunResult with exit_code, stdout, stderr.
+
+        Example:
+            result = await b.execute("python:3.12", ["python", "-c", "print('hi')"])
+            print(result.exit_code, result.stdout)
+        """
+        return await asyncio.to_thread(
+            self.execute_sync,
+            image=image, command=command, name=name, timeout=timeout,
+            network=network, env=env, secrets=secrets, profile=profile,
+        )
+
+    def execute_sync(
+        self,
+        image: str,
+        command: list[str],
+        name: str | None = None,
+        timeout: str = "5m",
+        network: str = "default",
+        env: list[str] | None = None,
+        secrets: list[str] | None = None,
+        profile: str | None = None,
+    ) -> CellRunResult:
+        """Synchronous execute. Runs code, waits, collects output, cleans up."""
+        from brig.cell.names import generate_name
+
+        cell_name = name or generate_name()
+        cell = self.run_sync(
+            name=cell_name, image=image, command=command,
+            env=env, secrets=secrets, network=network,
+            profile=profile, detach=True, timeout=timeout,
+        )
+
+        try:
+            # Wait for completion.
+            timeout_seconds = None
+            if timeout:
+                from brig.cell.spec import parse_duration
+                timeout_seconds = parse_duration(timeout)
+                if timeout_seconds:
+                    timeout_seconds += 10  # Grace period beyond container timeout.
+
+            exit_code = cell.wait_sync(timeout=timeout_seconds)
+
+            # Collect output. Podman logs merges stdout/stderr but we separate
+            # by capturing each stream individually.
+            stdout_result = vm_run(["podman", "logs", "--follow=false", cell._cn])
+            stderr_result = vm_run(["podman", "logs", "--follow=false", cell._cn],
+                                   capture=True)
+
+            return CellRunResult(
+                name=cell_name,
+                exit_code=exit_code,
+                stdout=stdout_result.stdout,
+                stderr=stderr_result.stderr,
+                success=exit_code == 0,
+            )
+        finally:
+            try:
+                cell.rm_sync(force=True)
+            except Exception:
+                pass
 
     async def list_cells(self) -> list[CellInfo]:
         """List all cells."""
