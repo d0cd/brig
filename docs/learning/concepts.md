@@ -279,7 +279,7 @@ Each cell's state is completely separate.
 
 ### Network Logs
 
-Network logs are stored separately in `/var/log/cells/network/` inside the VM. Cells cannot access or modify them.
+Network logs are stored separately in `/var/log/brig/network/` inside the VM. Cells cannot access or modify them.
 
 ---
 

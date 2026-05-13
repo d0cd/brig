@@ -325,7 +325,7 @@ brig kill cell-a && brig rm cell-a
 
 ```bash
 # Run inside VM:
-brig vm shell -- bash -c '
+limactl shell --workdir / brig -- sudo bash -c '
 for net in $(podman network ls --format "{{.Name}}" | grep "^brig-"); do
   echo "== $net =="
   podman network inspect "$net" --format "{{json .Containers}}"
@@ -337,7 +337,7 @@ done
 
 ```bash
 # Check runtime via podman inspect
-brig vm shell -- podman inspect my-cell --format '{{.OCIRuntime}}'
+limactl shell --workdir / brig -- sudo podman inspect my-cell --format '{{.OCIRuntime}}'
 # Should output: runsc
 
 # Verify from inside container
@@ -418,7 +418,7 @@ echo "Exit code: $?"  # MUST be non-zero
 ### Test 14: Subnet Allocator Bounds
 
 ```bash
-brig vm shell -- python3 -c '
+limactl shell --workdir / brig -- sudo python3 -c '
 import json
 state = {"next_index": 255, "allocated": {}, "freed": []}
 if state["next_index"] > 254:
@@ -439,7 +439,7 @@ brig exec test-identity -- curl -s https://httpbin.org/ip
 sleep 1
 
 # Check last log entry
-brig vm shell -- tail -1 /var/log/cells/network/test-identity.jsonl | jq .
+limactl shell --workdir / brig -- sudo tail -1 /var/log/brig/network/test-identity.jsonl | jq .
 # Should show src_ip within expected subnet
 
 # Cleanup
@@ -454,12 +454,12 @@ brig kill test-identity && brig rm test-identity
 
 1. Verify network is `--internal`:
    ```bash
-   brig vm shell -- podman network inspect brig-xxx | grep -i internal
+   limactl shell --workdir / brig -- sudo podman network inspect brig-xxx | grep -i internal
    ```
 
 2. Verify no gateway is set:
    ```bash
-   brig vm shell -- podman network inspect brig-xxx | grep -i gateway
+   limactl shell --workdir / brig -- sudo podman network inspect brig-xxx | grep -i gateway
    ```
 
 3. Recreate the network:
@@ -472,12 +472,12 @@ brig kill test-identity && brig rm test-identity
 
 1. Check containers.conf:
    ```bash
-   brig vm shell -- cat /etc/containers/containers.conf.d/gvisor.conf
+   limactl shell --workdir / brig -- sudo cat /etc/containers/containers.conf.d/gvisor.conf
    ```
 
 2. Verify runsc is installed:
    ```bash
-   brig vm shell -- runsc --version
+   limactl shell --workdir / brig -- sudo runsc --version
    ```
 
 ### Unexpected container on cell network
@@ -489,7 +489,7 @@ brig kill test-identity && brig rm test-identity
 
 2. Disconnect the container:
    ```bash
-   brig vm shell -- podman network disconnect brig-xxx unexpected-container
+   limactl shell --workdir / brig -- sudo podman network disconnect brig-xxx unexpected-container
    ```
 
 ---
@@ -509,15 +509,15 @@ brig start --all
 ```bash
 brig kill --all
 warden stop
-brig vm shell -- 'for net in $(podman network ls -q | grep "^brig-"); do podman network rm "$net" 2>/dev/null; done'
-warden start
+limactl shell --workdir / brig -- sudo 'for net in $(podman network ls -q | grep "^brig-"); do podman network rm "$net" 2>/dev/null; done'
+brig up
 brig start --all
 ```
 
 ### VM Restart (preserves macOS state)
 
 ```bash
-brig vm restart
+limactl stop brig && limactl start brig
 # Proxy starts automatically via systemd
 brig start --all
 ```
@@ -525,7 +525,7 @@ brig start --all
 ### VM Recreate (clean slate VM, preserves macOS state)
 
 ```bash
-brig vm recreate
+limactl delete brig && make setup
 # All VM state destroyed and rebuilt
 brig start --all
 ```
@@ -533,9 +533,9 @@ brig start --all
 ### Full Reset (destroy everything)
 
 ```bash
-brig vm stop
+limactl stop brig
 rm -rf ~/.brig/state/*
-brig vm recreate
+limactl delete brig && make setup
 ```
 
 ### Verify Recovery
