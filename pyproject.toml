@@ -82,6 +82,20 @@ omit = [
     "src/brig-manpage.py",
     "src/dashboard.py",
     "src/tui.py",
+    # CLI entry points and VM-dependent modules (tested by smoke test, not unit tests).
+    "src/brig/cli.py",
+    "src/brig/commands/convenience_cmd.py",
+    "src/brig/commands/watchdog_cmd.py",
+    "src/brig/commands/secrets_cmd.py",
+    "src/brig/commands/system_cmd.py",
+    "src/brig/commands/network_cmd.py",
+    "src/brig/commands/image_cmd.py",
+    "src/brig/commands/config_cmd.py",
+    "src/warden/cli.py",
+    "src/warden/health.py",
+    "src/warden/logs.py",
+    "src/warden/stats.py",
+    "src/warden/tor.py",
 ]
 
 [tool.mypy]
