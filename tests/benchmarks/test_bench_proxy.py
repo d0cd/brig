@@ -109,39 +109,29 @@ def test_bench_token_bucket_consume(benchmark, token_bucket_class):
 # Metrics recording — per-request accounting
 # =========================================================================
 
-@pytest.mark.bench
-def test_bench_histogram_add(benchmark, histogram_class):
-    """HistogramLatencyBuffer.add() — O(1) latency recording."""
-    histogram = histogram_class()
-    counter = [0]
-
-    def add_latency():
-        counter[0] += 1
-        histogram.add(float(counter[0] % 1000))
-
-    benchmark(add_latency)
 
 
 @pytest.mark.bench
-def test_bench_metrics_record(benchmark, metrics_collector_class):
-    """Record a request: get_or_create cell metrics + update counters."""
-    collector = metrics_collector_class()
+def test_bench_metrics_record(benchmark, ops_addon_class):
+    """Record a request: get cell metrics + update counters."""
+    collector = ops_addon_class()
 
     def record():
-        m = collector._get_or_create_metrics("bench-cell")
-        m.total_requests += 1
-        m.bytes_sent += 1234
+        with collector.metrics_lock:
+            m = collector._get_metrics("bench-cell")
+        m.requests += 1
+        m.bytes_received += 1234
 
     benchmark(record)
 
 
 @pytest.mark.bench
-def test_bench_lru_eviction(benchmark, metrics_collector_class):
+def test_bench_lru_eviction(benchmark, ops_addon_class):
     """Eviction cost at capacity — worst case for _get_or_create_metrics."""
-    collector = metrics_collector_class()
+    collector = ops_addon_class()
     for i in range(1000):
         with collector.metrics_lock:
-            from metrics import CellMetrics
+            from ops import CellMetrics
             collector.metrics[f"cell-{i}"] = CellMetrics()
             collector.metrics[f"cell-{i}"].last_request_ts = float(i)
 
@@ -149,7 +139,8 @@ def test_bench_lru_eviction(benchmark, metrics_collector_class):
 
     def create_new_cell():
         counter[0] += 1
-        collector._get_or_create_metrics(f"new-cell-{counter[0]}")
+        with collector.metrics_lock:
+            collector._get_metrics(f"new-cell-{counter[0]}")
 
     benchmark(create_new_cell)
 
@@ -214,7 +205,7 @@ def test_bench_throughput_concurrent(benchmark, policy_class):
 
 @pytest.mark.bench
 def test_bench_full_addon_chain(benchmark, policy_class, token_bucket_class,
-                                 metrics_collector_class, log_filter_class):
+                                 ops_addon_class, log_filter_class):
     """Simulated full addon chain: enforce + ratelimit + log + metrics.
 
     This is the most important benchmark — it measures the total CPU cost
@@ -225,7 +216,7 @@ def test_bench_full_addon_chain(benchmark, policy_class, token_bucket_class,
         deny=["evil.com"],
     )
     bucket = token_bucket_class(rate=10000, burst=50000)
-    collector = metrics_collector_class()
+    collector = ops_addon_class()
     log_filter = log_filter_class({
         "exclude_hosts": [],
         "exclude_paths": ["/healthz"],
@@ -247,8 +238,9 @@ def test_bench_full_addon_chain(benchmark, policy_class, token_bucket_class,
             json.dumps({"host": host, "path": path, "status": 200})
 
         # 4. Metrics update.
-        m = collector._get_or_create_metrics("bench-cell")
-        m.total_requests += 1
+        with collector.metrics_lock:
+            m = collector._get_metrics("bench-cell")
+        m.requests += 1
 
     benchmark(full_chain)
 

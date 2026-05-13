@@ -50,30 +50,23 @@ def policy_enforcer_class():
 
 @pytest.fixture(scope="session")
 def token_bucket_class():
-    """TokenBucket class from ratelimit.py."""
-    from ratelimit import TokenBucket
+    """TokenBucket class from ops.py."""
+    from ops import TokenBucket
     return TokenBucket
 
 
 @pytest.fixture(scope="session")
-def histogram_class():
-    """HistogramLatencyBuffer class from metrics.py."""
-    from metrics import HistogramLatencyBuffer
-    return HistogramLatencyBuffer
-
-
-@pytest.fixture(scope="session")
 def cell_metrics_class():
-    """CellMetrics class from metrics.py."""
-    from metrics import CellMetrics
+    """CellMetrics class from ops.py."""
+    from ops import CellMetrics
     return CellMetrics
 
 
 @pytest.fixture(scope="session")
-def metrics_collector_class():
-    """MetricsCollector class from metrics.py."""
-    from metrics import MetricsCollector
-    return MetricsCollector
+def ops_addon_class():
+    """OpsAddon class from ops.py (replaces MetricsCollector)."""
+    from ops import OpsAddon
+    return OpsAddon
 
 
 @pytest.fixture(scope="session")
@@ -85,12 +78,9 @@ def log_filter_class():
 
 @pytest.fixture(scope="session")
 def brig_module():
-    """Import brig.py via importlib (requires mocking subprocess)."""
-    spec = importlib.util.spec_from_file_location("brig_main", SRC_DIR / "brig.py")
-    mod = importlib.util.module_from_spec(spec)
-    # Brig imports brig.config which needs the brig package on path.
-    spec.loader.exec_module(mod)
-    return mod
+    """Import brig domain modules."""
+    import brig.cell.spec as spec_mod
+    return spec_mod
 
 
 @pytest.fixture
