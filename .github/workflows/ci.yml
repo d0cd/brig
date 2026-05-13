@@ -122,3 +122,4 @@ jobs:
         with:
           scandir: '.'
           severity: warning
+          ignore_paths: 'src/brig-completion.zsh'
