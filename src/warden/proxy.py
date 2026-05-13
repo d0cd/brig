@@ -48,9 +48,7 @@ def container_exists() -> bool:
 
 def stop(timeout: int = 10) -> bool:
     """Stop the proxy container gracefully. Idempotent."""
-    result = vm_run(
-        ["podman", "stop", "-t", str(timeout), PROXY_NAME],
-    )
+    vm_run(["podman", "stop", "-t", str(timeout), PROXY_NAME])
     # Clean up stopped container regardless.
     vm_run(
         ["podman", "rm", PROXY_NAME],
@@ -88,7 +86,7 @@ def start() -> bool:
     for addon in required_addons:
         if not (HostPaths.ADDONS_DIR / addon).exists():
             debug(f"Required addon missing: {HostPaths.ADDONS_DIR / addon}")
-            info(f"Run: make install (to copy addons)")
+            info("Run: make install (to copy addons)")
             return False
 
     if not HostPaths.NETWORK_POLICY.exists():

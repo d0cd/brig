@@ -22,7 +22,9 @@ class CheckResult:
     details: list[str] | None = None
 
 
-def _run(cmd: list[str], timeout: int = 10) -> object:
+import subprocess as _subprocess
+
+def _run(cmd: list[str], timeout: int = 10) -> _subprocess.CompletedProcess[str]:
     """Run a command inside the VM for verification."""
     return vm_run(cmd, timeout=timeout)
 

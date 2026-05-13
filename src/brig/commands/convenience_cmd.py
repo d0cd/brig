@@ -56,7 +56,7 @@ def cmd_up(args: Any) -> int:
 
     # Step 4: start warden if not running.
     from brig.vm.shell import vm_run
-    result = vm_run(
+    result = vm_run(  # type: ignore[assignment]
         ["podman", "inspect", "warden", "--format", "{{.State.Status}}"],
         timeout=5,
     )

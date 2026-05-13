@@ -75,7 +75,7 @@ class TestAllocateAndFree(unittest.TestCase):
 
     def test_freed_index_reuse(self):
         allocate("cell-a", self.state_file, self.lock_file)
-        info2 = allocate("cell-b", self.state_file, self.lock_file)
+        allocate("cell-b", self.state_file, self.lock_file)
         free("cell-a", self.state_file, self.lock_file)
 
         # Next allocation should reuse index 1.

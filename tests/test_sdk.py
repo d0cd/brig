@@ -54,7 +54,8 @@ class TestBrigListSync(unittest.TestCase):
 
     @patch("brig.sdk.vm_run")
     def test_list_with_cells(self, mock_run):
-        import json, subprocess
+        import json
+        import subprocess
         containers = [
             {"Names": ["brig-cell1"], "State": "running", "Image": "alpine"},
             {"Names": ["warden"], "State": "running", "Image": "mitmproxy"},

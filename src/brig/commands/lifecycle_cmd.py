@@ -53,7 +53,7 @@ def cmd_run(args: Any) -> int:
         cell_def = load_cell_definition(args.file)
         errors = validate_cell_definition(cell_def, args.file)
         if errors:
-            raise BrigError(f"Invalid cell definition:\n  - " + "\n  - ".join(errors))
+            raise BrigError("Invalid cell definition:\n  - " + "\n  - ".join(errors))
         for key in ("image", "name"):
             if key in cell_def and not getattr(args, key, None):
                 spec_kwargs[key] = cell_def[key]

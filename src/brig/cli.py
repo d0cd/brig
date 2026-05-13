@@ -170,7 +170,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--max-restarts", type=int, default=5, help="Max restart attempts")
 
     # --- System ---
-    p_init = sub.add_parser("init", help="Initialize brig")
+    sub.add_parser("init", help="Initialize brig")
 
     p_verify = sub.add_parser("verify", help="Verify security invariants")
     p_verify.add_argument("--fix", action="store_true", help="Auto-fix issues")
@@ -248,7 +248,7 @@ def main() -> None:
         if not vm_running():
             # Allow init-adjacent commands through with a warning.
             if args.command not in {"health", "preflight"}:
-                print(f"ERROR: Brig VM is not running", file=sys.stderr)
+                print("ERROR: Brig VM is not running", file=sys.stderr)
                 print("  Start it with: limactl start brig", file=sys.stderr)
                 print("  Or initialize: brig init && limactl create --name=brig ~/.brig/lima.yaml", file=sys.stderr)
                 sys.exit(1)
@@ -334,7 +334,7 @@ def main() -> None:
         tui_main()
         return
     elif args.command == "dashboard":
-        from dashboard import main as dash_main
+        from dashboard import main as dash_main  # type: ignore[attr-defined]
         dash_main()
         return
     else:

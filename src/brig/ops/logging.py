@@ -166,14 +166,13 @@ class Spinner:
             self.thread.start()
         return self
 
-    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> bool:
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         self.running = False
         if self.thread:
             self.thread.join(timeout=0.2)
         if sys.stderr.isatty() and not _state["debug"] and not _state["quiet"]:
             sys.stderr.write("\r" + " " * (len(self.message) + 3) + "\r")
             sys.stderr.flush()
-        return False
 
     def success(self, message: str | None = None) -> None:
         """Show success message and stop spinner."""

@@ -37,7 +37,7 @@ def verify_image_signature(
     Note: cosign runs on macOS host, not in the VM.
     """
     result = subprocess.run(
-        ["which", "cosign"], check=False, capture_output=True,
+        ["which", "cosign"], check=False, capture_output=True, text=True,
     )
     if result.returncode != 0:
         debug(f"Verifying image with podman trust: {image}")

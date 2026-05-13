@@ -42,7 +42,7 @@ class TestFullRunCommandChain(unittest.TestCase):
         cmd = build_run_command(spec, "10.60.42.1")
 
         # Container name.
-        self.assertIn(f"--name", cmd)
+        self.assertIn("--name", cmd)
         self.assertIn(f"{CONTAINER_PREFIX}smoke-test", cmd)
 
         # Invariant 5: gVisor runtime.

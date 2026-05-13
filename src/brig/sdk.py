@@ -247,7 +247,7 @@ class Brig:
         run_cell(spec)
         return Cell(name)
 
-    async def list(self) -> list[CellInfo]:
+    async def list_cells(self) -> list[CellInfo]:
         """List all cells."""
         return await asyncio.to_thread(self.list_sync)
 

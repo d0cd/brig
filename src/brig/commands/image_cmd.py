@@ -30,9 +30,7 @@ def cmd_warmup(args: Any) -> int:
 
     profile_name = getattr(args, "profile", None)
     if profile_name:
-        profiles = {profile_name: load_profile(profile_name)}
-    else:
-        profiles = BUILTIN_PROFILES
+        load_profile(profile_name)  # Validate profile exists.
 
     # Warmup just ensures the proxy image is available.
     output("Warming up proxy image...")

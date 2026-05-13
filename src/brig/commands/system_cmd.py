@@ -64,8 +64,8 @@ def cmd_init(args: Any) -> int:
     output(f"Initialized brig at {BRIG_HOME}")
     output("")
     output("Next steps:")
-    output(f"  brig up                 # create VM, start VM, start warden")
-    output(f"  brig run alpine echo hi # run your first cell")
+    output("  brig up                 # create VM, start VM, start warden")
+    output("  brig run alpine echo hi # run your first cell")
     return 0
 
 
@@ -176,8 +176,8 @@ def cmd_metrics(args: Any) -> int:
     from brig.network.subnet import list_all
 
     subnets = list_all()
-    output(f"# HELP brig_cells_total Number of allocated cells")
-    output(f"# TYPE brig_cells_total gauge")
+    output("# HELP brig_cells_total Number of allocated cells")
+    output("# TYPE brig_cells_total gauge")
     output(f"brig_cells_total {len(subnets)}")
 
     result = vm_run(
@@ -195,8 +195,8 @@ def cmd_metrics(args: Any) -> int:
         except json.JSONDecodeError:
             pass
 
-    output(f"# HELP brig_cells_running Number of running cells")
-    output(f"# TYPE brig_cells_running gauge")
+    output("# HELP brig_cells_running Number of running cells")
+    output("# TYPE brig_cells_running gauge")
     output(f"brig_cells_running {running}")
     return 0
 
