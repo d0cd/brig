@@ -88,6 +88,11 @@ def cmd_run(args: Any) -> int:
     if args.policy_deny:
         spec_kwargs["policy_deny"] = args.policy_deny
 
+    # Ingress from cell definition file (no CLI flag — file-only).
+    if args.file:
+        if "ingress" in cell_def:
+            spec_kwargs["ingress"] = cell_def["ingress"]
+
     # Filter to CellSpec fields only — profiles may add extra keys like 'runtime'.
     import dataclasses
     valid_fields = {f.name for f in dataclasses.fields(CellSpec)}

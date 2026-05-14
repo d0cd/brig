@@ -652,7 +652,22 @@ class PolicyEnforcer:
         return header_host != url_host
 
     def request(self, flow: http.HTTPFlow) -> None:
-        """Process each HTTP request."""
+        """Process each HTTP request.
+
+        Egress traffic (port 8080): full policy enforcement.
+        Ingress traffic (port 8443): handled by ingress addon. If the ingress
+        addon has already processed the request (set metadata), allow it.
+        Otherwise block — fail closed.
+        """
+        listen_port = flow.client_conn.sockname[1] if flow.client_conn.sockname else 0
+        if listen_port == 8443:
+            # Ingress addon sets this flag after successful auth + routing.
+            if flow.metadata.get("ingress"):
+                return
+            # Ingress addon did not handle this request — block.
+            self._block(flow, "ingress: not handled by ingress addon (fail closed)")
+            return
+
         # Drain any deferred SIGHUP reload. Double-checked under _reload_lock
         # so concurrent requests do not both run the reload body.
         self._check_reload()
@@ -742,7 +757,16 @@ class PolicyEnforcer:
         ctx.log.info(f"BLOCKED: {safe_host}{safe_path} - {safe_reason}")
 
     def http_connect(self, flow: http.HTTPFlow) -> None:
-        """Enforce port and domain policy on CONNECT tunnels."""
+        """Enforce port and domain policy on CONNECT tunnels.
+
+        CONNECT is blocked entirely on the ingress port — reverse proxy
+        ingress does not support tunneling.
+        """
+        listen_port = flow.client_conn.sockname[1] if flow.client_conn.sockname else 0
+        if listen_port == 8443:
+            self._block(flow, "CONNECT not allowed on ingress port")
+            return
+
         self._check_reload()
 
         host = flow.request.host
@@ -815,6 +839,25 @@ class PolicyEnforcer:
                 data.server.close()
             except Exception:
                 pass
+
+    def websocket_message(self, flow: http.HTTPFlow) -> None:
+        """Log WebSocket messages on established connections.
+
+        The initial HTTP upgrade is already checked by request()/http_connect()
+        against the domain allowlist. This hook only logs frame metadata for
+        observability — it does not re-check policy (the connection is already
+        allowed).
+        """
+        message = flow.websocket.messages[-1] if flow.websocket and flow.websocket.messages else None
+        if message is None:
+            return
+        cell_name = flow.metadata.get("cell", "unknown")
+        direction = "client" if message.from_client else "server"
+        safe_host = re.sub(r'[\x00-\x1f\x7f]', '', flow.request.host)
+        ctx.log.debug(
+            f"WS: {cell_name} {direction} {safe_host} "
+            f"{'text' if message.is_text else 'binary'} {len(message.content)}b"
+        )
 
     def responseheaders(self, flow: http.HTTPFlow) -> None:
         """Block responses from connections that resolved to internal IPs.

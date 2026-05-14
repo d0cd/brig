@@ -24,6 +24,7 @@ from brig.ops.logging import debug
 from brig.vm.shell import vm_run
 
 
+
 class ActionType(Enum):
     """Types of reconciliation actions."""
     ALLOCATE_SUBNET = auto()

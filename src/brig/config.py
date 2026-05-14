@@ -58,6 +58,13 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
     "*.home", "*.lan", "*.corp", "*.private",
 ]
 
+# Ingress (authenticated reverse proxy through Warden).
+INGRESS_PORT = 8443
+MAX_INGRESS_PER_CELL = 8
+INGRESS_AUTH_METHODS = {"token"}
+INGRESS_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
+INGRESS_PATH_PREFIX_PATTERN = re.compile(r'^/[a-zA-Z0-9/_-]+$')
+
 # Unsafe file extensions for --sanitize mode.
 UNSAFE_EXTENSIONS = {
     ".app", ".command", ".scpt", ".dmg", ".pkg", ".webloc",
@@ -83,6 +90,9 @@ class HostPaths:
     LIMA_YAML = BRIG_HOME / "lima.yaml"
     NETWORK_POLICY = CELLS_DIR / "network-policy.json"
     CONFIG_FILE = CELLS_DIR / "config.json"
+
+    # Ingress routes (host-side, synced to VM).
+    INGRESS_ROUTES_FILE = STATE_DIR / "system" / "ingress-routes.json"
 
     # Rate limit state (host-side, used before entering VM).
     RATE_LIMIT_FILE = STATE_DIR / "system" / "rate_limit.json"
@@ -112,6 +122,9 @@ class VMPaths:
 
     # Per-cell policy directory (inside VM).
     POLICY_DIR = Path("/var/run/brig/policies")
+
+    # Ingress routes file (inside VM).
+    INGRESS_ROUTES_FILE = Path("/var/run/brig/ingress-routes.json")
 
     # Logs (inside VM).
     LOG_DIR = Path("/var/log/brig/network")

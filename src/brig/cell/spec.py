@@ -13,7 +13,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from brig.config import CELL_NAME_PATTERN, DOMAIN_PATTERN, MEMORY_PATTERN
+from brig.config import (
+    CELL_NAME_PATTERN,
+    DOMAIN_PATTERN,
+    INGRESS_AUTH_METHODS,
+    INGRESS_NAME_PATTERN,
+    INGRESS_PATH_PREFIX_PATTERN,
+    MAX_INGRESS_PER_CELL,
+    MEMORY_PATTERN,
+)
 from brig.network.validation import is_suspicious_domain
 
 try:
@@ -83,6 +91,7 @@ class CellSpec:
     workdir: str | None = None
     image_digest: str | None = None
     profile: str | None = None
+    ingress: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate inputs at construction time — the system boundary."""
@@ -233,6 +242,80 @@ def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> l
     if "detach" in cell_def:
         if not isinstance(cell_def["detach"], bool):
             errors.append(f"'detach' must be a boolean{context}")
+
+    # Ingress (authenticated reverse proxy endpoints).
+    if "ingress" in cell_def:
+        ingress = cell_def["ingress"]
+        if not isinstance(ingress, list):
+            errors.append(f"'ingress' must be a list{context}")
+        else:
+            if len(ingress) > MAX_INGRESS_PER_CELL:
+                errors.append(
+                    f"Too many ingress entries ({len(ingress)}), "
+                    f"max {MAX_INGRESS_PER_CELL}{context}"
+                )
+            seen_names = set()
+            seen_prefixes = set()
+            for i, entry in enumerate(ingress):
+                if not isinstance(entry, dict):
+                    errors.append(f"'ingress[{i}]' must be a dict{context}")
+                    continue
+
+                # Name: required, alphanumeric with hyphens.
+                name = entry.get("name")
+                if not name or not isinstance(name, str):
+                    errors.append(f"'ingress[{i}].name' is required and must be a string{context}")
+                elif not INGRESS_NAME_PATTERN.match(name):
+                    errors.append(
+                        f"'ingress[{i}].name' must be lowercase alphanumeric "
+                        f"with hyphens, max 31 chars{context}"
+                    )
+                elif name in seen_names:
+                    errors.append(f"Duplicate ingress name '{name}'{context}")
+                else:
+                    seen_names.add(name)
+
+                # Port: required, integer 1-65535.
+                port = entry.get("port")
+                if port is None:
+                    errors.append(f"'ingress[{i}].port' is required{context}")
+                elif not isinstance(port, int) or port < 1 or port > 65535:
+                    errors.append(f"'ingress[{i}].port' must be an integer 1-65535{context}")
+
+                # Path prefix: required, must start with /, no traversal.
+                path_prefix = entry.get("path_prefix")
+                if not path_prefix or not isinstance(path_prefix, str):
+                    errors.append(f"'ingress[{i}].path_prefix' is required and must be a string{context}")
+                elif not path_prefix.startswith("/"):
+                    errors.append(f"'ingress[{i}].path_prefix' must start with '/'{context}")
+                elif ".." in path_prefix:
+                    errors.append(f"'ingress[{i}].path_prefix' must not contain '..'{context}")
+                elif not INGRESS_PATH_PREFIX_PATTERN.match(path_prefix):
+                    errors.append(
+                        f"'ingress[{i}].path_prefix' contains invalid characters "
+                        f"(only alphanumeric, /, -, _ allowed){context}"
+                    )
+                elif path_prefix in seen_prefixes:
+                    errors.append(f"Duplicate ingress path_prefix '{path_prefix}'{context}")
+                else:
+                    seen_prefixes.add(path_prefix)
+
+                # Auth: required, must be a supported method.
+                auth = entry.get("auth")
+                if not auth or not isinstance(auth, str):
+                    errors.append(f"'ingress[{i}].auth' is required and must be a string{context}")
+                elif auth not in INGRESS_AUTH_METHODS:
+                    errors.append(
+                        f"'ingress[{i}].auth' must be one of: "
+                        f"{', '.join(sorted(INGRESS_AUTH_METHODS))}{context}"
+                    )
+
+            # Ingress requires network=default (not airgapped).
+            net = cell_def.get("network", "default")
+            if isinstance(net, str) and net == "none" and ingress:
+                errors.append(
+                    f"'ingress' cannot be used with network='none' (airgapped){context}"
+                )
 
     return errors
 

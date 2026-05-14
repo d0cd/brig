@@ -681,6 +681,31 @@ class RequestLogger:
         # Write log.
         self._write_log(cell_name, entry)
 
+    def websocket_message(self, flow: http.HTTPFlow) -> None:
+        """Log WebSocket frame metadata for observability."""
+        message = flow.websocket.messages[-1] if flow.websocket and flow.websocket.messages else None
+        if message is None:
+            return
+
+        cell_name = flow.metadata.get("cell")
+        if not cell_name or cell_name == "unknown":
+            client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
+            cell_name = self._get_cell_name(client_ip)
+
+        entry = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "cell": cell_name or "unknown",
+            "src_ip": flow.client_conn.peername[0] if flow.client_conn.peername else "unknown",
+            "type": "websocket",
+            "host": flow.request.host,
+            "path": _redact_path(flow.request.path),
+            "direction": "client" if message.from_client else "server",
+            "frame_type": "text" if message.is_text else "binary",
+            "frame_size": len(message.content),
+        }
+
+        self._write_log(cell_name, entry)
+
     def _extract_error_details(self, flow: http.HTTPFlow) -> dict:
         """Extract detailed error information from flow."""
         import errno
