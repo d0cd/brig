@@ -125,7 +125,7 @@ def _validate_domains(domains: list[str]) -> None:
 
 
 def _apply_policy_changes(args: Any, policy: dict) -> dict:
-    """Apply --allow/--deny/--remove-allow/--remove-deny to a policy dict."""
+    """Apply --allow/--deny/--remove-allow/--remove-deny/--host-service to a policy dict."""
     changes: dict[str, list[str]] = {}
 
     if getattr(args, "allow", None):
@@ -152,4 +152,58 @@ def _apply_policy_changes(args: Any, policy: dict) -> dict:
                 deny_list.remove(domain)
         changes["remove_deny"] = args.remove_deny
 
+    # Host services.
+    if getattr(args, "host_service", None):
+        _apply_host_service_additions(args.host_service, policy)
+        changes["add_host_services"] = args.host_service
+
+    if getattr(args, "remove_host_service", None):
+        _apply_host_service_removals(args.remove_host_service, policy)
+        changes["remove_host_services"] = args.remove_host_service
+
     return changes
+
+
+def _apply_host_service_additions(services: list[str], policy: dict) -> None:
+    """Parse and add host service entries (name:port format)."""
+    import re
+    from brig.config import HOST_SERVICE_NAME_PATTERN, MAX_HOST_SERVICES
+
+    host_services = policy.setdefault("host_services", [])
+
+    for spec in services:
+        if ":" not in spec:
+            raise BrigError(
+                f"Invalid host service format: {spec}",
+                suggestion="Use name:port format, e.g. aitelier:7777",
+            )
+        name, port_str = spec.rsplit(":", 1)
+        if not HOST_SERVICE_NAME_PATTERN.match(name):
+            raise BrigError(
+                f"Invalid host service name: {name}",
+                suggestion="Use lowercase alphanumeric with hyphens, max 31 chars",
+            )
+        try:
+            port = int(port_str)
+            if port < 1 or port > 65535:
+                raise ValueError
+        except ValueError:
+            raise BrigError(f"Invalid port for host service '{name}': {port_str}")
+
+        # Remove existing entry with same name (idempotent update).
+        host_services[:] = [s for s in host_services if s.get("name") != name]
+
+        if len(host_services) >= MAX_HOST_SERVICES:
+            raise BrigError(
+                f"Too many host services (max {MAX_HOST_SERVICES})",
+            )
+
+        host_services.append({"name": name, "port": port})
+
+
+def _apply_host_service_removals(names: list[str], policy: dict) -> None:
+    """Remove host services by name."""
+    host_services = policy.get("host_services", [])
+    policy["host_services"] = [
+        s for s in host_services if s.get("name") not in names
+    ]

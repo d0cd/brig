@@ -58,6 +58,11 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
     "*.home", "*.lan", "*.corp", "*.private",
 ]
 
+# Host services (cell → host forwarding through Warden).
+HOST_SERVICE_DOMAIN_SUFFIX = ".host.brig"
+HOST_SERVICE_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
+MAX_HOST_SERVICES = 16
+
 # Ingress (authenticated reverse proxy through Warden).
 INGRESS_PORT = 8443
 MAX_INGRESS_PER_CELL = 8

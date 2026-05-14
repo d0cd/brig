@@ -678,6 +678,11 @@ class RequestLogger:
         if policy_trace:
             entry["policy_trace"] = policy_trace
 
+        # Add host service attribution.
+        host_service = flow.metadata.get("host_service")
+        if host_service:
+            entry["host_service"] = host_service
+
         # Write log.
         self._write_log(cell_name, entry)
 

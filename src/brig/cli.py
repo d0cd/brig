@@ -195,6 +195,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pset.add_argument("--deny", action="append", help="Add denied domain")
     p_pset.add_argument("--remove-allow", action="append", help="Remove allowed domain")
     p_pset.add_argument("--remove-deny", action="append", help="Remove denied domain")
+    p_pset.add_argument("--host-service", action="append",
+                        help="Add host service (name:port, e.g. aitelier:7777)")
+    p_pset.add_argument("--remove-host-service", action="append",
+                        help="Remove host service by name")
 
     # --- Config ---
     p_config = sub.add_parser("config", help="Manage configuration")

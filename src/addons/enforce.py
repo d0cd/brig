@@ -46,6 +46,10 @@ from mitmproxy import ctx, http
 # Policy file path (mounted into container).
 POLICY_FILE = Path("/policy.json")
 
+# Host service virtual domain suffix. Cells request <name>.host.brig;
+# Warden rewrites to the macOS host IP + declared port.
+HOST_SERVICE_SUFFIX = ".host.brig"
+
 # Subnet map for cell identification.
 SUBNET_MAP_FILE = Path("/var/run/cells/subnet-map.json")
 
@@ -369,6 +373,12 @@ class PolicyEnforcer:
         self.trace_config = PolicyTraceConfig()
         self._cell_policy_lock = threading.Lock()
         self._reload_lock = threading.RLock()
+        # Host services: name → port mapping for cell → host forwarding.
+        self.host_services: dict[str, int] = {}
+        self._host_ip: str = ""
+        # Set of (host_ip, port) tuples for host-service-rewritten connections.
+        # server_connected/responseheaders check this to skip blocked-IP checks.
+        self._host_service_targets: set[tuple[str, int]] = set()
 
     def load(self, loader):
         """Called when addon is loaded.
@@ -378,10 +388,47 @@ class PolicyEnforcer:
         empty allow/deny list (which defaults-deny but looks healthy).
         """
         ctx.log.info("PolicyEnforcer: Loading...")
+        self._discover_host_ip()
         self._reload_policy(strict=True)
         self._reload_subnet_map()
         self._reload_cell_policies()
         ctx.log.info("PolicyEnforcer: Loaded")
+
+    def _discover_host_ip(self) -> None:
+        """Discover the macOS host IP from inside the Lima VM.
+
+        Tries host.lima.internal first (Lima's built-in host alias),
+        then falls back to the default gateway IP.
+        """
+        import socket
+        import subprocess
+
+        # Try Lima's host alias.
+        try:
+            self._host_ip = socket.gethostbyname("host.lima.internal")
+            ctx.log.info(f"PolicyEnforcer: Host IP (Lima): {self._host_ip}")
+            return
+        except socket.gaierror:
+            pass
+
+        # Fallback: default gateway (works on most Linux VMs).
+        try:
+            result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for part in result.stdout.split():
+                try:
+                    ipaddress.ip_address(part)
+                    self._host_ip = part
+                    ctx.log.info(f"PolicyEnforcer: Host IP (gateway): {self._host_ip}")
+                    return
+                except ValueError:
+                    continue
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        ctx.log.warn("PolicyEnforcer: Could not discover host IP — host services disabled")
 
     def configure(self, updated):
         """Called by mitmproxy on configuration changes and periodically.
@@ -461,6 +508,37 @@ class PolicyEnforcer:
             trace_config = data.get("policy_trace", {})
             self.trace_config = PolicyTraceConfig(trace_config)
 
+            # Load host services with strict validation.
+            new_host_services: dict[str, int] = {}
+            for svc in data.get("host_services", []):
+                if not isinstance(svc, dict):
+                    continue
+                svc_name = svc.get("name")
+                svc_port = svc.get("port")
+                if not isinstance(svc_name, str) or not isinstance(svc_port, int):
+                    continue
+                # Validate name: lowercase alphanumeric + hyphens, max 31 chars.
+                if not re.match(r'^[a-z0-9][a-z0-9-]{0,30}$', svc_name):
+                    ctx.log.warn(
+                        f"PolicyEnforcer: Skipping host service with invalid name: "
+                        f"{svc_name!r}"
+                    )
+                    continue
+                # Validate port: 1-65535.
+                if svc_port < 1 or svc_port > 65535:
+                    ctx.log.warn(
+                        f"PolicyEnforcer: Skipping host service '{svc_name}' with "
+                        f"invalid port: {svc_port}"
+                    )
+                    continue
+                new_host_services[svc_name] = svc_port
+            self.host_services = new_host_services
+            # Rebuild host service targets set.
+            if self._host_ip:
+                self._host_service_targets = {
+                    (self._host_ip, port) for port in new_host_services.values()
+                }
+
             self.policy_mtime = mtime
 
             ctx.log.info(
@@ -468,6 +546,11 @@ class PolicyEnforcer:
                 f"{len(self.global_policy.allow_rules)} allow, "
                 f"{len(self.global_policy.deny_rules)} deny rules"
             )
+            if self.host_services:
+                ctx.log.info(
+                    f"PolicyEnforcer: {len(self.host_services)} host services: "
+                    f"{', '.join(sorted(self.host_services))}"
+                )
             if self.trace_config.enabled:
                 ctx.log.info("PolicyEnforcer: Policy tracing enabled")
 
@@ -686,6 +769,12 @@ class PolicyEnforcer:
         flow.metadata["cell"] = cell_name or "unknown"
         flow.metadata["client_ip"] = client_ip
 
+        # Check 0: Host services — virtual .host.brig domains.
+        # Must come before port/IP checks since we rewrite to a private IP.
+        if host.endswith(HOST_SERVICE_SUFFIX):
+            self._handle_host_service(flow, host, cell_name)
+            return
+
         # Check 1: Port restriction.
         if port not in ALLOWED_PORTS:
             self._block(flow, f"port {port} not allowed (only 80, 443)")
@@ -740,6 +829,42 @@ class PolicyEnforcer:
         # Default: Block.
         self._block(flow, f"global policy: {reason}")
 
+    def _handle_host_service(self, flow: http.HTTPFlow, host: str, cell_name: str | None) -> None:
+        """Route a .host.brig request to the macOS host.
+
+        Validates the service name, rewrites host/port, tags metadata.
+        Blocks if service is unknown or host IP is not discovered.
+        """
+        service_name = host[: -len(HOST_SERVICE_SUFFIX)]
+        safe_name = re.sub(r'[\x00-\x1f\x7f]', '', service_name)
+
+        if not self._host_ip:
+            self._block(flow, f"host service '{safe_name}': host IP not discovered")
+            return
+
+        service_port = self.host_services.get(service_name)
+        if service_port is None:
+            self._block(flow, f"unknown host service: {safe_name}")
+            return
+
+        # Rewrite request to target the macOS host.
+        flow.request.host = self._host_ip
+        flow.request.port = service_port
+        flow.request.headers["Host"] = f"{service_name}.host.brig"
+
+        # Register target so server_connected/responseheaders skip the
+        # blocked-IP check for this connection (the host IP is private).
+        self._host_service_targets.add((self._host_ip, service_port))
+
+        flow.metadata["host_service"] = service_name
+        flow.metadata["cell"] = cell_name or "unknown"
+        flow.metadata["policy_reason"] = f"host_service:{service_name}"
+
+        ctx.log.info(
+            f"HOST_SERVICE: {cell_name or 'unknown'} -> "
+            f"{service_name} ({self._host_ip}:{service_port})"
+        )
+
     def _block(self, flow: http.HTTPFlow, reason: str) -> None:
         """Block the request with a 403 response."""
         flow.metadata["blocked"] = True
@@ -771,6 +896,13 @@ class PolicyEnforcer:
 
         host = flow.request.host
         port = flow.request.port
+
+        # Host services — rewrite .host.brig CONNECT tunnels.
+        if host.endswith(HOST_SERVICE_SUFFIX):
+            client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
+            cell_name = self._get_cell_name(client_ip)
+            self._handle_host_service(flow, host, cell_name)
+            return
 
         if port not in ALLOWED_PORTS:
             self._block(flow, f"port {port} not allowed (only 80, 443)")
@@ -821,11 +953,19 @@ class PolicyEnforcer:
         """Check resolved IP against blocked ranges after DNS resolution.
 
         Fails closed: if IP validation raises an exception, kill the connection.
+        Skips check for host-service-rewritten connections (the target IP
+        is private by design).
         """
         try:
             peername = data.server.peername
             if peername:
                 ip_str = peername[0]
+                port = peername[1] if len(peername) > 1 else 0
+
+                # Skip blocked-IP check for host service targets.
+                if (ip_str, port) in self._host_service_targets:
+                    return
+
                 ip = ipaddress.ip_address(ip_str)
                 for net in BLOCKED_NETWORKS:
                     if ip in net:
@@ -868,6 +1008,12 @@ class PolicyEnforcer:
             return
         try:
             ip_str = flow.server_conn.peername[0]
+            port = flow.server_conn.peername[1] if len(flow.server_conn.peername) > 1 else 0
+
+            # Skip blocked-IP check for host service targets.
+            if (ip_str, port) in self._host_service_targets:
+                return
+
             ip = ipaddress.ip_address(ip_str)
             for net in BLOCKED_NETWORKS:
                 if ip in net:
