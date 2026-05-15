@@ -40,17 +40,15 @@ def verify_image_signature(
         ["which", "cosign"], check=False, capture_output=True, text=True,
     )
     if result.returncode != 0:
-        debug(f"Verifying image with podman trust: {image}")
-        result = subprocess.run(
-            ["podman", "image", "trust", "show"],
-            check=False, capture_output=True, text=True,
-        )
-        if result.returncode == 0 and "accept" in result.stdout.lower():
-            return True, "Image from trusted registry", {}
-
+        # The previous fallback ran `podman image trust show` and accepted
+        # the image whenever ANY policy line said "accept" — even if the
+        # specific image wasn't covered by that policy's scope. That's
+        # vacuous trust. cosign is now a hard prerequisite for verification.
         return (
             False,
-            "cosign is not installed. Install from https://docs.sigstore.dev/cosign/",
+            "cosign is not installed. Install from https://docs.sigstore.dev/cosign/. "
+            "Image signature verification requires cosign — `podman image trust` is "
+            "not specific enough to attest individual images.",
             {},
         )
 

@@ -2,7 +2,7 @@
 
 import unittest
 
-from brig.ops.cache import cached, clear, invalidate_cell_cache, set_cache
+from brig.ops.cache import cached, clear, set_cache
 
 
 class TestCache(unittest.TestCase):
@@ -25,18 +25,11 @@ class TestCache(unittest.TestCase):
         hit, _ = cached("key2", ttl=0.0)
         self.assertFalse(hit)
 
-    def test_invalidate_cell_cache(self):
-        set_cache("cell_exists:foo", True)
-        set_cache("cell_running:foo", False)
-        set_cache("other_key", "keep")
-
-        invalidate_cell_cache("foo")
-
-        hit_exists, _ = cached("cell_exists:foo")
-        hit_running, _ = cached("cell_running:foo")
-        hit_other, val = cached("other_key")
-
-        self.assertFalse(hit_exists)
-        self.assertFalse(hit_running)
-        self.assertTrue(hit_other)
-        self.assertEqual(val, "keep")
+    def test_clear_drops_everything(self):
+        set_cache("k1", "v1")
+        set_cache("k2", "v2")
+        clear()
+        hit_a, _ = cached("k1")
+        hit_b, _ = cached("k2")
+        self.assertFalse(hit_a)
+        self.assertFalse(hit_b)

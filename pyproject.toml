@@ -29,7 +29,6 @@ classifiers = [
 dependencies = ["pyyaml>=6.0"]
 
 [project.optional-dependencies]
-tui = ["textual>=0.40"]
 dev = [
     "pytest>=7.0",
     "pytest-benchmark>=4.0",
@@ -48,12 +47,14 @@ Documentation = "https://github.com/d0cd/brig/tree/main/docs"
 Repository = "https://github.com/d0cd/brig"
 
 [tool.setuptools]
-py-modules = ["tui"]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["brig*", "warden*", "addons*"]
+# addons/ is intentionally NOT installed as a Python package — those files
+# are mounted into the warden container via `make _copy-addons` and have
+# no __init__.py. They are sibling scripts, not a brig submodule.
+include = ["brig*", "warden*"]
 
 [tool.setuptools.package-data]
 "brig.vm" = ["*.template"]
@@ -79,9 +80,6 @@ source = ["src"]
 omit = [
     "*/tests/*",
     "*/__pycache__/*",
-    "src/brig-manpage.py",
-    "src/dashboard.py",
-    "src/tui.py",
     # CLI entry points and VM-dependent modules (tested by smoke test, not unit tests).
     "src/brig/cli.py",
     "src/brig/commands/convenience_cmd.py",
@@ -104,7 +102,7 @@ warn_return_any = false
 warn_unused_configs = true
 ignore_missing_imports = true
 check_untyped_defs = false
-exclude = ["tests/", "src/dashboard\\.py", "src/tui\\.py"]
+exclude = ["tests/"]
 
 [tool.coverage.report]
 exclude_lines = [

@@ -10,6 +10,9 @@ Sends real-time notifications on blocked requests:
     - Exponential backoff for retries
     - Dead-letter queue for failed notifications
 
+Stateless helpers + config dataclasses live in `_notifier_state.py`. This
+file owns the addon class and the mitmproxy lifecycle.
+
 Configuration in policy file:
     {
         "notifications": {
@@ -32,19 +35,36 @@ Usage:
 """
 
 import collections
-import ipaddress
 import json
 import queue
-import re
-import socket as _socket
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 from mitmproxy import ctx, http
+
+from _common import BLOCKED_NETWORKS, atomic_write_json  # noqa: F401  (re-exported for tests)
+from _notifier_state import (
+    DEFAULT_BASE_BACKOFF,
+    DEFAULT_FAILURE_THRESHOLD,
+    DEFAULT_MAX_BACKOFF,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MIN_INTERVAL,
+    DEFAULT_RECOVERY_TIMEOUT,
+    HTTP_TIMEOUT,
+    MAX_DEAD_LETTERS,
+    MAX_QUEUE_SIZE,
+    MAX_TRACKED_CELLS,
+    CircuitBreakerConfig,
+    CircuitBreakerState,
+    NotificationConfig,
+    _is_safe_webhook_url,
+    _redact_notification_path,
+    _redact_url_for_logging,
+    _resolve_webhook_url,
+)
 
 # Try to use urllib3 for connection pooling, fall back to urllib.
 try:
@@ -55,166 +75,12 @@ except ImportError:
     import urllib.request
     URLLIB3_AVAILABLE = False
 
-# Blocked networks for SSRF prevention.
-# Must match enforce.py BLOCKED_NETWORKS to prevent webhook-based SSRF.
-BLOCKED_NETWORKS = [
-    # RFC1918 private ranges.
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    # Localhost.
-    ipaddress.ip_network("127.0.0.0/8"),
-    # Link-local.
-    ipaddress.ip_network("169.254.0.0/16"),
-    # CGNAT.
-    ipaddress.ip_network("100.64.0.0/10"),
-    # Benchmarking.
-    ipaddress.ip_network("198.18.0.0/15"),
-    # Reserved.
-    ipaddress.ip_network("240.0.0.0/4"),
-    # "This network" (used in SSRF attacks).
-    ipaddress.ip_network("0.0.0.0/8"),
-    # Multicast.
-    ipaddress.ip_network("224.0.0.0/4"),
-    # IPv6 equivalents.
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-    # IPv4-mapped IPv6 (bypass for all IPv4 blocked ranges).
-    ipaddress.ip_network("::ffff:0:0/96"),
-    # Documentation prefix (should never appear in production).
-    ipaddress.ip_network("2001:db8::/32"),
-    # IPv6 multicast.
-    ipaddress.ip_network("ff00::/8"),
-]
-
-
-def _resolve_webhook_url(url: str) -> tuple[bool, str, str, int]:
-    """Resolve webhook URL and validate against internal networks.
-
-    Returns (safe, resolved_ip, hostname, port). If safe is False the
-    remaining fields are empty/zero.
-    """
-    parsed = urlparse(url)
-    if not parsed.hostname:
-        return False, "", "", 0
-    if parsed.scheme not in ("http", "https"):
-        return False, "", "", 0
-
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    try:
-        addrs = _socket.getaddrinfo(parsed.hostname, port)
-        # Collect the first usable address while checking all.
-        first_ip_str = ""
-        for family, socktype, proto, canonname, sockaddr in addrs:
-            ip = ipaddress.ip_address(sockaddr[0])
-            for net in BLOCKED_NETWORKS:
-                if ip in net:
-                    return False, "", "", 0
-            if not first_ip_str:
-                first_ip_str = sockaddr[0]
-        if not first_ip_str:
-            return False, "", "", 0
-    except (OSError, ValueError):
-        return False, "", "", 0
-
-    return True, first_ip_str, parsed.hostname, port
-
-
-def _is_safe_webhook_url(url: str) -> bool:
-    """Validate webhook URL is not targeting internal networks."""
-    safe, _, _, _ = _resolve_webhook_url(url)
-    return safe
-
-
-# Regex matching path segments that look like secrets/tokens.
-# Matches hex strings >= 20 chars, base64-ish strings >= 20 chars, or
-# segments containing common secret indicators.
-_SECRET_PATH_RE = re.compile(
-    r"(?<=/)"                         # Preceded by /.
-    r"(?:"
-    r"[A-Fa-f0-9]{20,}"              # Long hex string.
-    r"|[A-Za-z0-9_\-]{20,}"          # Long base64-ish string.
-    r")"
-    r"(?=/|$)"                        # Followed by / or end.
-)
-
-
-def _redact_notification_path(path: str) -> str:
-    """Remove query parameters, fragments, and potential secrets from path."""
-    # Strip query string.
-    path = path.split("?")[0]
-    # Strip fragment identifier.
-    path = path.split("#")[0]
-    # Redact path segments that look like secrets or tokens.
-    path = _SECRET_PATH_RE.sub("[REDACTED]", path)
-    return path
-
-
-def _redact_url_for_logging(url: str) -> str:
-    """Return scheme + hostname only, stripping path, query, and credentials."""
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.hostname}"
-
 
 # Policy file path.
 POLICY_FILE = Path("/policy.json")
 
 # Dead letter queue file path.
 DEAD_LETTER_FILE = Path("/var/run/cells/dead-letters.json")
-
-# Default minimum interval between notifications (per cell).
-DEFAULT_MIN_INTERVAL = 60  # seconds
-
-# Maximum queue size.
-MAX_QUEUE_SIZE = 100
-
-# HTTP timeout for webhook requests.
-HTTP_TIMEOUT = 10  # seconds
-
-# Maximum number of cells to track for rate limiting (LRU eviction beyond this).
-MAX_TRACKED_CELLS = 1000
-
-# Circuit breaker defaults.
-DEFAULT_FAILURE_THRESHOLD = 5  # Consecutive failures before opening circuit.
-DEFAULT_RECOVERY_TIMEOUT = 300  # Seconds before attempting recovery.
-DEFAULT_MAX_RETRIES = 3  # Max retry attempts per notification.
-DEFAULT_BASE_BACKOFF = 1.0  # Base backoff in seconds.
-DEFAULT_MAX_BACKOFF = 60.0  # Maximum backoff in seconds.
-
-# Maximum dead letters to keep.
-MAX_DEAD_LETTERS = 1000
-
-
-@dataclass
-class CircuitBreakerConfig:
-    """Circuit breaker configuration."""
-    failure_threshold: int = DEFAULT_FAILURE_THRESHOLD
-    recovery_timeout: float = DEFAULT_RECOVERY_TIMEOUT
-    max_retries: int = DEFAULT_MAX_RETRIES
-    base_backoff: float = DEFAULT_BASE_BACKOFF
-    max_backoff: float = DEFAULT_MAX_BACKOFF
-
-
-@dataclass
-class CircuitBreakerState:
-    """Circuit breaker state tracking."""
-    consecutive_failures: int = 0
-    last_failure_time: float = 0.0
-    state: str = "closed"  # closed, open, half-open
-    total_failures: int = 0
-    total_successes: int = 0
-
-
-@dataclass
-class NotificationConfig:
-    """Notification configuration."""
-    webhook_url: str = ""
-    block_reasons: Optional[list] = None  # None = all reasons.
-    cells: Optional[list] = None  # None = all cells.
-    min_interval_seconds: int = DEFAULT_MIN_INTERVAL
-    enabled: bool = False
-    circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
 
 
 class Notifier:
@@ -229,28 +95,42 @@ class Notifier:
         self.running = False
         self.circuit_breaker = CircuitBreakerState()
         self.dead_letters: list[dict] = []
-        self._dl_lock = threading.Lock()  # Lock for dead_letters list.
-        self._dl_dirty_count = 0  # Pending unsaved dead letters.
-        self._cb_lock = threading.Lock()  # Lock for circuit breaker state.
-        # Connection pool for HTTP requests (reuses connections).
+        self._dl_lock = threading.Lock()
+        self._dl_dirty_count = 0
+        self._cb_lock = threading.Lock()
         self._http_pool: Optional[object] = None
         self._pool_lock = threading.Lock()
 
     def _get_http_pool(self):
-        """Get or create HTTP connection pool for the webhook URL."""
+        """Get or create HTTP connection pool for the webhook URL.
+
+        Configures strict TLS verification and a system CA bundle. urllib3
+        defaults to CERT_REQUIRED in v2 but we set it explicitly so behavior
+        does not silently regress. retries=False because we manage retries
+        ourselves with circuit breaker + exponential backoff.
+        """
         if not URLLIB3_AVAILABLE:
             return None
 
         with self._pool_lock:
             if self._http_pool is None and self.config.webhook_url:
-                # Create a PoolManager for connection reuse.
-                self._http_pool = urllib3.PoolManager(
+                ca_bundle = None
+                try:
+                    import certifi
+                    ca_bundle = certifi.where()
+                except ImportError:
+                    pass
+                pool_kwargs = dict(
                     num_pools=1,
                     maxsize=10,
                     timeout=urllib3.Timeout(total=HTTP_TIMEOUT),
-                    retries=False,  # We handle retries ourselves.
+                    retries=False,
+                    cert_reqs="CERT_REQUIRED",
                 )
-                ctx.log.info("Notifier: Created HTTP connection pool")
+                if ca_bundle:
+                    pool_kwargs["ca_certs"] = ca_bundle
+                self._http_pool = urllib3.PoolManager(**pool_kwargs)
+                ctx.log.info("Notifier: Created HTTP connection pool (TLS verify: required)")
             return self._http_pool
 
     def load(self, loader):
@@ -263,7 +143,6 @@ class Notifier:
     def done(self):
         """Called when addon is unloaded."""
         self._stop_worker()
-        # Clean up connection pool.
         with self._pool_lock:
             if self._http_pool is not None:
                 self._http_pool.clear()
@@ -283,9 +162,7 @@ class Notifier:
                 data = json.load(f)
 
             notifications = data.get("notifications", {})
-
             webhook_url = notifications.get("webhook_url", "")
-            # Validate webhook URL at load time for fast feedback.
             if webhook_url and not _is_safe_webhook_url(webhook_url):
                 ctx.log.error("Notifier: webhook URL targets internal network, disabling")
                 webhook_url = ""
@@ -304,9 +181,8 @@ class Notifier:
                     max_retries=cb_config.get("max_retries", DEFAULT_MAX_RETRIES),
                     base_backoff=cb_config.get("base_backoff", DEFAULT_BASE_BACKOFF),
                     max_backoff=cb_config.get("max_backoff", DEFAULT_MAX_BACKOFF),
-                )
+                ),
             )
-
             self.policy_mtime = mtime
 
             if self.config.enabled:
@@ -316,7 +192,6 @@ class Notifier:
             else:
                 ctx.log.info("Notifier: Disabled (no webhook URL)")
                 self._stop_worker()
-
         except (json.JSONDecodeError, IOError, OSError) as e:
             ctx.log.error(f"Notifier: Failed to load config: {e}")
 
@@ -332,7 +207,6 @@ class Notifier:
     def _stop_worker(self) -> None:
         """Stop background worker."""
         self.running = False
-        # Signal worker to exit.
         try:
             self.notification_queue.put_nowait(None)
         except queue.Full:
@@ -344,7 +218,7 @@ class Notifier:
             try:
                 notification = self.notification_queue.get(timeout=1.0)
                 if notification is None:
-                    continue  # Shutdown signal or spurious wakeup.
+                    continue
                 self._send_notification(notification)
             except queue.Empty:
                 continue
@@ -355,21 +229,16 @@ class Notifier:
         """Check if circuit breaker allows requests. Returns True if allowed."""
         with self._cb_lock:
             now = time.time()
-
             if self.circuit_breaker.state == "closed":
                 return True
-
             if self.circuit_breaker.state == "open":
-                # Check if recovery timeout has passed.
                 elapsed = now - self.circuit_breaker.last_failure_time
                 if elapsed >= self.config.circuit_breaker.recovery_timeout:
                     self.circuit_breaker.state = "half-open"
                     ctx.log.info("Notifier: Circuit breaker half-open, attempting recovery")
                     return True
                 return False
-
-            # Half-open: allow one request to test.
-            return True
+            return True  # half-open
 
     def _record_success(self) -> None:
         """Record a successful webhook call."""
@@ -386,7 +255,6 @@ class Notifier:
             self.circuit_breaker.consecutive_failures += 1
             self.circuit_breaker.total_failures += 1
             self.circuit_breaker.last_failure_time = time.time()
-
             if self.circuit_breaker.state == "half-open":
                 self.circuit_breaker.state = "open"
                 ctx.log.warn("Notifier: Circuit breaker re-opened after failed recovery")
@@ -405,15 +273,10 @@ class Notifier:
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "attempts": notification.get("_attempts", 1),
         }
-
         with self._dl_lock:
             self.dead_letters.append(dead_letter)
-
-            # Trim if over limit.
             if len(self.dead_letters) > MAX_DEAD_LETTERS:
                 self.dead_letters = self.dead_letters[-MAX_DEAD_LETTERS:]
-
-            # Batch disk writes: persist every 10 failures or on trim.
             self._dl_dirty_count += 1
             if self._dl_dirty_count >= 10 or len(self.dead_letters) >= MAX_DEAD_LETTERS:
                 self._save_dead_letters()
@@ -422,11 +285,7 @@ class Notifier:
     def _save_dead_letters(self) -> None:
         """Persist dead letters to disk."""
         try:
-            DEAD_LETTER_FILE.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = DEAD_LETTER_FILE.with_suffix(".tmp")
-            with open(tmp_path, "w") as f:
-                json.dump(self.dead_letters, f, indent=2)
-            tmp_path.rename(DEAD_LETTER_FILE)
+            atomic_write_json(DEAD_LETTER_FILE, self.dead_letters)
         except (IOError, OSError) as e:
             ctx.log.error(f"Notifier: Failed to save dead letters: {e}")
 
@@ -434,47 +293,52 @@ class Notifier:
         """Send HTTP request to the webhook URL. Returns (success, error).
 
         The caller has already validated the resolved IP against
-        BLOCKED_NETWORKS. We use the original hostname URL for proper TLS
-        certificate verification and rely on the OS DNS cache returning
-        the same answer within the same process lifetime.
+        BLOCKED_NETWORKS. We connect to the resolved IP directly to
+        prevent DNS rebinding between validation and connection.
         """
-        url = self.config.webhook_url
+        parsed = urlparse(self.config.webhook_url)
+        ip_url = f"{parsed.scheme}://{resolved_ip}:{port}{parsed.path or '/'}"
+        if parsed.query:
+            ip_url += f"?{parsed.query}"
 
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "Warden/1.0",
+            "Host": hostname,
         }
 
         pool = self._get_http_pool()
         if pool is not None:
-            # Use urllib3 connection pool.
             try:
                 response = pool.request(
-                    "POST",
-                    url,
-                    body=data,
-                    headers=headers,
+                    "POST", ip_url, body=data, headers=headers,
+                    assert_hostname=hostname, server_hostname=hostname,
                 )
                 if response.status < 400:
                     return True, None
-                else:
-                    return False, f"HTTP {response.status}"
+                return False, f"HTTP {response.status}"
             except urllib3.exceptions.HTTPError as e:
                 return False, str(e)
         else:
-            # Fallback to urllib.
+            # Fallback to urllib. Disable redirect following so a 302 from
+            # the webhook cannot point to an internal-by-name host that
+            # _resolve_webhook_url did not pre-validate (SSRF / H2).
             try:
+                class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        return None
+                opener = urllib.request.build_opener(_NoRedirect())
                 req = urllib.request.Request(
-                    url,
-                    data=data,
-                    headers=headers,
-                    method="POST"
+                    ip_url, data=data, headers=headers, method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:  # nosec B310
+                with opener.open(req, timeout=HTTP_TIMEOUT) as response:  # nosec B310
                     if response.status < 400:
                         return True, None
-                    else:
-                        return False, f"HTTP {response.status}"
+                    return False, f"HTTP {response.status}"
+            except urllib.error.HTTPError as e:
+                if 300 <= e.code < 400:
+                    return False, f"HTTP {e.code} (redirect refused)"
+                return False, str(e)
             except urllib.error.URLError as e:
                 return False, str(e)
 
@@ -483,14 +347,11 @@ class Notifier:
         if not self.config.webhook_url:
             return
 
-        # Resolve DNS once and validate against internal networks.
-        # Using the resolved IP for the HTTP request prevents DNS rebinding.
         safe, resolved_ip, hostname, port = _resolve_webhook_url(self.config.webhook_url)
         if not safe:
             ctx.log.warn("Notifier: webhook URL targets internal network, skipping")
             return
 
-        # Check circuit breaker.
         if not self._check_circuit_breaker():
             ctx.log.debug("Notifier: Circuit breaker open, dropping notification")
             self._add_to_dead_letter(notification, "circuit_breaker_open")
@@ -504,29 +365,23 @@ class Notifier:
             notification["_attempts"] = attempts
 
             try:
-                # Strip internal fields before sending to webhook.
                 payload = {k: v for k, v in notification.items() if not k.startswith("_")}
                 data = json.dumps(payload).encode("utf-8")
                 success, error = self._send_http_request(data, resolved_ip, hostname, port)
-
                 if success:
                     self._record_success()
-                    return  # Success.
-                else:
-                    ctx.log.warn(f"Notifier: Webhook failed (attempt {attempts}): {error}")
-
+                    return
+                ctx.log.warn(f"Notifier: Webhook failed (attempt {attempts}): {error}")
             except Exception as e:
                 ctx.log.error(f"Notifier: Unexpected error (attempt {attempts}): {e}")
 
-            # Calculate exponential backoff.
             if attempts < max_retries:
                 backoff = min(
                     self.config.circuit_breaker.base_backoff * (2 ** (attempts - 1)),
-                    self.config.circuit_breaker.max_backoff
+                    self.config.circuit_breaker.max_backoff,
                 )
                 time.sleep(backoff)
 
-        # All retries exhausted.
         self._record_failure()
         self._add_to_dead_letter(notification, f"max_retries_exceeded_{max_retries}")
 
@@ -534,33 +389,19 @@ class Notifier:
         """Check if we should send a notification."""
         if not self.config.enabled:
             return False
-
-        # Check cell filter.
-        if self.config.cells is not None:
-            if cell_name not in self.config.cells:
-                return False
-
-        # Check block reason filter.
+        if self.config.cells is not None and cell_name not in self.config.cells:
+            return False
         if self.config.block_reasons is not None:
-            matched = False
-            for reason_pattern in self.config.block_reasons:
-                if reason_pattern in block_reason:
-                    matched = True
-                    break
-            if not matched:
+            if not any(p in block_reason for p in self.config.block_reasons):
                 return False
-
-        # Check rate limit.
         now = time.time()
         last = self.last_notification.get(cell_name, 0)
         if now - last < self.config.min_interval_seconds:
             return False
-
         return True
 
     def response(self, flow: http.HTTPFlow) -> None:
         """Check for blocked requests and queue notifications."""
-        # Hot-reload config.
         self._reload_config()
 
         if not flow.metadata.get("blocked", False):
@@ -580,7 +421,6 @@ class Notifier:
             self.last_notification.move_to_end(cell_name)
         self.last_notification[cell_name] = time.time()
 
-        # Build notification.
         notification = {
             "event": "request_blocked",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -592,7 +432,6 @@ class Notifier:
             "client_ip": flow.client_conn.peername[0] if flow.client_conn.peername else "unknown",
         }
 
-        # Queue notification.
         try:
             self.notification_queue.put_nowait(notification)
         except queue.Full:

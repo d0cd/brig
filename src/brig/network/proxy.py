@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from brig.config import CONTAINER_PREFIX, PROXY_NAME
+from brig.config import PROXY_NAME, container_name
 from brig.ops.cache import cached, set_cache
 from brig.ops.logging import debug
 from brig.vm.shell import vm_run
@@ -31,7 +31,7 @@ def proxy_running() -> bool:
 
 def get_proxy_ip(cell_name: str) -> str | None:
     """Get the proxy's IP address on a cell's network."""
-    network_name = f"{CONTAINER_PREFIX}{cell_name}"
+    network_name = container_name(cell_name)
     result = vm_run(
         ["podman", "inspect", PROXY_NAME, "--format", "json"],
         timeout=5,
@@ -52,7 +52,7 @@ def get_proxy_ip(cell_name: str) -> str | None:
 
 def connect_proxy_to_network(cell_name: str) -> bool:
     """Connect the proxy container to a cell's network."""
-    network_name = f"{CONTAINER_PREFIX}{cell_name}"
+    network_name = container_name(cell_name)
     result = vm_run(["podman", "network", "connect", network_name, PROXY_NAME])
     if result.returncode != 0:
         debug(f"Failed to connect proxy to {network_name}: {result.stderr}")
@@ -62,7 +62,7 @@ def connect_proxy_to_network(cell_name: str) -> bool:
 
 def disconnect_proxy_from_network(cell_name: str) -> bool:
     """Disconnect the proxy container from a cell's network."""
-    network_name = f"{CONTAINER_PREFIX}{cell_name}"
+    network_name = container_name(cell_name)
     result = vm_run(["podman", "network", "disconnect", network_name, PROXY_NAME])
     if result.returncode != 0:
         debug(f"Failed to disconnect proxy from {network_name}: {result.stderr}")

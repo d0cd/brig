@@ -19,9 +19,10 @@ from pathlib import Path
 from typing import Any
 
 from brig.cell.spec import CellSpec
-from brig.config import CONTAINER_PREFIX, PROXY_NAME, RUNTIME, VMPaths
+from brig.config import PROXY_NAME, RUNTIME, VMPaths, container_name
 from brig.ops.logging import debug
 from brig.vm.shell import vm_run
+
 
 
 class ActionType(Enum):
@@ -89,7 +90,7 @@ def _podman_inspect_json(name: str) -> dict | None:
 def observe(cell_name: str) -> CellState:
     """Query podman for the actual state of a cell."""
     state = CellState()
-    name = f"{CONTAINER_PREFIX}{cell_name}"
+    name = container_name(cell_name)
     state.container_name = name
     state.network_name = name
 
@@ -174,7 +175,7 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
 
     Enforces invariant 5: --runtime runsc is always set.
     """
-    name = f"{CONTAINER_PREFIX}{spec.name}"
+    name = container_name(spec.name)
 
     cmd = [
         "podman", "run",
@@ -185,7 +186,8 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.is_airgapped:
         cmd.extend(["--network", "none"])
     else:
-        assert proxy_ip is not None
+        if not proxy_ip:
+            raise RuntimeError("proxy_ip is required for non-airgapped cells")
         cmd.extend([
             "--network", name,
             "-e", f"http_proxy=http://{proxy_ip}:8080",
@@ -205,7 +207,7 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.timeout:
         from brig.cell.spec import parse_duration
         timeout_seconds = parse_duration(spec.timeout)
-        if timeout_seconds:
+        if timeout_seconds is not None:
             cmd.extend(["--timeout", str(timeout_seconds)])
 
     for label in spec.labels:
@@ -293,7 +295,7 @@ def _rollback(completed: list[Action]) -> None:
 
 def _execute_action(action: Action, result: ReconcileResult) -> None:
     """Execute a single reconciliation action."""
-    name = f"{CONTAINER_PREFIX}{action.cell_name}"
+    name = container_name(action.cell_name)
 
     if action.type == ActionType.ALLOCATE_SUBNET:
         from brig.network.subnet import allocate

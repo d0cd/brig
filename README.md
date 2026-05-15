@@ -137,7 +137,7 @@ Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
 
 ```bash
 make setup                    # install with dev deps, create VM, start
-make test                     # run unit tests (352 tests)
+make test                     # run unit tests
 make check                    # full CI checks (lint, types, tests)
 make smoke                    # end-to-end test (requires VM)
 make bench                    # benchmarks
@@ -145,10 +145,15 @@ make bench                    # benchmarks
 
 ## Docs
 
+- [Quickstart](docs/learning/quickstart.md)
+- [Concepts](docs/learning/concepts.md)
+- [Troubleshooting](docs/learning/troubleshooting.md)
 - [Cell Definition Reference](docs/design/cell-definition.md)
 - [Architecture](docs/design/architecture.md)
-- [Security Design](docs/design/security.md)
+- [Security Design](docs/design/security.md) — and the [supply-chain notes](docs/design/supply-chain.md)
 - [SDK Specification](docs/sdk-spec.md)
+- [Warden CLI Reference](docs/reference/warden-cli.md)
+- [Addons Reference](docs/reference/addons.md)
 - [Security Invariants](docs/INVARIANTS.md)
 
 ## License

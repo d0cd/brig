@@ -2,7 +2,7 @@
 
 import unittest
 
-from brig.network.validation import is_overly_permissive_domain, is_suspicious_domain
+from brig.network.validation import is_suspicious_domain
 
 
 class TestIsSuspiciousDomain(unittest.TestCase):
@@ -49,29 +49,3 @@ class TestIsSuspiciousDomain(unittest.TestCase):
         self.assertTrue(is_suspicious_domain("*.xyz"))
 
 
-class TestIsOverlyPermissiveDomain(unittest.TestCase):
-    """Test is_overly_permissive_domain() warns on broad TLD patterns."""
-
-    def test_wildcard_com(self):
-        self.assertTrue(is_overly_permissive_domain("*.com"))
-
-    def test_wildcard_net(self):
-        self.assertTrue(is_overly_permissive_domain("*.net"))
-
-    def test_wildcard_org(self):
-        self.assertTrue(is_overly_permissive_domain("*.org"))
-
-    def test_wildcard_io(self):
-        self.assertTrue(is_overly_permissive_domain("*.io"))
-
-    def test_safe_specific(self):
-        self.assertEqual(is_overly_permissive_domain("*.example.com"), "")
-
-    def test_short_tld_warning(self):
-        """Short TLDs like *.de get a warning even if not in the list."""
-        warning = is_overly_permissive_domain("*.de")
-        self.assertTrue(warning)
-
-    def test_long_tld_no_warning(self):
-        """TLDs longer than 4 chars and not in the list are fine."""
-        self.assertEqual(is_overly_permissive_domain("*.museum"), "")

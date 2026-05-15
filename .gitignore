@@ -103,6 +103,9 @@ uv.lock
 # Claude Code
 .claude/
 
+# Local cell definitions (workload-specific, not part of the harness)
+cells/
+
 # Ralphx audit (keep config templates, ignore run outputs)
 .ralphx/**/runs/
 .ralphx/**/progress.md

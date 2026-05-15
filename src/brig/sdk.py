@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,7 +25,7 @@ from brig.vm.shell import vm_run
 from brig.cell.profiles import apply_profile, load_profile
 from brig.cell.reconciler import CellState, ReconcileResult, observe
 from brig.cell.spec import CellSpec
-from brig.config import CELL_NAME_PATTERN, CONTAINER_PREFIX, PROXY_NAME
+from brig.config import CELL_NAME_PATTERN, CONTAINER_PREFIX, PROXY_NAME, container_name
 from brig.errors import BrigError
 
 
@@ -81,24 +80,22 @@ class Cell:
 
     def __init__(self, name: str):
         self.name = name
-        self._cn = f"{CONTAINER_PREFIX}{name}"
+        self._cn = container_name(name)
 
     async def wait(self, timeout: int | None = None) -> int:
         """Wait for cell to exit. Returns exit code."""
         return await asyncio.to_thread(self.wait_sync, timeout)
 
     def wait_sync(self, timeout: int | None = None) -> int:
-        """Synchronous wait for cell to exit."""
+        """Synchronous wait for cell to exit. Returns -1 on subprocess error."""
+        import subprocess as _subprocess
         cmd = ["podman", "wait", self._cn]
         try:
-            result = vm_run(
-                cmd,
-                timeout=timeout,
-            )
-            code = result.stdout.strip()
-            return int(code) if code.isdigit() else 1
-        except Exception:
+            result = vm_run(cmd, timeout=timeout)
+        except (_subprocess.SubprocessError, OSError):
             return -1
+        code = result.stdout.strip()
+        return int(code) if code.isdigit() else 1
 
     async def stop(self) -> None:
         await asyncio.to_thread(stop_cell, self.name)
@@ -307,23 +304,22 @@ class Brig:
 
             exit_code = cell.wait_sync(timeout=timeout_seconds)
 
-            # Collect output. Podman logs merges stdout/stderr but we separate
-            # by capturing each stream individually.
-            stdout_result = vm_run(["podman", "logs", "--follow=false", cell._cn])
-            stderr_result = vm_run(["podman", "logs", "--follow=false", cell._cn],
-                                   capture=True)
+            # Collect output. Podman logs merges stdout and stderr into a
+            # single stream, so reliable stderr separation is not possible.
+            log_result = vm_run(["podman", "logs", "--follow=false", cell._cn])
 
             return CellRunResult(
                 name=cell_name,
                 exit_code=exit_code,
-                stdout=stdout_result.stdout,
-                stderr=stderr_result.stderr,
+                stdout=log_result.stdout,
+                stderr="",
                 success=exit_code == 0,
             )
         finally:
             try:
                 cell.rm_sync(force=True)
-            except Exception:
+            except BrigError:
+                # Best-effort cleanup; other errors should propagate.
                 pass
 
     async def list_cells(self) -> list[CellInfo]:

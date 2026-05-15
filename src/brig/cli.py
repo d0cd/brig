@@ -19,7 +19,7 @@ from brig.ops.history import log_operation_start, log_operation_end
 
 # Commands that run on the macOS host without needing the Lima VM.
 _HOST_ONLY_COMMANDS = frozenset({
-    "init", "config", "history", "upgrade", "image-verify", "up", "profiles", "secrets",
+    "init", "config", "history", "image-verify", "up", "profiles", "secrets",
 })
 
 
@@ -44,7 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
                "  brig run --secret api-key alpine -- curl -H @/run/secrets/api-key $URL\n"
                "  brig run --file mycell.yaml\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p_run.add_argument("image", nargs="?", help="Container image")
+    p_run.add_argument("image", nargs="?", help="Container image (must precede 'command'; flags must come before image)")
     p_run.add_argument("container_cmd", nargs=argparse.REMAINDER, metavar="command",
                        help="Command to run (use -- before flags like -la)")
     p_run.add_argument("--name", "-n", help="Cell name (auto-generated if omitted)")
@@ -63,15 +63,23 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--workspace-quota", help="Workspace size limit")
     p_run.add_argument("-d", "--detach", action="store_true", help="Run in background")
     p_run.add_argument("--rm", action="store_true", help="Remove on exit")
-    p_run.add_argument("--tor", action="store_true", help="Route through Tor")
     p_run.add_argument("--image-digest", help="Expected image digest")
     p_run.add_argument("--workdir", help="Working directory override")
 
-    for name in ["stop", "kill", "start", "pause", "unpause", "attach", "shell"]:
-        p = sub.add_parser(name, help=f"{name.capitalize()} a cell")
+    _LIFECYCLE_HELP = {
+        "stop": "Gracefully stop a running cell",
+        "kill": "Immediately kill a running cell (SIGKILL)",
+        "start": "Start a previously-stopped cell",
+        "pause": "Suspend processes in a running cell",
+        "unpause": "Resume processes in a paused cell",
+        "attach": "Attach stdio to a running cell",
+        "shell": "Open an interactive /bin/sh inside a running cell",
+    }
+    for name, help_text in _LIFECYCLE_HELP.items():
+        p = sub.add_parser(name, help=help_text)
         p.add_argument("name", help="Cell name")
 
-    p_wait = sub.add_parser("wait", help="Block until cell exits")
+    p_wait = sub.add_parser("wait", help="Block until a cell exits, then print its exit code")
     p_wait.add_argument("name", help="Cell name")
 
     p_rm = sub.add_parser("rm", help="Remove a cell")
@@ -88,7 +96,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_exec.add_argument("exec_cmd", nargs=argparse.REMAINDER, metavar="command", help="Command to execute")
 
     p_list = sub.add_parser("list", help="List all cells")
-    p_list.add_argument("--format", choices=["table", "json"], default="table")
+    p_list.add_argument("--format", choices=["table", "wide", "json"], default="table",
+                        help="table (default), wide (more columns), or json")
 
     # --- Info ---
     p_inspect = sub.add_parser("inspect", help="Show cell details")
@@ -97,17 +106,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser("export", help="Export cell as reusable YAML definition")
     p_export.add_argument("name", help="Cell name")
 
-    # --- Secrets ---
-    p_secrets = sub.add_parser("secrets", help="Manage secrets")
-    secrets_sub = p_secrets.add_subparsers(dest="secrets_command", required=True)
-    secrets_sub.add_parser("list", help="List all secrets")
-    p_sa = secrets_sub.add_parser("add", help="Add a secret")
-    p_sa.add_argument("name", help="Secret name")
-    p_sa.add_argument("--value", help="Secret value (insecure — prefer stdin)")
-    p_sa.add_argument("--from-file", help="Read value from file")
-    p_sa.add_argument("--force", action="store_true", help="Overwrite existing")
-    p_sr = secrets_sub.add_parser("rm", help="Remove a secret")
-    p_sr.add_argument("name", help="Secret name")
+    # --- Secrets / Policy / Config — registered by their command modules ---
+    from brig.commands import secrets_cmd, policy_cmd, config_cmd
+    secrets_cmd.register_parser(sub)
 
     p_files = sub.add_parser("files", help="List workspace contents")
     p_files.add_argument("name", help="Cell name")
@@ -136,10 +137,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_network = sub.add_parser("network", help="View network activity")
     p_network.add_argument("name", help="Cell name")
     p_network.add_argument("--tail", type=int, default=20, help="Number of entries")
+    p_network.add_argument("--blocked", action="store_true",
+                           help="Show only requests that warden blocked (and why)")
 
     p_events = sub.add_parser("events", help="Stream lifecycle events")
     p_events.add_argument("name", nargs="?", help="Cell name filter")
     p_events.add_argument("--tail", type=int, default=20, help="Number of entries")
+    p_events.add_argument("-f", "--follow", action="store_true",
+                          help="Block and print new events as they arrive")
 
     # --- Image ---
     p_pull = sub.add_parser("pull", help="Pull and cache image")
@@ -175,37 +180,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diagnose = sub.add_parser("diagnose", help="Run diagnostic checks")
     p_diagnose.add_argument("name", help="Cell name")
 
+    sub.add_parser("doctor", help="Check environment and report fixable issues")
+
     sub.add_parser("preflight", help="Run pre-start checks")
     sub.add_parser("metrics", help="Output Prometheus metrics")
-    sub.add_parser("upgrade", help="Upgrade state schema")
 
     p_history = sub.add_parser("history", help="Show operation history")
     p_history.add_argument("--tail", type=int, default=20, help="Number of entries")
     p_history.add_argument("--cell", help="Filter by cell name")
 
-    # --- Policy ---
-    p_policy = sub.add_parser("policy", help="Manage cell policies")
-    policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
-    p_ps = policy_sub.add_parser("show", help="Show cell or global policy")
-    p_ps.add_argument("name", nargs="?", default="global", help="Cell name or 'global'")
-    p_ps.add_argument("--effective", action="store_true", help="Show merged global + per-cell policy")
-    p_pset = policy_sub.add_parser("set", help="Update cell or global policy")
-    p_pset.add_argument("name", help="Cell name or 'global'")
-    p_pset.add_argument("--allow", action="append", help="Add allowed domain")
-    p_pset.add_argument("--deny", action="append", help="Add denied domain")
-    p_pset.add_argument("--remove-allow", action="append", help="Remove allowed domain")
-    p_pset.add_argument("--remove-deny", action="append", help="Remove denied domain")
-
-    # --- Config ---
-    p_config = sub.add_parser("config", help="Manage configuration")
-    config_sub = p_config.add_subparsers(dest="config_command", required=True)
-    p_cs = config_sub.add_parser("show", help="Show configuration")
-    p_cs.add_argument("key", nargs="?", help="Config key")
-    p_cset = config_sub.add_parser("set", help="Set configuration value")
-    p_cset.add_argument("key", help="Config key")
-    p_cset.add_argument("value", help="Value")
-    config_sub.add_parser("reset", help="Reset to defaults")
-
+    policy_cmd.register_parser(sub)
+    config_cmd.register_parser(sub)
 
     return parser
 
@@ -277,41 +262,24 @@ def main() -> None:
         "verify": system_cmd.cmd_verify,
         "health": system_cmd.cmd_health,
         "diagnose": system_cmd.cmd_diagnose,
+        "doctor": system_cmd.cmd_doctor,
         "preflight": system_cmd.cmd_preflight,
         "metrics": system_cmd.cmd_metrics,
         "history": system_cmd.cmd_history,
-        "upgrade": system_cmd.cmd_upgrade,
         "up": convenience_cmd.cmd_up,
         "down": convenience_cmd.cmd_down,
         "profiles": convenience_cmd.cmd_profiles,
         "watchdog": watchdog_cmd.cmd_watchdog,
     }
 
-    policy_dispatch = {
-        "show": policy_cmd.cmd_policy_show,
-        "set": policy_cmd.cmd_policy_set,
-    }
-
-    config_dispatch = {
-        "show": config_cmd.cmd_config_show,
-        "set": config_cmd.cmd_config_set,
-        "reset": config_cmd.cmd_config_reset,
-    }
-
-    secrets_dispatch = {
-        "list": secrets_cmd.cmd_secrets_list,
-        "add": secrets_cmd.cmd_secrets_add,
-        "rm": secrets_cmd.cmd_secrets_rm,
-    }
-
     if args.command == "policy":
-        cmd_func = policy_dispatch.get(args.policy_command)
+        cmd_func = policy_cmd.DISPATCH.get(args.policy_command)
         cmd_name = f"policy.{args.policy_command}"
     elif args.command == "config":
-        cmd_func = config_dispatch.get(args.config_command)
+        cmd_func = config_cmd.DISPATCH.get(args.config_command)
         cmd_name = f"config.{args.config_command}"
     elif args.command == "secrets":
-        cmd_func = secrets_dispatch.get(args.secrets_command)
+        cmd_func = secrets_cmd.DISPATCH.get(args.secrets_command)
         cmd_name = f"secrets.{args.secrets_command}"
     else:
         cmd_func = dispatch.get(args.command)

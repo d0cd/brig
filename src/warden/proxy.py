@@ -10,7 +10,7 @@ import json
 import time
 from pathlib import Path
 
-from brig.config import CONTAINER_PREFIX, PROXY_EXTERNAL_NETWORK, PROXY_NAME
+from brig.config import CONTAINER_PREFIX, INGRESS_PORT, PROXY_EXTERNAL_NETWORK, PROXY_NAME
 from brig.ops.logging import debug, info
 from brig.vm.shell import vm_run, vm_run_interactive
 
@@ -124,26 +124,46 @@ def start() -> bool:
         "--pids-limit", PIDS_LIMIT,
     ]
 
+    # Check if ingress addon is available.
+    has_ingress = (HostPaths.ADDONS_DIR / "ingress.py").exists()
+
     # Volume mounts (VM-side paths — podman runs inside the VM).
     cmd.extend(["-v", f"{VM_LOG_DIR}:/logs:rw"])
     cmd.extend(["-v", "/var/run/brig:/var/run/cells:rw"])
     cmd.extend(["-v", f"{VM_ADDONS_DIR}:/addons:ro"])
     cmd.extend(["-v", f"{VM_POLICY_FILE}:/policy.json:ro"])
 
+    # Expose ingress port if addon exists.
+    if has_ingress:
+        cmd.extend(["-p", f"{INGRESS_PORT}:{INGRESS_PORT}"])
+
     # Image.
     cmd.append(IMAGE)
 
-    # mitmproxy args.
-    cmd.extend([
-        "--listen-host", "0.0.0.0",
-        "--listen-port", "8080",
-        "--set", "block_global=false",
-        "-s", "/addons/enforce.py",
-        "-s", "/addons/logger.py",
-    ])
+    if has_ingress:
+        # Multi-mode: forward proxy on 8080, ingress on INGRESS_PORT.
+        # mitmproxy 10+ supports multiple --mode flags with port binding.
+        # ingress.py MUST load before enforce.py so it can authenticate
+        # and tag requests before enforce.py checks the ingress flag.
+        cmd.extend([
+            "--mode", "regular@8080",
+            "--mode", f"regular@{INGRESS_PORT}",
+            "--set", "block_global=false",
+            "-s", "/addons/ingress.py",
+            "-s", "/addons/enforce.py",
+            "-s", "/addons/logger.py",
+        ])
+    else:
+        cmd.extend([
+            "--listen-host", "0.0.0.0",
+            "--listen-port", "8080",
+            "--set", "block_global=false",
+            "-s", "/addons/enforce.py",
+            "-s", "/addons/logger.py",
+        ])
 
     # Optional addons (check host-side, mount VM-side).
-    for addon in ["ops.py", "notifier.py", "canary.py", "signer.py"]:
+    for addon in ["ops.py", "notifier.py"]:
         if (HostPaths.ADDONS_DIR / addon).exists():
             cmd.extend(["-s", f"/addons/{addon}"])
 

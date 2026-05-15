@@ -30,7 +30,7 @@ All exceptions carry:
 
 ### `CellInfo`
 
-Returned by `Brig.list()` / `Brig.list_sync()`.
+Returned by `Brig.list_cells()` / `Brig.list_sync()`.
 
 | Field    | Type  | Description         |
 |----------|-------|---------------------|
@@ -96,11 +96,15 @@ Enforces:
 - Rate limiting.
 - Cell name validation against `CELL_NAME_PATTERN`.
 
-### `Brig.list()` / `Brig.list_sync()`
+### `Brig.list_cells()` / `Brig.list_sync()`
 
 ```python
-async def list() -> list[CellInfo]
+async def list_cells() -> list[CellInfo]
+def list_sync() -> list[CellInfo]
 ```
+
+Returns information about all existing cells (running and stopped). Note:
+the method is `list_cells()`, not `list()` — there is no `list()` method.
 
 ### `Brig.cell()`
 

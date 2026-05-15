@@ -55,7 +55,6 @@ workspace_quota: "500m"          # Max workspace size
 
 # Execution mode
 detach: false                    # Run in background
-tor: false                       # Route through Tor (requires warden tor start)
 
 # Working directory inside container (default: /work)
 workdir: /app
@@ -64,7 +63,43 @@ workdir: /app
 labels:
   team: platform
   purpose: scraping
+
+# Ingress — authenticated reverse proxy for inbound traffic (optional)
+# Warden routes external requests to cell-internal ports by path prefix.
+# All ingress is token-authenticated and logged.
+ingress:
+  - name: api                   # Alphanumeric + hyphens, max 31 chars
+    port: 8642                   # Cell-internal port (1-65535)
+    path_prefix: /api            # Route prefix (must start with /)
+    auth: token                  # Auth method (only "token" supported)
+  - name: webhooks
+    port: 8642
+    path_prefix: /webhooks
+    auth: token
 ```
+
+## Ingress
+
+Cells have no inbound connectivity by default. Declaring `ingress` enables
+authenticated reverse proxying through Warden.
+
+External requests reach the cell via:
+```
+https://warden:8443/{cell_name}/{path_prefix}/...
+```
+
+Requirements:
+- Each request must include `Authorization: Bearer <token>`
+- Token is stored as a Brig secret: `brig secrets add {cell}-ingress-token`
+- `network` must be `default` (ingress is incompatible with airgapped cells)
+- Maximum 8 ingress entries per cell
+
+Security properties:
+- Opt-in (zero inbound unless declared)
+- Token-authenticated with salted SHA-256 hashing
+- Path-scoped (only declared prefixes are routed)
+- All inbound traffic logged
+- CONNECT tunneling blocked on ingress port
 
 ## Policy Rule Formats
 
@@ -98,6 +133,58 @@ The env var name is derived from the filename:
 
 Application reads the file at runtime — secret values never appear in env vars,
 process listings, or container inspect output.
+
+## Host Services
+
+Cells cannot reach the macOS host by default (private IPs are blocked).
+Host services allow cells to reach specific host-side services through
+virtual `.host.brig` domains.
+
+Declaration is two-step:
+
+1. **Global policy** declares the (name → port) mapping that warden knows
+   how to forward:
+   ```bash
+   brig policy set global --host-service aitelier:7777
+   brig policy set global --host-service litellm:4000
+   ```
+
+2. **Per-cell policy** opts the cell into reaching specific services. By
+   default a cell has *no* host-service access; you must add the names you
+   want it to reach (audit fix H1):
+   ```bash
+   brig policy set hermes --host-service aitelier
+   ```
+
+   Or write the per-cell policy file directly:
+   ```json
+   {
+     "allow": ["api.github.com"],
+     "deny": [],
+     "host_services": ["aitelier"]
+   }
+   ```
+
+From inside the cell:
+```bash
+curl http://aitelier.host.brig/v1/health
+```
+
+Warden intercepts `.host.brig` requests and rewrites them to the macOS
+host IP + declared port. The cell never sees the real host IP.
+
+Security properties:
+- Only declared services are reachable (not a blanket private IP bypass)
+- A cell can only reach services in **its own** `host_services` list
+  (per-cell ACL — global declaration is necessary but not sufficient)
+- Cells with no per-cell policy have **no** host-service access
+- All traffic logged with `host_service` attribution
+- Virtual domains only resolve through the proxy
+- Unknown `.host.brig` domains are blocked
+- DNS rebinding to `(host_ip, host_service_port)` from an allowlisted
+  domain is detected: the host-service skip on `BLOCKED_NETWORKS` is
+  gated on `flow.metadata["host_service"]`, not on the destination tuple
+  (audit fix H4)
 
 ## Examples
 

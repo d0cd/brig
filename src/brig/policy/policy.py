@@ -13,6 +13,7 @@ from typing import Any
 
 from brig.config import DOMAIN_PATTERN, POLICY_DIR
 from brig.network.validation import is_suspicious_domain
+from brig.ops.atomic import atomic_write_json
 from brig.ops.logging import debug
 
 try:
@@ -49,10 +50,7 @@ def save_cell_policy(
     policy_dir: Path = POLICY_DIR,
 ) -> None:
     """Save a cell's policy to disk."""
-    policy_dir.mkdir(parents=True, exist_ok=True)
-    path = get_cell_policy_path(cell_name, policy_dir)
-    with open(path, "w") as f:
-        json.dump(policy, f, indent=2)
+    atomic_write_json(get_cell_policy_path(cell_name, policy_dir), policy)
 
 
 def delete_cell_policy(

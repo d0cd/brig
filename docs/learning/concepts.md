@@ -75,10 +75,12 @@ Some programs don't work with gVisor:
 - Some network tools
 - Programs with specific kernel dependencies
 
-If you must run without gVisor (not recommended):
+If you must run without gVisor (not recommended), use the `dev` profile,
+which keeps gVisor off by default but applies the same network/policy
+gating:
 
 ```bash
-brig run --name test --runtime=runc --unsafe -- your-command
+brig run --name test --profile dev your-image -- your-command
 ```
 
 ---

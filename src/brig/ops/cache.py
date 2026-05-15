@@ -30,12 +30,6 @@ def set_cache(key: str, value: Any) -> None:
     _cache[key] = (time.time(), value)
 
 
-def invalidate_cell_cache(cell_name: str) -> None:
-    """Invalidate cache for a specific cell after state changes."""
-    _cache.pop(f"cell_exists:{cell_name}", None)
-    _cache.pop(f"cell_running:{cell_name}", None)
-
-
 def clear() -> None:
     """Clear the entire cache. Useful in tests."""
     _cache.clear()

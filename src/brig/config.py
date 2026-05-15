@@ -24,6 +24,11 @@ CELL_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9._-]{0,62}$')
 # Container naming prefix for cells.
 CONTAINER_PREFIX = "brig-"
 
+
+def container_name(cell_name: str) -> str:
+    """Map a cell name to its podman container name."""
+    return f"{CONTAINER_PREFIX}{cell_name}"
+
 # Default runtime (gVisor).
 RUNTIME = "runsc"
 
@@ -47,7 +52,7 @@ MUTATION_COMMANDS = {"run", "stop", "kill", "rm", "start", "pause", "unpause", "
 SENSITIVE_PATTERNS = {"password", "secret", "key", "token", "credential", "auth", "value"}
 
 # Valid memory suffixes.
-MEMORY_PATTERN = r"^\d+[kmgKMG]?[bB]?$"
+MEMORY_PATTERN = r"^\d+[kmgKMG]?$"
 
 # Valid domain pattern for policy.
 DOMAIN_PATTERN = r"^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$"
@@ -58,15 +63,24 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
     "*.home", "*.lan", "*.corp", "*.private",
 ]
 
+# Host services (cell → host forwarding through Warden).
+# The .host.brig suffix is also defined as HOST_SERVICE_SUFFIX in
+# src/addons/enforce.py — addons can't import from brig.* so the suffix
+# lives in both places. Keep them in sync.
+HOST_SERVICE_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
+MAX_HOST_SERVICES = 16
+
+# Ingress (authenticated reverse proxy through Warden).
+INGRESS_PORT = 8443
+MAX_INGRESS_PER_CELL = 8
+INGRESS_AUTH_METHODS = {"token"}
+INGRESS_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
+INGRESS_PATH_PREFIX_PATTERN = re.compile(r'^/[a-zA-Z0-9/_-]+$')
+
 # Unsafe file extensions for --sanitize mode.
 UNSAFE_EXTENSIONS = {
     ".app", ".command", ".scpt", ".dmg", ".pkg", ".webloc",
     ".jar", ".exe", ".bat", ".cmd", ".msi", ".vbs", ".ps1",
-}
-
-# Script file extensions.
-SCRIPT_EXTENSIONS = {
-    ".sh", ".py", ".js", ".rb", ".pl", ".php",
 }
 
 
@@ -83,6 +97,9 @@ class HostPaths:
     LIMA_YAML = BRIG_HOME / "lima.yaml"
     NETWORK_POLICY = CELLS_DIR / "network-policy.json"
     CONFIG_FILE = CELLS_DIR / "config.json"
+
+    # Ingress routes (host-side, synced to VM).
+    INGRESS_ROUTES_FILE = STATE_DIR / "system" / "ingress-routes.json"
 
     # Rate limit state (host-side, used before entering VM).
     RATE_LIMIT_FILE = STATE_DIR / "system" / "rate_limit.json"
@@ -112,6 +129,9 @@ class VMPaths:
 
     # Per-cell policy directory (inside VM).
     POLICY_DIR = Path("/var/run/brig/policies")
+
+    # Ingress routes file (inside VM).
+    INGRESS_ROUTES_FILE = Path("/var/run/brig/ingress-routes.json")
 
     # Logs (inside VM).
     LOG_DIR = Path("/var/log/brig/network")

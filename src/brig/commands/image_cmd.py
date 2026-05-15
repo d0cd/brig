@@ -1,12 +1,11 @@
 """
-CLI handlers for image operations and checkpoint/restore.
+CLI handlers for image operations.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from brig.config import CONTAINER_PREFIX
 from brig.vm.shell import vm_run
 from brig.errors import BrigError
 from brig.ops.logging import info, output
@@ -57,26 +56,3 @@ def cmd_verify_image(args: Any) -> int:
     )
     output(f"{'VERIFIED' if ok else 'FAILED'}: {msg}")
     return 0 if ok else 1
-
-
-def cmd_checkpoint(args: Any) -> int:
-    """Handle `brig checkpoint` — checkpoint a running cell."""
-    cn = f"{CONTAINER_PREFIX}{args.name}"
-    result = vm_run(
-        ["podman", "container", "checkpoint", cn],
-    )
-    if result.returncode != 0:
-        raise BrigError(f"Checkpoint failed: {result.stderr.strip()}")
-    info(f"Cell '{args.name}' checkpointed")
-    return 0
-
-
-def cmd_restore(args: Any) -> int:
-    """Handle `brig restore` — restore from checkpoint."""
-    result = vm_run(
-        ["podman", "container", "restore", args.checkpoint],
-    )
-    if result.returncode != 0:
-        raise BrigError(f"Restore failed: {result.stderr.strip()}")
-    info(f"Restored from {args.checkpoint}")
-    return 0
