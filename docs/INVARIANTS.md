@@ -36,7 +36,10 @@ to that invariant's row — don't leave the coverage implicit.
 | Enforcement | `src/addons/enforce.py` — port allowlist (80/443), literal-IP block, RFC1918/CGNAT/etc block at request + http_connect + server_connected |
 | DNS rebinding defense | `server_connected` re-checks resolved IP against `BLOCKED_NETWORKS` |
 | Host header smuggling | `_host_header_mismatches` in `request()` and `http_connect()` |
+| Host services | `.host.brig` virtual domains are an **intentional, scoped relaxation** of this invariant. Only explicitly declared name:port pairs are reachable on the host. Unknown `.host.brig` domains are blocked. `server_connected`/`responseheaders` skip the blocked-IP check only for registered host service targets. See `_handle_host_service()` in enforce.py. |
+| Ingress | Warden ingress (port 8443) allows authenticated inbound traffic to cells. enforce.py blocks unhandled ingress requests (fail closed). CONNECT is blocked entirely on the ingress port. See `src/addons/ingress.py`. |
 | Unit test | `tests/test_addons_ops.py` — token bucket rate limiting |
+| Unit test | `tests/test_ingress.py` — ingress routing, token auth, cell IP validation, rate limiting |
 | E2E test | `tests/test_proxy_policy.sh` tests 7-11 — asserted via JSONL log entries |
 | CI | Unit + E2E |
 
