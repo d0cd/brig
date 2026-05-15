@@ -55,6 +55,7 @@ MAX_INGRESS_BODY_SIZE = 16 * 1024 * 1024
 # Auth failure rate limiting: max failures per IP before returning 429.
 AUTH_FAIL_WINDOW = 60  # Seconds.
 AUTH_FAIL_MAX = 10  # Max failures per window per IP.
+AUTH_FAIL_MAX_IPS = 10000  # Max tracked IPs (LRU eviction beyond this).
 
 
 class IngressRoute:
@@ -246,6 +247,13 @@ class IngressRouter:
         now = time.monotonic()
         with self._auth_failures_lock:
             if client_ip not in self._auth_failures:
+                # Evict oldest IP if at capacity.
+                if len(self._auth_failures) >= AUTH_FAIL_MAX_IPS:
+                    try:
+                        oldest_ip = next(iter(self._auth_failures))
+                        del self._auth_failures[oldest_ip]
+                    except StopIteration:
+                        pass
                 self._auth_failures[client_ip] = collections.deque()
             self._auth_failures[client_ip].append(now)
             # Cap deque size to prevent memory growth.

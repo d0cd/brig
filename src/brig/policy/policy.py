@@ -48,11 +48,13 @@ def save_cell_policy(
     policy: dict[str, Any],
     policy_dir: Path = POLICY_DIR,
 ) -> None:
-    """Save a cell's policy to disk."""
+    """Save a cell's policy to disk. Atomic write (temp + rename)."""
     policy_dir.mkdir(parents=True, exist_ok=True)
     path = get_cell_policy_path(cell_name, policy_dir)
-    with open(path, "w") as f:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(policy, f, indent=2)
+    tmp.rename(path)
 
 
 def delete_cell_policy(

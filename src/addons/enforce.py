@@ -852,10 +852,6 @@ class PolicyEnforcer:
         flow.request.port = service_port
         flow.request.headers["Host"] = f"{service_name}.host.brig"
 
-        # Register target so server_connected/responseheaders skip the
-        # blocked-IP check for this connection (the host IP is private).
-        self._host_service_targets.add((self._host_ip, service_port))
-
         flow.metadata["host_service"] = service_name
         flow.metadata["cell"] = cell_name or "unknown"
         flow.metadata["policy_reason"] = f"host_service:{service_name}"

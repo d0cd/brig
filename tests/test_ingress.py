@@ -208,9 +208,14 @@ class TestIngressRouteManagement(unittest.TestCase):
         self.assertEqual(route["cell_ip"], "10.60.1.2")
         self.assertEqual(route["port"], 8642)
         self.assertEqual(route["path_prefix"], "/api")
-        # Token should be hashed, not stored raw.
-        # Token must be hashed, not stored raw.
-        expected_hash = hashlib.sha256(b"test-token-123").hexdigest()
+        # Token must be salted-hashed, not stored raw.
+        self.assertIn("auth_secret_hash", route)
+        self.assertIn("auth_salt", route)
+        self.assertEqual(len(route["auth_salt"]), 32, "Salt must be 32 hex chars")
+        # Verify the stored hash matches salted computation.
+        expected_hash = hashlib.sha256(
+            (route["auth_salt"] + "test-token-123").encode()
+        ).hexdigest()
         self.assertEqual(route["auth_secret_hash"], expected_hash)
         # Raw token must not appear anywhere in the file.
         self.assertNotIn("test-token-123", self.routes_file.read_text())
