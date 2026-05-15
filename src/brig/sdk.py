@@ -306,17 +306,15 @@ class Brig:
 
             exit_code = cell.wait_sync(timeout=timeout_seconds)
 
-            # Collect output. Podman logs merges stdout/stderr but we separate
-            # by capturing each stream individually.
-            stdout_result = vm_run(["podman", "logs", "--follow=false", cell._cn])
-            stderr_result = vm_run(["podman", "logs", "--follow=false", cell._cn],
-                                   capture=True)
+            # Collect output. Podman logs merges stdout and stderr into a
+            # single stream, so reliable stderr separation is not possible.
+            log_result = vm_run(["podman", "logs", "--follow=false", cell._cn])
 
             return CellRunResult(
                 name=cell_name,
                 exit_code=exit_code,
-                stdout=stdout_result.stdout,
-                stderr=stderr_result.stderr,
+                stdout=log_result.stdout,
+                stderr="",
                 success=exit_code == 0,
             )
         finally:

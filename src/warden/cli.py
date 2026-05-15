@@ -138,7 +138,6 @@ def _handle_policy(args: object, policy_mod: object) -> int:
         print("Validation OK")
         return 0
     elif cmd == "test":
-        from pathlib import Path
         try:
             pol = policy_mod.load_policy_file(Path("/cells/network-policy.json"))  # type: ignore[attr-defined]
         except (ValueError, FileNotFoundError) as e:
@@ -162,7 +161,10 @@ def _handle_policy(args: object, policy_mod: object) -> int:
 def _handle_tor(args: object, tor_mod: object) -> int:
     """Handle tor subcommands."""
     cmd = getattr(args, "tor_command", "")
-    if cmd == "stop":
+    if cmd == "start":
+        print("Tor start is not yet implemented. Use 'warden tor status' to check state.")
+        return 1
+    elif cmd == "stop":
         tor_mod.stop_tor_stack()  # type: ignore[attr-defined]
         return 0
     elif cmd == "status":

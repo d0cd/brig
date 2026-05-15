@@ -7,6 +7,7 @@ Supports both JSON and YAML policy files.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,8 @@ def save_cell_policy(
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(policy, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.rename(path)
 
 

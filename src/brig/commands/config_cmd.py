@@ -5,6 +5,8 @@ CLI handlers for config commands.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 from typing import Any
 
 from brig.config import CONFIG_FILE
@@ -65,8 +67,12 @@ def cmd_config_set(args: Any) -> int:
     target[parts[-1]] = value
 
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(config, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp.rename(CONFIG_FILE)
 
     info(f"Set {args.key} = {args.value}")
     return 0

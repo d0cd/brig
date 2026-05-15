@@ -424,7 +424,7 @@ def compact_cell_logs(
     """
     from datetime import timedelta
 
-    if not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', cell_name):
+    if not re.match(r'^[a-z0-9][a-z0-9._-]{0,62}$', cell_name):
         return {"error": f"Invalid cell name: {cell_name}"}
 
     config = load_config_for_cell(cell_name, policy_dir)

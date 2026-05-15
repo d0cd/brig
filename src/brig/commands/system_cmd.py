@@ -222,7 +222,7 @@ def cmd_history(args: Any) -> int:
                 if cell_filter and entry.get("cell") != cell_filter:
                     continue
                 ts = entry.get("ts", "")
-                cmd = entry.get("command", "")
+                cmd = entry.get("operation", "")
                 cell = entry.get("cell", "")
                 code = entry.get("exit_code", "")
                 dur = entry.get("duration_ms", "")
