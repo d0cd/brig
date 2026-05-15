@@ -13,7 +13,7 @@ from typing import Any
 from brig.cell.lifecycle import kill_cell, rm_cell, run_cell, stop_cell
 from brig.cell.profiles import apply_profile, load_profile
 from brig.cell.spec import CellSpec, load_cell_definition, validate_cell_definition
-from brig.config import CONTAINER_PREFIX, PROXY_NAME
+from brig.config import CONTAINER_PREFIX, PROXY_NAME, container_name
 from brig.errors import BrigError
 from brig.ops.logging import info, output
 from brig.vm.shell import vm_run, vm_run_interactive
@@ -21,6 +21,18 @@ from brig.vm.shell import vm_run, vm_run_interactive
 
 def cmd_run(args: Any) -> int:
     """Handle `brig run`."""
+    # Catch the common foot-gun: `brig run alpine -m 512m sh` puts -m and 512m
+    # into the container command instead of being parsed as a brig flag.
+    # nargs=REMAINDER swallows everything after the image, so flags must
+    # precede the image. If args.image looks like a flag, the user almost
+    # certainly meant to put it before the image.
+    if args.image and args.image.startswith("-"):
+        raise BrigError(
+            f"'{args.image}' looks like a flag but appears in image position",
+            suggestion="Brig flags must precede the image name. Did you forget '--' "
+                       "before the container command? e.g. brig run --memory 512m alpine -- sh",
+        )
+
     # Auto-generate name if not provided.
     if not args.name:
         from brig.cell.names import generate_name
@@ -44,7 +56,6 @@ def cmd_run(args: Any) -> int:
         "labels": args.label or [],
         "detach": args.detach,
         "rm": args.rm,
-        "tor": getattr(args, "tor", False),
         "image_digest": getattr(args, "image_digest", None),
         "workdir": getattr(args, "workdir", None),
     }
@@ -140,26 +151,42 @@ def cmd_list(args: Any) -> int:
     except json.JSONDecodeError:
         return 1
 
-    if getattr(args, "format", "table") == "json":
+    fmt = getattr(args, "format", "table")
+    if fmt == "json":
         output(json.dumps(containers, indent=2))
+        return 0
+
+    cells = []
+    for c in containers:
+        names = c.get("Names", "")
+        # Podman 4.x returns Names as a string; 5.x as a list.
+        name = names[0] if isinstance(names, list) else names
+        if name == PROXY_NAME:
+            continue
+        cells.append((name, c))
+
+    if not cells:
+        output("No cells found")
+        return 0
+
+    if fmt == "wide":
+        output(f"{'NAME':<25} {'STATUS':<12} {'CREATED':<22} {'NETWORK':<25} {'IMAGE'}")
+        for name, c in cells:
+            cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+            networks = c.get("Networks") or []
+            network = ",".join(networks)[:25] if networks else "-"
+            created = c.get("CreatedAt", "")[:22]
+            output(f"{cell:<25} {c.get('State', ''):<12} {created:<22} {network:<25} {c.get('Image', '')}")
     else:
-        if not containers:
-            output("No cells found")
-        else:
-            output(f"{'NAME':<25} {'STATUS':<12} {'IMAGE':<30}")
-            for c in containers:
-                names = c.get("Names", "")
-                # Podman 4.x returns Names as a string; 5.x as a list.
-                name = names[0] if isinstance(names, list) else names
-                if name == PROXY_NAME:
-                    continue
-                cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
-                output(f"{cell:<25} {c.get('State', ''):<12} {c.get('Image', ''):<30}")
+        output(f"{'NAME':<25} {'STATUS':<12} {'IMAGE':<30}")
+        for name, c in cells:
+            cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+            output(f"{cell:<25} {c.get('State', ''):<12} {c.get('Image', ''):<30}")
     return 0
 
 
 def cmd_inspect(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     result = vm_run(["podman", "inspect", cn, "--format", "json"])
     if result.returncode != 0:
         raise BrigError(
@@ -172,13 +199,13 @@ def cmd_inspect(args: Any) -> int:
 
 def cmd_files(args: Any) -> int:
     """List workspace contents inside a cell."""
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     path = getattr(args, "path", "/work")
     return vm_run_interactive(["podman", "exec", cn, "ls", "-la", path])
 
 
 def cmd_logs(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     cmd = ["podman", "logs"]
     if getattr(args, "follow", False):
         cmd.append("-f")
@@ -188,33 +215,55 @@ def cmd_logs(args: Any) -> int:
     return vm_run_interactive(cmd)
 
 
+def _parse_cp_target(spec: str) -> tuple[str, str] | None:
+    """Parse 'cell:/path' into (cell, path), or return None if not a cell ref.
+
+    Only treats the colon as a cell separator when the prefix matches the
+    canonical cell-name pattern. Avoids misreading paths containing colons
+    (e.g. './out:put.txt') as cell references.
+    """
+    from brig.config import CELL_NAME_PATTERN
+    if ":" not in spec or spec.startswith("/") or spec.startswith("."):
+        return None
+    head, tail = spec.split(":", 1)
+    if not CELL_NAME_PATTERN.match(head):
+        return None
+    return head, tail
+
+
 def cmd_cp(args: Any) -> int:
     """Copy files to/from a cell with safety checks.
 
-    Detects direction from the colon syntax (container:path).
+    Detects direction from the colon syntax (cell:path). The cell prefix
+    must match the canonical cell-name pattern, so a literal path like
+    './out:put.txt' is not misread as a cell reference.
     Exports apply quarantine xattr and extension blocking by default.
     """
     src, dst = args.src, args.dst
+    src_target = _parse_cp_target(src)
+    dst_target = _parse_cp_target(dst)
 
-    # Detect direction: "cellname:/path" means export from cell.
-    if ":" in src and not src.startswith("/"):
-        cell_name = src.split(":")[0]
+    if src_target and dst_target:
+        raise BrigError(
+            "Cannot copy between two cells",
+            suggestion="Copy from cell to host first, then from host to cell",
+        )
+    if src_target:
         from brig.workspace.workspace import copy_out
-        copy_out(cell_name, src, dst, sanitize=True)
-    elif ":" in dst and not dst.startswith("/"):
-        cell_name = dst.split(":")[0]
+        copy_out(src_target[0], src, dst, sanitize=True)
+    elif dst_target:
         from brig.workspace.workspace import copy_in
-        copy_in(cell_name, src, dst)
+        copy_in(dst_target[0], src, dst)
     else:
         raise BrigError(
             "Could not determine copy direction",
-            suggestion="Use container:path syntax, e.g.: brig cp mycell:/work/out.txt ./",
+            suggestion="Use cell:path syntax, e.g.: brig cp mycell:/work/out.txt ./",
         )
     return 0
 
 
 def cmd_exec(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     cmd = ["podman", "exec"]
     if getattr(args, "interactive", False):
         cmd.append("-it")
@@ -224,12 +273,12 @@ def cmd_exec(args: Any) -> int:
 
 
 def cmd_shell(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     return vm_run_interactive(["podman", "exec", "-it", cn, "/bin/sh"])
 
 
 def cmd_attach(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     return vm_run_interactive(["podman", "attach", cn])
 
 
@@ -241,7 +290,7 @@ def cmd_start(args: Any) -> int:
             "Warden proxy is not running",
             suggestion="Start with: brig up",
         )
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     result = vm_run(["podman", "start", cn])
     if result.returncode != 0:
         raise BrigError(
@@ -253,7 +302,7 @@ def cmd_start(args: Any) -> int:
 
 
 def cmd_wait(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     result = vm_run(["podman", "wait", cn], timeout=None)
     if result.returncode != 0:
         raise BrigError(
@@ -266,7 +315,7 @@ def cmd_wait(args: Any) -> int:
 
 
 def cmd_pause(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     result = vm_run(["podman", "pause", cn])
     if result.returncode != 0:
         raise BrigError(f"Failed to pause cell '{args.name}': {result.stderr.strip()}")
@@ -275,7 +324,7 @@ def cmd_pause(args: Any) -> int:
 
 
 def cmd_unpause(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     result = vm_run(["podman", "unpause", cn])
     if result.returncode != 0:
         raise BrigError(f"Failed to unpause cell '{args.name}': {result.stderr.strip()}")
@@ -290,8 +339,8 @@ def cmd_rename(args: Any) -> int:
             f"Invalid cell name '{args.new_name}': must match {CELL_NAME_PATTERN.pattern}",
             suggestion="Cell names: lowercase alphanumeric, hyphens, dots, max 63 chars",
         )
-    old_cn = f"{CONTAINER_PREFIX}{args.old_name}"
-    new_cn = f"{CONTAINER_PREFIX}{args.new_name}"
+    old_cn = container_name(args.old_name)
+    new_cn = container_name(args.new_name)
     result = vm_run(["podman", "rename", old_cn, new_cn])
     if result.returncode != 0:
         raise BrigError(f"Failed to rename: {result.stderr.strip()}")
@@ -300,19 +349,19 @@ def cmd_rename(args: Any) -> int:
 
 
 def cmd_top(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     return vm_run_interactive(["podman", "top", cn])
 
 
 def cmd_diff(args: Any) -> int:
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     return vm_run_interactive(["podman", "diff", cn])
 
 
 def cmd_stats(args: Any) -> int:
     cmd = ["podman", "stats", "--no-stream"]
     if hasattr(args, "name") and args.name:
-        cmd.append(f"{CONTAINER_PREFIX}{args.name}")
+        cmd.append(container_name(args.name))
     else:
         cmd.extend(["--filter", f"name={CONTAINER_PREFIX}"])
     return vm_run_interactive(cmd)
@@ -320,7 +369,7 @@ def cmd_stats(args: Any) -> int:
 
 def cmd_export(args: Any) -> int:
     """Export a running cell's config as a reusable YAML cell definition."""
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
     result = vm_run(["podman", "inspect", cn, "--format", "json"])
     if result.returncode != 0:
         raise BrigError(

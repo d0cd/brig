@@ -5,6 +5,78 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Host services: cells reach declared host:port pairs via `<name>.host.brig` virtual domains, rewritten by Warden to the macOS host. Per-cell ACL: cells may only reach host services explicitly listed under `host_services` in their per-cell policy. (Audit fix H1.)
+- Authenticated ingress reverse proxy through Warden: external requests to `https://warden:8443/{cell}/{prefix}/...` route to a cell-internal port after Bearer-token auth. Salted SHA-256 token hashing, constant-time comparison, per-IP auth-failure rate limiting.
+- WebSocket passthrough through Warden (logged but not re-policy-checked once the upgrade has been allowed).
+- `brig doctor` — deep environment check (PATH, Lima VM state, addon presence, directory permissions, port collisions). Complements the lighter `brig health`.
+- `brig policy test <domain>` — host-side passthrough that runs the same allow/deny logic warden uses.
+- `brig events --follow` — block and tail new lifecycle events.
+- `brig network <cell> --blocked` — filter to only the requests warden blocked, with reason.
+- `brig list --format=wide` — adds CREATED, NETWORK columns.
+- `canary` addon: scans egress traffic for canary tokens registered against a cell; on detection, blocks the request and kills the cell.
+- `signer` addon scaffolding for outbound request signing.
+- Shared `_common.py` addon helper module: single-source-of-truth `BLOCKED_NETWORKS`, `SubnetResolver`, `atomic_write_json`.
+- Sibling addon modules (`_` prefix; not registered as mitmproxy addons): `_policy.py` for `PolicyRule` / `DomainTrie` / `Policy` (extracted from `enforce.py`); `_log_writer.py` for `AsyncLogWriter` / `LogFilter` (extracted from `logger.py`); `_notifier_state.py` for circuit-breaker / config dataclasses / URL helpers (extracted from `notifier.py`). Top-level addon files (`enforce.py` 710, `logger.py` 345, `notifier.py` 442) now own just the mitmproxy lifecycle.
+- `brig.ops.atomic.atomic_write_json` host-side helper for the same temp+fsync+rename pattern.
+- Invariant tests for DNS rebinding rechecks (IPv4-mapped-IPv6, IPv6 link-local), CONNECT method enforcement, IPv6 host normalization edge cases.
+
+### Changed
+
+- `ops` addon now bundles what was previously split across `metrics`, `ratelimit`, and `health`.
+- `brig run` flag-after-image foot-gun now produces a clear error suggesting `--`.
+- `brig secrets rm` requires `--yes` (or interactive y/N) before destroying a secret.
+- `brig cp` colon parsing rejects ambiguous paths like `./out:put.txt` instead of silently treating them as cell references.
+- gVisor (`runsc`) install in `provision-vm.sh` is pinned to a release + sha512 instead of fetching latest from the same TLS endpoint as the checksum.
+
+### Removed
+
+- `brig upgrade` (was a no-op printing "State is up to date").
+- `brig run --tor` flag and `CellSpec.tor` field (the Tor stack management was a stub; `warden tor start` did not exist).
+- `brig checkpoint` / `brig restore` argparse-unregistered handlers (dead code in `image_cmd.py`).
+- `src/tui.py` and `src/dashboard.py` (1110 lines, never wired into the CLI; no tests; deferred `brig watch` in the roadmap).
+- `setup.py` (referenced nonexistent modules `brig_cli` / `warden_cli` / `brig_subnet_cli`; pyproject.toml is the canonical source).
+- `tui` extra in `pyproject.toml` and the `runtime` field in `BUILTIN_PROFILES` (never propagated by `apply_profile`; reconciler hardcodes `--runtime runsc`).
+- `src/install-addons.sh` (duplicated `make _copy-addons` with stale `limactl start cell` instructions; the Makefile is the canonical install path).
+- `requirements.lock` and `requirements-dev.lock` (auto-generated months ago; `uv.lock` is the canonical lockfile and matches `make setup`).
+- Dead constants `HOST_SERVICE_DOMAIN_SUFFIX` and `SCRIPT_EXTENSIONS` in `brig/config.py` (defined but never imported).
+- `addons*` from the setuptools `packages.find` include list — `src/addons/` has no `__init__.py` and is mounted into the warden container by `make _copy-addons`, not installed by pip.
+- `src/addons/summarizer.py` (519 lines): never loaded by warden (missing from `proxy.py:166` optional addon list); no `addons = [...]` declaration so mitmproxy wouldn't register anything anyway; advertised CLI `warden logs compact` doesn't exist; `compact_cell_logs()` had no callers; the `log_compaction` policy key was read by no enforcement path; referenced 2024-era Claude model names. AI log summarization belongs as a host-side `brig logs compact` tool (future work) reading JSONL rather than running inside the minimal warden container.
+- `src/addons/signer.py` (273 lines): warden "loaded" it via `-s /addons/signer.py` but it had no `addons = [...]` declaration and no mitmproxy hooks (`request` / `response` / etc.), so mitmproxy registered nothing; `init()` was never called, `add_entry()` was never called from outside its own tests; the `verify_batch()` helper had no host-side audit-verifier consumer. Audit-trail signing as a feature should be re-implemented as either a real mitmproxy addon (with hooks that wrap logger.py) or a host-side `brig audit verify` tool.
+- `src/addons/canary.py` (214 lines): the addon was fully wired into warden and would correctly block + kill cells on canary detection, **but no part of brig (CLI, SDK, or policy-set command) writes the `canary_tokens` field to per-cell policy files**, so the only way to register a canary was hand-editing JSON. Removed because the surface didn't exist and isn't planned for the first ship. If/when canary tokens come back, they need a `brig canary add <cell>` command (with `getpass`-style value entry), persistence to per-cell policy via the existing atomic-write helpers, and a `warden reload` after registration.
+- `src/warden/stats.py` (45 lines): `query_metrics()` queried a Unix socket that no addon creates (`ops.py`'s health endpoint is HTTP). The only past caller was `src/tui.py`, which is gone.
+- `src/warden/tor.py` (88 lines) and the `warden tor` subcommand tree: `warden tor start` was already removed as a stub, leaving `stop` / `status` operating on `warden-tor` / `warden-privoxy` containers that no code in the repo could ever create.
+- `warden/logs.py:export_logs`: defined but had no `warden logs export` subcommand and no callers. `warden logs prune` (the actually-wired path) is unaffected.
+- `scripts/brig-manpage.py` (377 lines): orphan man-page generator. No `make manpage` target invoked it, no docs referenced it, and macOS Python CLIs rarely ship man pages. If we want one, generate from `argparse` directly in CI.
+- `src/brig-completion.bash` and `src/brig-completion.zsh` (179 + ~100 lines): hand-maintained shell completion that drifted badly — listed nonexistent `brig cat`, missing 15+ real commands (doctor, health, history, init, metrics, preflight, profiles, up, down, watchdog, pull, warmup, image-verify, secrets subcommands, config subcommands, events, shell, wait, rename, files), missing every flag added since the script was written. No install path documented. If completion comes back, generate from argparse via a `brig completion bash|zsh` subcommand (e.g. argcomplete).
+- `brig.ops.cache.invalidate_cell_cache`: defined but never called from any production path. The cache is keyed for general use; cell-state cache invalidation can be added back when there's an actual call site.
+
+### Added
+
+- `brig policy rm <cell>`: drops a cell's per-cell policy override (the cell falls back to the global policy on the next request). Wired up an existing-but-unreachable `delete_cell_policy()` function that already had tests.
+- `brig policy set <cell> --host-service <name>`: per-cell ACL grant. Previously `--host-service` only worked for the global policy (`name:port` form), so the H1 per-cell ACL field could only be set by hand-editing JSON. Now: global takes `name:port` (declares warden's forward target), per-cell takes a bare `name` (grants the cell access to a globally-declared service). The CLI rejects each form in the wrong context with a clear suggestion.
+- The `log_compaction` block in `docs/examples/network-policy.example.json` (no consumer).
+
+### Moved
+
+- `src/brig-manpage.py` → `scripts/brig-manpage.py` (one-shot generator script; was at top-level src/ where importable modules live).
+- `src/config/network-policy.example.json` → `docs/examples/network-policy.example.json` (reference doc, not installed by anything).
+- `src/config/brig-logrotate.conf` → `docs/examples/brig-logrotate.conf` (admin-installed manually).
+
+### Security
+
+- **H1**: Host services now require explicit per-cell ACL via `host_services` in cell policy. Previously any cell could reach any declared host service regardless of per-cell policy.
+- **H2/H5**: `notifier` urllib fallback no longer follows redirects (a 302 from a webhook could otherwise reach an internal-by-name host that DNS validation hadn't pre-checked). urllib3 PoolManager now sets `cert_reqs=CERT_REQUIRED` and a CA bundle explicitly.
+- **H3**: `_normalize_hostspec` now validates multi-colon strings against `ipaddress.ip_address` instead of treating them as bare IPv6 by colon count. Closes a host-header smuggling edge case.
+- **H4**: `server_connected` and `responseheaders` now skip blocked-IP checks based on `flow.metadata["host_service"]`, not on a `(ip, port)` tuple. The tuple match was exploitable via DNS rebinding to a (host_ip, host_service_port) pair.
+- **M1**: Ingress token reads call `validate_secret_path` to prevent symlink escape from the secrets directory.
+- **M2**: `verify_image_signature` no longer falls back to `podman image trust show` (which only inspects global policy and could vacuously accept any image when a single `accept` line was present anywhere). cosign is now a hard prerequisite.
+- **M3**: Sensitive directories (`~/.brig/secrets`, `~/.brig/cells/addons`, `~/.brig/state/system`) are chmod 0700 on `brig init`.
+- **M4**: Ingress route validator rejects `cell_ip` ending in `.1` (warden gateway address on every cell network), preventing an HTTP-level loop into mitmproxy itself.
+
 ## [0.2.0] - 2026-02-20
 
 ### Added
@@ -52,7 +124,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - gVisor sandboxing with runtime verification (no silent downgrade).
 - Per-cell networking with dedicated subnets and no east-west traffic.
 - Network policy system with domain allowlists, deny rules, and rate limiting.
-- 8-addon system: enforce, logger, ratelimit, metrics, health, notifier, sanitizer, summarizer.
+- Initial Warden addon system: `enforce` (policy), `logger` (per-cell JSONL logs), `ratelimit`, `metrics`, `health`, `notifier`, `summarizer` (AI log compaction).
 - SDK for programmatic cell management (`brig.sdk`).
 - TUI dashboard via optional `textual` dependency (`brig tui`).
 - Security model with 9 invariants and verification tests (`brig verify`).

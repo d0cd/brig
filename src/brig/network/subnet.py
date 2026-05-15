@@ -76,7 +76,12 @@ def _load_state(state_file: Path = SUBNET_STATE_FILE) -> dict:
 
 def _save_state(state: dict, state_file: Path = SUBNET_STATE_FILE) -> None:
     """Save state atomically (write to temp, fsync, rename)."""
-    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Tighten perms in case the dir already existed with looser permissions.
+    try:
+        os.chmod(state_file.parent, 0o700)
+    except OSError:
+        pass
     fd, tmp_path = tempfile.mkstemp(dir=state_file.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:

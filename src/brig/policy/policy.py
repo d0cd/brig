@@ -7,13 +7,13 @@ Supports both JSON and YAML policy files.
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
 
 from brig.config import DOMAIN_PATTERN, POLICY_DIR
 from brig.network.validation import is_suspicious_domain
+from brig.ops.atomic import atomic_write_json
 from brig.ops.logging import debug
 
 try:
@@ -49,15 +49,8 @@ def save_cell_policy(
     policy: dict[str, Any],
     policy_dir: Path = POLICY_DIR,
 ) -> None:
-    """Save a cell's policy to disk. Atomic write (temp + rename)."""
-    policy_dir.mkdir(parents=True, exist_ok=True)
-    path = get_cell_policy_path(cell_name, policy_dir)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(policy, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.rename(path)
+    """Save a cell's policy to disk."""
+    atomic_write_json(get_cell_policy_path(cell_name, policy_dir), policy)
 
 
 def delete_cell_policy(

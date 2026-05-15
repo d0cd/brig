@@ -51,22 +51,28 @@ def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
         .get("IPAddress", "")
     )
     if not cell_ip:
-        debug(f"Could not determine cell IP for ingress registration")
+        debug("Could not determine cell IP for ingress registration")
         return
 
-    # Read ingress auth token from secrets.
+    # Read ingress auth token from secrets. Validate the path resolves inside
+    # the secrets dir to prevent symlink escape (an attacker who plants a
+    # symlink in ~/.brig/secrets pointing at /etc/passwd would otherwise
+    # have its contents adopted as the ingress token).
     from brig.config import HostPaths
+    from brig.security.secrets import validate_secret_path
+
     token_name = f"{spec.name}-ingress-token"
-    token_path = HostPaths.SECRETS_DIR / token_name
-    if not token_path.exists():
-        # Fall back to a generic ingress-token secret.
-        token_path = HostPaths.SECRETS_DIR / "ingress-token"
-    if not token_path.exists():
-        info(
-            f"WARNING: No ingress token found for '{spec.name}'. "
-            f"Create one with: brig secrets add {token_name}"
-        )
-        return
+    try:
+        token_path = validate_secret_path(token_name, HostPaths.SECRETS_DIR)
+    except (ValueError, FileNotFoundError):
+        try:
+            token_path = validate_secret_path("ingress-token", HostPaths.SECRETS_DIR)
+        except (ValueError, FileNotFoundError):
+            info(
+                f"WARNING: No ingress token found for '{spec.name}'. "
+                f"Create one with: brig secrets add {token_name}"
+            )
+            return
 
     auth_token = token_path.read_text().strip()
     if not auth_token:
@@ -74,8 +80,8 @@ def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
         return
     if len(auth_token) < 32:
         info(
-            f"WARNING: Ingress token for '{spec.name}' is short "
-            f"({len(auth_token)} chars). Use at least 32 characters."
+            f"WARNING: Ingress token for '{spec.name}' is short. "
+            f"Use at least 32 characters."
         )
 
     register_ingress(spec.name, cell_ip, spec.ingress, auth_token)

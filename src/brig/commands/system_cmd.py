@@ -9,8 +9,9 @@ from brig.vm.shell import vm_run
 from pathlib import Path
 from typing import Any
 
-from brig.config import BRIG_HOME, CONTAINER_PREFIX, PROXY_NAME, STATE_DIR
+from brig.config import BRIG_HOME, CONTAINER_PREFIX, PROXY_NAME, STATE_DIR, container_name
 from brig.errors import BrigError
+from brig.ops.atomic import atomic_write_json
 from brig.ops.logging import info, output
 from brig.security.verify import verify_all
 
@@ -45,12 +46,19 @@ def cmd_init(args: Any) -> int:
     for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
 
-    (BRIG_HOME / "secrets").chmod(0o700)
+    # Sensitive dirs must not be readable/writable by other users on the host.
+    # secrets: holds API keys, tokens.
+    # cells/addons: an attacker who can write here can replace enforce.py.
+    # state/system: holds subnet allocator state and operation history.
+    for sensitive in (BRIG_HOME / "secrets",
+                      BRIG_HOME / "cells" / "addons",
+                      BRIG_HOME / "state" / "system"):
+        sensitive.chmod(0o700)
 
     # Default network policy.
     policy_file = BRIG_HOME / "cells" / "network-policy.json"
     if not policy_file.exists():
-        policy_file.write_text(json.dumps(_DEFAULT_POLICY, indent=2))
+        atomic_write_json(policy_file, _DEFAULT_POLICY)
         output(f"  Created default policy: {policy_file}")
 
     # Lima VM template.
@@ -94,6 +102,107 @@ def cmd_verify(args: Any) -> int:
         return 0
 
 
+def cmd_doctor(args: Any) -> int:
+    """Handle `brig doctor` — deep environment + system check.
+
+    Goes beyond `brig health`: verifies tooling on PATH, Lima version, gVisor
+    presence inside the VM, addons installed, port collisions, and disk
+    space. Prints a checklist with actionable suggestions on each failure.
+    """
+    import shutil as _shutil
+    from brig.config import HostPaths
+    from brig.network.proxy import proxy_running
+
+    failures = []
+    output("Running brig doctor...")
+    output("=" * 50)
+
+    def _check(label: str, ok: bool, detail: str = "", suggestion: str = ""):
+        status = "[OK]" if ok else "[FAIL]"
+        output(f"  {status} {label}")
+        if detail:
+            output(f"    {detail}")
+        if not ok:
+            failures.append((label, suggestion))
+
+    # 1. Required commands on PATH.
+    for cmd, hint in [
+        ("limactl", "brew install lima"),
+        ("podman", "brew install podman (optional on host)"),
+        ("cosign", "brew install cosign (image signature verification)"),
+    ]:
+        path = _shutil.which(cmd)
+        _check(f"{cmd} on PATH", bool(path), detail=path or "not found",
+               suggestion=hint)
+
+    # 2. Lima VM exists and is running.
+    if _shutil.which("limactl"):
+        import subprocess
+        result = subprocess.run(
+            ["limactl", "list", "--format", "{{.Name}}={{.Status}}"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        vm_states = dict(
+            line.split("=", 1) for line in result.stdout.strip().splitlines()
+            if "=" in line
+        )
+        brig_status = vm_states.get("brig", "missing")
+        _check("Lima VM 'brig' exists", brig_status != "missing",
+               detail=f"status: {brig_status}",
+               suggestion="limactl create --name=brig ~/.brig/lima.yaml")
+        _check("Lima VM 'brig' running", brig_status == "Running",
+               detail=f"status: {brig_status}",
+               suggestion="limactl start brig")
+
+    # 3. ~/.brig directories exist with safe permissions. Use a different
+    # name from `path` (which mypy infers as `str | None` from the earlier
+    # `_shutil.which()` loop) to keep the type checker happy.
+    for dir_path, expected_mode in [
+        (HostPaths.SECRETS_DIR, 0o700),
+        (HostPaths.ADDONS_DIR, 0o700),
+        (HostPaths.STATE_DIR / "system", 0o700),
+    ]:
+        if dir_path.exists():
+            actual_mode = dir_path.stat().st_mode & 0o777
+            _check(f"{dir_path} has 0700 perms", actual_mode == expected_mode,
+                   detail=f"mode: {oct(actual_mode)}",
+                   suggestion=f"chmod 0700 {dir_path}")
+        else:
+            _check(f"{dir_path} exists", False, suggestion="brig init")
+
+    # 4. Required addons present.
+    for addon in ["enforce.py", "logger.py", "_common.py"]:
+        addon_path = HostPaths.ADDONS_DIR / addon
+        _check(f"addon: {addon}", addon_path.exists(),
+               suggestion="make _copy-addons (re-install addons from source)")
+
+    # 5. Network policy file exists and parses.
+    policy_path = HostPaths.NETWORK_POLICY
+    if policy_path.exists():
+        try:
+            json.loads(policy_path.read_text())
+            _check(f"policy: {policy_path.name}", True)
+        except json.JSONDecodeError as e:
+            _check(f"policy: {policy_path.name}", False,
+                   detail=str(e), suggestion="brig policy show global")
+    else:
+        _check(f"policy: {policy_path.name}", False, suggestion="brig init")
+
+    # 6. Warden running.
+    _check("warden proxy running", proxy_running(),
+           suggestion="brig up")
+
+    output("=" * 50)
+    if failures:
+        output(f"FAILED: {len(failures)} check(s)")
+        for label, suggestion in failures:
+            if suggestion:
+                output(f"  fix '{label}': {suggestion}")
+        return 1
+    output("All checks passed")
+    return 0
+
+
 def cmd_health(args: Any) -> int:
     """Handle `brig health`."""
     from brig.network.proxy import proxy_running
@@ -125,8 +234,7 @@ def cmd_health(args: Any) -> int:
 
 def cmd_diagnose(args: Any) -> int:
     """Handle `brig diagnose` — run diagnostic checks for a cell."""
-    from brig.config import CONTAINER_PREFIX
-    cn = f"{CONTAINER_PREFIX}{args.name}"
+    cn = container_name(args.name)
 
     # Container state.
     result = vm_run(
@@ -235,12 +343,4 @@ def cmd_history(args: Any) -> int:
     except IOError as e:
         raise BrigError(f"Failed to read history: {e}")
 
-    return 0
-
-
-def cmd_upgrade(args: Any) -> int:
-    """Handle `brig upgrade` — upgrade state to current schema."""
-    output("Checking state schema...")
-    # Currently no migrations needed — this is a fresh v2 install.
-    output("State is up to date (v2)")
     return 0

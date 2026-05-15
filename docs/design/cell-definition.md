@@ -55,7 +55,6 @@ workspace_quota: "500m"          # Max workspace size
 
 # Execution mode
 detach: false                    # Run in background
-tor: false                       # Route through Tor (requires warden tor start)
 
 # Working directory inside container (default: /work)
 workdir: /app
@@ -141,16 +140,34 @@ Cells cannot reach the macOS host by default (private IPs are blocked).
 Host services allow cells to reach specific host-side services through
 virtual `.host.brig` domains.
 
-Declared in the **global** network policy (not per-cell):
-```bash
-brig policy set global --host-service aitelier:7777
-brig policy set global --host-service litellm:4000
-```
+Declaration is two-step:
 
-From inside a cell:
+1. **Global policy** declares the (name → port) mapping that warden knows
+   how to forward:
+   ```bash
+   brig policy set global --host-service aitelier:7777
+   brig policy set global --host-service litellm:4000
+   ```
+
+2. **Per-cell policy** opts the cell into reaching specific services. By
+   default a cell has *no* host-service access; you must add the names you
+   want it to reach (audit fix H1):
+   ```bash
+   brig policy set hermes --host-service aitelier
+   ```
+
+   Or write the per-cell policy file directly:
+   ```json
+   {
+     "allow": ["api.github.com"],
+     "deny": [],
+     "host_services": ["aitelier"]
+   }
+   ```
+
+From inside the cell:
 ```bash
 curl http://aitelier.host.brig/v1/health
-curl http://litellm.host.brig/v1/models
 ```
 
 Warden intercepts `.host.brig` requests and rewrites them to the macOS
@@ -158,9 +175,16 @@ host IP + declared port. The cell never sees the real host IP.
 
 Security properties:
 - Only declared services are reachable (not a blanket private IP bypass)
+- A cell can only reach services in **its own** `host_services` list
+  (per-cell ACL — global declaration is necessary but not sufficient)
+- Cells with no per-cell policy have **no** host-service access
 - All traffic logged with `host_service` attribution
 - Virtual domains only resolve through the proxy
 - Unknown `.host.brig` domains are blocked
+- DNS rebinding to `(host_ip, host_service_port)` from an allowlisted
+  domain is detected: the host-service skip on `BLOCKED_NETWORKS` is
+  gated on `flow.metadata["host_service"]`, not on the destination tuple
+  (audit fix H4)
 
 ## Examples
 

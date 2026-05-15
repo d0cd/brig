@@ -5,13 +5,24 @@ CLI handlers for config commands.
 from __future__ import annotations
 
 import json
-import os
-from pathlib import Path
 from typing import Any
 
 from brig.config import CONFIG_FILE
 from brig.errors import BrigError
+from brig.ops.atomic import atomic_write_json
 from brig.ops.logging import info, output
+
+
+def register_parser(sub) -> None:
+    """Register the `brig config` subcommand tree."""
+    p = sub.add_parser("config", help="Manage configuration")
+    s = p.add_subparsers(dest="config_command", required=True)
+    p_show = s.add_parser("show", help="Show configuration")
+    p_show.add_argument("key", nargs="?", help="Config key")
+    p_set = s.add_parser("set", help="Set configuration value")
+    p_set.add_argument("key", help="Config key")
+    p_set.add_argument("value", help="Value")
+    s.add_parser("reset", help="Reset to defaults")
 
 
 def cmd_config_show(args: Any) -> int:
@@ -66,13 +77,7 @@ def cmd_config_set(args: Any) -> int:
         target = target[part]
     target[parts[-1]] = value
 
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_FILE.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(config, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.rename(CONFIG_FILE)
+    atomic_write_json(CONFIG_FILE, config)
 
     info(f"Set {args.key} = {args.value}")
     return 0
@@ -88,8 +93,13 @@ def cmd_config_reset(args: Any) -> int:
             "redact_env_values": True,
         }
     }
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(default, f, indent=2)
+    atomic_write_json(CONFIG_FILE, default)
     info("Configuration reset to defaults")
     return 0
+
+
+DISPATCH = {
+    "show": cmd_config_show,
+    "set": cmd_config_set,
+    "reset": cmd_config_reset,
+}

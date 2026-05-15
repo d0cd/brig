@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 from brig.config import HostPaths, VMPaths
+from brig.ops.atomic import atomic_write_json
 from brig.ops.logging import debug, info
 
 
@@ -30,17 +31,6 @@ def _load_routes(path: Path) -> dict:
         return data
     except (json.JSONDecodeError, IOError):
         return {"routes": []}
-
-
-def _write_routes_atomic(path: Path, data: dict) -> None:
-    """Write routes file atomically (temp + rename)."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.rename(path)
 
 
 def _hash_token(token: str, salt: str | None = None) -> tuple[str, str]:
@@ -103,7 +93,7 @@ def register_ingress(
                     "auth_salt": token_salt,
                 })
 
-            _write_routes_atomic(routes_file, data)
+            atomic_write_json(routes_file, data)
             info(f"Registered {len(ingress_spec)} ingress routes for '{cell_name}'")
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -128,7 +118,7 @@ def deregister_ingress(cell_name: str) -> None:
             after = len(data["routes"])
 
             if before != after:
-                _write_routes_atomic(routes_file, data)
+                atomic_write_json(routes_file, data)
                 debug(f"Deregistered {before - after} ingress routes for '{cell_name}'")
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)

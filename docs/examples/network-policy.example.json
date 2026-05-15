@@ -48,15 +48,6 @@
     "max_size_mb": 500,
     "compress_after_days": 1
   },
-  "log_compaction": {
-    "ai": {
-      "enabled": false,
-      "model": "claude-haiku-3",
-      "preserve_verbatim": ["blocked", "error", "rate_limited", "cert_invalid"],
-      "max_input_tokens": 50000,
-      "cost_limit_daily_usd": 1.00
-    }
-  },
   "notifications": {
     "webhook_url": "",
     "filters": {

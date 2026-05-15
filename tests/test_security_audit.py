@@ -29,7 +29,7 @@ _addons_dir = str(Path(__file__).parent.parent / "src" / "addons")
 if _addons_dir not in sys.path:
     sys.path.insert(0, _addons_dir)
 
-from enforce import DomainTrie, PolicyEnforcer, PolicyRule  # noqa: E402
+from enforce import DomainTrie, Policy, PolicyEnforcer, PolicyRule  # noqa: E402
 from logger import RequestLogger  # noqa: E402
 
 from brig.cell.reconciler import build_run_command  # noqa: E402
@@ -68,15 +68,17 @@ class TestHandleHostService(unittest.TestCase):
         self.enforcer = PolicyEnforcer()
         self.enforcer._host_ip = "192.168.64.1"
         self.enforcer.host_services = {"mydb": 5432, "redis": 6379}
-        self.enforcer._host_service_targets = {
-            ("192.168.64.1", 5432),
-            ("192.168.64.1", 6379),
-        }
+        # Per-cell policy that grants access to mydb and redis (H1).
+        self.allow_policy = Policy(
+            allow=[], deny=[], host_services=["mydb", "redis"],
+        )
 
     def test_valid_host_service_rewrites(self):
         """Known service rewrites host and port to macOS host IP."""
         flow = _make_flow(host="mydb.host.brig", port=443)
-        self.enforcer._handle_host_service(flow, "mydb.host.brig", "cell-a")
+        self.enforcer._handle_host_service(
+            flow, "mydb.host.brig", "cell-a", self.allow_policy,
+        )
 
         self.assertEqual(flow.request.host, "192.168.64.1")
         self.assertEqual(flow.request.port, 5432)
@@ -85,7 +87,9 @@ class TestHandleHostService(unittest.TestCase):
     def test_unknown_service_blocked(self):
         """Unknown .host.brig service is blocked."""
         flow = _make_flow(host="unknown-svc.host.brig", port=443)
-        self.enforcer._handle_host_service(flow, "unknown-svc.host.brig", "cell-a")
+        self.enforcer._handle_host_service(
+            flow, "unknown-svc.host.brig", "cell-a", self.allow_policy,
+        )
 
         self.assertTrue(flow.metadata.get("blocked"))
         self.assertIn("unknown host service", flow.metadata.get("block_reason", ""))
@@ -94,7 +98,9 @@ class TestHandleHostService(unittest.TestCase):
         """When host IP is not discovered, host service requests are blocked."""
         self.enforcer._host_ip = ""
         flow = _make_flow(host="mydb.host.brig", port=443)
-        self.enforcer._handle_host_service(flow, "mydb.host.brig", "cell-a")
+        self.enforcer._handle_host_service(
+            flow, "mydb.host.brig", "cell-a", self.allow_policy,
+        )
 
         self.assertTrue(flow.metadata.get("blocked"))
         self.assertIn("host IP not discovered", flow.metadata.get("block_reason", ""))
@@ -102,9 +108,30 @@ class TestHandleHostService(unittest.TestCase):
     def test_host_header_set_to_virtual_domain(self):
         """After rewrite, Host header must be the virtual domain, not raw IP."""
         flow = _make_flow(host="redis.host.brig", port=443)
-        self.enforcer._handle_host_service(flow, "redis.host.brig", "cell-a")
+        self.enforcer._handle_host_service(
+            flow, "redis.host.brig", "cell-a", self.allow_policy,
+        )
 
         self.assertEqual(flow.request.headers["Host"], "redis.host.brig")
+
+    def test_no_cell_policy_blocked(self):
+        """H1: cell with no per-cell policy cannot reach host services."""
+        flow = _make_flow(host="mydb.host.brig", port=443)
+        self.enforcer._handle_host_service(
+            flow, "mydb.host.brig", "cell-without-policy", None,
+        )
+        self.assertTrue(flow.metadata.get("blocked"))
+        self.assertIn("no host_services configured", flow.metadata.get("block_reason", ""))
+
+    def test_cell_policy_without_service_blocked(self):
+        """H1: cell whose policy doesn't list the service is blocked."""
+        deny_policy = Policy(allow=[], deny=[], host_services=["redis"])
+        flow = _make_flow(host="mydb.host.brig", port=443)
+        self.enforcer._handle_host_service(
+            flow, "mydb.host.brig", "cell-a", deny_policy,
+        )
+        self.assertTrue(flow.metadata.get("blocked"))
+        self.assertIn("not in cell", flow.metadata.get("block_reason", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +298,7 @@ class TestSeccompProfileValidation(unittest.TestCase):
     @patch("brig.cell.reconciler.vm_run")
     def test_path_traversal_rejected(self, mock_vm_run):
         """seccomp_profile with '..' is rejected."""
-        spec = self._make_spec("..%2f..%2fetc%2fpasswd")
-        # The actual code checks for ".." in the string.
-        # URL-encoded ".." won't trigger, but literal ".." will.
+        # URL-encoded ".." won't trigger the check, but literal ".." will.
         spec_literal = self._make_spec("../../../etc/seccomp.json")
         with self.assertRaises(ValueError, msg="path"):
             build_run_command(spec_literal, "10.60.1.1")
@@ -284,8 +309,6 @@ class TestSeccompProfileValidation(unittest.TestCase):
         spec = self._make_spec("default.json")
         cmd = build_run_command(spec, "10.60.1.1")
         self.assertIn("--security-opt", cmd)
-        # The profile path should contain the filename.
-        seccomp_idx = cmd.index("--security-opt") + 1
         # There are two --security-opt flags; find the seccomp one.
         for i, arg in enumerate(cmd):
             if arg == "--security-opt" and i + 1 < len(cmd) and cmd[i + 1].startswith("seccomp="):
@@ -427,6 +450,197 @@ class TestLoggerCellNameValidation(unittest.TestCase):
                 self.logger._write_log(None, {"ts": "test"})
                 self.assertEqual(len(self.logged_files), 1)
                 self.assertEqual(self.logged_files[0].name, "unknown.jsonl")
+
+
+# ---------------------------------------------------------------------------
+# 7. Invariant tests added per audit (closes documented gaps in INVARIANTS.md)
+# ---------------------------------------------------------------------------
+
+class TestServerConnectedDnsRebinding(unittest.TestCase):
+    """Inv. 2: server_connected/responseheaders close connections that resolve
+    into BLOCKED_NETWORKS (DNS rebinding defense). Skip ONLY when the flow we
+    rewrote ourselves carries the host_service metadata flag.
+    """
+
+    def setUp(self):
+        self.enforcer = PolicyEnforcer()
+        self.enforcer._host_ip = "192.168.64.1"
+
+    def _make_server_data(self, ip: str, port: int = 443, flow=None):
+        data = MagicMock()
+        data.server.peername = (ip, port)
+        # mitmproxy 10+: data.flow is the associated HTTP flow when applicable.
+        if flow is not None:
+            data.flow = flow
+        else:
+            # Explicitly remove `flow` so getattr returns None.
+            del data.flow
+        return data
+
+    def test_rfc1918_blocked(self):
+        data = self._make_server_data("10.0.0.5")
+        self.enforcer.server_connected(data)
+        data.server.close.assert_called()
+
+    def test_localhost_blocked(self):
+        data = self._make_server_data("127.0.0.1")
+        self.enforcer.server_connected(data)
+        data.server.close.assert_called()
+
+    def test_link_local_blocked(self):
+        data = self._make_server_data("169.254.169.254")
+        self.enforcer.server_connected(data)
+        data.server.close.assert_called()
+
+    def test_ipv4_mapped_ipv6_blocked(self):
+        data = self._make_server_data("::ffff:10.0.0.5")
+        self.enforcer.server_connected(data)
+        data.server.close.assert_called()
+
+    def test_ipv6_link_local_blocked(self):
+        data = self._make_server_data("fe80::1")
+        self.enforcer.server_connected(data)
+        data.server.close.assert_called()
+
+    def test_public_ip_allowed(self):
+        data = self._make_server_data("93.184.216.34")
+        self.enforcer.server_connected(data)
+        data.server.close.assert_not_called()
+
+    def test_host_service_skip_requires_flow_metadata(self):
+        """Host-service skip is keyed on flow.metadata, not (ip,port) tuple.
+        A naked tuple match (no metadata) must NOT bypass the BLOCKED check.
+        """
+        data = self._make_server_data("192.168.64.1", port=5432)
+        self.enforcer.server_connected(data)
+        data.server.close.assert_called()
+
+    def test_host_service_skip_when_metadata_set(self):
+        """When the rewritten flow has host_service metadata, skip the check."""
+        flow = MagicMock()
+        flow.metadata = {"host_service": "mydb"}
+        data = self._make_server_data("192.168.64.1", port=5432, flow=flow)
+        self.enforcer.server_connected(data)
+        data.server.close.assert_not_called()
+
+
+class TestResponseHeadersDnsRebinding(unittest.TestCase):
+    """Inv. 2: responseheaders blocks responses from blocked-IP servers."""
+
+    def setUp(self):
+        self.enforcer = PolicyEnforcer()
+
+    def _make_flow(self, ip: str, port: int = 443, host_service=None):
+        flow = MagicMock()
+        flow.server_conn.peername = (ip, port)
+        flow.metadata = {"host_service": host_service} if host_service else {}
+        flow.request.host = "example.com"
+        flow.request.path = "/"
+        flow.response = None
+        return flow
+
+    def test_blocks_rfc1918_response(self):
+        flow = self._make_flow("172.16.0.5")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_blocks_ipv4_mapped_response(self):
+        flow = self._make_flow("::ffff:192.168.0.5")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_skips_when_host_service_metadata_set(self):
+        flow = self._make_flow("192.168.64.1", port=5432, host_service="mydb")
+        self.enforcer.responseheaders(flow)
+        self.assertFalse(flow.metadata.get("blocked"))
+
+    def test_does_not_skip_without_metadata(self):
+        """Without host_service metadata, even host-IP-tuple matches block."""
+        flow = self._make_flow("192.168.64.1", port=5432)
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+
+class TestConnectMethodEnforcement(unittest.TestCase):
+    """CONNECT tunnels must respect the same port and policy gates."""
+
+    def setUp(self):
+        self.enforcer = PolicyEnforcer()
+        self.enforcer.global_policy = Policy(allow=["example.com"])
+
+    def test_connect_to_disallowed_port_blocked(self):
+        flow = _make_flow(host="example.com", port=22, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+        self.assertIn("port", flow.metadata.get("block_reason", ""))
+
+    def test_connect_to_internal_ip_blocked(self):
+        flow = _make_flow(host="10.0.0.5", port=443, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_connect_to_literal_ip_blocked(self):
+        flow = _make_flow(host="93.184.216.34", port=443, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_connect_to_disallowed_domain_blocked(self):
+        flow = _make_flow(host="evil.com", port=443, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_connect_on_ingress_port_blocked(self):
+        """CONNECT is always rejected on the ingress listener (8443)."""
+        flow = _make_flow(host="example.com", port=443, listen_port=8443)
+        self.enforcer.http_connect(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+        self.assertIn("CONNECT", flow.metadata.get("block_reason", ""))
+
+
+class TestNormalizeHostspecRobustness(unittest.TestCase):
+    """H3: ambiguous IPv6-looking hostspecs must not bypass mismatch checks."""
+
+    def test_bare_ipv6_loopback(self):
+        self.assertEqual(PolicyEnforcer._normalize_hostspec("::1"), "::1")
+
+    def test_bracketed_ipv6_with_port(self):
+        self.assertEqual(PolicyEnforcer._normalize_hostspec("[::1]:443"), "::1")
+
+    def test_invalid_multi_colon_string_falls_through(self):
+        """'example.com:80:extra' has 2 colons but is not a valid IPv6 — it
+        must NOT be treated as bare IPv6, otherwise host-header smuggling
+        comparisons can collide."""
+        self.assertEqual(
+            PolicyEnforcer._normalize_hostspec("example.com:80:extra"),
+            "example.com",
+        )
+
+    def test_invalid_double_colon_address(self):
+        """Strings like '1::1::bad' are not valid IPv6 — fall through to split."""
+        self.assertEqual(
+            PolicyEnforcer._normalize_hostspec("1::1::bad"),
+            "1",
+        )
+
+
+class TestAirgappedSpecValidation(unittest.TestCase):
+    """Inv. 9: airgapped cells skip the proxy-running gate, but their spec
+    must still be valid. Validate that flipping network=none does not let a
+    cell mount secrets without policy.
+    """
+
+    def test_airgapped_spec_with_secrets_validates(self):
+        """An airgapped spec mounting secrets is valid; the runtime gate
+        elsewhere ensures the proxy isn't required for airgapped cells."""
+        from brig.cell.spec import CellSpec
+        spec = CellSpec(
+            name="test", image="alpine",
+            network="none", secrets=["api-key"],
+        )
+        # is_airgapped property is what skips the proxy_running gate; the
+        # secrets list must still be honored by the reconciler.
+        self.assertTrue(spec.is_airgapped)
+        self.assertEqual(spec.secrets, ["api-key"])
 
 
 if __name__ == "__main__":

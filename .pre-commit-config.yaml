@@ -23,4 +23,4 @@ repos:
       - id: mypy
         args: [--ignore-missing-imports, --explicit-package-bases, src/brig/]
         pass_filenames: false
-        additional_dependencies: [pyyaml]
+        additional_dependencies: [pyyaml, types-PyYAML]

@@ -24,6 +24,11 @@ CELL_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9._-]{0,62}$')
 # Container naming prefix for cells.
 CONTAINER_PREFIX = "brig-"
 
+
+def container_name(cell_name: str) -> str:
+    """Map a cell name to its podman container name."""
+    return f"{CONTAINER_PREFIX}{cell_name}"
+
 # Default runtime (gVisor).
 RUNTIME = "runsc"
 
@@ -59,7 +64,9 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
 ]
 
 # Host services (cell → host forwarding through Warden).
-HOST_SERVICE_DOMAIN_SUFFIX = ".host.brig"
+# The .host.brig suffix is also defined as HOST_SERVICE_SUFFIX in
+# src/addons/enforce.py — addons can't import from brig.* so the suffix
+# lives in both places. Keep them in sync.
 HOST_SERVICE_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
 MAX_HOST_SERVICES = 16
 
@@ -74,11 +81,6 @@ INGRESS_PATH_PREFIX_PATTERN = re.compile(r'^/[a-zA-Z0-9/_-]+$')
 UNSAFE_EXTENSIONS = {
     ".app", ".command", ".scpt", ".dmg", ".pkg", ".webloc",
     ".jar", ".exe", ".bat", ".cmd", ".msi", ".vbs", ".ps1",
-}
-
-# Script file extensions.
-SCRIPT_EXTENSIONS = {
-    ".sh", ".py", ".js", ".rb", ".pl", ".php",
 }
 
 

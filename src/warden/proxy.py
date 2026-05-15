@@ -163,7 +163,7 @@ def start() -> bool:
         ])
 
     # Optional addons (check host-side, mount VM-side).
-    for addon in ["ops.py", "notifier.py", "canary.py", "signer.py"]:
+    for addon in ["ops.py", "notifier.py"]:
         if (HostPaths.ADDONS_DIR / addon).exists():
             cmd.extend(["-s", f"/addons/{addon}"])
 

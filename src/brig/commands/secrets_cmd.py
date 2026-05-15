@@ -1,5 +1,6 @@
 """
-CLI handlers for secret management.
+CLI handlers for secret management. Includes argparse registration so cli.py
+doesn't have to know about the secrets subcommand structure.
 
 Secrets are plain files in ~/.brig/secrets/. Each file is one secret.
 When mounted into a cell:
@@ -22,6 +23,25 @@ from typing import Any
 from brig.config import HostPaths
 from brig.errors import BrigError
 from brig.ops.logging import info, output, warn
+
+
+def register_parser(sub) -> None:
+    """Register the `brig secrets` subcommand tree."""
+    p = sub.add_parser("secrets", help="Manage secrets")
+    s = p.add_subparsers(dest="secrets_command", required=True)
+    s.add_parser("list", help="List all secrets")
+    p_add = s.add_parser("add", help="Add a secret")
+    p_add.add_argument("name", help="Secret name")
+    p_add.add_argument("--value", help="Secret value (insecure — prefer stdin)")
+    p_add.add_argument("--from-file", help="Read value from file")
+    p_add.add_argument("--force", action="store_true", help="Overwrite existing")
+    p_rm = s.add_parser("rm", help="Remove a secret")
+    p_rm.add_argument("name", help="Secret name")
+    p_rm.add_argument("-y", "--yes", action="store_true",
+                      help="Skip the confirmation prompt")
+
+
+DISPATCH = {}  # Populated below after handlers are defined.
 
 
 def cmd_secrets_list(args: Any) -> int:
@@ -110,11 +130,40 @@ def cmd_secrets_add(args: Any) -> int:
 
 
 def cmd_secrets_rm(args: Any) -> int:
-    """Handle `brig secrets rm <name>`."""
+    """Handle `brig secrets rm <name>`.
+
+    Requires --yes for non-interactive use, or an interactive y/N confirmation,
+    because secret deletion is irreversible and a typo at the prompt
+    permanently destroys credentials.
+    """
     path = HostPaths.SECRETS_DIR / args.name
-    try:
-        path.unlink()
-        info(f"Secret '{args.name}' removed")
-    except FileNotFoundError:
+    if not path.exists():
         raise BrigError(f"Secret '{args.name}' not found")
+
+    if not getattr(args, "yes", False):
+        if not sys.stdin.isatty():
+            raise BrigError(
+                f"Refusing to delete secret '{args.name}' without confirmation",
+                suggestion="Pass --yes to skip the prompt in non-interactive use",
+            )
+        try:
+            answer = input(
+                f"Delete secret '{args.name}'? This cannot be undone. [y/N]: "
+            )
+        except (EOFError, KeyboardInterrupt):
+            output("")
+            raise BrigError("Aborted")
+        if answer.strip().lower() not in ("y", "yes"):
+            output("Aborted")
+            return 1
+
+    path.unlink()
+    info(f"Secret '{args.name}' removed")
     return 0
+
+
+DISPATCH = {
+    "list": cmd_secrets_list,
+    "add": cmd_secrets_add,
+    "rm": cmd_secrets_rm,
+}

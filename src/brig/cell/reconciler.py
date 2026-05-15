@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from brig.cell.spec import CellSpec
-from brig.config import CONTAINER_PREFIX, PROXY_NAME, RUNTIME, VMPaths
+from brig.config import PROXY_NAME, RUNTIME, VMPaths, container_name
 from brig.ops.logging import debug
 from brig.vm.shell import vm_run
 
@@ -90,7 +90,7 @@ def _podman_inspect_json(name: str) -> dict | None:
 def observe(cell_name: str) -> CellState:
     """Query podman for the actual state of a cell."""
     state = CellState()
-    name = f"{CONTAINER_PREFIX}{cell_name}"
+    name = container_name(cell_name)
     state.container_name = name
     state.network_name = name
 
@@ -175,7 +175,7 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
 
     Enforces invariant 5: --runtime runsc is always set.
     """
-    name = f"{CONTAINER_PREFIX}{spec.name}"
+    name = container_name(spec.name)
 
     cmd = [
         "podman", "run",
@@ -295,7 +295,7 @@ def _rollback(completed: list[Action]) -> None:
 
 def _execute_action(action: Action, result: ReconcileResult) -> None:
     """Execute a single reconciliation action."""
-    name = f"{CONTAINER_PREFIX}{action.cell_name}"
+    name = container_name(action.cell_name)
 
     if action.type == ActionType.ALLOCATE_SUBNET:
         from brig.network.subnet import allocate

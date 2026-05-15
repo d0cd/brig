@@ -92,13 +92,21 @@ Brig runs untrusted code safely on macOS using Lima VM + gVisor + per-cell netwo
 
 ### Atomic File Writes
 
+Use the helpers — don't reinvent the temp+rename pattern.
+
 ```python
-# Write to temp, rename to target
-tmp_file = target_file.with_suffix('.tmp')
-with open(tmp_file, 'w') as f:
-    json.dump(data, f)
-tmp_file.rename(target_file)  # Atomic on POSIX
+from brig.ops.atomic import atomic_write_json
+atomic_write_json(target_file, data)
 ```
+
+Inside addons (which can't import `brig.*`):
+
+```python
+from _common import atomic_write_json
+atomic_write_json(target_file, data)
+```
+
+Both write to a tempfile in the same directory, fsync, and rename — POSIX-atomic.
 
 ### File Locking
 
@@ -109,6 +117,9 @@ with open(LOCK_FILE, 'w') as lock:
 ```
 
 ### Path Validation
+
+For secrets, use `brig.security.secrets.validate_secret_path` — it resolves the path
+and verifies it stays inside the secrets directory (defends against symlinks).
 
 ```python
 def validate_path(path):
@@ -127,18 +138,28 @@ def validate_path(path):
 ```
 src/
 ├── brig/
-│   ├── cli.py              # CLI entry point
-│   ├── config.py           # Constants and paths
+│   ├── cli.py              # CLI entry point (argparse + dispatch)
+│   ├── config.py           # Constants, paths, container_name() helper
 │   ├── errors.py           # BrigError + error helpers
-│   ├── cell/               # Cell lifecycle (spec, reconciler, profiles)
-│   ├── network/            # Subnet allocator, proxy, validation
+│   ├── sdk.py              # Programmatic SDK (Brig, Cell)
+│   ├── cell/               # Cell lifecycle (spec, reconciler, profiles, names)
+│   ├── network/            # Subnet allocator, proxy, validation, ingress routes
 │   ├── policy/             # Policy CRUD (JSON + YAML)
-│   ├── security/           # Secrets, image verification, invariant checks
-│   ├── ops/                # Logging, cache, rate limiting, history
-│   └── commands/           # Thin CLI handlers
-├── warden/                 # Proxy manager (lifecycle, policy, health, reconcile)
-└── addons/                 # mitmproxy addons (enforce, logger, ops)
+│   ├── security/           # Secrets validation, image verify, invariant checks
+│   ├── ops/                # Logging, cache, rate limiting, history, atomic
+│   ├── workspace/          # Cell workspace file ops (cp in/out, sanitize)
+│   ├── vm/                 # Lima shell wrapper + VM config template
+│   └── commands/           # Thin CLI handlers (one file per command group)
+├── warden/                 # Proxy manager (lifecycle, policy, health, reconcile, logs)
+└── addons/                 # mitmproxy addons mounted into warden container:
+                            # _common (shared helpers), _policy (policy data
+                            # structures), enforce, logger, ops, ingress,
+                            # notifier
 ```
+
+Addons run inside the warden container with their own Python env. They can
+import sibling addons (e.g. `from _common import ...`) but cannot import
+`brig.*`.
 
 ### Data (`~/.brig/`)
 

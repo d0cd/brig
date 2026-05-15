@@ -1,17 +1,15 @@
 """
-Log management for Warden — pruning, compaction, export.
+Log management for Warden — age + size pruning with compression.
 """
 
 from __future__ import annotations
 
 import gzip
-import json
-import os
 import shutil
 import time
 from pathlib import Path
 
-from brig.ops.logging import debug, info
+from brig.ops.logging import debug
 
 
 def prune_logs(log_dir: Path, days: int = 7, size_mb: int | None = None) -> dict:
@@ -72,65 +70,3 @@ def prune_logs(log_dir: Path, days: int = 7, size_mb: int | None = None) -> dict
                     stats["freed_bytes"] += size
 
     return stats
-
-
-def export_logs(
-    log_dir: Path,
-    cell_name: str | None = None,
-    format_type: str = "jsonl",
-    output_file: str | None = None,
-    days: int = 7,
-) -> str:
-    """Export logs to the specified format.
-
-    Returns the output file path.
-    """
-    cutoff = time.time() - (days * 86400)
-
-    # Collect matching log files.
-    entries: list[dict] = []
-    pattern = f"{cell_name}.jsonl*" if cell_name else "*.jsonl*"
-    for f in sorted(log_dir.glob(pattern)):
-        try:
-            if f.stat().st_mtime < cutoff:
-                continue
-            if f.suffix == ".gz":
-                import gzip as gz
-                with gz.open(f, "rt") as src:
-                    for line in src:
-                        try:
-                            entries.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-            else:
-                with open(f) as src:
-                    for line in src:
-                        try:
-                            entries.append(json.loads(line))
-                        except json.JSONDecodeError:
-                            pass
-        except OSError as e:
-            debug(f"Failed to read {f}: {e}")
-
-    # Write output.
-    if output_file is None:
-        output_file = f"brig-logs-export.{format_type}"
-
-    if format_type == "jsonl":
-        with open(output_file, "w") as f:
-            for entry in entries:
-                f.write(json.dumps(entry) + "\n")
-    elif format_type == "csv":
-        import csv
-        if entries:
-            keys = list(entries[0].keys())
-            with open(output_file, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=keys)
-                writer.writeheader()
-                for entry in entries:
-                    writer.writerow(entry)
-    elif format_type == "json":
-        with open(output_file, "w") as f:
-            json.dump(entries, f, indent=2)
-
-    return output_file

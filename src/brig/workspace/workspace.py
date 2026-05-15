@@ -15,7 +15,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from brig.config import UNSAFE_EXTENSIONS, HostPaths, VMPaths
+from brig.config import UNSAFE_EXTENSIONS, HostPaths, VMPaths, container_name
 from brig.errors import BrigError
 from brig.ops.logging import debug, warn
 from brig.vm.shell import vm_run
@@ -30,8 +30,7 @@ def copy_out(cell_name: str, src: str, dst: str, sanitize: bool = False) -> None
         dst: Destination path on host.
         sanitize: If True, validate file types and apply quarantine.
     """
-    from brig.config import CONTAINER_PREFIX
-    cn = f"{CONTAINER_PREFIX}{cell_name}"
+    cn = container_name(cell_name)
 
     result = vm_run(["podman", "cp", f"{cn}:{src}", dst])
     if result.returncode != 0:
@@ -64,8 +63,7 @@ def copy_in(cell_name: str, src: str, dst: str, quota: str | None = None) -> Non
         dst: Destination path inside cell.
         quota: Workspace quota (e.g. "500m"). Checked before copy.
     """
-    from brig.config import CONTAINER_PREFIX
-    cn = f"{CONTAINER_PREFIX}{cell_name}"
+    cn = container_name(cell_name)
 
     if quota:
         from brig.cell.spec import parse_size

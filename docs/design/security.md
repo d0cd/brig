@@ -140,7 +140,7 @@ xattr -w com.apple.quarantine "0181;$(printf %x $(date +%s));brig;$(uuidgen)" ~/
 
 1. **Default runtime is gVisor** — set in containers.conf, not just CLI flag
 2. **`brig list` shows runtime** — always visible which runtime a cell uses
-3. **Native runtime requires explicit opt-in** — via `--profile compute` or `--unsafe`
+3. **Native runtime requires explicit opt-in** — via `--profile dev` (or another non-gVisor profile)
 4. **Runtime is verified at startup** — don't rely solely on config defaults
 
 #### Understanding gVisor's Role
@@ -187,9 +187,9 @@ Measured on Apple Silicon (Lima VZ, steady-state inside running container):
 |---------|---------|-------------|----------|
 | `untrusted` | gVisor | Unknown/hostile code | Running submissions from strangers |
 | `supervised` | gVisor | Semi-trusted, defense-in-depth | AI agents, CI runners |
-| `compute` | crun + seccomp | Trusted code, performance critical | ML training, data processing |
 | `dev` | crun + seccomp | Your own code | Development, fast iteration |
 | `airgapped` | gVisor | No network, maximum isolation | Offline compute |
+| `honeypot` | gVisor | Adversarial; capture telemetry | Studying malware behaviour |
 
 Use gVisor when the code is untrusted and you want protection against unknown kernel exploits. Use crun when the code is trusted and syscall-heavy performance matters — the VM + seccomp + network isolation still provide strong protection.
 
@@ -197,7 +197,7 @@ Use gVisor when the code is untrusted and you want protection against unknown ke
 
 ### Invariant 6: Only Infrastructure Containers May Attach to `proxy-external`
 
-**Rule:** Only `warden` (and optionally `warden-tor` and `warden-privoxy` when Tor is active) may attach to `proxy-external`. No cell containers.
+**Rule:** Only `warden` may attach to `proxy-external`. No cell containers.
 
 **Why this matters:** The `proxy-external` network has outbound internet access. Any container attached to it inherits the VM-level egress rules but bypasses per-cell isolation.
 
@@ -205,7 +205,7 @@ Use gVisor when the code is untrusted and you want protection against unknown ke
 
 ```bash
 # Verify only infrastructure containers are on proxy-external:
-ALLOWED="warden warden-tor warden-privoxy"
+ALLOWED="warden"
 containers=$(podman network inspect proxy-external --format '{{range .Containers}}{{.Name}} {{end}}')
 for c in $containers; do
   if ! echo "$ALLOWED" | grep -qw "$c"; then
@@ -392,9 +392,10 @@ brig run --name test --rm -- curl -s -x http://proxy:8080 http://10.50.0.1/
 brig run --name test-default --rm -- cat /proc/version
 # Should show gVisor
 
-# Verify runc requires --unsafe
-brig run --name test --runtime=runc -- echo hello
-# Should fail with: "Error: runc runtime requires --unsafe flag"
+# Verify the only way to opt out of gVisor is to pick a non-gVisor profile.
+# `brig run` has no `--runtime` flag — runtime is set by the profile.
+brig run --name test --profile dev -- echo hello   # Uses crun.
+brig run --name test --profile untrusted -- echo hello   # Uses gVisor.
 ```
 
 ### Test 12: IPv6 Is Disabled
@@ -549,47 +550,6 @@ brig run --name recovery-test --rm -- curl -m 5 https://httpbin.org/ip
 # Full verification suite
 brig test isolation
 ```
-
----
-
-## Tor Integration
-
-### Architecture
-
-When Tor is enabled, traffic flows through a Privoxy bridge that converts HTTP proxy requests to SOCKS5 for the Tor daemon:
-
-```
-Cell → Warden (mitmproxy :8080, policy enforcement)
-         → Privoxy (:8118, HTTP→SOCKS5 bridge)
-            → Tor (:9050, SOCKS5 proxy)
-               → Internet (via Tor network)
-```
-
-### Why Privoxy?
-
-mitmproxy cannot chain to a SOCKS5 upstream proxy — it only supports HTTP upstream mode. Privoxy bridges the gap by accepting HTTP proxy connections from mitmproxy and forwarding them as SOCKS5 to Tor.
-
-### Network Topology
-
-All three containers (Warden, Privoxy, Tor) run on the `proxy-external` network. Cells remain on their isolated `brig-<cell>` networks and can only reach Warden. This preserves all security invariants:
-
-- **Policy enforcement is preserved.** Every request passes through Warden's mitmproxy before reaching Privoxy/Tor.
-- **No direct Tor access.** Cells cannot reach Privoxy or Tor directly (different networks).
-- **No east-west bypass.** Cell network isolation is unchanged.
-- **Invariant 6 holds.** Only Warden, Privoxy, and Tor attach to `proxy-external` — all are infrastructure containers, not cells.
-
-### Container Hardening
-
-Both Privoxy and Tor containers run with:
-- `--read-only` filesystem
-- `--cap-drop ALL`
-- `--security-opt no-new-privileges`
-- `--tmpfs` for writable directories (noexec, nosuid)
-- Strict resource limits (128MB RAM, 0.25 CPU for Privoxy)
-
-### Activation
-
-Tor routing is global. When active, all cell traffic routes through Tor. The `--tor` flag on `brig run` is a pre-flight safety check, not a per-cell toggle.
 
 ---
 

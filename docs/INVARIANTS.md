@@ -34,12 +34,19 @@ to that invariant's row — don't leave the coverage implicit.
 | Surface | Location |
 |---|---|
 | Enforcement | `src/addons/enforce.py` — port allowlist (80/443), literal-IP block, RFC1918/CGNAT/etc block at request + http_connect + server_connected |
-| DNS rebinding defense | `server_connected` re-checks resolved IP against `BLOCKED_NETWORKS` |
-| Host header smuggling | `_host_header_mismatches` in `request()` and `http_connect()` |
-| Host services | `.host.brig` virtual domains are an **intentional, scoped relaxation** of this invariant. Only explicitly declared name:port pairs are reachable on the host. Unknown `.host.brig` domains are blocked. `server_connected`/`responseheaders` skip the blocked-IP check only for registered host service targets. See `_handle_host_service()` in enforce.py. |
+| Blocklist source | `src/addons/_common.py:BLOCKED_NETWORKS` — single source shared by enforce + notifier |
+| DNS rebinding defense | `server_connected` and `responseheaders` re-check resolved IP against `BLOCKED_NETWORKS`. Skip is **gated on `flow.metadata["host_service"]`** (set by `_handle_host_service`), not on a `(ip, port)` tuple — a tuple skip would let a DNS-rebinding allowlisted domain reach a host service. |
+| Host header smuggling | `_host_header_mismatches` in `request()` and `http_connect()`. Multi-colon strings validated via `ipaddress.ip_address` so non-IPv6 inputs like `example.com:80:extra` don't silently get treated as bare IPv6. |
+| Host services | `.host.brig` virtual domains are an **intentional, scoped relaxation** of this invariant. Per-cell ACL: a cell can reach `<name>.host.brig` only if `<name>` is in its per-cell policy's `host_services` list. Cells with no per-cell policy have no host-service access. Unknown `.host.brig` domains are blocked. See `_handle_host_service()` in enforce.py. |
 | Ingress | Warden ingress (port 8443) allows authenticated inbound traffic to cells. enforce.py blocks unhandled ingress requests (fail closed). CONNECT is blocked entirely on the ingress port. See `src/addons/ingress.py`. |
 | Unit test | `tests/test_addons_ops.py` — token bucket rate limiting |
-| Unit test | `tests/test_ingress.py` — ingress routing, token auth, cell IP validation, rate limiting |
+| Unit test | `tests/test_ingress.py` — ingress routing, token auth, cell IP validation (rejects `.0` / `.1` / `.255`), rate limiting |
+| Unit test | `tests/test_security_audit.py::TestServerConnectedDnsRebinding` — RFC1918, localhost, link-local, IPv4-mapped-IPv6, IPv6 link-local; flow-metadata-gated host-service skip; a naked tuple match must NOT bypass |
+| Unit test | `tests/test_security_audit.py::TestResponseHeadersDnsRebinding` — same coverage at the response stage |
+| Unit test | `tests/test_security_audit.py::TestConnectMethodEnforcement` — CONNECT to disallowed port / internal IP / literal IP / disallowed domain / ingress port |
+| Unit test | `tests/test_security_audit.py::TestNormalizeHostspecRobustness` — bracketed IPv6, multi-colon non-IPv6 strings |
+| Unit test | `tests/test_security_audit.py::TestHandleHostService` — per-cell ACL: cell with no per-cell policy is blocked; cell whose policy doesn't list the service is blocked |
+| Unit test | `tests/test_addon_common.py::TestBlockedNetworks` — covers every entry in the SSRF blocklist |
 | E2E test | `tests/test_proxy_policy.sh` tests 7-11 — asserted via JSONL log entries |
 | CI | Unit + E2E |
 
@@ -87,6 +94,7 @@ proxy logs, not prevention.
 | Verify check | `src/brig/security/verify.py:verify_cell_network_members` — flags any member of a `brig-<cell>` network that isn't warden or the cell itself |
 | Unit test | `tests/test_security_verify.py::TestVerifyCellNetworkMembers::test_foreign_container` |
 | Unit test | `tests/test_security_verify.py::TestVerifyCellNetworkMembers::test_only_warden_and_cell` |
+| Gap | No E2E test that actually attaches a foreign container and asserts detection. Tracked for a future E2E test pass. |
 | CI | Unit |
 
 ### 8. Cells Must Be Single-Homed
@@ -132,8 +140,13 @@ proxy logs, not prevention.
 | `--env HTTP_PROXY=attacker` to bypass warden | `test_cell_reconciler.py::TestBuildRunCommand::test_all_proxy_env_names_rejected` |
 | Symlink in secrets dir escaping | `test_security_secrets.py::TestValidateSecretPath::test_symlink_escaping_rejected` |
 | Double-hop symlink in secrets | `test_security_secrets.py::TestValidateSecretPath::test_double_hop_symlink_rejected` |
+| Symlink at ingress token read site | `src/brig/cell/lifecycle.py:_register_cell_ingress` calls `validate_secret_path` (covered by the symlink-escape tests above, applied at the read site) |
 | Concurrent allocator race — 50 threads | `test_network_subnet.py::TestConcurrentAllocation::test_concurrent_allocate_no_duplicates` |
 | Cell def with `network: proxy-external` | `test_cell_spec.py::TestValidateCellDefinition::test_network_proxy_external_rejected` |
+| DNS rebinding to host-service tuple | `test_security_audit.py::TestServerConnectedDnsRebinding::test_host_service_skip_requires_flow_metadata` — naked (ip,port) match must not bypass |
+| Webhook redirect to internal host | `notifier.py` urllib fallback uses a redirect-disabling opener; urllib3 path uses `assert_hostname` and `cert_reqs=CERT_REQUIRED` |
+| Cell with deny-all reaching host service | `test_security_audit.py::TestHandleHostService::test_no_cell_policy_blocked` |
+| Ingress route pointing at warden gateway IP | `src/addons/ingress.py` `_reload_routes` rejects host octets `< 2` (audit M4) |
 
 ## CI wiring
 

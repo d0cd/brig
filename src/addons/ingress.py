@@ -177,8 +177,12 @@ class IngressRouter:
                     octets = route.cell_ip.split(".")
                     if int(octets[2]) < 1 or int(octets[2]) > 254:
                         raise ValueError("invalid subnet octet")
-                    if int(octets[3]) < 1 or int(octets[3]) > 254:
-                        raise ValueError("invalid host octet")
+                    # Host octets .0 (network), .1 (warden gateway on each cell
+                    # network), and .255 (broadcast) are reserved. Forwarding
+                    # ingress to .1 would loop back into mitmproxy itself.
+                    host_octet = int(octets[3])
+                    if host_octet < 2 or host_octet > 254:
+                        raise ValueError("invalid host octet (reserved)")
                 except (ValueError, TypeError) as e:
                     ctx.log.warn(
                         f"IngressRouter: Skipping route with invalid cell_ip: "

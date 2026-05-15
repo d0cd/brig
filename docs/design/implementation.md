@@ -62,18 +62,16 @@ src/
     proxy.py                 # Container lifecycle (start/stop/status)
     reconcile.py             # Subnet state reconciliation
     health.py                # Health checks
-    logs.py                  # Log management
-    tor.py                   # Tor/Privoxy bridge
-    stats.py                 # Metrics query
+    logs.py                  # Log management (prune)
 
   addons/
-    enforce.py               # Policy engine (DomainTrie, DNS rebinding defense)
+    _common.py               # Shared: BLOCKED_NETWORKS, SubnetResolver, atomic_write_json
+    _policy.py               # Policy data structures (PolicyRule, DomainTrie, Policy)
+    enforce.py               # Policy enforcer addon (uses _policy)
     logger.py                # Request logging (JSONL per cell)
     ops.py                   # Merged: metrics + rate limiting + health endpoint
-    canary.py                # Canary token detection
-    signer.py                # Request signing
+    ingress.py               # Authenticated reverse proxy (port 8443)
     notifier.py              # Webhook notifications
-    summarizer.py            # Log summarization
 ```
 
 ## Declarative Reconciler

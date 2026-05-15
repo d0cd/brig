@@ -24,17 +24,21 @@ class TestParseCosignOutput(unittest.TestCase):
 
 class TestVerifyImageSignature(unittest.TestCase):
     @patch("brig.security.image.subprocess.run")
-    def test_cosign_not_installed_fallback_trusted(self, mock_run):
-        """When cosign is missing, falls back to podman trust."""
+    def test_cosign_missing_fails_closed(self, mock_run):
+        """When cosign is missing, verification fails closed (no podman trust fallback).
+
+        The podman trust fallback was removed in M2 because `podman image
+        trust show` returns a global policy that doesn't tell us whether the
+        specific image is covered by an "accept" rule — vacuous trust.
+        """
         def side_effect(cmd, **kwargs):
             if cmd[0] == "which":
                 return subprocess.CompletedProcess(cmd, 1)
-            # podman trust show
             return subprocess.CompletedProcess(cmd, 0, stdout="default  accept", stderr="")
         mock_run.side_effect = side_effect
         ok, msg, _ = verify_image_signature("alpine:latest")
-        self.assertTrue(ok)
-        self.assertIn("trusted registry", msg)
+        self.assertFalse(ok)
+        self.assertIn("cosign", msg.lower())
 
     @patch("brig.security.image.subprocess.run")
     def test_cosign_verify_success(self, mock_run):

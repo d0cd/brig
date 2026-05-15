@@ -168,10 +168,6 @@ class TestBrigCliParsing(unittest.TestCase):
         self.assertEqual(args.tail, 50)
         self.assertEqual(args.cell, "mycell")
 
-    def test_upgrade(self):
-        args = self.parser.parse_args(["upgrade"])
-        self.assertEqual(args.command, "upgrade")
-
     # --- Policy ---
 
     def test_policy_show(self):

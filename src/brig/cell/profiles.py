@@ -16,9 +16,13 @@ from brig.ops.logging import debug
 PROFILES_DIR = BRIG_HOME / "profiles"
 
 # Built-in profiles. Each is a partial cell definition (no name/image/command).
+#
+# `runtime` is intentionally omitted: invariant 5 requires gVisor (`runsc`)
+# and the reconciler hardcodes `--runtime runsc`. The field used to be set
+# here but was never propagated by apply_profile() — keeping it would have
+# implied configurability that doesn't exist.
 BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
     "untrusted": {
-        "runtime": "runsc",
         "memory": "512m",
         "cpus": "1",
         "pids_limit": 256,
@@ -27,7 +31,6 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "labels": {"brig.profile": "untrusted"},
     },
     "supervised": {
-        "runtime": "runsc",
         "memory": "2g",
         "cpus": "2",
         "pids_limit": 512,
@@ -35,7 +38,6 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "labels": {"brig.profile": "supervised"},
     },
     "dev": {
-        "runtime": "runsc",
         "memory": "4g",
         "cpus": "4",
         "pids_limit": 2048,
@@ -43,7 +45,6 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "labels": {"brig.profile": "dev"},
     },
     "airgapped": {
-        "runtime": "runsc",
         "memory": "2g",
         "cpus": "2",
         "pids_limit": 512,
@@ -51,7 +52,6 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
         "labels": {"brig.profile": "airgapped"},
     },
     "honeypot": {
-        "runtime": "runsc",
         "memory": "1g",
         "cpus": "1",
         "pids_limit": 256,

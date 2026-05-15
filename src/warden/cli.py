@@ -46,13 +46,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_test.add_argument("--path", default="/", help="Path to test")
     p_test.add_argument("--method", default="GET", help="HTTP method")
 
-    # Tor subcommands.
-    p_tor = sub.add_parser("tor", help="Tor bridge management")
-    p_tor_sub = p_tor.add_subparsers(dest="tor_command", required=True)
-    p_tor_sub.add_parser("start", help="Start Tor stack")
-    p_tor_sub.add_parser("stop", help="Stop Tor stack")
-    p_tor_sub.add_parser("status", help="Tor stack status")
-
     return parser
 
 
@@ -63,7 +56,7 @@ def main() -> None:
 
     configure_logging(debug=args.debug, quiet=args.quiet)
 
-    from warden import proxy, health, tor
+    from warden import proxy, health
     from brig.policy import policy as brig_policy
 
     dispatch = {
@@ -78,8 +71,6 @@ def main() -> None:
 
     if args.command == "policy":
         exit_code = _handle_policy(args, brig_policy)
-    elif args.command == "tor":
-        exit_code = _handle_tor(args, tor)
     elif args.command == "logs":
         exit_code = _handle_logs(args)
     elif args.command in dispatch:
@@ -158,22 +149,6 @@ def _handle_policy(args: object, policy_mod: object) -> int:
     return 1
 
 
-def _handle_tor(args: object, tor_mod: object) -> int:
-    """Handle tor subcommands."""
-    cmd = getattr(args, "tor_command", "")
-    if cmd == "start":
-        print("Tor start is not yet implemented. Use 'warden tor status' to check state.")
-        return 1
-    elif cmd == "stop":
-        tor_mod.stop_tor_stack()  # type: ignore[attr-defined]
-        return 0
-    elif cmd == "status":
-        running = tor_mod.is_tor_running()  # type: ignore[attr-defined]
-        print(f"Tor: {'running' if running else 'not running'}")
-        return 0
-    return 1
-
-
 def _cmd_preflight() -> int:
     """Run preflight checks."""
     from warden.reconcile import reconcile_subnet_state
@@ -214,6 +189,7 @@ def _handle_logs(args: object) -> int:
         stats = prune_logs(Path("/var/log/brig/network"), days=days, size_mb=size)
         print(f"Removed {stats['removed']} files, compressed {stats['compressed']}")
         return 0
-    # Default: tail proxy logs.
+    # Default: tail proxy logs (route through the Lima VM wrapper, since
+    # podman runs inside the VM, not on the macOS host).
     from brig.vm.shell import vm_run_interactive
     return vm_run_interactive(["podman", "logs", "-f", "warden"])

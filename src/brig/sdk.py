@@ -25,7 +25,7 @@ from brig.vm.shell import vm_run
 from brig.cell.profiles import apply_profile, load_profile
 from brig.cell.reconciler import CellState, ReconcileResult, observe
 from brig.cell.spec import CellSpec
-from brig.config import CELL_NAME_PATTERN, CONTAINER_PREFIX, PROXY_NAME
+from brig.config import CELL_NAME_PATTERN, CONTAINER_PREFIX, PROXY_NAME, container_name
 from brig.errors import BrigError
 
 
@@ -80,24 +80,22 @@ class Cell:
 
     def __init__(self, name: str):
         self.name = name
-        self._cn = f"{CONTAINER_PREFIX}{name}"
+        self._cn = container_name(name)
 
     async def wait(self, timeout: int | None = None) -> int:
         """Wait for cell to exit. Returns exit code."""
         return await asyncio.to_thread(self.wait_sync, timeout)
 
     def wait_sync(self, timeout: int | None = None) -> int:
-        """Synchronous wait for cell to exit."""
+        """Synchronous wait for cell to exit. Returns -1 on subprocess error."""
+        import subprocess as _subprocess
         cmd = ["podman", "wait", self._cn]
         try:
-            result = vm_run(
-                cmd,
-                timeout=timeout,
-            )
-            code = result.stdout.strip()
-            return int(code) if code.isdigit() else 1
-        except Exception:
+            result = vm_run(cmd, timeout=timeout)
+        except (_subprocess.SubprocessError, OSError):
             return -1
+        code = result.stdout.strip()
+        return int(code) if code.isdigit() else 1
 
     async def stop(self) -> None:
         await asyncio.to_thread(stop_cell, self.name)
@@ -320,7 +318,8 @@ class Brig:
         finally:
             try:
                 cell.rm_sync(force=True)
-            except Exception:
+            except BrigError:
+                # Best-effort cleanup; other errors should propagate.
                 pass
 
     async def list_cells(self) -> list[CellInfo]:
