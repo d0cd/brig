@@ -38,6 +38,8 @@ def _write_routes_atomic(path: Path, data: dict) -> None:
     tmp = path.with_suffix(".tmp")
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     tmp.rename(path)
 
 

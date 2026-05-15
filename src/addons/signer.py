@@ -41,7 +41,6 @@ BATCH_SIZE = 100     # Flush batch every 100 entries.
 AUDIT_DIR = Path("/var/log/brig/audit")
 SIGNED_DIR = AUDIT_DIR / "signed"
 PUBKEY_PATH = AUDIT_DIR / "session_pubkey.pem"
-PRIVKEY_PATH = AUDIT_DIR / ".session_privkey.pem"
 
 # Lock for thread-safe batch operations.
 _lock = threading.Lock()
@@ -49,9 +48,11 @@ _lock = threading.Lock()
 # Batch state (protected by _lock).
 _batch_entries = []
 _batch_start_time = None
+_batch_start_mono = None
 _batch_counter = 0
 _signing_key = None
 _algorithm = None  # "ed25519" only.
+_signing_enabled = False
 
 
 def _ensure_dirs():
@@ -125,11 +126,12 @@ def _sign_data(data: bytes) -> bytes:
 
 def _flush_batch():
     """Flush current batch to a signed file. Caller must hold _lock."""
-    global _batch_entries, _batch_start_time, _batch_counter
+    global _batch_entries, _batch_start_time, _batch_start_mono, _batch_counter
 
     if not _batch_entries:
         # Reset start time to prevent immediate re-flush on next entry.
         _batch_start_time = None
+        _batch_start_mono = None
         return
 
     _batch_counter += 1
@@ -173,28 +175,38 @@ def _flush_batch():
     # Reset batch state.
     _batch_entries = []
     _batch_start_time = None
+    _batch_start_mono = None
 
 
 def init():
     """Initialize the signer addon. Called once on Warden start."""
+    global _signing_enabled
     _ensure_dirs()
-    _generate_keypair()
+    if not _generate_keypair():
+        logger.warning("Signing disabled: cryptography package not available.")
+        _signing_enabled = False
+        return
+    _signing_enabled = True
 
 
 def add_entry(entry: dict):
     """Add a log entry to the current batch (thread-safe)."""
-    global _batch_start_time
+    global _batch_start_time, _batch_start_mono
+
+    if not _signing_enabled:
+        return
 
     with _lock:
         if _batch_start_time is None:
             _batch_start_time = time.time()
+            _batch_start_mono = time.monotonic()
 
         _batch_entries.append(entry)
 
         # Check flush conditions.
         if len(_batch_entries) >= BATCH_SIZE:
             _flush_batch()
-        elif time.time() - _batch_start_time >= BATCH_INTERVAL:
+        elif time.monotonic() - _batch_start_mono >= BATCH_INTERVAL:
             _flush_batch()
 
 

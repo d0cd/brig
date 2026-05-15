@@ -47,7 +47,7 @@ MUTATION_COMMANDS = {"run", "stop", "kill", "rm", "start", "pause", "unpause", "
 SENSITIVE_PATTERNS = {"password", "secret", "key", "token", "credential", "auth", "value"}
 
 # Valid memory suffixes.
-MEMORY_PATTERN = r"^\d+[kmgKMG]?[bB]?$"
+MEMORY_PATTERN = r"^\d+[kmgKMG]?$"
 
 # Valid domain pattern for policy.
 DOMAIN_PATTERN = r"^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$"

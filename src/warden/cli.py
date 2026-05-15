@@ -107,6 +107,16 @@ def _cmd_status(proxy_mod: object) -> int:
     return 0
 
 
+def _domain_matches_rule(domain: str, rule: str) -> bool:
+    """Check if a domain matches a policy rule, supporting wildcard rules."""
+    domain = domain.lower()
+    rule = rule.lower()
+    if rule.startswith("*."):
+        suffix = rule[1:]  # ".example.com"
+        return domain.endswith(suffix) and len(domain) > len(suffix)
+    return domain == rule
+
+
 def _handle_policy(args: object, policy_mod: object) -> int:
     """Handle policy subcommands using brig.policy."""
     from pathlib import Path
@@ -135,14 +145,13 @@ def _handle_policy(args: object, policy_mod: object) -> int:
             print(f"ERROR: {e}")
             return 1
         # Simple allow/deny check.
-        from brig.network.validation import is_suspicious_domain
         domain = getattr(args, "domain", "")
         for rule in pol.get("deny", []):
-            if isinstance(rule, str) and rule == domain:
+            if isinstance(rule, str) and _domain_matches_rule(domain, rule):
                 print(f"BLOCKED: Denied by rule: {rule}")
                 return 1
         for rule in pol.get("allow", []):
-            if isinstance(rule, str) and rule == domain:
+            if isinstance(rule, str) and _domain_matches_rule(domain, rule):
                 print(f"ALLOWED: Matched rule: {rule}")
                 return 0
         print("BLOCKED: Not in allowlist")

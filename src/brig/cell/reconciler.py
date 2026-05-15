@@ -207,7 +207,7 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.timeout:
         from brig.cell.spec import parse_duration
         timeout_seconds = parse_duration(spec.timeout)
-        if timeout_seconds:
+        if timeout_seconds is not None:
             cmd.extend(["--timeout", str(timeout_seconds)])
 
     for label in spec.labels:
