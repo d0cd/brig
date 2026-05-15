@@ -39,13 +39,13 @@ def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
     container_name = f"brig-{spec.name}"
     network_name = container_name
     from brig.cell.reconciler import _podman_inspect_json
-    info = _podman_inspect_json(container_name)
-    if not info:
+    container_info = _podman_inspect_json(container_name)
+    if not container_info:
         debug(f"Could not inspect {container_name} for ingress registration")
         return
 
     cell_ip = (
-        info.get("NetworkSettings", {})
+        container_info.get("NetworkSettings", {})
         .get("Networks", {})
         .get(network_name, {})
         .get("IPAddress", "")

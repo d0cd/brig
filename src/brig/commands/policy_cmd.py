@@ -29,11 +29,13 @@ def _load_global_policy() -> dict:
 
 
 def _save_global_policy(policy: dict) -> None:
-    """Save global network policy to host."""
+    """Save global network policy to host. Atomic write (temp + rename)."""
     path = HostPaths.NETWORK_POLICY
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
         json.dump(policy, f, indent=2)
+    tmp.rename(path)
 
 
 def cmd_policy_show(args: Any) -> int:

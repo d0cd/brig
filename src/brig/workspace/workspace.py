@@ -39,10 +39,19 @@ def copy_out(cell_name: str, src: str, dst: str, sanitize: bool = False) -> None
 
     if sanitize:
         dst_path = Path(dst)
-        if dst_path.is_dir():
-            _sanitize_tree(dst_path)
-        else:
-            _sanitize_file(dst_path)
+        try:
+            if dst_path.is_dir():
+                _sanitize_tree(dst_path)
+            else:
+                _sanitize_file(dst_path)
+        except BrigError:
+            # Remove unsafe files that were already written to host.
+            import shutil
+            if dst_path.is_dir():
+                shutil.rmtree(dst_path, ignore_errors=True)
+            elif dst_path.exists():
+                dst_path.unlink(missing_ok=True)
+            raise
         _apply_quarantine(dst_path)
 
 

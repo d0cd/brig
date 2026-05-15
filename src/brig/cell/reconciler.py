@@ -186,7 +186,8 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.is_airgapped:
         cmd.extend(["--network", "none"])
     else:
-        assert proxy_ip is not None
+        if not proxy_ip:
+            raise RuntimeError("proxy_ip is required for non-airgapped cells")
         cmd.extend([
             "--network", name,
             "-e", f"http_proxy=http://{proxy_ip}:8080",

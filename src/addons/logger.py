@@ -713,7 +713,6 @@ class RequestLogger:
 
     def _extract_error_details(self, flow: http.HTTPFlow) -> dict:
         """Extract detailed error information from flow."""
-        import errno
         import re
 
         details = {}
