@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from brig.config import ALLOCATOR_LOCK_FILE, CELL_NAME_PATTERN, SUBNET_STATE_FILE
+from brig.config import ALLOCATOR_LOCK_FILE, CELL_NAME_PATTERN, SUBNET_MAP_FILE, SUBNET_STATE_FILE
 
 SUBNET_PREFIX = "10.60"
 MIN_INDEX = 1
@@ -101,6 +101,28 @@ def _build_subnet_map(state: dict) -> dict[str, str]:
     return mapping
 
 
+def _write_subnet_map(state: dict, map_file: Path = SUBNET_MAP_FILE) -> None:
+    """Write subnet-map.json atomically for enforce.py consumption.
+
+    Must be called under the allocator lock.
+    """
+    mapping = _build_subnet_map(state)
+    map_file.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=map_file.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(mapping, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp_path, str(map_file))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def allocate(
     cell_name: str,
     state_file: Path = SUBNET_STATE_FILE,
@@ -140,6 +162,7 @@ def allocate(
             }
 
             _save_state(state, state_file)
+            _write_subnet_map(state)
 
             return SubnetInfo(
                 cell_name=cell_name,
@@ -177,6 +200,7 @@ def free(
                 state["freed"].sort()
 
             _save_state(state, state_file)
+            _write_subnet_map(state)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 

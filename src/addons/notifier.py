@@ -434,15 +434,20 @@ class Notifier:
         """Send HTTP request to the webhook URL. Returns (success, error).
 
         The caller has already validated the resolved IP against
-        BLOCKED_NETWORKS. We use the original hostname URL for proper TLS
-        certificate verification and rely on the OS DNS cache returning
-        the same answer within the same process lifetime.
+        BLOCKED_NETWORKS. We connect to the resolved IP directly to
+        prevent DNS rebinding between validation and connection. The
+        original Host header is set for correct routing/vhost selection.
         """
-        url = self.config.webhook_url
+        parsed = urlparse(self.config.webhook_url)
+        # Build URL with resolved IP to prevent DNS rebinding.
+        ip_url = f"{parsed.scheme}://{resolved_ip}:{port}{parsed.path or '/'}"
+        if parsed.query:
+            ip_url += f"?{parsed.query}"
 
         headers = {
             "Content-Type": "application/json",
             "User-Agent": "Warden/1.0",
+            "Host": hostname,
         }
 
         pool = self._get_http_pool()
@@ -451,9 +456,11 @@ class Notifier:
             try:
                 response = pool.request(
                     "POST",
-                    url,
+                    ip_url,
                     body=data,
                     headers=headers,
+                    assert_hostname=hostname,
+                    server_hostname=hostname,
                 )
                 if response.status < 400:
                     return True, None
@@ -465,7 +472,7 @@ class Notifier:
             # Fallback to urllib.
             try:
                 req = urllib.request.Request(
-                    url,
+                    ip_url,
                     data=data,
                     headers=headers,
                     method="POST"

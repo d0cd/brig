@@ -30,6 +30,9 @@ SUBNET_MAP_FILE = Path("/var/run/cells/subnet-map.json")
 # Per-cell policy directory (canary tokens stored here).
 CELL_POLICY_DIR = Path("/var/run/cells/policies")
 
+# Ingress routes file (mounted from host).
+INGRESS_ROUTES_FILE = Path("/var/run/cells/ingress-routes.json")
+
 
 class CanaryDetector:
     """mitmproxy addon that scans egress traffic for canary token values."""
@@ -190,8 +193,42 @@ class CanaryDetector:
         )
         t.start()
 
+    def _deregister_ingress(self, cell_name: str) -> None:
+        """Remove ingress routes for a killed cell.
+
+        Directly edits the ingress-routes.json file (same format as
+        brig.network.ingress) because we run inside the Warden container
+        and cannot import brig.cell.lifecycle.
+        """
+        try:
+            if not INGRESS_ROUTES_FILE.exists():
+                return
+            with open(INGRESS_ROUTES_FILE, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or "routes" not in data:
+                return
+            before = len(data["routes"])
+            data["routes"] = [
+                r for r in data["routes"] if r.get("cell") != cell_name
+            ]
+            if len(data["routes"]) < before:
+                tmp = INGRESS_ROUTES_FILE.with_suffix(".tmp")
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=2)
+                tmp.rename(INGRESS_ROUTES_FILE)
+                ctx.log.info(
+                    f"CanaryDetector: Deregistered {before - len(data['routes'])} "
+                    f"ingress routes for '{cell_name}'"
+                )
+        except (json.JSONDecodeError, IOError, OSError) as e:
+            ctx.log.error(
+                f"CanaryDetector: Failed to deregister ingress for '{cell_name}': {e}"
+            )
+
     def _kill_cell_sync(self, cell_name: str):
         """Synchronous cell kill (runs in background thread)."""
+        # Deregister ingress routes before killing the cell.
+        self._deregister_ingress(cell_name)
         try:
             subprocess.run(
                 ["podman", "kill", "--", f"brig-{cell_name}"],

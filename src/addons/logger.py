@@ -599,7 +599,7 @@ class RequestLogger:
     def _write_log(self, cell_name: str, entry: dict) -> None:
         """Queue log entry for async writing."""
         # Validate cell name to prevent path traversal.
-        if cell_name and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$', cell_name):
+        if cell_name and not re.match(r'^[a-z0-9][a-z0-9._-]{0,62}$', cell_name):
             cell_name = None  # Fall back to unknown log.
         if cell_name:
             log_file = LOG_DIR / f"{cell_name}.jsonl"
