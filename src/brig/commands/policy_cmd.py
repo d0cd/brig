@@ -100,43 +100,62 @@ def cmd_policy_show(args: Any) -> int:
 
 
 def cmd_policy_test(args: Any) -> int:
-    """Handle `brig policy test <domain>` — check if a domain is allowed.
+    """Handle `brig policy test <domain>` — check if a request is allowed.
 
     Walks the same global policy that warden enforces and reports the
-    decision. Useful for debugging "why was this blocked?" before sending
-    real traffic through warden.
+    decision, honoring dict-form rules with `paths` / `methods` filters
+    when --path / --method are supplied. Useful for debugging
+    "why was this blocked?" before sending real traffic through warden.
+
+    Note: this re-implements the matching logic that lives in
+    src/addons/_policy.py:PolicyRule (addons can't import brig.*). C6 in
+    docs/plans/0.3-validation-plan.md tracks the dedup.
     """
-    from pathlib import Path
     from brig.policy.policy import load_policy_file
 
     domain = args.domain
-    # path/method aren't used yet — global policy at the brig CLI level
-    # only stores domain-level rules. Path/method matching happens in
-    # the warden enforce addon's PolicyRule.
+    path = getattr(args, "path", "/") or "/"
+    method = (getattr(args, "method", "GET") or "GET").upper()
 
     try:
         policy = load_policy_file(HostPaths.NETWORK_POLICY)
     except (ValueError, FileNotFoundError) as e:
         raise BrigError(f"Failed to load global policy: {e}")
 
-    def _matches(rule: str | dict, host: str) -> bool:
-        rule_str = rule if isinstance(rule, str) else rule.get("domain", "")
-        rule_str = rule_str.lower().rstrip(".")
-        host = host.lower().rstrip(".")
-        if rule_str.startswith("*."):
-            suffix = rule_str[1:]
-            return host.endswith(suffix) and len(host) > len(suffix)
-        return host == rule_str
+    def _matches(rule: str | dict, host: str, path: str, method: str) -> bool:
+        # String rule = domain-only. Dict rule may add paths/methods.
+        if isinstance(rule, str):
+            return _domain_match(rule, host)
+        rule_domain = rule.get("domain", "")
+        if not _domain_match(rule_domain, host):
+            return False
+        # Optional path filter — fnmatch glob.
+        paths = rule.get("paths")
+        if paths:
+            import fnmatch
+            if not any(fnmatch.fnmatch(path, p) for p in paths):
+                return False
+        # Optional method filter — case-insensitive.
+        methods = rule.get("methods")
+        if methods and method not in {m.upper() for m in methods}:
+            return False
+        return True
+
+    from brig.policy.policy import domain_matches_rule as _domain_match_impl
+
+    def _domain_match(rule_str: str, host: str) -> bool:
+        return _domain_match_impl(rule_str, host)
+
+    def _rule_name(rule: str | dict) -> str:
+        return rule if isinstance(rule, str) else rule.get("domain", "")
 
     for rule in policy.get("deny", []):
-        if _matches(rule, domain):
-            rule_str = rule if isinstance(rule, str) else rule.get("domain", "")
-            output(f"BLOCKED: denied by rule: {rule_str}")
+        if _matches(rule, domain, path, method):
+            output(f"BLOCKED: denied by rule: {_rule_name(rule)}")
             return 1
     for rule in policy.get("allow", []):
-        if _matches(rule, domain):
-            rule_str = rule if isinstance(rule, str) else rule.get("domain", "")
-            output(f"ALLOWED: matched rule: {rule_str}")
+        if _matches(rule, domain, path, method):
+            output(f"ALLOWED: matched rule: {_rule_name(rule)} ({method} {path})")
             return 0
     output("BLOCKED: not in allowlist (default deny)")
     return 1

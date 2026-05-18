@@ -180,7 +180,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_diagnose = sub.add_parser("diagnose", help="Run diagnostic checks")
     p_diagnose.add_argument("name", help="Cell name")
 
-    sub.add_parser("doctor", help="Check environment and report fixable issues")
+    p_doctor = sub.add_parser("doctor", help="Check environment and report fixable issues")
+    p_doctor.add_argument(
+        "--quick", action="store_true",
+        help="Only check the two essentials (proxy + VM). Same as the "
+             "deprecated `brig health`.",
+    )
 
     sub.add_parser("preflight", help="Run pre-start checks")
     sub.add_parser("metrics", help="Output Prometheus metrics")

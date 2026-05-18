@@ -23,6 +23,27 @@ except ImportError:
     YAML_AVAILABLE = False
 
 
+def domain_matches_rule(rule: str, host: str) -> bool:
+    """Brig-CLI-side wildcard suffix match for "is host allowed by this rule".
+
+    Mirrors src/addons/_policy.py:PolicyRule.matches_domain in spirit;
+    that lives in the addon (which can't import brig.*) and has IDN
+    encoding + a trie wrapper around it. For host-side commands
+    (`brig policy test`, `warden cli policy test`) we only need the
+    plain wildcard semantics. Keep the two in sync; the constant-mirror
+    test guards against drift on shared constants.
+
+    Wildcard `*.example.com` matches `sub.example.com` but NOT
+    `example.com` itself (dot-boundary check).
+    """
+    rule = rule.lower().rstrip(".")
+    host = host.lower().rstrip(".")
+    if rule.startswith("*."):
+        suffix = rule[1:]  # ".example.com"
+        return host.endswith(suffix) and len(host) > len(suffix)
+    return host == rule
+
+
 def get_cell_policy_path(cell_name: str, policy_dir: Path = POLICY_DIR) -> Path:
     """Get the path for a cell's policy file."""
     return policy_dir / f"{cell_name}.json"

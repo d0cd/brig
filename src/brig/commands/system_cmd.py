@@ -110,7 +110,12 @@ def cmd_doctor(args: Any) -> int:
     Goes beyond `brig health`: verifies tooling on PATH, Lima version, gVisor
     presence inside the VM, addons installed, port collisions, and disk
     space. Prints a checklist with actionable suggestions on each failure.
+
+    --quick: only the two essentials (proxy + VM). Equivalent to the
+    deprecated `brig health` and meant for scripting / readiness probes.
     """
+    if getattr(args, "quick", False):
+        return _cmd_doctor_quick()
     import shutil as _shutil
     from brig.config import HostPaths
     from brig.network.proxy import proxy_running
@@ -205,13 +210,12 @@ def cmd_doctor(args: Any) -> int:
     return 0
 
 
-def cmd_health(args: Any) -> int:
-    """Handle `brig health`."""
+def _cmd_doctor_quick(fmt: str = "table") -> int:
+    """The "quick" two-essentials check, shared by `brig doctor --quick`
+    and the deprecated `brig health`."""
     from brig.network.proxy import proxy_running
 
-    checks = [
-        ("Proxy running", proxy_running()),
-    ]
+    checks = [("Proxy running", proxy_running())]
 
     # Check VM reachability. `podman info`'s template field is `.Host.OS`
     # (lower-case `Os` silently returns rc=1).
@@ -221,18 +225,32 @@ def cmd_health(args: Any) -> int:
     )
     checks.append(("VM reachable", vm_result.returncode == 0))
 
-    fmt = getattr(args, "format", "table")
     if fmt == "json":
         output(json.dumps([{"check": n, "passed": p} for n, p in checks], indent=2))
-    else:
-        all_ok = True
-        for name, passed in checks:
-            status = "[OK]" if passed else "[FAIL]"
-            output(f"  {status} {name}")
-            if not passed:
-                all_ok = False
-        return 0 if all_ok else 1
-    return 0
+        return 0 if all(p for _, p in checks) else 1
+
+    all_ok = True
+    for name, passed in checks:
+        status = "[OK]" if passed else "[FAIL]"
+        output(f"  {status} {name}")
+        if not passed:
+            all_ok = False
+    return 0 if all_ok else 1
+
+
+def cmd_health(args: Any) -> int:
+    """Handle `brig health` — DEPRECATED, use `brig doctor --quick`.
+
+    Kept for one release cycle so existing scripts keep working. The
+    deprecation note goes to stderr so it doesn't corrupt JSON output
+    consumed by readiness probes.
+    """
+    import sys
+    print(
+        "WARN: `brig health` is deprecated; use `brig doctor --quick`",
+        file=sys.stderr,
+    )
+    return _cmd_doctor_quick(getattr(args, "format", "table"))
 
 
 def cmd_diagnose(args: Any) -> int:
