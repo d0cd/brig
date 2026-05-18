@@ -152,6 +152,7 @@ make bench                    # benchmarks
 - [Architecture](docs/design/architecture.md)
 - [Security Design](docs/design/security.md) — and the [supply-chain notes](docs/design/supply-chain.md)
 - [SDK Specification](docs/sdk-spec.md)
+- [Brig CLI Reference](docs/reference/brig-cli.md)
 - [Warden CLI Reference](docs/reference/warden-cli.md)
 - [Addons Reference](docs/reference/addons.md)
 - [Security Invariants](docs/INVARIANTS.md)

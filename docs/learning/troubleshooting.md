@@ -96,6 +96,16 @@ brig rm -f <cell>             # Free workspace + container layer.
 limactl shell brig -- podman system prune -f   # Reclaim image layers.
 ```
 
+Or in one shot — `brig prune` cleans up stopped cells, old rotated logs
+(default >7 days), and orphan subnet allocations (cells whose podman
+network was removed outside brig):
+
+```bash
+brig prune --dry-run          # see what would be removed
+brig prune                    # do it (all three categories)
+brig prune --logs --log-days 1  # just trim recent logs
+```
+
 ## "podman: command not found" inside the VM
 
 `make setup` runs `scripts/provision-vm.sh` to install gVisor (`runsc`)
