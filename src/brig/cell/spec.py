@@ -84,6 +84,10 @@ class CellSpec:
     labels: list[str] = field(default_factory=list)
     timeout: str | None = None
     workspace_quota: str | None = None
+    # Where the per-cell workspace is mounted inside the cell. Default /work
+    # matches existing cells; agent-delegation scenarios may prefer the host
+    # path basename (e.g. /workspace) so the in-cell and on-host paths agree.
+    workspace_mount: str = "/work"
     detach: bool = False
     rm: bool = False
     seccomp_profile: str | None = None
@@ -235,6 +239,47 @@ def _v_workspace_quota(value: Any, context: str) -> list[str]:
     return []
 
 
+def _v_workspace_mount(value: Any, context: str) -> list[str]:
+    """workspace_mount must be an absolute, non-traversal path that
+    doesn't shadow brig-internal paths.
+
+    Rejection covers three cases for each forbidden path P:
+      - value == P                (exact shadow)
+      - value.startswith(P + "/") (descends into P, masks subtree)
+      - P.startswith(value + "/") (ANCESTOR of P — mounting at the
+                                   ancestor masks P via mount-over-mount,
+                                   so e.g. workspace_mount: /run hides
+                                   the /run/secrets mount even though
+                                   "/run" itself isn't in the forbidden
+                                   set). Audit finding M3.
+    Also reject "/" outright — shadowing rootfs breaks the cell in
+    bizarre ways without offering any value.
+    """
+    if not isinstance(value, str):
+        return [f"'workspace_mount' must be a string{context}"]
+    if not value.startswith("/"):
+        return [f"'workspace_mount' must be an absolute path{context}"]
+    if ".." in value.split("/"):
+        return [f"'workspace_mount' must not contain '..'{context}"]
+    if value == "/":
+        return [f"'workspace_mount' must not be '/' (shadows rootfs){context}"]
+    forbidden_prefixes = ("/proc", "/sys", "/dev", "/run/secrets", "/etc")
+    for p in forbidden_prefixes:
+        # Exact match or descendant: workspace_mount masks P.
+        if value == p or value.startswith(p + "/"):
+            return [
+                f"'workspace_mount' must not shadow {p}{context} "
+                f"(would mask a required system path)"
+            ]
+        # Ancestor: workspace_mount masks P via mount-over-mount.
+        if p.startswith(value + "/"):
+            return [
+                f"'workspace_mount' must not be an ancestor of {p}{context} "
+                f"(would mask {p} via mount-over-mount)"
+            ]
+    return []
+
+
 def _v_detach(value: Any, context: str) -> list[str]:
     if not isinstance(value, bool):
         return [f"'detach' must be a boolean{context}"]
@@ -334,6 +379,7 @@ _SIMPLE_VALIDATORS = {
     "policy": _v_policy,
     "network": _v_network,
     "workspace_quota": _v_workspace_quota,
+    "workspace_mount": _v_workspace_mount,
     "detach": _v_detach,
 }
 

@@ -140,6 +140,18 @@ class TestValidateCellDefinition(unittest.TestCase):
         errors = validate_cell_definition({"workspace_mount": 42})
         self.assertTrue(any("must be a string" in e for e in errors), errors)
 
+    def test_workspace_mount_root_rejected(self):
+        errors = validate_cell_definition({"workspace_mount": "/"})
+        self.assertTrue(any("shadows rootfs" in e for e in errors), errors)
+
+    def test_workspace_mount_ancestor_of_forbidden_rejected(self):
+        """Audit M3: workspace_mount: /run would shadow /run/secrets via
+        mount-over-mount, even though /run itself isn't in the forbidden
+        set. The cell starts fine; secrets silently disappear."""
+        errors = validate_cell_definition({"workspace_mount": "/run"})
+        self.assertTrue(any("ancestor of /run/secrets" in e for e in errors),
+                        errors)
+
     def test_file_path_in_context(self):
         errors = validate_cell_definition({"name": "INVALID!"}, file_path="test.yaml")
         self.assertTrue(any("in test.yaml" in e for e in errors))

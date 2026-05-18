@@ -18,6 +18,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
+from brig.cell.metadata import IN_CELL_PATH, vm_source_path, write_metadata
 from brig.cell.spec import CellSpec
 from brig.config import PROXY_NAME, RUNTIME, VMPaths, container_name
 from brig.ops.logging import debug
@@ -236,7 +237,14 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         cmd.extend(["-e", env])
 
     workspace_dir = VMPaths.STATE_DIR / spec.name / "workspace"
-    cmd.extend(["-v", f"{workspace_dir}:/work:rw", "-w", "/work"])
+    cmd.extend([
+        "-v", f"{workspace_dir}:{spec.workspace_mount}:rw",
+        "-w", spec.workspace_mount,
+    ])
+    # Downward-API: read-only bind mount of the metadata JSON. The host
+    # writes it (see reconciler PODMAN_RUN handler), the cell reads it
+    # to learn its own name, workspace host path, and policy ACL.
+    cmd.extend(["-v", f"{vm_source_path(spec.name)}:{IN_CELL_PATH}:ro"])
 
     if spec.secrets:
         secrets_dir = Path("/secrets")
@@ -322,6 +330,9 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # Ensure workspace directory exists inside the VM before podman mounts it.
         workspace = VMPaths.STATE_DIR / spec.name / "workspace"
         _run_cmd(["mkdir", "-p", str(workspace)])
+        # Write the cell metadata file (downward API) so it's in place when
+        # podman creates the read-only bind mount at /run/brig/cell.json.
+        write_metadata(spec.name, spec.workspace_mount)
         proxy_ip = None
         if not spec.is_airgapped:
             # Retry — network connect may not have propagated yet.

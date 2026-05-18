@@ -5,6 +5,33 @@ have a clear trigger condition — build them when you hit the friction, not bef
 
 ## Near-term
 
+### `nosymfollow` on cell workspace mounts
+**Status:** Deferred — podman 4.x doesn't expose this for bind mounts.
+
+Brig currently relies on host-side consumers calling
+`brig.workspace.validation.assert_inside_workspace()` before reading
+files from a cell's workspace (see `docs/reference/cell-metadata.md` —
+"workspace passthrough security model"). That's necessary but
+contractual; a kernel-level guarantee would be better.
+
+Linux 5.10 added `MS_NOSYMFOLLOW`. The Lima VM is on a 6.x kernel so it's
+available, but podman 4.x doesn't expose it for `-v` bind mounts. Three
+options when this is built:
+1. Wait for podman to expose it (cleanest, no extra mount choreography).
+2. Pre-mount the workspace inside the VM with `MS_NOSYMFOLLOW` via a
+   provisioning hook, then bind-mount into podman. Adds a kernel-level
+   mount step per cell.
+3. Switch from bind mounts to podman volumes with the `nosymfollow`
+   option — breaks the host-side-access property that makes workspace
+   passthrough useful at all, so this is the wrong direction.
+
+**Trigger:** workspace-passthrough flows ship and we want defense-in-depth
+beyond the consumer-side validator, OR a real symlink-escape attempt is
+observed in network logs.
+
+**Effort:** Low (option 1) to medium (option 2, once we decide on the
+mount-step injection point).
+
 ### Snapshot / restore
 **Status:** Deferred — check if runtime installs are common.
 

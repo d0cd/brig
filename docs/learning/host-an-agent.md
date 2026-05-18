@@ -88,6 +88,16 @@ Notes:
   once you know the workload.
 - For a one-shot smoke test, drop `--detach` and pass a `--query` or
   `--exec` style flag to the agent's entrypoint.
+- **Cell stays alive only as long as PID 1 runs.** If the agent's default
+  command prints help and exits, the cell flips to `stopped` in a few
+  hundred ms. For an interactive cell you'll attach `brig cell exec` to
+  repeatedly, either pick a long-running default command (e.g. the
+  agent's gateway / daemon mode) or override:
+  ```yaml
+  # cell yaml — keeps the cell alive without any agent logic
+  command: ["sleep", "infinity"]
+  ```
+  Then drive work via `brig cell exec my-agent -- <whatever>`.
 
 ## 5. Verify it's reaching the host service
 

@@ -57,17 +57,26 @@ def cmd_run(args: Any) -> int:
         "workdir": getattr(args, "workdir", None),
     }
 
+    # Precedence (audit L4): CLI flag > yaml > profile > defaults.
+    # Build up from least-specific to most-specific: apply profile first,
+    # then merge yaml on top, then CLI flag overrides below.
+
+    if args.profile:
+        profile = load_profile(args.profile)
+        merged = apply_profile(spec_kwargs, profile)
+        spec_kwargs.update(merged)
+
     if args.file:
         cell_def = load_cell_definition(args.file)
         errors = validate_cell_definition(cell_def, args.file)
         if errors:
             raise BrigError("Invalid cell definition:\n  - " + "\n  - ".join(errors))
         # Special-cased fields:
-        #   - image / name: --flag wins over yaml.
+        #   - image / name: --flag wins over yaml (handled by the
+        #     `not getattr(args, key, None)` check).
         #   - command: --container_cmd (positional) wins over yaml.
         #   - env: additive — yaml entries appended to --env entries.
-        # All other CellSpec-valid fields fall through to the generic merge
-        # below.
+        # All other CellSpec-valid fields fall through to the generic merge.
         for key in ("image", "name"):
             if key in cell_def and not getattr(args, key, None):
                 spec_kwargs[key] = cell_def[key]
@@ -79,23 +88,13 @@ def cmd_run(args: Any) -> int:
             if isinstance(env_list, dict):
                 env_list = [f"{k}={v}" for k, v in env_list.items()]
             spec_kwargs["env"] = (args.env or []) + env_list
-        # Generic merge: pull any other CellSpec-valid fields from the yaml.
-        # CLI flag overrides below still fire (they're `if args.flag: set`),
-        # so precedence stays: CLI flag > yaml > defaults. The previous
-        # behavior silently dropped yaml `memory:`, `cpus:`, `workspace_*`,
-        # `secrets:`, `labels:`, etc. — even though the validator accepts
-        # them and the design doc shows them as supported.
+        # Generic merge for everything else the validator accepts.
         import dataclasses as _dc
         _spec_field_names = {f.name for f in _dc.fields(CellSpec)}
         _already_handled = {"image", "name", "command", "env", "ingress"}
         for key, val in cell_def.items():
             if key in _spec_field_names and key not in _already_handled:
                 spec_kwargs[key] = val
-
-    if args.profile:
-        profile = load_profile(args.profile)
-        merged = apply_profile(spec_kwargs, profile)
-        spec_kwargs.update(merged)
 
     if args.memory:
         spec_kwargs["memory"] = args.memory
@@ -311,15 +310,45 @@ def cmd_start(args: Any) -> int:
             "Warden proxy is not running",
             suggestion="Start with: brig up",
         )
+    # Refresh the cell metadata so /run/brig/cell.json's `started_at`
+    # reflects this start, not the original create. workspace_mount is
+    # preserved from whatever the cell was created with (bind mounts are
+    # fixed at container-create time; we can't change them on start).
+    # Audit L5.
+    _refresh_metadata_for_start(args.name)
     cn = container_name(args.name)
     result = vm_run(["podman", "start", cn])
     if result.returncode != 0:
         raise BrigError(
             f"Failed to start cell '{args.name}': {result.stderr.strip()}",
-            suggestion="Check if cell exists with: brig list",
+            suggestion="Check if cell exists with: brig cell list",
         )
     info(f"Cell '{args.name}' started")
     return 0
+
+
+def _refresh_metadata_for_start(cell_name: str) -> None:
+    """Rewrite /run/brig/cell.json on restart with a fresh `started_at`.
+
+    Preserves the original workspace_mount (the bind mount is fixed at
+    container-create time and re-setting it on `podman start` doesn't
+    take effect). If the existing metadata is missing or unreadable
+    (e.g. the cell was created before cell.json existed), write a
+    default-mount metadata file as a best-effort fallback.
+    """
+    import json as _json
+    from brig.cell.metadata import (
+        _host_metadata_path,
+        write_metadata,
+    )
+    existing = _host_metadata_path(cell_name)
+    workspace_mount = "/work"
+    try:
+        prior = _json.loads(existing.read_text())
+        workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        pass
+    write_metadata(cell_name, workspace_mount)
 
 
 def cmd_wait(args: Any) -> int:

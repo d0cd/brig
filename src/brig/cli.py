@@ -25,18 +25,16 @@ from brig.ops.logging import configure as configure_logging, error as log_error
 from brig.ops.history import log_operation_start, log_operation_end
 
 # Top-level commands that run on the macOS host without needing the Lima VM.
-# `system` is special — only a few of its subcommands need the VM (see below).
-_HOST_ONLY_TOP = frozenset({
-    "config", "secrets",
-})
+_HOST_ONLY_TOP = frozenset({"config", "policy", "secrets"})
 # `system` subcommands that don't touch the VM.
-_HOST_ONLY_SYSTEM = frozenset({
-    "init", "profiles", "up",  # up creates+starts the VM; doesn't need it pre-existing.
-})
+#   - init / profiles: pure config-file reads.
+#   - up: creates+starts the VM; doesn't need it pre-existing.
+#   - down: must work even when the VM is broken (idempotent cleanup) — and
+#     `brig system down --vm` definitionally has to work without the VM up.
+#   - history: reads ~/.brig/state/system/operations.jsonl on host only.
+_HOST_ONLY_SYSTEM = frozenset({"init", "profiles", "up", "down", "history"})
 # `image` subcommands that don't touch the VM.
-_HOST_ONLY_IMAGE = frozenset({
-    "verify",
-})
+_HOST_ONLY_IMAGE = frozenset({"verify"})
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -266,8 +264,7 @@ def _is_host_only(args: argparse.Namespace) -> bool:
         return getattr(args, "system_command", "") in _HOST_ONLY_SYSTEM
     if cmd == "image":
         return getattr(args, "image_command", "") in _HOST_ONLY_IMAGE
-    # `policy`, `config` — host-only.
-    return cmd in {"policy", "config"}
+    return False
 
 
 def main() -> None:

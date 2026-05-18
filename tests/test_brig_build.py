@@ -82,6 +82,28 @@ class TestBrigBuildValidation(unittest.TestCase):
 class TestBrigBuildCommandShape(unittest.TestCase):
     """Assert the produced podman build command has the right flags."""
 
+    def test_uses_crun_not_runsc(self):
+        """Issue 2 from brig-image-build-feedback.md v2: the VM defaults to
+        runsc (gVisor); buildah can't run under it. Build must explicitly
+        pass --runtime crun."""
+        from brig.commands.image_cmd import cmd_build
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "Containerfile").write_text("FROM alpine\n")
+            with patch("brig.commands.image_cmd.subprocess.run", side_effect=fake_run):
+                cmd_build(_args(context=td))
+
+        cmd = captured["cmd"]
+        self.assertIn("--runtime", cmd)
+        self.assertEqual(cmd[cmd.index("--runtime") + 1], "crun")
+        # runsc must NOT appear (would mean the default leaked through).
+        self.assertNotIn("runsc", cmd)
+
     def test_default_tag_derived_from_dir_name(self):
         from brig.commands.image_cmd import cmd_build
         captured = {}
@@ -221,6 +243,65 @@ class TestContainerIgnore(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(_load_ignore_patterns(Path(td)), [])
 
+    def test_anchored_pattern_matches_only_at_root(self):
+        """Audit M1 bug #1: leading-slash patterns (`/.git`, `/build`)
+        previously matched nothing because paths from relative_to() never
+        start with /. Now they should anchor to the context root."""
+        from brig.commands.image_cmd import _path_excluded
+        patterns = ["/build"]
+        self.assertTrue(_path_excluded("build", patterns))
+        self.assertTrue(_path_excluded("build/out.bin", patterns))
+        # Non-root `build/` directory should NOT match an anchored pattern.
+        self.assertFalse(_path_excluded("src/build", patterns))
+        self.assertFalse(_path_excluded("vendor/build/x", patterns))
+
+    def test_unanchored_pattern_matches_anywhere(self):
+        from brig.commands.image_cmd import _path_excluded
+        patterns = ["node_modules"]
+        self.assertTrue(_path_excluded("node_modules", patterns))
+        self.assertTrue(_path_excluded("src/node_modules", patterns))
+        self.assertTrue(_path_excluded("a/b/c/node_modules/foo", patterns))
+
+    def test_double_star_matches_zero_components(self):
+        """Audit M1 bug #2: `a/**/b` should match `a/b` (zero intermediate),
+        not only `a/x/b` or deeper."""
+        from brig.commands.image_cmd import _path_excluded
+        patterns = ["a/**/b"]
+        self.assertTrue(_path_excluded("a/b", patterns), "zero-component case")
+        self.assertTrue(_path_excluded("a/x/b", patterns), "one-component case")
+        self.assertTrue(_path_excluded("a/x/y/z/b", patterns), "many-component case")
+        self.assertFalse(_path_excluded("a/c", patterns))
+
+    def test_negation_reincludes(self):
+        """Audit M1 bug #3: negation (!pattern) re-includes a previously-
+        excluded path. Last matching rule wins."""
+        from brig.commands.image_cmd import _path_excluded
+        patterns = ["*.log", "!important.log"]
+        self.assertTrue(_path_excluded("debug.log", patterns))
+        self.assertFalse(_path_excluded("important.log", patterns),
+            "negation should re-include important.log")
+
+    def test_negation_only_overrides_when_later(self):
+        """Order matters: !pattern BEFORE the exclude doesn't help."""
+        from brig.commands.image_cmd import _path_excluded
+        patterns = ["!important.log", "*.log"]
+        self.assertTrue(_path_excluded("important.log", patterns),
+            "later *.log should still exclude")
+
+    def test_bounded_regex_no_redos(self):
+        """Audit M1 ReDoS: matching a non-matching path against many `**`
+        segments completes promptly (sub-second). Previous `.*`-based
+        translation took ~10s per path under similar inputs."""
+        import time
+        from brig.commands.image_cmd import _path_excluded
+        # Many `**` segments, no match.
+        pattern = "a/" + "/".join(["**"] * 15) + "/foo"
+        start = time.monotonic()
+        for _ in range(100):
+            _path_excluded("not-the-target/path/that/wont/match", [pattern])
+        elapsed = time.monotonic() - start
+        self.assertLess(elapsed, 1.0, f"100 matches took {elapsed:.2f}s — ReDoS risk")
+
     def test_stream_tar_context_drops_excluded(self):
         """Integration: tar a dir with excluded files; assert they're gone."""
         from brig.commands.image_cmd import _stream_tar_context, _load_ignore_patterns
@@ -249,6 +330,84 @@ class TestContainerIgnore(unittest.TestCase):
             for excluded in (".git", ".git/HEAD", "build", "build/out.bin"):
                 self.assertNotIn(excluded, names,
                     f"{excluded} should have been excluded, names: {names}")
+
+
+class TestBuildContextSymlinkSafety(unittest.TestCase):
+    """Audit H1: a symlink in the build context pointing outside the
+    context can exfiltrate host secrets (the resolved file contents
+    end up in the tar / become readable inside the build container).
+    The tar filter must reject these."""
+
+    def test_symlink_escaping_context_is_dropped(self):
+        from brig.commands.image_cmd import _stream_tar_context
+        import io as _io
+        import tarfile as _tarfile
+
+        with tempfile.TemporaryDirectory() as outer:
+            outer_p = Path(outer)
+            # Host secret OUTSIDE the build context.
+            secret = outer_p / "host-secret"
+            secret.write_text("PRIVATE-KEY")
+
+            ctx = outer_p / "build-ctx"
+            ctx.mkdir()
+            (ctx / "Containerfile").write_text("FROM alpine\n")
+            # Hostile symlink pointing OUT.
+            (ctx / "innocuous.txt").symlink_to(secret)
+
+            data = _stream_tar_context(ctx, patterns=[])
+            with _tarfile.open(fileobj=_io.BytesIO(data)) as tf:
+                names = tf.getnames()
+                # The symlink must NOT have made it into the tar.
+                self.assertNotIn("innocuous.txt", names,
+                    f"escaping symlink was bundled; tar contains {names}")
+            # And the secret content must not appear anywhere in the bytes.
+            self.assertNotIn(b"PRIVATE-KEY", data,
+                "host secret contents leaked into build tar")
+
+    def test_symlink_staying_inside_context_is_preserved(self):
+        """Don't over-restrict: a symlink that points to another file
+        inside the build context is fine and should be preserved as
+        a symlink in the tar (podman replicates this in the image)."""
+        from brig.commands.image_cmd import _stream_tar_context
+        import io as _io
+        import tarfile as _tarfile
+
+        with tempfile.TemporaryDirectory() as td:
+            ctx = Path(td)
+            (ctx / "Containerfile").write_text("FROM alpine\n")
+            (ctx / "real.txt").write_text("hello")
+            (ctx / "link.txt").symlink_to("real.txt")
+
+            data = _stream_tar_context(ctx, patterns=[])
+            with _tarfile.open(fileobj=_io.BytesIO(data)) as tf:
+                names = tf.getnames()
+                self.assertIn("link.txt", names)
+                member = tf.getmember("link.txt")
+                self.assertTrue(member.issym(),
+                    "in-context symlink should be preserved as symlink, "
+                    f"got type byte {member.type!r}")
+
+
+class TestBuildContextSizeCap(unittest.TestCase):
+    """Audit M2: a runaway build context should fail with a clear error
+    rather than OOM the host."""
+
+    def test_oversized_context_refused(self):
+        from brig.commands import image_cmd
+        from brig.errors import BrigError
+
+        with tempfile.TemporaryDirectory() as td:
+            ctx = Path(td)
+            (ctx / "Containerfile").write_text("FROM alpine\n")
+            # Lower the abort cap to something quick to trip.
+            with patch.object(image_cmd, "_TAR_ABORT_BYTES", 4 * 1024), \
+                 patch.object(image_cmd, "_TAR_WARN_BYTES", 1):
+                # Create one chunky file that pushes us past the cap.
+                (ctx / "big.bin").write_bytes(b"x" * 8 * 1024)
+                with self.assertRaises(BrigError) as cm:
+                    image_cmd._stream_tar_context(ctx, patterns=[])
+                self.assertIn("exceeded", str(cm.exception))
 
 
 class TestBrigImageLoad(unittest.TestCase):

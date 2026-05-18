@@ -40,16 +40,16 @@ rm -rf ~/.brig
 step "1. make setup"
 make setup
 
-step "2. brig health is fast and green"
+step "2. brig system doctor --quick is fast and green"
 START=$(date +%s)
-if ! brig health; then
-    echo "ERROR: brig health reported failure on a fresh install" >&2
+if ! brig system doctor --quick; then
+    echo "ERROR: brig system doctor --quick reported failure on a fresh install" >&2
     exit 1
 fi
 ELAPSED=$(($(date +%s) - START))
-echo "  brig health wall time: ${ELAPSED}s"
+echo "  wall time: ${ELAPSED}s"
 if [[ "$ELAPSED" -gt 5 ]]; then
-    echo "ERROR: brig health took ${ELAPSED}s (>5s). The sudo/DNS-timeout regression is back." >&2
+    echo "ERROR: doctor --quick took ${ELAPSED}s (>5s). The sudo/DNS-timeout regression is back." >&2
     exit 1
 fi
 
@@ -61,21 +61,21 @@ if ! grep -q "hello-from-fresh-install" <<< "$OUT"; then
     exit 1
 fi
 
-step "4. brig rm -f fresh-test-*"
+step "4. brig cell rm -f fresh-test-*"
 # Use a name pattern based on PID so concurrent runs don't collide.
-brig list --format json | python3 -c '
+brig cell list --format json | python3 -c '
 import json, sys
 cells = json.load(sys.stdin) if sys.stdin.isatty() is False else []
 for c in cells:
     if c["name"].startswith("fresh-test-"):
         print(c["name"])
 ' | while read -r name; do
-    [ -n "$name" ] && brig rm -f "$name"
+    [ -n "$name" ] && brig cell rm -f "$name"
 done
 
-step "5. Smoke: brig doctor reports nothing wrong"
-if ! brig doctor; then
-    echo "ERROR: brig doctor failed on a fresh install" >&2
+step "5. Smoke: brig system doctor reports nothing wrong"
+if ! brig system doctor; then
+    echo "ERROR: brig system doctor failed on a fresh install" >&2
     exit 1
 fi
 

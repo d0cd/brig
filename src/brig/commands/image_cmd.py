@@ -37,37 +37,90 @@ def _load_ignore_patterns(ctx: Path) -> list[str]:
     return []
 
 
+def _glob_segment_to_regex(seg: str) -> str:
+    """Translate one path-segment glob (no `/` inside) to a bounded regex.
+
+    `*` → `[^/]*`, `?` → `[^/]`, everything else escaped. Bounded means
+    no `.*` — protects against ReDoS via crafted long patterns (audit M1).
+    """
+    out = []
+    for ch in seg:
+        if ch == "*":
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(ch))
+    return "".join(out)
+
+
+def _compile_pattern(pattern: str) -> tuple[bool, re.Pattern, bool]:
+    """Parse one ignore line into (negate, regex, dir_only).
+
+    Supports `**` (matches zero or more path components), `*`/`?`
+    (within a segment), leading `!` for negation, leading `/` for
+    root-anchored, trailing `/` for directory-only.
+    """
+    negate = pattern.startswith("!")
+    if negate:
+        pattern = pattern[1:]
+    anchored = pattern.startswith("/")
+    if anchored:
+        pattern = pattern[1:]
+    dir_only = pattern.endswith("/")
+    if dir_only:
+        pattern = pattern[:-1]
+
+    parts = pattern.split("/")
+    rx_parts: list[str] = []
+    for i, seg in enumerate(parts):
+        if seg == "**":
+            # `**` matches zero or more path components. Emit a regex that
+            # consumes any number of /-separated segments (including none).
+            # Trailing slash is contributed by the next iteration's join,
+            # but for the zero-component case we need the join to collapse.
+            # We handle this by emitting `(?:.+/)?` and then collapsing
+            # adjacent `/` in the final join.
+            rx_parts.append("(?:.+/)?")
+        else:
+            rx_parts.append(_glob_segment_to_regex(seg) + ("/" if i < len(parts) - 1 else ""))
+    body = "".join(rx_parts).rstrip("/")
+    # Anchored: must start at the root. Unanchored: match anywhere
+    # (Docker semantics — `node_modules` matches at any depth).
+    prefix = r"\A" if anchored else r"(?:\A|.+/)"
+    # Allow the pattern to match either the path itself or any descendant.
+    suffix = r"(?:/.*)?\Z"
+    rx = re.compile(prefix + body + suffix)
+    return (negate, rx, dir_only)
+
+
 def _path_excluded(relpath: str, patterns: list[str]) -> bool:
     """Match a path-relative-to-context against dockerignore-style globs.
 
-    Supports `*`, `?`, `**` (any-depth), and exact paths. Trailing slash
-    on a pattern means directory-only. No support for negation (`!`); add
-    when we hit a case that needs it.
+    Implements the full dockerignore spec relevant to brig:
+      - `*`, `?`, `**`
+      - leading `/` = anchored to context root
+      - trailing `/` = directory-only
+      - leading `!` = negation (re-include a previously-excluded path)
+      - last matching pattern wins (so `*.log\\n!important.log` keeps
+        important.log)
+
+    Bounded regex translation (no `.*` segments) — see audit finding M1
+    on ReDoS via crafted `**` patterns.
     """
     rel = relpath.replace("\\", "/")
-    for pat in patterns:
-        # Strip trailing slash; pattern still matches dir + descendants
-        # when we compare the path prefix below.
-        is_dir_only = pat.endswith("/")
-        p = pat.rstrip("/")
+    excluded = False
+    for raw in patterns:
+        negate, rx, _dir_only = _compile_pattern(raw)
+        if rx.match(rel):
+            excluded = not negate
+    return excluded
 
-        # `**` cross-component → translate to a regex-friendly form.
-        # Convert each segment, joining with `/`; `**` becomes `.*`.
-        regex_parts = []
-        for seg in p.split("/"):
-            if seg == "**":
-                regex_parts.append(".*")
-            else:
-                regex_parts.append(fnmatch.translate(seg).rstrip(r"\Z").rstrip("$"))
-        # Anchor at start; allow trailing path after the matched prefix so
-        # `hermes-src/.git` matches `hermes-src/.git/HEAD`.
-        pattern = "^" + "/".join(regex_parts) + r"(/.*)?$"
-        if re.match(pattern, rel):
-            return True
-        # Plain string prefix match for simple "dir" forms.
-        if not is_dir_only and rel == p:
-            return True
-    return False
+
+# Soft + hard size caps for the in-memory tar (audit finding M2: a 50 GB
+# `brig image build ~` would OOM the host before podman saw a byte).
+_TAR_WARN_BYTES = 500 * 1024 * 1024     # 500 MB — warn but proceed.
+_TAR_ABORT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB — refuse with clear error.
 
 
 def _stream_tar_context(ctx: Path, patterns: list[str]) -> bytes:
@@ -75,18 +128,62 @@ def _stream_tar_context(ctx: Path, patterns: list[str]) -> bytes:
 
     Buffered (not streamed) for simplicity; most contexts are <100 MB and
     fitting in memory is acceptable. If/when someone needs to build a
-    >1 GB context, switch to a streaming Popen-tar pipeline.
+    >2 GB context, switch to a streaming Popen-tar pipeline.
+
+    Security (audit finding H1): symlinks in the build context that point
+    outside `ctx` are REJECTED. Otherwise a project containing
+    `ln -s ~/.ssh/id_rsa secret.txt` would bundle the host key into the
+    build context, and a Containerfile `COPY secret.txt /` could exfiltrate
+    via any allowlisted egress. Symlinks pointing *inside* the context are
+    preserved as symlinks (so the unpacked image sees the link, not the
+    target's contents).
     """
+    ctx_resolved = ctx.resolve()
     buf = io.BytesIO()
+    skipped_escapes = 0
+
+    def _safe_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        # tarfile.add() supports a per-entry filter. We use it to drop
+        # any symlink whose link target resolves outside the context.
+        if info.issym() or info.islnk():
+            # info.name is the arcname; the real on-disk path is
+            # ctx / info.name (see how we call tar.add below).
+            on_disk = ctx / info.name
+            try:
+                link_target = on_disk.resolve()
+            except (OSError, RuntimeError):
+                # ELOOP, ENAMETOOLONG, etc. — refuse.
+                return None
+            try:
+                link_target.relative_to(ctx_resolved)
+            except ValueError:
+                nonlocal skipped_escapes
+                skipped_escapes += 1
+                return None
+        return info
+
     with tarfile.open(fileobj=buf, mode="w") as tar:
         for path in sorted(ctx.rglob("*")):
             rel = path.relative_to(ctx).as_posix()
             if _path_excluded(rel, patterns):
                 continue
             try:
-                tar.add(str(path), arcname=rel, recursive=False)
+                tar.add(str(path), arcname=rel, recursive=False, filter=_safe_filter)
             except OSError as e:
                 info(f"  skip {rel}: {e}")
+            # Bail before swap-thrashing.
+            if buf.tell() > _TAR_ABORT_BYTES:
+                raise BrigError(
+                    f"Build context exceeded {_TAR_ABORT_BYTES // (1024**3)} GB. "
+                    "Add patterns to .containerignore to exclude large "
+                    "directories (node_modules, .git, .venv, build artifacts).",
+                )
+
+    if skipped_escapes:
+        info(f"  dropped {skipped_escapes} symlink(s) pointing outside the build context")
+    if buf.tell() > _TAR_WARN_BYTES:
+        size_mb = buf.tell() // (1024 * 1024)
+        info(f"  warning: build context is {size_mb} MB; consider .containerignore patterns")
     return buf.getvalue()
 
 
@@ -147,10 +244,17 @@ def cmd_build(args: Any) -> int:
 
     info(f"Building {tag} from {ctx}")
     tar_bytes = _stream_tar_context(ctx, patterns)
+    # --runtime crun: the VM's default container runtime is runsc (gVisor)
+    # which buildah can't operate under (gVisor lacks the cgroup ops buildah
+    # uses for intermediate build containers). Fall back to crun for builds —
+    # already installed in the VM and used by warden for the same reason.
+    # Runtime isolation for *cells* still uses runsc; this only affects the
+    # build sandbox, which runs trusted code (the user's Containerfile).
     build = subprocess.run(
         [
             "limactl", "shell", "--workdir", "/", "brig", "--",
-            "sudo", "podman", "build", "-t", tag, *cfile_arg, *build_args, "-",
+            "sudo", "podman", "build", "--runtime", "crun",
+            "-t", tag, *cfile_arg, *build_args, "-",
         ],
         input=tar_bytes,
         check=False,

@@ -155,6 +155,7 @@ make bench                    # benchmarks
 - [SDK Specification](docs/sdk-spec.md)
 - [Brig CLI Reference](docs/reference/brig-cli.md)
 - [Warden CLI Reference](docs/reference/warden-cli.md)
+- [Cell Metadata Reference](docs/reference/cell-metadata.md) — `/run/brig/cell.json` schema and workspace-passthrough security model
 - [Addons Reference](docs/reference/addons.md)
 - [Security Invariants](docs/INVARIANTS.md)
 
