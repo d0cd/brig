@@ -14,7 +14,7 @@ import sys
 
 from brig.config import VERSION
 from brig.errors import BrigError
-from brig.ops.logging import configure as configure_logging
+from brig.ops.logging import configure as configure_logging, error as log_error
 from brig.ops.history import log_operation_start, log_operation_end
 
 # Commands that run on the macOS host without needing the Lima VM.
@@ -185,6 +185,19 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("preflight", help="Run pre-start checks")
     sub.add_parser("metrics", help="Output Prometheus metrics")
 
+    p_prune = sub.add_parser("prune",
+        help="Clean up stopped cells, old logs, orphan subnet allocations")
+    p_prune.add_argument("--cells", action="store_true",
+                         help="Only prune stopped cells (default: all categories)")
+    p_prune.add_argument("--logs", action="store_true",
+                         help="Only prune old log files (default: all categories)")
+    p_prune.add_argument("--subnets", action="store_true",
+                         help="Only prune orphan subnet allocations (default: all categories)")
+    p_prune.add_argument("--log-days", type=int, default=7,
+                         help="Drop rotated logs older than N days (default: 7)")
+    p_prune.add_argument("-n", "--dry-run", action="store_true",
+                         help="Show what would be removed without acting")
+
     p_history = sub.add_parser("history", help="Show operation history")
     p_history.add_argument("--tail", type=int, default=20, help="Number of entries")
     p_history.add_argument("--cell", help="Filter by cell name")
@@ -212,16 +225,16 @@ def main() -> None:
     if args.command not in _HOST_ONLY_COMMANDS:
         import shutil
         if not shutil.which("limactl"):
-            print("ERROR: limactl not found on PATH", file=sys.stderr)
-            print("  Install Lima: brew install lima", file=sys.stderr)
+            log_error("limactl not found on PATH")
+            log_error("  Install Lima: brew install lima")
             sys.exit(1)
         from brig.vm.shell import vm_running
         if not vm_running():
             # Allow init-adjacent commands through with a warning.
             if args.command not in {"health", "preflight"}:
-                print("ERROR: Brig VM is not running", file=sys.stderr)
-                print("  Start it with: limactl start brig", file=sys.stderr)
-                print("  Or initialize: brig init && limactl create --name=brig ~/.brig/lima.yaml", file=sys.stderr)
+                log_error("Brig VM is not running")
+                log_error("  Start it with: limactl start brig")
+                log_error("  Or initialize: brig init && limactl create --name=brig ~/.brig/lima.yaml")
                 sys.exit(1)
 
     # Lazy imports to avoid loading all modules on every invocation.
@@ -265,6 +278,7 @@ def main() -> None:
         "doctor": system_cmd.cmd_doctor,
         "preflight": system_cmd.cmd_preflight,
         "metrics": system_cmd.cmd_metrics,
+        "prune": system_cmd.cmd_prune,
         "history": system_cmd.cmd_history,
         "up": convenience_cmd.cmd_up,
         "down": convenience_cmd.cmd_down,
@@ -298,9 +312,9 @@ def main() -> None:
     except BrigError as e:
         error_msg = str(e)
         exit_code = e.returncode
-        print(f"ERROR: {e}", file=sys.stderr)
+        log_error(str(e))
         if e.suggestion:
-            print(f"  Suggestion: {e.suggestion}", file=sys.stderr)
+            log_error(f"  Suggestion: {e.suggestion}")
     except KeyboardInterrupt:
         error_msg = "Interrupted by user"
         exit_code = 130
@@ -314,7 +328,7 @@ def main() -> None:
             import traceback
             traceback.print_exc()
         else:
-            print(f"ERROR: {sanitized}", file=sys.stderr)
+            log_error(sanitized)
     finally:
         log_operation_end(op_context, exit_code, error_msg)
 

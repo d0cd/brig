@@ -83,6 +83,7 @@ state/
 # Lima VM user configs (keep templates, ignore user-specific)
 lima-*.yaml
 !lima.yaml.template
+!.github/e2e/lima-ci.yaml
 
 # Jupyter
 .ipynb_checkpoints/

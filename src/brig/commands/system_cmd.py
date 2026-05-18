@@ -5,6 +5,7 @@ CLI handlers for system commands.
 from __future__ import annotations
 
 import json
+import time
 from brig.vm.shell import vm_run
 from pathlib import Path
 from typing import Any
@@ -289,7 +290,7 @@ def cmd_metrics(args: Any) -> int:
     output(f"brig_cells_total {len(subnets)}")
 
     result = vm_run(
-        ["podman", "ps", "--format", "json", "--filter", f"name={CONTAINER_PREFIX}"],
+        ["podman", "ps", "--format", "json", "--filter", f"name=^{CONTAINER_PREFIX}"],
     )
     running = 0
     if result.returncode == 0 and result.stdout.strip():
@@ -306,6 +307,92 @@ def cmd_metrics(args: Any) -> int:
     output("# HELP brig_cells_running Number of running cells")
     output("# TYPE brig_cells_running gauge")
     output(f"brig_cells_running {running}")
+    return 0
+
+
+def cmd_prune(args: Any) -> int:
+    """Handle `brig prune` — clean up stopped cells, old logs, orphan subnets.
+
+    With --dry-run, prints what would be removed without taking action.
+    Without any of --cells/--logs/--subnets, all three categories are pruned.
+    """
+    from brig.config import HostPaths
+    from brig.network.subnet import free, list_all
+
+    do_cells = getattr(args, "cells", False)
+    do_logs = getattr(args, "logs", False)
+    do_subnets = getattr(args, "subnets", False)
+    # If no scope flag is set, do everything.
+    if not (do_cells or do_logs or do_subnets):
+        do_cells = do_logs = do_subnets = True
+    dry_run = getattr(args, "dry_run", False)
+    log_days = getattr(args, "log_days", 7) or 7
+
+    removed_cells = 0
+    removed_logs = 0
+    freed_subnets = 0
+
+    # 1. Stopped cells.
+    if do_cells:
+        result = vm_run(
+            ["podman", "ps", "-a", "--format", "json",
+             "--filter", f"name=^{CONTAINER_PREFIX}"],
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                containers = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                containers = []
+            for c in containers:
+                names = c.get("Names", "")
+                name = names[0] if isinstance(names, list) else names
+                if name == PROXY_NAME:
+                    continue
+                state = (c.get("State") or "").lower()
+                if state in ("exited", "stopped", "created", "configured"):
+                    output(f"  {'would remove' if dry_run else 'removing'} cell: {name}")
+                    if not dry_run:
+                        vm_run(["podman", "rm", "-f", name])
+                        # Also remove the network if it exists; subnet stays
+                        # allocated until the subnets phase below cleans it.
+                        vm_run(["podman", "network", "rm", name])
+                    removed_cells += 1
+
+    # 2. Old log files (network logs are inside the VM).
+    if do_logs:
+        # Host-side operation logs.
+        for path in [HostPaths.OPERATIONS_FILE, HostPaths.HISTORY_FILE,
+                     HostPaths.LIFECYCLE_FILE, HostPaths.POLICY_AUDIT_FILE]:
+            for rotated in path.parent.glob(f"{path.stem}.*.jsonl"):
+                age_days = (time.time() - rotated.stat().st_mtime) / 86400
+                if age_days >= log_days:
+                    output(f"  {'would remove' if dry_run else 'removing'} log: {rotated}")
+                    if not dry_run:
+                        rotated.unlink()
+                    removed_logs += 1
+        # VM-side network logs via warden's prune.
+        if not dry_run:
+            vm_run(["warden", "logs", "prune", "--days", str(log_days)])
+
+    # 3. Orphan subnet allocations — subnets whose podman network is gone.
+    if do_subnets:
+        result = vm_run(["podman", "network", "ls", "--format", "{{.Name}}"])
+        existing_networks = set(result.stdout.strip().split("\n")) if result.returncode == 0 else set()
+        for info in list_all():
+            net_name = f"{CONTAINER_PREFIX}{info.cell_name}"
+            if net_name not in existing_networks:
+                output(f"  {'would free' if dry_run else 'freeing'} subnet: {info.subnet} ({info.cell_name})")
+                if not dry_run:
+                    try:
+                        free(info.cell_name)
+                    except ValueError:
+                        pass
+                freed_subnets += 1
+
+    output("")
+    output(f"Pruned: {removed_cells} cells, {removed_logs} log files, {freed_subnets} subnets")
+    if dry_run:
+        output("(dry run — no changes made)")
     return 0
 
 

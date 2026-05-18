@@ -139,6 +139,11 @@ def warn(msg: str) -> None:
     log(LOG_LEVEL_WARN, msg)
 
 
+def error(msg: str) -> None:
+    """Print error message to stderr (always; not suppressed by --quiet)."""
+    log(LOG_LEVEL_ERROR, msg)
+
+
 class Spinner:
     """Context manager for showing a spinner during long operations."""
 

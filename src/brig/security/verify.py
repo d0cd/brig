@@ -36,7 +36,7 @@ def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
     """
     result = _run([
         "podman", "ps", "-a", "--format", "json",
-        "--filter", f"name={CONTAINER_PREFIX}",
+        "--filter", f"name=^{CONTAINER_PREFIX}",
     ])
     if not result.stdout.strip():
         return [], []

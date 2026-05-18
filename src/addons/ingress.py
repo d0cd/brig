@@ -344,6 +344,14 @@ class IngressRouter:
             return
 
         # Check request body size.
+        #
+        # LIMITATION: mitmproxy has already buffered the body into memory by
+        # the time this check runs, so this gate is post-allocation and
+        # only protects the cell-side application (and downstream memory)
+        # from large payloads. Auth still gates this — an unauthenticated
+        # client can't make warden buffer a body, since 401 returns earlier.
+        # For a true wire-level cap, mitmproxy stream mode would have to be
+        # configured for the ingress listener; we don't do that today.
         if flow.request.content and len(flow.request.content) > MAX_INGRESS_BODY_SIZE:
             flow.response = http.Response.make(
                 413, "Request body too large", {"Content-Type": "text/plain"}

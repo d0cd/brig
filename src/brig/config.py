@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 
 # Version.
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # Lima VM name.
 VM_NAME = "brig"

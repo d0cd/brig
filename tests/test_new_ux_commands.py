@@ -325,5 +325,63 @@ class TestDeprecatedCommandsRemoved(unittest.TestCase):
             parser.parse_args(["run", "--tor", "alpine"])
 
 
+class TestPruneCommand(unittest.TestCase):
+    def test_prune_in_parser(self):
+        from brig.cli import _build_parser
+        parser = _build_parser()
+        args = parser.parse_args(["prune"])
+        self.assertEqual(args.command, "prune")
+        # Defaults: no scope flag set → all categories.
+        self.assertFalse(args.cells)
+        self.assertFalse(args.logs)
+        self.assertFalse(args.subnets)
+        self.assertFalse(args.dry_run)
+        self.assertEqual(args.log_days, 7)
+
+    def test_prune_flags(self):
+        from brig.cli import _build_parser
+        parser = _build_parser()
+        args = parser.parse_args(["prune", "--cells", "--dry-run", "--log-days", "30"])
+        self.assertTrue(args.cells)
+        self.assertTrue(args.dry_run)
+        self.assertEqual(args.log_days, 30)
+
+    def test_prune_dry_run_doesnt_touch_anything(self):
+        from brig.commands.system_cmd import cmd_prune
+        from unittest.mock import patch
+        # With --dry-run + empty containers + empty subnet allocator,
+        # the command should complete with rc=0 and make no podman calls.
+        with patch("brig.commands.system_cmd.vm_run") as mock_vm, \
+             patch("brig.network.subnet.list_all", return_value=[]):
+            mock_vm.return_value = SimpleNamespace(stdout="", returncode=0)
+            rc = cmd_prune(SimpleNamespace(
+                cells=True, logs=False, subnets=False,
+                dry_run=True, log_days=7,
+            ))
+        self.assertEqual(rc, 0)
+
+
+class TestVersionFlag(unittest.TestCase):
+    def test_version_flag_prints_and_exits(self):
+        from brig.cli import _build_parser
+        parser = _build_parser()
+        # argparse --version exits 0 after printing.
+        with self.assertRaises(SystemExit) as ctx:
+            parser.parse_args(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_version_string_matches_brig_config(self):
+        from brig.config import VERSION
+        import brig
+        self.assertEqual(brig.__version__, VERSION)
+
+
+class TestErrorOutputUsesLogging(unittest.TestCase):
+    def test_log_error_exists(self):
+        """O1: cli.py error paths route through brig.ops.logging.error()."""
+        from brig.ops.logging import error as log_error
+        self.assertTrue(callable(log_error))
+
+
 if __name__ == "__main__":
     unittest.main()

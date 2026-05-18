@@ -86,7 +86,7 @@ def cmd_down(args: Any) -> int:
     from brig.vm.shell import vm_run
 
     # Stop all cells.
-    result = vm_run(["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={CONTAINER_PREFIX}"])
+    result = vm_run(["podman", "ps", "--format", "{{.Names}}", "--filter", f"name=^{CONTAINER_PREFIX}"])
     if result.returncode == 0 and result.stdout.strip():
         for name in result.stdout.strip().split("\n"):
             if name and name != PROXY_NAME:

@@ -44,7 +44,14 @@ def validate_index(index: int) -> bool:
 
 
 def _load_state(state_file: Path = SUBNET_STATE_FILE) -> dict:
-    """Load subnet allocation state from file."""
+    """Load subnet allocation state from file.
+
+    UNLOCKED — caller must hold the allocator file lock (fcntl.LOCK_SH or
+    LOCK_EX on ALLOCATOR_LOCK_FILE). Direct reads without the lock can
+    observe a torn file in the rename window. All callers in this module
+    (allocate/free/get/list_all/get_subnet_map) wrap _load_state in a lock;
+    if you add a new caller, do the same.
+    """
     default: dict = {"next_index": 1, "allocated": {}, "freed": []}
     if not state_file.exists():
         return default

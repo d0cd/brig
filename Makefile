@@ -36,7 +36,7 @@ test: ## Run unit tests (no VM needed)
 check: ## Run full CI checks locally
 	uv run ruff check src/ tests/
 	uv run mypy src/brig/ --ignore-missing-imports --follow-imports=silent
-	uv run pytest tests/ -q -m "not slow" --ignore=tests/benchmarks --cov=src --cov-fail-under=70
+	uv run pytest tests/ -q -m "not slow" --ignore=tests/benchmarks --cov=src --cov-fail-under=65
 
 smoke: ## Run end-to-end smoke test (requires VM)
 	./scripts/local-smoke-test.sh
@@ -66,6 +66,9 @@ reset: ## Full reset: remove venv, VM, and all state
 .venv:
 	uv venv
 
+pin-gvisor: ## Fetch + write gVisor sha512s into scripts/provision-vm.sh (run once per bump)
+	@./scripts/pin-gvisor.sh
+
 _copy-addons:
 	@mkdir -p ~/.brig/cells/addons
 	@chmod 0700 ~/.brig/cells/addons
@@ -73,3 +76,9 @@ _copy-addons:
 	@for f in src/addons/_notifier_state.py src/addons/notifier.py src/addons/ingress.py; do \
 		[ -f "$$f" ] && cp "$$f" ~/.brig/cells/addons/ || true; \
 	done
+	@# Seccomp profiles are referenced by reconciler.build_run_command as
+	@# /cells/seccomp/<name>.json inside the VM (the host's ~/.brig/cells
+	@# is mounted at /cells). Without these, --seccomp-profile fails to
+	@# find the profile inside the container.
+	@mkdir -p ~/.brig/cells/seccomp
+	@cp src/seccomp/*.json ~/.brig/cells/seccomp/

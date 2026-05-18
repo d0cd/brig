@@ -141,7 +141,7 @@ def cmd_rm(args: Any) -> int:
 
 def cmd_list(args: Any) -> int:
     result = vm_run(
-        ["podman", "ps", "-a", "--format", "json", "--filter", f"name={CONTAINER_PREFIX}"],
+        ["podman", "ps", "-a", "--format", "json", "--filter", f"name=^{CONTAINER_PREFIX}"],
     )
     if result.returncode != 0:
         return 1
@@ -363,7 +363,7 @@ def cmd_stats(args: Any) -> int:
     if hasattr(args, "name") and args.name:
         cmd.append(container_name(args.name))
     else:
-        cmd.extend(["--filter", f"name={CONTAINER_PREFIX}"])
+        cmd.extend(["--filter", f"name=^{CONTAINER_PREFIX}"])
     return vm_run_interactive(cmd)
 
 

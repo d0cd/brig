@@ -90,6 +90,7 @@ class Notifier:
         self.config = NotificationConfig()
         self.policy_mtime = 0.0
         self.last_notification: collections.OrderedDict[str, float] = collections.OrderedDict()
+        self._last_notification_lock = threading.Lock()
         self.notification_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
         self.worker_thread: Optional[threading.Thread] = None
         self.running = False
@@ -205,12 +206,20 @@ class Notifier:
         ctx.log.info("Notifier: Worker started")
 
     def _stop_worker(self) -> None:
-        """Stop background worker."""
+        """Stop background worker.
+
+        Mirrors the pattern in _log_writer.AsyncLogWriter.stop(): set the
+        flag, signal via a sentinel, then join with a bounded timeout so
+        warden shutdown can't hang on a stuck worker.
+        """
         self.running = False
         try:
             self.notification_queue.put_nowait(None)
         except queue.Full:
             pass
+        if self.worker_thread:
+            self.worker_thread.join(timeout=1.0)
+            self.worker_thread = None
 
     def _worker(self) -> None:
         """Background worker for sending notifications."""
@@ -395,7 +404,8 @@ class Notifier:
             if not any(p in block_reason for p in self.config.block_reasons):
                 return False
         now = time.time()
-        last = self.last_notification.get(cell_name, 0)
+        with self._last_notification_lock:
+            last = self.last_notification.get(cell_name, 0)
         if now - last < self.config.min_interval_seconds:
             return False
         return True
@@ -413,13 +423,15 @@ class Notifier:
         if not self._should_notify(cell_name, block_reason):
             return
 
-        # Update last notification time with LRU eviction.
-        if cell_name not in self.last_notification:
-            if len(self.last_notification) >= MAX_TRACKED_CELLS:
-                self.last_notification.popitem(last=False)
-        else:
-            self.last_notification.move_to_end(cell_name)
-        self.last_notification[cell_name] = time.time()
+        # Update last notification time with LRU eviction (single-writer for
+        # the OrderedDict invariant — popitem/move_to_end aren't atomic).
+        with self._last_notification_lock:
+            if cell_name not in self.last_notification:
+                if len(self.last_notification) >= MAX_TRACKED_CELLS:
+                    self.last_notification.popitem(last=False)
+            else:
+                self.last_notification.move_to_end(cell_name)
+            self.last_notification[cell_name] = time.time()
 
         notification = {
             "event": "request_blocked",

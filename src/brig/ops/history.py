@@ -30,19 +30,27 @@ MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB per log file.
 
 
 def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
-    """Append a JSON line to a log file with file locking.
+    """Append a JSON line to a log file under an exclusive lock.
 
-    Rotates when file exceeds MAX_LOG_SIZE: current → .1, .1 → .2 (max 3).
+    The lock is held across both the rotation check and the append, so two
+    concurrent brig invocations can't race on the size check (both seeing
+    >MAX_LOG_SIZE and both renaming the file). Sidecar `.lock` file lets
+    the data file be renamed without affecting the lock.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    _maybe_rotate(path)
-    with open(path, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(json.dumps(entry) + "\n")
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _maybe_rotate(path)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
 
 def _maybe_rotate(path: Path) -> None:
-    """Rotate log file if it exceeds MAX_LOG_SIZE."""
+    """Rotate log file if it exceeds MAX_LOG_SIZE.
+
+    Caller must hold the sidecar lock (`<path>.lock` via fcntl.LOCK_EX).
+    """
     try:
         if not path.exists() or path.stat().st_size < MAX_LOG_SIZE:
             return

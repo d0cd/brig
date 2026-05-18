@@ -87,15 +87,24 @@ class Cell:
         return await asyncio.to_thread(self.wait_sync, timeout)
 
     def wait_sync(self, timeout: int | None = None) -> int:
-        """Synchronous wait for cell to exit. Returns -1 on subprocess error."""
+        """Synchronous wait for cell to exit.
+
+        Returns the cell's exit code (0 = success, non-zero = the cell's own
+        exit), OR -1 to signal that the wait itself failed (subprocess error,
+        timeout, or podman returned an unparseable status). The caller can
+        distinguish a real "command exited 1" from a wait failure by checking
+        for -1 explicitly.
+        """
         import subprocess as _subprocess
         cmd = ["podman", "wait", self._cn]
         try:
             result = vm_run(cmd, timeout=timeout)
         except (_subprocess.SubprocessError, OSError):
             return -1
+        if result.returncode != 0:
+            return -1
         code = result.stdout.strip()
-        return int(code) if code.isdigit() else 1
+        return int(code) if code.isdigit() else -1
 
     async def stop(self) -> None:
         await asyncio.to_thread(stop_cell, self.name)
@@ -330,7 +339,7 @@ class Brig:
         """Synchronous version of list()."""
         result = vm_run(
             ["podman", "ps", "-a", "--format", "json",
-             "--filter", f"name={CONTAINER_PREFIX}"],
+             "--filter", f"name=^{CONTAINER_PREFIX}"],
         )
         if result.returncode != 0 or not result.stdout.strip():
             return []
