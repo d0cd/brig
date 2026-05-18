@@ -87,7 +87,13 @@ UNSAFE_EXTENSIONS = {
 # --- Host paths (macOS side) ---
 
 class HostPaths:
-    """Paths on the macOS host, used directly by the CLI."""
+    """Paths on the macOS host, used directly by the CLI.
+
+    Coordination state (subnet-map, per-cell policies, ingress routes) lives
+    under STATE_DIR/system. Lima mounts STATE_DIR at /state inside the VM,
+    and warden mounts /state/system at /var/run/cells inside its container,
+    so host writes flow to warden via virtiofs without any sync step.
+    """
     BRIG_HOME = Path.home() / ".brig"
     CELLS_DIR = BRIG_HOME / "cells"
     ADDONS_DIR = CELLS_DIR / "addons"
@@ -98,8 +104,10 @@ class HostPaths:
     NETWORK_POLICY = CELLS_DIR / "network-policy.json"
     CONFIG_FILE = CELLS_DIR / "config.json"
 
-    # Ingress routes (host-side, synced to VM).
-    INGRESS_ROUTES_FILE = STATE_DIR / "system" / "ingress-routes.json"
+    # Coordination state — written by host CLI, read by warden via /state mount.
+    SYSTEM_DIR = STATE_DIR / "system"
+    POLICY_DIR = SYSTEM_DIR / "policies"
+    INGRESS_ROUTES_FILE = SYSTEM_DIR / "ingress-routes.json"
 
     # Rate limit state (host-side, used before entering VM).
     RATE_LIMIT_FILE = STATE_DIR / "system" / "rate_limit.json"
@@ -114,24 +122,27 @@ class HostPaths:
 # --- VM paths (inside Lima VM) ---
 
 class VMPaths:
-    """Paths inside the Lima VM, used in podman commands."""
+    """Paths inside the Lima VM, used in podman commands.
+
+    Coordination files (subnet-map, policies, ingress routes) live under
+    /state/system, which Lima maps to the host's ~/.brig/state/system.
+    Warden bind-mounts /state/system into its container at /var/run/cells.
+    """
     STATE_DIR = Path("/state")
+    SYSTEM_DIR = STATE_DIR / "system"
     CELLS_DIR = Path("/cells")
     SECRETS_DIR = Path("/secrets")
     ADDONS_DIR = CELLS_DIR / "addons"
     NETWORK_POLICY = CELLS_DIR / "network-policy.json"
     CONFIG_FILE = CELLS_DIR / "config.json"
 
-    # Subnet allocator state.
-    SUBNET_STATE_FILE = STATE_DIR / "system" / "subnets.json"
-    SUBNET_MAP_FILE = Path("/var/run/brig/subnet-map.json")
-    ALLOCATOR_LOCK_FILE = Path("/var/run/brig/allocator.lock")
-
-    # Per-cell policy directory (inside VM).
-    POLICY_DIR = Path("/var/run/brig/policies")
-
-    # Ingress routes file (inside VM).
-    INGRESS_ROUTES_FILE = Path("/var/run/brig/ingress-routes.json")
+    # Coordination state — host writes here via virtiofs, warden reads
+    # the same files through its own bind mount of SYSTEM_DIR.
+    SUBNET_STATE_FILE = SYSTEM_DIR / "subnets.json"
+    SUBNET_MAP_FILE = SYSTEM_DIR / "subnet-map.json"
+    ALLOCATOR_LOCK_FILE = SYSTEM_DIR / "allocator.lock"
+    POLICY_DIR = SYSTEM_DIR / "policies"
+    INGRESS_ROUTES_FILE = SYSTEM_DIR / "ingress-routes.json"
 
     # Logs (inside VM).
     LOG_DIR = Path("/var/log/brig/network")
@@ -146,8 +157,9 @@ OPERATIONS_FILE = HostPaths.OPERATIONS_FILE
 LIFECYCLE_FILE = HostPaths.LIFECYCLE_FILE
 POLICY_AUDIT_FILE = HostPaths.POLICY_AUDIT_FILE
 RATE_LIMIT_FILE = HostPaths.RATE_LIMIT_FILE
-# Subnet allocator runs on the host — use host paths.
-SUBNET_STATE_FILE = HostPaths.STATE_DIR / "system" / "subnets.json"
-SUBNET_MAP_FILE = HostPaths.STATE_DIR / "system" / "subnet-map.json"
-ALLOCATOR_LOCK_FILE = HostPaths.STATE_DIR / "system" / "allocator.lock"
-POLICY_DIR = VMPaths.POLICY_DIR
+# Coordination state runs on the host — warden sees the same files via the
+# /state virtiofs mount (see HostPaths / VMPaths docstrings).
+SUBNET_STATE_FILE = HostPaths.SYSTEM_DIR / "subnets.json"
+SUBNET_MAP_FILE = HostPaths.SYSTEM_DIR / "subnet-map.json"
+ALLOCATOR_LOCK_FILE = HostPaths.SYSTEM_DIR / "allocator.lock"
+POLICY_DIR = HostPaths.POLICY_DIR

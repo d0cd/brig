@@ -145,15 +145,15 @@ Declaration is two-step:
 1. **Global policy** declares the (name → port) mapping that warden knows
    how to forward:
    ```bash
-   brig policy set global --host-service aitelier:7777
-   brig policy set global --host-service litellm:4000
+   brig policy set global --host-service db:5432
+   brig policy set global --host-service model:7777
    ```
 
 2. **Per-cell policy** opts the cell into reaching specific services. By
    default a cell has *no* host-service access; you must add the names you
    want it to reach (audit fix H1):
    ```bash
-   brig policy set hermes --host-service aitelier
+   brig policy set my-cell --host-service db
    ```
 
    Or write the per-cell policy file directly:
@@ -161,13 +161,13 @@ Declaration is two-step:
    {
      "allow": ["api.github.com"],
      "deny": [],
-     "host_services": ["aitelier"]
+     "host_services": ["db"]
    }
    ```
 
 From inside the cell:
 ```bash
-curl http://aitelier.host.brig/v1/health
+curl http://db.host.brig/health
 ```
 
 Warden intercepts `.host.brig` requests and rewrites them to the macOS

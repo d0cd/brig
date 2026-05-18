@@ -57,7 +57,7 @@ def vm_run(
         timeout: Timeout in seconds (None for no timeout).
     """
     # Rootful podman and system commands inside Lima need sudo.
-    if cmd and cmd[0] in ("podman", "mkdir", "du"):
+    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown"):
         cmd = ["sudo"] + cmd
 
     full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
@@ -78,7 +78,7 @@ def vm_run_interactive(cmd: list[str]) -> int:
     Used for: brig exec -it, brig shell, brig attach.
     Returns the exit code.
     """
-    if cmd and cmd[0] in ("podman", "mkdir", "du"):
+    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown"):
         cmd = ["sudo"] + cmd
     full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
     debug(f"VM interactive: {_redact_cmd(cmd)}")

@@ -62,11 +62,16 @@ provision:
       # Create proxy-external network
       podman network create proxy-external || true
 
-      # Create required directories
+      # Create log directory (coordination state lives on the host under
+      # ~/.brig/state/system and reaches warden via the /state virtiofs mount).
       mkdir -p /var/log/brig/network
-      mkdir -p /var/run/brig/policies
       chmod 755 /var/log/brig/network
-      chmod 755 /var/run/brig
+
+      # Map the VM hostname to 127.0.0.1 so sudo doesn't pay a 5-second DNS
+      # timeout resolving "lima-brig" for its logging — that delay was making
+      # every "brig" command on the host feel hung.
+      grep -q "$(hostname)" /etc/hosts || \
+        echo "127.0.0.1 $(hostname)" >> /etc/hosts
 
       # Log rotation
       cat > /etc/logrotate.d/brig <<'LOGROTATE'

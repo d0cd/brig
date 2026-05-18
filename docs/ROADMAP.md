@@ -61,8 +61,8 @@ auth failures. Data already tracked in addons.
 Track per-cell LLM costs via Warden logs. Parse usage from API responses.
 Enforce daily/monthly budgets per cell.
 
-**Trigger:** Switching from subscription pricing (aitelier runAgent) to
-per-token pricing and getting surprise bills.
+**Trigger:** Switching from subscription pricing to per-token pricing and
+getting surprise bills.
 
 **Effort:** Medium. Response body parsing in Warden + budget enforcement addon.
 
@@ -151,9 +151,9 @@ nothing loaded it and it lived in the wrong place architecturally.
 
 If revived, build it as a host-side `brig logs compact` tool that reads
 the JSONL files outside the warden container. That keeps warden small,
-keeps the API egress on the host (where it can be policied or proxied
-through aitelier), and avoids putting an LLM dependency on the proxy's
-critical path.
+keeps the LLM API egress on the host (where it can be policied or routed
+through an existing gateway), and avoids putting an LLM dependency on the
+proxy's critical path.
 
 **Trigger:** Per-cell logs are big enough that grep is slow and you want
 preserved-but-summarized rolling history.

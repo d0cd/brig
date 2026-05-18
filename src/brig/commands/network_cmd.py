@@ -8,9 +8,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from brig.config import CONTAINER_PREFIX, STATE_DIR
+from brig.config import CONTAINER_PREFIX, STATE_DIR, VMPaths
 from brig.errors import BrigError
 from brig.ops.logging import output
+from brig.vm.shell import vm_run
 
 
 def cmd_network(args: Any) -> int:
@@ -21,17 +22,24 @@ def cmd_network(args: Any) -> int:
     is in the same line.
     """
     cell_name = args.name
-    log_dir = Path("/var/log/brig/network")
-    log_file = log_dir / f"{cell_name}.jsonl"
-
-    if not log_file.exists():
+    # Logs live inside the VM under /var/log/brig/network/, owned by uid 1000
+    # (the mitmproxy user in the warden container). The host has no direct
+    # view of that path, and the Lima user can't read mitmproxy-owned files,
+    # so read them with sudo via vm_run.
+    log_path = VMPaths.LOG_DIR / f"{cell_name}.jsonl"
+    result = vm_run(["sudo", "cat", str(log_path)], timeout=10)
+    if result.returncode != 0:
         output(f"No network logs for cell '{cell_name}'")
         return 0
 
     tail = getattr(args, "tail", 20) or 20
     only_blocked = getattr(args, "blocked", False)
     try:
-        lines = log_file.read_text().strip().split("\n")
+        content = result.stdout.strip()
+        if not content:
+            output(f"No network logs for cell '{cell_name}'")
+            return 0
+        lines = content.split("\n")
         # When filtering, scan from the end to collect only `tail` matches.
         matches = []
         for line in reversed(lines):

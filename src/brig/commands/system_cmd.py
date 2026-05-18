@@ -42,6 +42,7 @@ def cmd_init(args: Any) -> int:
         BRIG_HOME / "cells" / "addons",
         BRIG_HOME / "secrets",
         BRIG_HOME / "state" / "system",
+        BRIG_HOME / "state" / "system" / "policies",
         BRIG_HOME / "profiles",
     ]
     for d in dirs:
@@ -212,9 +213,10 @@ def cmd_health(args: Any) -> int:
         ("Proxy running", proxy_running()),
     ]
 
-    # Check VM reachability.
+    # Check VM reachability. `podman info`'s template field is `.Host.OS`
+    # (lower-case `Os` silently returns rc=1).
     vm_result = vm_run(
-        ["podman", "info", "--format", "{{.Host.Os}}"],
+        ["podman", "info", "--format", "{{.Host.OS}}"],
         timeout=5,
     )
     checks.append(("VM reachable", vm_result.returncode == 0))

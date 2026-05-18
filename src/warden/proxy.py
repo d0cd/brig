@@ -10,7 +10,14 @@ import json
 import time
 from pathlib import Path
 
-from brig.config import CONTAINER_PREFIX, INGRESS_PORT, PROXY_EXTERNAL_NETWORK, PROXY_NAME
+from brig.config import (
+    CONTAINER_PREFIX,
+    HostPaths,
+    INGRESS_PORT,
+    PROXY_EXTERNAL_NETWORK,
+    PROXY_NAME,
+    VMPaths,
+)
 from brig.ops.logging import debug, info
 from brig.vm.shell import vm_run, vm_run_interactive
 
@@ -19,12 +26,13 @@ MEMORY_LIMIT = "1g"
 CPU_LIMIT = "1"
 PIDS_LIMIT = "256"
 
-from brig.config import HostPaths
-
 # VM-side paths (used in podman volume mounts).
-VM_POLICY_FILE = Path("/cells/network-policy.json")
-VM_LOG_DIR = Path("/var/log/brig/network")
-VM_ADDONS_DIR = Path("/cells/addons")
+VM_POLICY_FILE = VMPaths.NETWORK_POLICY
+VM_LOG_DIR = VMPaths.LOG_DIR
+VM_ADDONS_DIR = VMPaths.ADDONS_DIR
+# Warden bind-mounts /state/system → /var/run/cells so it sees the same
+# subnet-map / per-cell policies / ingress routes the host CLI writes.
+VM_SYSTEM_DIR = VMPaths.SYSTEM_DIR
 
 
 def _podman_ps(all_states: bool = False) -> list[str]:
@@ -103,8 +111,16 @@ def start() -> bool:
 
     # Ensure proxy-external network exists in VM.
     vm_run(["podman", "network", "create", PROXY_EXTERNAL_NETWORK], timeout=10)
-    # Ensure VM-side directories exist.
-    vm_run(["mkdir", "-p", str(VM_LOG_DIR), "/var/run/brig/policies"], timeout=5)
+    # Ensure VM-side log directory exists (rootful, so created here, not on
+    # host) and is writable by the mitmproxy user (uid 1000) inside warden.
+    # The mitmproxy image uses uid:gid 1000:1000; without chown the addon's
+    # log writer hits EACCES on /logs/<cell>.jsonl.
+    vm_run(["mkdir", "-p", str(VM_LOG_DIR)], timeout=5)
+    vm_run(["chown", "1000:1000", str(VM_LOG_DIR)], timeout=5)
+    # Ensure host-side coordination dirs exist; warden bind-mounts them in
+    # via the /state virtiofs mount.
+    HostPaths.SYSTEM_DIR.mkdir(parents=True, exist_ok=True)
+    HostPaths.POLICY_DIR.mkdir(parents=True, exist_ok=True)
 
     # Build podman run command.
     cmd = [
@@ -129,7 +145,7 @@ def start() -> bool:
 
     # Volume mounts (VM-side paths — podman runs inside the VM).
     cmd.extend(["-v", f"{VM_LOG_DIR}:/logs:rw"])
-    cmd.extend(["-v", "/var/run/brig:/var/run/cells:rw"])
+    cmd.extend(["-v", f"{VM_SYSTEM_DIR}:/var/run/cells:rw"])
     cmd.extend(["-v", f"{VM_ADDONS_DIR}:/addons:ro"])
     cmd.extend(["-v", f"{VM_POLICY_FILE}:/policy.json:ro"])
 
