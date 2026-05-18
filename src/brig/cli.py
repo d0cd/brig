@@ -48,7 +48,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true", help="Suppress non-error output")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    # required=False so bare `brig` falls through to our friendly
+    # cheat-sheet (_print_quickstart) instead of argparse's
+    # "the following arguments are required: command" error.
+    sub = parser.add_subparsers(dest="command", required=False)
 
     _add_run_parser(sub)
     _add_cell_group(sub)
@@ -278,6 +281,37 @@ def _is_host_only(args: argparse.Namespace) -> bool:
     return False
 
 
+_QUICKSTART = """\
+brig - secure workload harness for running untrusted code
+
+Quickstart:
+  brig system up                   # start the VM + warden (once per boot)
+  brig run alpine echo hello       # run a cell
+  brig cell list                   # see what's running
+  brig cell logs <name>            # tail a cell's logs
+  brig cell rm <name>              # remove a cell
+
+Common verbs:
+  run         Run a new cell                  (brig run --help)
+  cell        Per-cell lifecycle + inspection (brig cell --help)
+  image       Build, pull, verify, warmup     (brig image --help)
+  system      VM + warden + diagnostics       (brig system --help)
+  policy      Network policy CRUD             (brig policy --help)
+  secrets     Secret storage                  (brig secrets --help)
+  config      Config file                     (brig config --help)
+
+Docs:           docs/learning/  (quickstart, concepts, workflows, troubleshooting)
+Full reference: brig --help
+"""
+
+
+def _print_quickstart() -> None:
+    """Print the categorized cheat-sheet shown when `brig` is run with
+    no subcommand. Replaces argparse's bare 'required: command' error
+    (which dumped a wall of flags) with a verb-grouped index."""
+    sys.stdout.write(_QUICKSTART)
+
+
 def main() -> None:
     """CLI entry point."""
     parser = _build_parser()
@@ -290,6 +324,12 @@ def main() -> None:
     )
 
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(130))
+
+    # Bare `brig` with no subcommand: show the cheat-sheet instead of
+    # walking into the dispatch table with command=None.
+    if args.command is None:
+        _print_quickstart()
+        sys.exit(0)
 
     # Preflight: check Lima is available for commands that need the VM.
     if not _is_host_only(args):

@@ -266,12 +266,20 @@ def cmd_build(args: Any) -> int:
 
 
 def cmd_pull(args: Any) -> int:
-    """Handle `brig pull` — pull and cache an image."""
+    """Handle `brig pull` — pull and cache an image.
+
+    Streams podman's progress directly to the user's terminal (instead
+    of capturing it) so large pulls don't look frozen. podman writes
+    layer-by-layer progress to stderr; with capture=False the user sees
+    it live.
+    """
+    info(f"Pulling {args.image}...")
     result = vm_run(
         ["podman", "pull", args.image],
+        capture=False,
     )
     if result.returncode != 0:
-        raise BrigError(f"Failed to pull image: {result.stderr.strip()}")
+        raise BrigError(f"Failed to pull image: {args.image}")
     info(f"Pulled {args.image}")
     return 0
 

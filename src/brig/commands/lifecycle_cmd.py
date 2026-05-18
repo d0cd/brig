@@ -30,6 +30,10 @@ def _warn_unverified_image(image: str) -> None:
     Brig doesn't refuse — verification is a publishing trust decision
     that varies by user. We just make the absence visible so a careless
     `brig run someorg/their-image:latest` doesn't slip through quietly.
+
+    Honors the `suppress_unverified_image_warn` config flag (set via
+    `brig config set suppress_unverified_image_warn true`) for users
+    who have made an explicit trust decision and want quiet runs.
     """
     if not image:
         return
@@ -37,13 +41,28 @@ def _warn_unverified_image(image: str) -> None:
         return
     if _DIGEST_RE.search(image):
         return
+    if _suppress_unverified_warn():
+        return
     # No registry component (e.g. "alpine") is an implicit Docker Hub pull,
     # which is the most common trust-by-default footgun. Warn anyway.
     info(
         f"WARN: image {image!r} is unpinned and unverified. "
         f"Pin a digest (image@sha256:...) or verify with: "
-        f"brig image verify {image}"
+        f"brig image verify {image}\n"
+        f"  (silence with: brig config set suppress_unverified_image_warn true)"
     )
+
+
+def _suppress_unverified_warn() -> bool:
+    """Read the suppress flag from CONFIG_FILE. Missing/unreadable
+    config is treated as 'warn' (the safe default)."""
+    import json as _json
+    from brig.config import CONFIG_FILE
+    try:
+        with open(CONFIG_FILE) as f:
+            return bool(_json.load(f).get("suppress_unverified_image_warn", False))
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return False
 
 
 def cmd_run(args: Any) -> int:
