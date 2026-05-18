@@ -144,6 +144,26 @@ class TestValidateCellDefinition(unittest.TestCase):
         errors = validate_cell_definition({"workspace_mount": "/"})
         self.assertTrue(any("shadows rootfs" in e for e in errors), errors)
 
+    def test_yaml_int_cpus_coerced_to_string(self):
+        """`cpus: 4` in yaml (parses as int) used
+        to slip through validation and reach subprocess as an int, raising
+        `argument of type 'int' is not iterable` at the redact-args check.
+        CellSpec.__post_init__ now coerces."""
+        spec = CellSpec(name="c", image="alpine", cpus=4)
+        self.assertEqual(spec.cpus, "4")
+        self.assertIsInstance(spec.cpus, str)
+
+    def test_yaml_float_cpus_coerced_to_string(self):
+        spec = CellSpec(name="c", image="alpine", cpus=0.5)
+        self.assertEqual(spec.cpus, "0.5")
+
+    def test_yaml_int_memory_coerced_to_string(self):
+        """Same class of bug — `memory: 4` without quotes would slip
+        through and crash subprocess. (Unlikely in practice since memory
+        usually has a unit suffix, but the validator accepts bare ints.)"""
+        spec = CellSpec(name="c", image="alpine", memory=4)
+        self.assertEqual(spec.memory, "4")
+
     def test_workspace_mount_ancestor_of_forbidden_rejected(self):
         """Audit M3: workspace_mount: /run would shadow /run/secrets via
         mount-over-mount, even though /run itself isn't in the forbidden

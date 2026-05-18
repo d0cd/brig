@@ -147,7 +147,7 @@ make bench                    # benchmarks
 
 - [Quickstart](docs/learning/quickstart.md)
 - [Concepts](docs/learning/concepts.md)
-- [Hosting an agent](docs/learning/host-an-agent.md) — end-to-end Hermes + aitelier walkthrough
+- [Hosting an agent](docs/learning/host-an-agent.md) — end-to-end agent + host-service walkthrough
 - [Troubleshooting](docs/learning/troubleshooting.md)
 - [Cell Definition Reference](docs/design/cell-definition.md)
 - [Architecture](docs/design/architecture.md)

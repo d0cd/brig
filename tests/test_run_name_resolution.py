@@ -1,7 +1,7 @@
 """Issue 3 from brig-image-build-feedback.md v2: `brig run --file <yaml>`
 must honor the yaml's `name:` field. Previously cmd_run auto-generated a
 name before the yaml was loaded, so `--file foo.yaml` always got
-`fair-ivy-41`-style names instead of the declared `name: hermes`.
+`fair-ivy-41`-style names instead of the declared `name: my-cell`.
 
 Resolution order: --name flag → yaml `name:` field → auto-generate.
 """
@@ -56,15 +56,15 @@ class TestNameResolution(unittest.TestCase):
 
     def test_yaml_name_used_when_no_flag(self):
         with tempfile.TemporaryDirectory() as td:
-            yml = _write_cell_yaml(Path(td), name="hermes", image="alpine")
+            yml = _write_cell_yaml(Path(td), name="my-cell", image="alpine")
             args = _args(file=str(yml))
             spec = self._captured_spec(args)
-            self.assertEqual(spec.name, "hermes",
+            self.assertEqual(spec.name, "my-cell",
                 "yaml name: should be used when --name flag is absent")
 
     def test_explicit_flag_overrides_yaml(self):
         with tempfile.TemporaryDirectory() as td:
-            yml = _write_cell_yaml(Path(td), name="hermes", image="alpine")
+            yml = _write_cell_yaml(Path(td), name="my-cell", image="alpine")
             args = _args(file=str(yml), name="other")
             spec = self._captured_spec(args)
             self.assertEqual(spec.name, "other",

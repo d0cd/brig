@@ -117,7 +117,7 @@ brig system prune                          # do it
 
 **Migrating a cell definition:**
 ```bash
-brig cell export hermes > hermes.yaml
-brig cell rm -f hermes
-brig run --file hermes.yaml
+brig cell export mycell > mycell.yaml
+brig cell rm -f mycell
+brig run --file mycell.yaml
 ```

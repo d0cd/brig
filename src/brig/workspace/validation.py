@@ -1,10 +1,10 @@
 """Workspace path validation — race-free file access for host-side
 consumers of cell workspaces.
 
-When a host-side process (e.g. an agent invoked via aitelier on behalf of
-a cell) reads files under a cell's workspace, a cell that drops a symlink
-into its workspace can trick the consumer into reading host files the
-cell itself cannot reach:
+When a host-side process (e.g. an agent-delegation worker running
+on behalf of a cell) reads files under a cell's workspace, a cell
+that drops a symlink into its workspace can trick the consumer into
+reading host files the cell itself cannot reach:
 
     cell$  ln -s /Users/d0c/.ssh/id_rsa /work/innocuous.txt
     # → host reads /work/innocuous.txt → kernel follows symlink → leaks key.
@@ -187,10 +187,10 @@ def safe_open(
     """Open a file inside `cell_name`'s workspace race-free.
 
     Examples:
-        with safe_open("hermes", "input.json", "r") as f:
+        with safe_open("my-cell", "input.json", "r") as f:
             data = json.load(f)
 
-        with safe_open("hermes", "result.bin", "wb") as f:
+        with safe_open("my-cell", "result.bin", "wb") as f:
             f.write(payload)
 
     Each path component is opened with `O_NOFOLLOW`. A cell that swaps a

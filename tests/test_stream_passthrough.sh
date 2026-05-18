@@ -5,12 +5,11 @@
 # Both tests verify that warden (mitmproxy) doesn't buffer streaming
 # responses. Buffering would break:
 #   B4 — WebSocket gateways (Telegram long-poll, Discord WSS, Slack
-#        Socket Mode). hermes-team's HERMES-MODIFICATIONS.md §6 makes
-#        this load-bearing.
-#   B5 — Server-Sent Events keepalives. hermes-team's VALIDATION.md
-#        Phase 3.4: aitelier emits `:keepalive` SSE comments every ~25s
-#        during silent agent runs; buffering would trip
-#        HERMES_STREAM_READ_TIMEOUT and kill long tasks.
+#        Socket Mode) that any agent / bot in a cell may use.
+#   B5 — Server-Sent Events keepalives. Long-running LLM-style endpoints
+#        commonly emit `:keepalive` SSE comments every ~25s during
+#        silent phases; buffering would trip the consumer's stream-read
+#        timeout and kill long tasks.
 #
 # Usage: ./tests/test_stream_passthrough.sh
 #
@@ -59,8 +58,8 @@ trap cleanup EXIT
 #              then sends `data: done\n\n` and closes
 #   GET /ws   → WebSocket upgrade; echoes each message; emits ping/pong
 #
-# Run it on the macOS host (the same place aitelier lives) and route the
-# cell to it via the host-service mechanism. Host port = $TEST_PORT.
+# Run it on the macOS host (the same place any host-service lives) and
+# route the cell to it via the host-service mechanism. Host port = $TEST_PORT.
 
 mkdir -p /tmp/brig-stream-test
 cat > /tmp/brig-stream-test/server.py <<'PY'

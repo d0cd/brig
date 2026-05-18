@@ -41,7 +41,7 @@ def register_parser(sub) -> None:
     p_set.add_argument("--remove-allow", action="append", help="Remove allowed domain")
     p_set.add_argument("--remove-deny", action="append", help="Remove denied domain")
     p_set.add_argument("--host-service", action="append",
-                       help="Add host service (name:port, e.g. aitelier:7777)")
+                       help="Add host service (name:port, e.g. model:7777)")
     p_set.add_argument("--remove-host-service", action="append",
                        help="Remove host service by name")
 
@@ -282,7 +282,7 @@ def _apply_host_service_additions(
             if ":" not in spec:
                 raise BrigError(
                     f"Global host service requires name:port format: {spec}",
-                    suggestion="e.g. brig policy set global --host-service aitelier:7777",
+                    suggestion="e.g. brig policy set global --host-service model:7777",
                 )
             name, port_str = spec.rsplit(":", 1)
             if not HOST_SERVICE_NAME_PATTERN.match(name):
@@ -311,7 +311,7 @@ def _apply_host_service_additions(
                     f"Per-cell host service must be a name only (no port): {spec}",
                     suggestion=(
                         "Per-cell entries grant access to a service already declared "
-                        "in the global policy. e.g. brig policy set <cell> --host-service aitelier"
+                        "in the global policy. e.g. brig policy set <cell> --host-service model"
                     ),
                 )
             if not HOST_SERVICE_NAME_PATTERN.match(spec):

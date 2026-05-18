@@ -3,8 +3,9 @@
 Every cell brig runs gets a read-only metadata file mounted at
 `/run/brig/cell.json`. The cell uses it to learn its own identity —
 particularly the **host path** of its workspace, which it needs to
-publish to host-side consumers (e.g. an agent invoked via aitelier
-that needs to see the same files the cell sees).
+publish to host-side consumers (e.g. an agent-delegation API that
+runs a worker on the host and needs to see the same files the cell
+sees).
 
 The pattern mirrors Kubernetes' downward API and cloud instance
 metadata: brig writes a small JSON file on the host, podman bind-mounts
@@ -15,14 +16,14 @@ it read-only into the cell. The cell can read but cannot modify it.
 ```json
 {
   "version": 1,
-  "name": "hermes",
+  "name": "my-cell",
   "started_at": "2026-05-18T17:30:00Z",
   "workspace": {
     "mount_point": "/work",
-    "host_path":   "/Users/d0c/.brig/state/hermes/workspace"
+    "host_path":   "/Users/d0c/.brig/state/my-cell/workspace"
   },
   "policy": {
-    "host_services": ["aitelier"]
+    "host_services": ["model"]
   }
 }
 ```
@@ -43,7 +44,7 @@ Any language, no library required:
 ```bash
 # Inside the cell
 cat /run/brig/cell.json | jq -r .workspace.host_path
-# → /Users/d0c/.brig/state/hermes/workspace
+# → /Users/d0c/.brig/state/my-cell/workspace
 ```
 
 ```python
@@ -62,6 +63,24 @@ The cell metadata file enables a class of features where a host-side
 process reads the cell's workspace (e.g. a Sandbox Agent that opens
 files the cell wrote). That pattern has a known attack surface and
 brig publishes the validation primitive consumers must use.
+
+> **This is a LIVE exploit if you publish `workspace.host_path` to a
+> consumer that uses plain `open()`.** Reproducer shape:
+>
+> ```bash
+> # 1. Cell drops a symlink into its workspace pointing at a host file.
+> brig cell exec my-cell -- ln -sf /etc/passwd /work/foo.txt
+>
+> # 2. Cell asks a host-side agent worker (via whichever delegation API
+> #    consumes workspace.host_path) to read that filename.
+> #    The host worker opens it with plain open() → kernel follows the
+> #    symlink → returns the host's /etc/passwd to the cell.
+> ```
+>
+> Substitute `~/.ssh/id_rsa`, `~/.aws/credentials`, `~/.config/gh/hosts.yml`,
+> etc., and the impact is severe. The cell got an arbitrary-host-file-read
+> primitive that bypasses its gVisor sandbox — by asking the host to
+> read on its behalf.
 
 ### Threat: symlink escape
 
@@ -116,23 +135,21 @@ for closing.
 
 | Defense | Status | Why |
 |---|---|---|
-| Mount workspace with `nosymfollow` | **Roadmap** | podman 4.x doesn't expose this flag on bind mounts. Converting to a podman volume would break the host-side-access requirement that makes workspace passthrough useful at all. Tracked in `docs/ROADMAP.md`. |
-| Sandbox Agent permissions default to `ask` | **Hermes/aitelier side** | Belongs in the consumer that invokes the agent, not in brig. Documented in `cells/hermes/hermes-src/plans/brig-image-build-feedback.md` guardrail #2. |
-| Aitelier validates `workspace` value against an allowlist | **Aitelier side** | Documented in the same feedback, guardrail #3. |
+| Mount workspace with `nosymfollow` | **Roadmap** | podman 4.x doesn't expose this flag on bind mounts (verified empirically: both `-v src:dst:nosymfollow` and `--mount type=bind,...,nosymfollow` are rejected). Converting to a podman volume would break the host-side-access property that makes workspace passthrough useful at all. Tracked in `docs/ROADMAP.md`. |
+| Worker-side default of "prompt before code execution" | **consumer side** | Belongs in the agent-delegation API that invokes the worker, not in brig. |
+| Worker-side allowlist of permitted `workspace` values | **consumer side** | Same — the API that accepts `workspace.host_path` from a caller decides what it'll do with it. |
 
 ### Implications
 
 - The brig-provided guardrail is **necessary but not sufficient** —
   every consumer of cell workspaces independently has to call
-  `assert_inside_workspace`. The blast radius of one consumer
-  forgetting it is one consumer's reads.
+  `safe_open`. The blast radius of one consumer forgetting it is one
+  consumer's reads.
 - Until `nosymfollow` lands at the mount layer, treat symlinks in cell
   workspaces as adversarial input. Don't open files inside a
-  workspace from the host without going through the validator.
+  workspace from the host without going through `safe_open`.
 
 ## See also
 
 - `brig.cell.metadata` — source for the writer
-- `brig.workspace.validation` — source for the validator
-- `cells/hermes/hermes-src/plans/brig-image-build-feedback.md` —
-  the design conversation that motivated this feature
+- `brig.workspace.validation` — source for `safe_open` / `safe_dirfd`

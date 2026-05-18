@@ -97,11 +97,23 @@ class CellSpec:
     ingress: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        """Validate inputs at construction time — the system boundary."""
+        """Validate inputs at construction time — the system boundary.
+
+        Coerces string-typed numeric fields. Yaml authors naturally write
+        `cpus: 4` (parsed as int) but `cpus` is declared `str` because
+        podman accepts fractional values. Without coercion, the int slips
+        through and crashes downstream when the subprocess args are
+        scanned (`"=" in <int>` raises).
+        """
         if not CELL_NAME_PATTERN.match(self.name):
             raise ValueError(
                 f"Invalid cell name '{self.name}': must match {CELL_NAME_PATTERN.pattern}"
             )
+        # Coerce numeric-yaml inputs on str-typed fields.
+        for fname in ("cpus", "memory"):
+            v = getattr(self, fname)
+            if isinstance(v, (int, float)):
+                object.__setattr__(self, fname, str(v))
 
     @property
     def is_airgapped(self) -> bool:

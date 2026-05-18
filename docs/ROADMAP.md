@@ -35,9 +35,9 @@ mount-step injection point).
 ### Snapshot / restore
 **Status:** Deferred — check if runtime installs are common.
 
-`brig snapshot hermes` captures the full container filesystem diff + workspace
+`brig snapshot my-cell` captures the full container filesystem diff + workspace
 + policy as a tarball. `brig restore` recreates the cell exactly. Currently
-`ops.sh migrate` only captures `/work/.hermes/` (agent state), not runtime
+`ops.sh migrate` only captures `/work/.my-cell/` (agent state), not runtime
 package installs.
 
 **Trigger:** You find yourself re-installing packages after `brig cell rm` + `brig run`.
@@ -62,9 +62,9 @@ path mapping differences. Test on multiple distros.
 ### Dispatcher integration
 **Status:** Deferred — dispatcher's job, not Brig's.
 
-`brig push hermes --target cloud` sends cell definition + state to
+`brig push my-cell --target cloud` sends cell definition + state to
 dispatcher for automated cloud deployment. The cell definition
-(`hermes.yaml`) is already the portable spec that dispatcher would consume.
+(`my-cell.yaml`) is already the portable spec that dispatcher would consume.
 
 **Trigger:** Dispatcher exists and has an API to receive cell specs.
 
@@ -196,7 +196,7 @@ Define multiple related cells in one file with shared policy. Like
 docker-compose but with Brig's security model.
 
 **Trigger:** You have a multi-cell workload that can't be solved with host
-services (e.g., MCP server as a separate cell that Hermes talks to directly).
+services (e.g., MCP server as a separate cell that the cell talks to directly).
 
 **Effort:** High. New spec format, dependency ordering, shared lifecycle.
 

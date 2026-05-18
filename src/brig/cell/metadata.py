@@ -1,12 +1,13 @@
 """Cell metadata file — `/run/brig/cell.json` (downward API).
 
-A cell at startup needs to know its own identity to drive features like
-agent delegation (Hermes → aitelier → Sandbox Agent on the host), where
-the inner agent must read the same workspace files the cell sees.
+A cell at startup needs to know its own identity to drive use cases
+like agent-delegation flows: the cell hands its `workspace.host_path`
+to a host-side worker that needs to open the same files the cell sees.
 
-Modeled on Kubernetes' downward API / cloud instance metadata: brig writes
-a small JSON file on the host, podman bind-mounts it read-only into the
-cell at `/run/brig/cell.json`. The cell can read but not modify it.
+Modeled on Kubernetes' downward API / cloud instance metadata: brig
+writes a small JSON file on the host, podman bind-mounts it read-only
+into the cell at `/run/brig/cell.json`. The cell can read but not
+modify it.
 
 Schema (v1):
     {
@@ -18,17 +19,17 @@ Schema (v1):
         "host_path":   "/Users/<user>/.brig/state/<name>/workspace"
       },
       "policy": {
-        "host_services": ["aitelier", ...]   // per-cell ACL (may be empty)
+        "host_services": ["<svc-name>", ...]   // per-cell ACL (may be empty)
       }
     }
 
 Security note: `workspace.host_path` is published to the cell so it can
-hand the path to a host-side consumer (e.g. via aitelier's `workspace`
-field). The path is derivable from the cell name + the brig install
-convention, so this leaks little. Consumers that *read* the workspace
-on the host MUST realpath-resolve before reading — see
-`brig.workspace.validation`. The mount itself is not yet
-`nosymfollow`-protected (podman 4.x limitation; tracked in ROADMAP).
+hand the path to a host-side consumer. The path is derivable from the
+cell name + the brig install convention, so this leaks little.
+Consumers that *read* the workspace on the host MUST use the race-free
+`brig.workspace.validation.safe_open` primitive. The mount itself is
+not yet `nosymfollow`-protected (podman 4.x limitation; tracked in
+ROADMAP).
 """
 
 from __future__ import annotations

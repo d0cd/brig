@@ -1,7 +1,6 @@
-"""C1 + hermes-team feedback: `brig image build <dir>` wraps the awkward
-`limactl shell brig -- sudo podman build` invocation, honors
-.containerignore / .dockerignore, supports --file/-f, and supports
---build-arg.
+"""`brig image build <dir>` wraps the awkward `limactl shell brig --
+sudo podman build` invocation, honors .containerignore / .dockerignore,
+supports --file/-f, and supports --build-arg.
 
 These tests cover validation + flag-routing + ignore-pattern matching.
 The actual podman invocation is e2e-only.
@@ -154,11 +153,11 @@ class TestBrigBuildCommandShape(unittest.TestCase):
             with patch("brig.commands.image_cmd.subprocess.run", side_effect=fake_run):
                 cmd_build(_args(
                     context=td,
-                    build_arg=["HERMES_SOURCE=local", "FOO=bar"],
+                    build_arg=["BUILD_MODE=local", "FOO=bar"],
                 ))
 
         cmd = captured["cmd"]
-        for ba in ("HERMES_SOURCE=local", "FOO=bar"):
+        for ba in ("BUILD_MODE=local", "FOO=bar"):
             self.assertIn(ba, cmd, f"--build-arg {ba} missing from {cmd}")
 
     def test_file_flag_passes_dash_f_to_podman(self):
@@ -181,9 +180,9 @@ class TestBrigBuildCommandShape(unittest.TestCase):
 
 
 class TestContainerIgnore(unittest.TestCase):
-    """Hermes-team feedback: build context must honor .containerignore /
-    .dockerignore. Otherwise hermes-src/.git, node_modules, etc. ship into
-    the image."""
+    """Build context must honor .containerignore / .dockerignore.
+    Without this, a typical project's `.git`, `node_modules`, `.venv`,
+    build artifacts, etc. would all ship into every image."""
 
     def test_ignore_excludes_matching_paths(self):
         from brig.commands.image_cmd import _path_excluded, _load_ignore_patterns

@@ -43,7 +43,7 @@ def cmd_run(args: Any) -> int:
 
     # Name resolution: --name flag wins, then the yaml's name: field (if any),
     # then auto-generate. The previous order auto-generated before loading the
-    # file, which made `--file foo.yaml` with `name: hermes` get an auto-name.
+    # file, which made `--file foo.yaml` with `name: my-cell` get an auto-name.
     spec_kwargs: dict[str, Any] = {
         "name": args.name or "",  # may be filled from yaml below
         "image": args.image or "",

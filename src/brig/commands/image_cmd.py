@@ -194,14 +194,13 @@ def cmd_build(args: Any) -> int:
     there. Rather than asking users to stage build contexts under ~/.brig
     or add a Lima mount for the source tree, tar the host directory and
     stream it into `sudo podman build -`. Works for any host path and
-    keeps the host-filesystem-invisible-to-VM property intact (hermes
-    team's brig-image-build-feedback.md). `.containerignore` and
-    `.dockerignore` are honored.
+    keeps the host-filesystem-invisible-to-VM property intact.
+    `.containerignore` and `.dockerignore` are honored.
 
     Tag is derived from the directory's basename if --tag isn't supplied
-    (e.g. `brig image build cells/hermes` → localhost/hermes:latest).
-    The Containerfile is auto-detected (Containerfile or Dockerfile)
-    unless overridden with --file.
+    (e.g. `brig image build cells/foo` → localhost/foo:latest). The
+    Containerfile is auto-detected (Containerfile or Dockerfile) unless
+    overridden with --file.
     """
     ctx = Path(args.context).resolve()
     if not ctx.is_dir():

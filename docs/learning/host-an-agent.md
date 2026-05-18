@@ -2,15 +2,15 @@
 
 This guide walks through running an agent inside a brig cell so it can talk
 to a local model API server on the macOS host through the Warden proxy.
-We'll use the [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+We'll use the [the cell Agent](https://github.com/NousResearch/my-cell-agent)
 (NousResearch) as the example, but the same pattern works for any
 container that needs cell-isolated egress plus a route back to a service
 on the host.
 
-> **Production-shaped reference**: `cells/hermes/` in this repo is the
-> canonical worked example — a real `Containerfile`, a `hermes.yaml`
+> **Production-shaped reference**: `cells/<your-cell>/` in this repo is the
+> canonical worked example — a real `Containerfile`, a `my-cell.yaml`
 > cell spec, a brig-aware entrypoint, and a phase-by-phase validation
-> plan at `cells/hermes/VALIDATION.md`. Start from there and adapt; the
+> plan at `cells/<your-cell>/VALIDATION.md`. Start from there and adapt; the
 > generic walk-through below covers the same pattern with placeholder
 > names.
 
