@@ -196,6 +196,51 @@ class TestBuildRunCommand(unittest.TestCase):
         cmd_str = " ".join(cmd)
         self.assertIn("/work:rw", cmd_str)
 
+    def test_readonly_rootfs_by_default(self):
+        """Safe-by-default: cells get --read-only rootfs with sized tmpfs
+        at /tmp and /run. Closes the DoS-via-writable-layer hole and the
+        hidden-persistence-across-stop/start hole."""
+        spec = CellSpec(name="test", image="alpine")
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertIn("--read-only", cmd)
+        # /tmp tmpfs with size cap.
+        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        self.assertTrue(any(t.startswith("/tmp:") and "size=64m" in t
+                            for t in tmpfs_pairs),
+            f"expected /tmp tmpfs with 64m cap, got --tmpfs values {tmpfs_pairs}")
+        # /run tmpfs.
+        self.assertTrue(any(t.startswith("/run:") for t in tmpfs_pairs),
+            f"expected /run tmpfs, got --tmpfs values {tmpfs_pairs}")
+
+    def test_readonly_tmpfs_has_security_options(self):
+        """Sized tmpfs is necessary but not sufficient — also need
+        noexec/nosuid/nodev so the cell can't drop a SUID binary in /tmp
+        and exec something privileged from there."""
+        spec = CellSpec(name="test", image="alpine")
+        cmd = build_run_command(spec, "10.60.1.1")
+        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        for t in tmpfs_pairs:
+            self.assertIn("noexec", t, f"{t} missing noexec")
+            self.assertIn("nosuid", t, f"{t} missing nosuid")
+            self.assertIn("nodev", t, f"{t} missing nodev")
+
+    def test_writable_rootfs_opt_out_omits_readonly(self):
+        """For cells whose images legitimately need a writable rootfs
+        (legacy daemons, dev images that build at runtime), opt-out via
+        writable_rootfs: true. Should skip --read-only entirely and not
+        introduce the tmpfs mounts (the cell's own filesystem covers /tmp
+        and /run)."""
+        spec = CellSpec(name="test", image="alpine", writable_rootfs=True)
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertNotIn("--read-only", cmd)
+        # /tmp and /run shouldn't appear in any --tmpfs flag.
+        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        for t in tmpfs_pairs:
+            self.assertFalse(t.startswith("/tmp:"),
+                f"writable_rootfs cell shouldn't get /tmp tmpfs: {t}")
+            self.assertFalse(t.startswith("/run:"),
+                f"writable_rootfs cell shouldn't get /run tmpfs: {t}")
+
     def test_workspace_mount_override(self):
         """The new `workspace_mount` field must flow into the podman -v
         argument and -w workdir, not just sit unused on CellSpec."""

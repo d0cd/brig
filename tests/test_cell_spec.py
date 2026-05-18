@@ -140,6 +140,17 @@ class TestValidateCellDefinition(unittest.TestCase):
         errors = validate_cell_definition({"workspace_mount": 42})
         self.assertTrue(any("must be a string" in e for e in errors), errors)
 
+    def test_writable_rootfs_accepts_bool(self):
+        for value in (True, False):
+            errors = validate_cell_definition({"writable_rootfs": value})
+            self.assertEqual(errors, [], f"bool {value} should validate")
+
+    def test_writable_rootfs_rejects_non_bool(self):
+        for value in ("true", 1, "yes", None):
+            errors = validate_cell_definition({"writable_rootfs": value})
+            self.assertTrue(any("boolean" in e for e in errors),
+                f"{value!r} should be rejected with 'boolean' in the error")
+
     def test_workspace_mount_root_rejected(self):
         errors = validate_cell_definition({"workspace_mount": "/"})
         self.assertTrue(any("shadows rootfs" in e for e in errors), errors)

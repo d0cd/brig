@@ -60,6 +60,18 @@ timeout: "30m"                   # Auto-kill after duration (30s, 5m, 2h, 1d)
 # Workspace
 workspace_quota: "500m"          # Max workspace size
 
+# Cell rootfs writability. Default false (safe). When false, brig runs the
+# cell with --read-only rootfs + sized tmpfs at /tmp (64m) and /run (16m).
+# The cell can still write to /work (its workspace).
+#
+# Set to true for images whose entrypoint needs to write outside /work,
+# /tmp, /run — e.g. legacy daemons that write to /var/log, dev images
+# that install/build at runtime. Opting in means the cell can (a) DoS
+# the shared VM disk by filling its writable layer, and (b) hide state
+# outside the workspace across stop/start. Don't opt in for cells that
+# run untrusted code.
+writable_rootfs: false
+
 # Execution mode
 detach: false                    # Run in background
 

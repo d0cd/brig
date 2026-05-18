@@ -88,6 +88,16 @@ class CellSpec:
     # matches existing cells; agent-delegation scenarios may prefer the host
     # path basename (e.g. /workspace) so the in-cell and on-host paths agree.
     workspace_mount: str = "/work"
+    # Cell rootfs writability. Default False (safe): podman runs the cell
+    # with --read-only, plus sized tmpfs at /tmp and /run. The cell can
+    # still write to /work (the workspace) — that's its persistence path.
+    # A hostile cell with the rootfs writable could (a) DoS the shared
+    # VM disk by filling its writable layer, and (b) hide state across
+    # stop/start outside the workspace where the user wouldn't think to
+    # look. The opt-out exists for images whose entrypoint genuinely
+    # needs to write outside /work, /tmp, /run (legacy daemons that
+    # write to /var/log, dev images that build at runtime, etc.).
+    writable_rootfs: bool = False
     detach: bool = False
     rm: bool = False
     seccomp_profile: str | None = None
@@ -251,6 +261,12 @@ def _v_workspace_quota(value: Any, context: str) -> list[str]:
     return []
 
 
+def _v_writable_rootfs(value: Any, context: str) -> list[str]:
+    if not isinstance(value, bool):
+        return [f"'writable_rootfs' must be a boolean{context}"]
+    return []
+
+
 def _v_workspace_mount(value: Any, context: str) -> list[str]:
     """workspace_mount must be an absolute, non-traversal path that
     doesn't shadow brig-internal paths.
@@ -392,6 +408,7 @@ _SIMPLE_VALIDATORS = {
     "network": _v_network,
     "workspace_quota": _v_workspace_quota,
     "workspace_mount": _v_workspace_mount,
+    "writable_rootfs": _v_writable_rootfs,
     "detach": _v_detach,
 }
 

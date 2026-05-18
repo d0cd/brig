@@ -199,6 +199,21 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         ])
 
     cmd.extend(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
+
+    # Safe-by-default rootfs. The cell's container-writable layer would
+    # otherwise let a hostile cell (a) fill the VM disk (shared across
+    # all cells; workspace_quota only bounds /work), and (b) stash
+    # state outside the workspace where the user wouldn't see it across
+    # stop/start. Read-only rootfs + sized tmpfs for the dirs every
+    # Linux app expects to write to. workspace_quota still applies to
+    # /work; opt-out via writable_rootfs: true in the cell spec.
+    if not spec.writable_rootfs:
+        cmd.extend([
+            "--read-only",
+            "--tmpfs", "/tmp:rw,size=64m,noexec,nosuid,nodev",
+            "--tmpfs", "/run:rw,size=16m,noexec,nosuid,nodev",
+        ])
+
     cmd.extend([
         "--memory", spec.memory,
         "--cpus", spec.cpus,
