@@ -213,6 +213,12 @@ jobs:
         continue-on-error: true
         run: tests/test_warden_features.sh
 
+      - name: "Test: Stream Passthrough (B4 WebSocket + B5 SSE keepalive)"
+        id: test_stream_passthrough
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_stream_passthrough.sh
+
       - name: "Benchmark: Stack Overhead"
         id: test_overhead
         timeout-minutes: 15
@@ -234,6 +240,7 @@ jobs:
             "${{ steps.test_hardening.outcome }}" \
             "${{ steps.test_per_cell_policy.outcome }}" \
             "${{ steps.test_warden_features.outcome }}" \
+            "${{ steps.test_stream_passthrough.outcome }}" \
             "${{ steps.test_overhead.outcome }}"
           do
             if [ "$step" = "failure" ]; then

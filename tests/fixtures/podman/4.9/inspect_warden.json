@@ -1,0 +1,416 @@
+[
+     {
+          "Id": "be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15",
+          "Created": "2026-05-18T13:12:24.8358659-04:00",
+          "Path": "mitmdump",
+          "Args": [
+               "--mode",
+               "regular@8080",
+               "--mode",
+               "regular@8443",
+               "--set",
+               "block_global=false",
+               "-s",
+               "/addons/ingress.py",
+               "-s",
+               "/addons/enforce.py",
+               "-s",
+               "/addons/logger.py",
+               "-s",
+               "/addons/ops.py",
+               "-s",
+               "/addons/notifier.py"
+          ],
+          "State": {
+               "OciVersion": "1.1.0",
+               "Status": "running",
+               "Running": true,
+               "Paused": false,
+               "Restarting": false,
+               "OOMKilled": false,
+               "Dead": false,
+               "Pid": 56348,
+               "ConmonPid": 56346,
+               "ExitCode": 0,
+               "Error": "",
+               "StartedAt": "2026-05-18T13:12:24.904368327-04:00",
+               "FinishedAt": "0001-01-01T00:00:00Z",
+               "Health": {
+                    "Status": "",
+                    "FailingStreak": 0,
+                    "Log": null
+               },
+               "CgroupPath": "/machine.slice/libpod-be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15.scope",
+               "CheckpointedAt": "0001-01-01T00:00:00Z",
+               "RestoredAt": "0001-01-01T00:00:00Z"
+          },
+          "Image": "d7425b6d0552a46dad133ecb3aca888f0ef00cccd0295b0250ed6fd08c567ef7",
+          "ImageDigest": "sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268",
+          "ImageName": "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268",
+          "Rootfs": "",
+          "Pod": "",
+          "ResolvConfPath": "/run/containers/storage/overlay-containers/be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15/userdata/resolv.conf",
+          "HostnamePath": "/run/containers/storage/overlay-containers/be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15/userdata/hostname",
+          "HostsPath": "/run/containers/storage/overlay-containers/be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15/userdata/hosts",
+          "StaticDir": "/var/lib/containers/storage/overlay-containers/be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15/userdata",
+          "OCIConfigPath": "/var/lib/containers/storage/overlay-containers/be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15/userdata/config.json",
+          "OCIRuntime": "crun",
+          "ConmonPidFile": "/run/containers/storage/overlay-containers/be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15/userdata/conmon.pid",
+          "PidFile": "/run/containers/storage/overlay-containers/be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15/userdata/pidfile",
+          "Name": "warden",
+          "RestartCount": 0,
+          "Driver": "overlay",
+          "MountLabel": "",
+          "ProcessLabel": "",
+          "AppArmorProfile": "containers-default-0.57.4-apparmor1",
+          "EffectiveCaps": null,
+          "BoundingCaps": null,
+          "ExecIDs": [],
+          "GraphDriver": {
+               "Name": "overlay",
+               "Data": {
+                    "LowerDir": "/var/lib/containers/storage/overlay/1d35dea8bfee88841260504027a34d955e70bbf61a955ea7dac18579f07a3960/diff:/var/lib/containers/storage/overlay/0ffe0b24ebe5509b1ddb935811f30711a2768fe3e4646efb53591e7fa4797b23/diff:/var/lib/containers/storage/overlay/fbe90f55934d8f0a788e167c01118b7e3934f8c6e9c52a88924c4d4eabb81945/diff:/var/lib/containers/storage/overlay/bf2ba3ba84f64ed5f1326c4f4edce7b9717a283859d86e79a26e4a5628c3d693/diff:/var/lib/containers/storage/overlay/f15cf1547eb385d21b90be596564307e29353b0d1b9abf8b57543187aea3d70a/diff:/var/lib/containers/storage/overlay/5f49bdfc86a64e02cfcbb9e733066882477cdb5d1bc732d74c485c6d81db6901/diff:/var/lib/containers/storage/overlay/928c3635a0894a7b2ad81e5566753cb9cf0ed97c4da3eaca87fd861fcbc36068/diff:/var/lib/containers/storage/overlay/f44d216767357d67358938ddeb72900f9a0cb73a0c164f093275a9b01ad4fc14/diff:/var/lib/containers/storage/overlay/c461f33bc9138c941b336eba93cec1e374eb65ed6967b07b27c032b9b80d828e/diff:/var/lib/containers/storage/overlay/8eca447980f2a9a65ae5921dde4b2a3487d30f9de0fb5370da24792bf079ed1f/diff:/var/lib/containers/storage/overlay/6c9ad649ba0489961dd64654574cc4134f9eed47c0be4524747da2f36f5dbbd0/diff",
+                    "MergedDir": "/var/lib/containers/storage/overlay/5be8c9c9164c00f1ad78016d94f8ffdfef880a04cf540eec9691b180701dd45f/merged",
+                    "UpperDir": "/var/lib/containers/storage/overlay/5be8c9c9164c00f1ad78016d94f8ffdfef880a04cf540eec9691b180701dd45f/diff",
+                    "WorkDir": "/var/lib/containers/storage/overlay/5be8c9c9164c00f1ad78016d94f8ffdfef880a04cf540eec9691b180701dd45f/work"
+               }
+          },
+          "Mounts": [
+               {
+                    "Type": "bind",
+                    "Source": "/state/system",
+                    "Destination": "/var/run/cells",
+                    "Driver": "",
+                    "Mode": "",
+                    "Options": [
+                         "rbind"
+                    ],
+                    "RW": true,
+                    "Propagation": "rprivate"
+               },
+               {
+                    "Type": "bind",
+                    "Source": "/cells/addons",
+                    "Destination": "/addons",
+                    "Driver": "",
+                    "Mode": "",
+                    "Options": [
+                         "noexec",
+                         "nosuid",
+                         "nodev",
+                         "rbind"
+                    ],
+                    "RW": false,
+                    "Propagation": "rprivate"
+               },
+               {
+                    "Type": "bind",
+                    "Source": "/cells/network-policy.json",
+                    "Destination": "/policy.json",
+                    "Driver": "",
+                    "Mode": "",
+                    "Options": [
+                         "noexec",
+                         "nosuid",
+                         "nodev",
+                         "rbind"
+                    ],
+                    "RW": false,
+                    "Propagation": "rprivate"
+               },
+               {
+                    "Type": "bind",
+                    "Source": "/var/log/brig/network",
+                    "Destination": "/logs",
+                    "Driver": "",
+                    "Mode": "",
+                    "Options": [
+                         "rbind"
+                    ],
+                    "RW": true,
+                    "Propagation": "rprivate"
+               }
+          ],
+          "Dependencies": [],
+          "NetworkSettings": {
+               "EndpointID": "",
+               "Gateway": "",
+               "IPAddress": "",
+               "IPPrefixLen": 0,
+               "IPv6Gateway": "",
+               "GlobalIPv6Address": "",
+               "GlobalIPv6PrefixLen": 0,
+               "MacAddress": "",
+               "Bridge": "",
+               "SandboxID": "",
+               "HairpinMode": false,
+               "LinkLocalIPv6Address": "",
+               "LinkLocalIPv6PrefixLen": 0,
+               "Ports": {
+                    "8080/tcp": null,
+                    "8081/tcp": null,
+                    "8443/tcp": [
+                         {
+                              "HostIp": "",
+                              "HostPort": "8443"
+                         }
+                    ]
+               },
+               "SandboxKey": "/run/netns/netns-7dfd97d0-3c76-2dbd-2c5a-45f140890440",
+               "Networks": {
+                    "proxy-external": {
+                         "EndpointID": "",
+                         "Gateway": "10.51.0.1",
+                         "IPAddress": "10.51.0.7",
+                         "IPPrefixLen": 24,
+                         "IPv6Gateway": "",
+                         "GlobalIPv6Address": "",
+                         "GlobalIPv6PrefixLen": 0,
+                         "MacAddress": "82:fe:81:79:7c:bc",
+                         "NetworkID": "proxy-external",
+                         "DriverOpts": null,
+                         "IPAMConfig": null,
+                         "Links": null,
+                         "Aliases": [
+                              "be5b38bbee63"
+                         ]
+                    }
+               }
+          },
+          "Namespace": "",
+          "IsInfra": false,
+          "IsService": false,
+          "KubeExitCodePropagation": "invalid",
+          "lockNumber": 0,
+          "Config": {
+               "Hostname": "be5b38bbee63",
+               "Domainname": "",
+               "User": "mitmproxy",
+               "AttachStdin": false,
+               "AttachStdout": false,
+               "AttachStderr": false,
+               "Tty": false,
+               "OpenStdin": false,
+               "StdinOnce": false,
+               "Env": [
+                    "PYTHON_GET_PIP_SHA256=45a2bb8bf2bb5eff16fdd00faef6f29731831c7c59bd9fc2bf1f3bed511ff1fe",
+                    "GPG_KEY=A035C8C19219BA821ECEA86B64E628F8D684696D",
+                    "PYTHON_VERSION=3.11.5",
+                    "PYTHON_SETUPTOOLS_VERSION=65.5.1",
+                    "PYTHON_PIP_VERSION=23.2.1",
+                    "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    "container=podman",
+                    "PYTHON_GET_PIP_URL=https://github.com/pypa/get-pip/raw/9af82b715db434abb94a0a6f3569f43e72157346/public/get-pip.py",
+                    "LANG=C.UTF-8",
+                    "HOME=/home/mitmproxy",
+                    "HOSTNAME=be5b38bbee63"
+               ],
+               "Cmd": [
+                    "--mode",
+                    "regular@8080",
+                    "--mode",
+                    "regular@8443",
+                    "--set",
+                    "block_global=false",
+                    "-s",
+                    "/addons/ingress.py",
+                    "-s",
+                    "/addons/enforce.py",
+                    "-s",
+                    "/addons/logger.py",
+                    "-s",
+                    "/addons/ops.py",
+                    "-s",
+                    "/addons/notifier.py"
+               ],
+               "Image": "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268",
+               "Volumes": null,
+               "WorkingDir": "/",
+               "Entrypoint": "mitmdump",
+               "OnBuild": null,
+               "Labels": null,
+               "Annotations": {
+                    "io.container.manager": "libpod",
+                    "org.opencontainers.image.stopSignal": "15"
+               },
+               "StopSignal": 15,
+               "HealthcheckOnFailureAction": "none",
+               "CreateCommand": [
+                    "podman",
+                    "run",
+                    "-d",
+                    "--name",
+                    "warden",
+                    "--runtime",
+                    "crun",
+                    "--network",
+                    "proxy-external",
+                    "--entrypoint",
+                    "mitmdump",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--read-only",
+                    "--tmpfs",
+                    "/tmp:rw,noexec,nosuid,size=64m",
+                    "--tmpfs",
+                    "/home/mitmproxy/.mitmproxy:rw,size=32m",
+                    "--user",
+                    "mitmproxy",
+                    "--memory",
+                    "1g",
+                    "--cpus",
+                    "1",
+                    "--pids-limit",
+                    "256",
+                    "-v",
+                    "/var/log/brig/network:/logs:rw",
+                    "-v",
+                    "/state/system:/var/run/cells:rw",
+                    "-v",
+                    "/cells/addons:/addons:ro",
+                    "-v",
+                    "/cells/network-policy.json:/policy.json:ro",
+                    "-p",
+                    "8443:8443",
+                    "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268",
+                    "--mode",
+                    "regular@8080",
+                    "--mode",
+                    "regular@8443",
+                    "--set",
+                    "block_global=false",
+                    "-s",
+                    "/addons/ingress.py",
+                    "-s",
+                    "/addons/enforce.py",
+                    "-s",
+                    "/addons/logger.py",
+                    "-s",
+                    "/addons/ops.py",
+                    "-s",
+                    "/addons/notifier.py"
+               ],
+               "Umask": "0022",
+               "Timeout": 0,
+               "StopTimeout": 10,
+               "Passwd": true,
+               "sdNotifyMode": "container"
+          },
+          "HostConfig": {
+               "Binds": [
+                    "/state/system:/var/run/cells:rw,rprivate,rbind",
+                    "/cells/addons:/addons:ro,rprivate,noexec,nosuid,nodev,rbind",
+                    "/cells/network-policy.json:/policy.json:ro,rprivate,noexec,nosuid,nodev,rbind",
+                    "/var/log/brig/network:/logs:rw,rprivate,rbind"
+               ],
+               "CgroupManager": "systemd",
+               "CgroupMode": "private",
+               "ContainerIDFile": "",
+               "LogConfig": {
+                    "Type": "journald",
+                    "Config": null,
+                    "Path": "",
+                    "Tag": "",
+                    "Size": "0B"
+               },
+               "NetworkMode": "bridge",
+               "PortBindings": {
+                    "8443/tcp": [
+                         {
+                              "HostIp": "",
+                              "HostPort": "8443"
+                         }
+                    ]
+               },
+               "RestartPolicy": {
+                    "Name": "",
+                    "MaximumRetryCount": 0
+               },
+               "AutoRemove": false,
+               "VolumeDriver": "",
+               "VolumesFrom": null,
+               "CapAdd": [],
+               "CapDrop": [
+                    "CAP_CHOWN",
+                    "CAP_DAC_OVERRIDE",
+                    "CAP_FOWNER",
+                    "CAP_FSETID",
+                    "CAP_KILL",
+                    "CAP_NET_BIND_SERVICE",
+                    "CAP_SETFCAP",
+                    "CAP_SETGID",
+                    "CAP_SETPCAP",
+                    "CAP_SETUID",
+                    "CAP_SYS_CHROOT"
+               ],
+               "Dns": [],
+               "DnsOptions": [],
+               "DnsSearch": [],
+               "ExtraHosts": [],
+               "GroupAdd": [],
+               "IpcMode": "shareable",
+               "Cgroup": "",
+               "Cgroups": "default",
+               "Links": null,
+               "OomScoreAdj": 0,
+               "PidMode": "private",
+               "Privileged": false,
+               "PublishAllPorts": false,
+               "ReadonlyRootfs": true,
+               "SecurityOpt": [
+                    "no-new-privileges"
+               ],
+               "Tmpfs": {
+                    "/home/mitmproxy/.mitmproxy": "rw,size=32m,rprivate,nosuid,nodev,tmpcopyup",
+                    "/tmp": "rw,noexec,nosuid,size=64m,rprivate,nodev,tmpcopyup"
+               },
+               "UTSMode": "private",
+               "UsernsMode": "",
+               "ShmSize": 65536000,
+               "Runtime": "oci",
+               "ConsoleSize": [
+                    0,
+                    0
+               ],
+               "Isolation": "",
+               "CpuShares": 0,
+               "Memory": 1073741824,
+               "NanoCpus": 1000000000,
+               "CgroupParent": "",
+               "BlkioWeight": 0,
+               "BlkioWeightDevice": null,
+               "BlkioDeviceReadBps": null,
+               "BlkioDeviceWriteBps": null,
+               "BlkioDeviceReadIOps": null,
+               "BlkioDeviceWriteIOps": null,
+               "CpuPeriod": 100000,
+               "CpuQuota": 100000,
+               "CpuRealtimePeriod": 0,
+               "CpuRealtimeRuntime": 0,
+               "CpusetCpus": "",
+               "CpusetMems": "",
+               "Devices": [],
+               "DiskQuota": 0,
+               "KernelMemory": 0,
+               "MemoryReservation": 0,
+               "MemorySwap": 2147483648,
+               "MemorySwappiness": -1,
+               "OomKillDisable": false,
+               "PidsLimit": 256,
+               "Ulimits": [
+                    {
+                         "Name": "RLIMIT_NPROC",
+                         "Soft": 4194304,
+                         "Hard": 4194304
+                    }
+               ],
+               "CpuCount": 0,
+               "CpuPercent": 0,
+               "IOMaximumIOps": 0,
+               "IOMaximumBandwidth": 0,
+               "CgroupConf": null
+          }
+     }
+]
