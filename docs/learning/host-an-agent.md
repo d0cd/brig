@@ -7,6 +7,13 @@ We'll use the [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 container that needs cell-isolated egress plus a route back to a service
 on the host.
 
+> **Production-shaped reference**: `cells/hermes/` in this repo is the
+> canonical worked example — a real `Containerfile`, a `hermes.yaml`
+> cell spec, a brig-aware entrypoint, and a phase-by-phase validation
+> plan at `cells/hermes/VALIDATION.md`. Start from there and adapt; the
+> generic walk-through below covers the same pattern with placeholder
+> names.
+
 > Prereqs (already done on this machine):
 > - Brig is installed and `brig up` succeeds.
 > - A model API server is listening on `127.0.0.1:$MODEL_PORT` on the host.

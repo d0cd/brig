@@ -147,6 +147,21 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="Block and print new events as they arrive")
 
     # --- Image ---
+    p_build = sub.add_parser(
+        "build",
+        help="Build a container image from a directory with a Containerfile",
+    )
+    p_build.add_argument("context", help="Build-context directory (host path)")
+    p_build.add_argument(
+        "--tag", "-t",
+        help="Image tag (default: localhost/<dir-basename>:latest)",
+    )
+    p_build.add_argument(
+        "--build-arg", action="append",
+        metavar="KEY=VALUE",
+        help="Build-time variable (passed through to podman build)",
+    )
+
     p_pull = sub.add_parser("pull", help="Pull and cache image")
     p_pull.add_argument("image", help="Image to pull")
 
@@ -273,6 +288,7 @@ def main() -> None:
         "cp": lifecycle_cmd.cmd_cp,
         "network": network_cmd.cmd_network,
         "events": network_cmd.cmd_events,
+        "build": image_cmd.cmd_build,
         "pull": image_cmd.cmd_pull,
         "warmup": image_cmd.cmd_warmup,
         "image-verify": image_cmd.cmd_verify_image,
