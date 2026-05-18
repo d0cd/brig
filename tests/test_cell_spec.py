@@ -111,6 +111,35 @@ class TestValidateCellDefinition(unittest.TestCase):
         errors = validate_cell_definition({"workspace_quota": "not-a-size"})
         self.assertTrue(any("workspace_quota" in e for e in errors))
 
+    def test_workspace_mount_default_is_fine(self):
+        # /work (the default) and /workspace pass through cleanly.
+        for path in ("/work", "/workspace", "/data", "/srv/app"):
+            errors = validate_cell_definition({"workspace_mount": path})
+            self.assertEqual(errors, [], f"{path} should validate")
+
+    def test_workspace_mount_relative_rejected(self):
+        errors = validate_cell_definition({"workspace_mount": "work"})
+        self.assertTrue(any("absolute" in e for e in errors), errors)
+
+    def test_workspace_mount_dotdot_rejected(self):
+        errors = validate_cell_definition({"workspace_mount": "/foo/../bar"})
+        self.assertTrue(any(".." in e for e in errors), errors)
+
+    def test_workspace_mount_shadowing_run_secrets_rejected(self):
+        # The crown jewel: a cell that sets workspace_mount: /run/secrets
+        # would hide its own secrets dir behind the workspace mount. Reject.
+        for shadow in ("/run/secrets", "/run/secrets/foo",
+                       "/proc", "/sys", "/dev", "/etc/passwd"):
+            errors = validate_cell_definition({"workspace_mount": shadow})
+            self.assertTrue(
+                any("must not shadow" in e for e in errors),
+                f"expected shadow rejection for {shadow}, got: {errors}",
+            )
+
+    def test_workspace_mount_non_string_rejected(self):
+        errors = validate_cell_definition({"workspace_mount": 42})
+        self.assertTrue(any("must be a string" in e for e in errors), errors)
+
     def test_file_path_in_context(self):
         errors = validate_cell_definition({"name": "INVALID!"}, file_path="test.yaml")
         self.assertTrue(any("in test.yaml" in e for e in errors))

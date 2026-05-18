@@ -196,6 +196,18 @@ class TestBuildRunCommand(unittest.TestCase):
         cmd_str = " ".join(cmd)
         self.assertIn("/work:rw", cmd_str)
 
+    def test_workspace_mount_override(self):
+        """The new `workspace_mount` field must flow into the podman -v
+        argument and -w workdir, not just sit unused on CellSpec."""
+        spec = CellSpec(name="test", image="alpine", workspace_mount="/workspace")
+        cmd = build_run_command(spec, "10.60.1.1")
+        cmd_str = " ".join(cmd)
+        self.assertIn(":/workspace:rw", cmd_str)
+        # -w /workspace too, so the cell's cwd matches the mount.
+        self.assertIn("-w /workspace", cmd_str)
+        # Default /work should NOT appear as a mount when overridden.
+        self.assertNotIn(":/work:rw", cmd_str)
+
     def test_user_env_accepted(self):
         """Non-proxy env vars are accepted."""
         spec = CellSpec(name="test", image="alpine", env=["FOO=bar", "BAZ=qux"])

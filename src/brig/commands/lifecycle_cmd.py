@@ -33,12 +33,6 @@ def cmd_run(args: Any) -> int:
                        "before the container command? e.g. brig run --memory 512m alpine -- sh",
         )
 
-    # Auto-generate name if not provided.
-    if not args.name:
-        from brig.cell.names import generate_name
-        args.name = generate_name()
-        info(f"Auto-generated name: {args.name}")
-
     # Strip leading -- from REMAINDER args.
     container_cmd = args.container_cmd or []
     if container_cmd and container_cmd[0] == "--":
@@ -47,8 +41,11 @@ def cmd_run(args: Any) -> int:
     if not args.image and not args.file:
         raise BrigError("Image is required unless --file is specified")
 
+    # Name resolution: --name flag wins, then the yaml's name: field (if any),
+    # then auto-generate. The previous order auto-generated before loading the
+    # file, which made `--file foo.yaml` with `name: hermes` get an auto-name.
     spec_kwargs: dict[str, Any] = {
-        "name": args.name,
+        "name": args.name or "",  # may be filled from yaml below
         "image": args.image or "",
         "command": container_cmd,
         "env": args.env or [],
@@ -65,6 +62,12 @@ def cmd_run(args: Any) -> int:
         errors = validate_cell_definition(cell_def, args.file)
         if errors:
             raise BrigError("Invalid cell definition:\n  - " + "\n  - ".join(errors))
+        # Special-cased fields:
+        #   - image / name: --flag wins over yaml.
+        #   - command: --container_cmd (positional) wins over yaml.
+        #   - env: additive — yaml entries appended to --env entries.
+        # All other CellSpec-valid fields fall through to the generic merge
+        # below.
         for key in ("image", "name"):
             if key in cell_def and not getattr(args, key, None):
                 spec_kwargs[key] = cell_def[key]
@@ -76,6 +79,18 @@ def cmd_run(args: Any) -> int:
             if isinstance(env_list, dict):
                 env_list = [f"{k}={v}" for k, v in env_list.items()]
             spec_kwargs["env"] = (args.env or []) + env_list
+        # Generic merge: pull any other CellSpec-valid fields from the yaml.
+        # CLI flag overrides below still fire (they're `if args.flag: set`),
+        # so precedence stays: CLI flag > yaml > defaults. The previous
+        # behavior silently dropped yaml `memory:`, `cpus:`, `workspace_*`,
+        # `secrets:`, `labels:`, etc. — even though the validator accepts
+        # them and the design doc shows them as supported.
+        import dataclasses as _dc
+        _spec_field_names = {f.name for f in _dc.fields(CellSpec)}
+        _already_handled = {"image", "name", "command", "env", "ingress"}
+        for key, val in cell_def.items():
+            if key in _spec_field_names and key not in _already_handled:
+                spec_kwargs[key] = val
 
     if args.profile:
         profile = load_profile(args.profile)
@@ -103,6 +118,12 @@ def cmd_run(args: Any) -> int:
     if args.file:
         if "ingress" in cell_def:
             spec_kwargs["ingress"] = cell_def["ingress"]
+
+    # Last resort: auto-generate name if neither --name nor yaml provided one.
+    if not spec_kwargs.get("name"):
+        from brig.cell.names import generate_name
+        spec_kwargs["name"] = generate_name()
+        info(f"Auto-generated name: {spec_kwargs['name']}")
 
     # Filter to CellSpec fields only — profiles may add extra keys like 'runtime'.
     import dataclasses
