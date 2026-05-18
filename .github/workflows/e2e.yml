@@ -233,7 +233,8 @@ jobs:
             "${{ steps.test_observability.outcome }}" \
             "${{ steps.test_hardening.outcome }}" \
             "${{ steps.test_per_cell_policy.outcome }}" \
-            "${{ steps.test_warden_features.outcome }}"
+            "${{ steps.test_warden_features.outcome }}" \
+            "${{ steps.test_overhead.outcome }}"
           do
             if [ "$step" = "failure" ]; then
               FAILED=$((FAILED + 1))

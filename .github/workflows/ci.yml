@@ -42,6 +42,13 @@ jobs:
         run: |
           pytest --cov=src --cov-report=term --cov-report=xml --cov-fail-under=65 -v -m "not slow" --ignore=tests/benchmarks
 
+      - name: Per-package coverage gate
+        # Ratchet on security-critical modules (B6 from
+        # docs/plans/0.3-validation-plan.md). Global 65% wouldn't catch
+        # a regression that drops src/brig/security from 95% → 70%.
+        if: matrix.python-version == '3.12'
+        run: python scripts/check-coverage-per-module.py coverage.xml
+
       - name: Upload coverage artifact
         if: matrix.python-version == '3.12'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
