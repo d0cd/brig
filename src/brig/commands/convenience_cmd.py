@@ -54,17 +54,14 @@ def cmd_up(args: Any) -> int:
     else:
         output("VM is running")
 
-    # Step 4: start warden if not running.
-    from brig.vm.shell import vm_run
-    result = vm_run(  # type: ignore[assignment]
-        ["podman", "inspect", "warden", "--format", "{{.State.Status}}"],
-        timeout=5,
-    )
-    if result.returncode == 0 and result.stdout.strip() == "running":
+    # Step 4: start warden if not running. Use warden.proxy.is_running()
+    # (the same check warden.proxy.start() uses internally) so cmd_up and
+    # start() can't disagree about state.
+    from warden.proxy import is_running, start
+    if is_running():
         output("Warden is running")
     else:
         output("Starting warden...")
-        from warden.proxy import start
         if not start():
             output("ERROR: Failed to start warden")
             return 1

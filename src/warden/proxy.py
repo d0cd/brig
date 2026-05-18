@@ -36,8 +36,14 @@ VM_SYSTEM_DIR = VMPaths.SYSTEM_DIR
 
 
 def _podman_ps(all_states: bool = False) -> list[str]:
-    """Get list of container names from podman ps."""
-    cmd = ["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={PROXY_NAME}"]
+    """Get list of container names from podman ps.
+
+    The filter is regex-anchored so `name=warden-old` doesn't match `warden`.
+    """
+    cmd = [
+        "podman", "ps", "--format", "{{.Names}}",
+        "--filter", f"name=^{PROXY_NAME}$",
+    ]
     if all_states:
         cmd.insert(2, "-a")
     result = vm_run(cmd)
@@ -45,8 +51,17 @@ def _podman_ps(all_states: bool = False) -> list[str]:
 
 
 def is_running() -> bool:
-    """Check if the proxy container is running."""
-    return PROXY_NAME in _podman_ps()
+    """Check if the proxy container is running.
+
+    Verifies State.Status == "running" via inspect, not just presence in
+    `podman ps`. An exited container can briefly appear in ps after a crash;
+    we want a strict "actually serving traffic" answer.
+    """
+    result = vm_run(
+        ["podman", "inspect", PROXY_NAME, "--format", "{{.State.Status}}"],
+        timeout=5,
+    )
+    return result.returncode == 0 and result.stdout.strip() == "running"
 
 
 def container_exists() -> bool:

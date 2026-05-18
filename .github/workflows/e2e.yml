@@ -28,6 +28,21 @@ env:
   CELL_VM_NAME: cell
 
 jobs:
+  gvisor-pin-drift:
+    # Re-fetch the pinned sha512 from upstream and assert it still matches
+    # the value in scripts/provision-vm.sh + src/brig/vm/lima.yaml.template.
+    # Drift means Google rotated the binary under us; either the pin needs
+    # updating or the bucket was tampered with. Cron-only — every PR run
+    # would hammer the bucket for no value (file-sync check in ci.yml is
+    # sufficient on PRs).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Fetch upstream sha512 + compare to pin
+        run: ./scripts/check-gvisor-pin.sh --fetch
+
   e2e:
     runs-on: macos-15
     timeout-minutes: 90

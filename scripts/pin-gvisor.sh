@@ -16,12 +16,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROVISION="$SCRIPT_DIR/provision-vm.sh"
+LIMA_TEMPLATE="$REPO_ROOT/src/brig/vm/lima.yaml.template"
 
-if [[ ! -f "$PROVISION" ]]; then
-    echo "ERROR: $PROVISION not found" >&2
-    exit 1
-fi
+# Both files carry the same GVISOR_RELEASE + SHA512 map. Keep them in sync.
+TARGETS=("$PROVISION" "$LIMA_TEMPLATE")
+
+for target in "${TARGETS[@]}"; do
+    if [[ ! -f "$target" ]]; then
+        echo "ERROR: $target not found" >&2
+        exit 1
+    fi
+done
 
 if [[ $# -ge 1 ]]; then
     RELEASE="$1"
@@ -50,21 +57,31 @@ SHA_X86_64=$(fetch_sha x86_64)
 echo "  aarch64: $SHA_AARCH64"
 echo "  x86_64:  $SHA_X86_64"
 
-# In-place rewrite of the map. We match the lines individually instead of
-# trying to rewrite a multi-line bash array.
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+# In-place rewrite of GVISOR_RELEASE + the SHA512 map in every target.
+# Matches lines individually instead of trying to rewrite a multi-line array,
+# so it works whether the array is indented (in lima.yaml.template) or not
+# (in scripts/provision-vm.sh).
+update_file() {
+    local target="$1"
+    local tmp
+    tmp=$(mktemp)
+    sed -E "s|^([[:space:]]*)GVISOR_RELEASE=\"[^\"]*\"|\\1GVISOR_RELEASE=\"${RELEASE}\"|" "$target" \
+      | sed -E "s|^([[:space:]]*\\[aarch64\\]=\")[^\"]*\"|\\1${SHA_AARCH64}\"|" \
+      | sed -E "s|^([[:space:]]*\\[x86_64\\]=\")[^\"]*\"|\\1${SHA_X86_64}\"|" \
+      > "$tmp"
 
-# Update GVISOR_RELEASE itself in case the user passed a different one.
-sed -E "s|^GVISOR_RELEASE=\"[^\"]*\"|GVISOR_RELEASE=\"${RELEASE}\"|" "$PROVISION" \
-  | sed -E "s|^([[:space:]]*\\[aarch64\\]=\")[^\"]*\"|\\1${SHA_AARCH64}\"|" \
-  | sed -E "s|^([[:space:]]*\\[x86_64\\]=\")[^\"]*\"|\\1${SHA_X86_64}\"|" \
-  > "$tmp"
+    if ! diff -u "$target" "$tmp" > /dev/null; then
+        mv "$tmp" "$target"
+        echo "  updated $target"
+    else
+        rm -f "$tmp"
+        echo "  no change to $target"
+    fi
+}
 
-if ! diff -u "$PROVISION" "$tmp"; then
-    mv "$tmp" "$PROVISION"
-    trap - EXIT
-    echo "Updated $PROVISION. Review the diff above and commit."
-else
-    echo "No changes — already pinned to this release."
-fi
+for target in "${TARGETS[@]}"; do
+    update_file "$target"
+done
+
+echo ""
+echo "Review the diffs and commit. Both files must stay in sync (CI checks this)."

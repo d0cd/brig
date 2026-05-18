@@ -105,6 +105,14 @@ jobs:
         run: |
           bandit -r src/ -ll --skip B101,B104,B108
 
+      - name: Check gVisor pin is in sync and non-placeholder
+        # Both the lima.yaml.template (used by `brig init`) and
+        # scripts/provision-vm.sh (used by `make setup`) install runsc.
+        # They must declare the same GVISOR_RELEASE and same sha512s, and
+        # neither may carry REPLACE_WITH_* placeholders into a release.
+        # Weekly fetch-and-compare against upstream is in e2e.yml's cron run.
+        run: ./scripts/check-gvisor-pin.sh
+
   dependency-audit:
     runs-on: ubuntu-latest
     steps:
