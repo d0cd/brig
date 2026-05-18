@@ -208,8 +208,24 @@ def kill_cell(cell_name: str) -> None:
         log_lifecycle("kill", cell_name)
 
 
-def rm_cell(cell_name: str, force: bool = False) -> None:
-    """Remove a cell and all associated resources."""
+def rm_cell(
+    cell_name: str,
+    force: bool = False,
+    keep_workspace: bool = False,
+) -> None:
+    """Remove a cell and all associated resources.
+
+    By default also deletes the cell's workspace directory (under
+    ~/.brig/state/<cell>/). Pass `keep_workspace=True` to preserve it;
+    callers that want to extract files first should `brig cell cp` them
+    out before calling rm.
+
+    Why default-delete (was leave-on-disk in earlier versions): the
+    workspace can contain cell-controlled content including symlinks
+    pointing at host files. If a new cell takes the same name later, it
+    inherits the prior cell's planted bait. Cleaning by default closes
+    that re-use foot-gun; users who need the data ask for it.
+    """
     actual = observe(cell_name)
     if not actual.exists and not actual.network_exists:
         raise BrigError(
@@ -230,9 +246,36 @@ def rm_cell(cell_name: str, force: bool = False) -> None:
     actions = plan_destroy(cell_name, actual)
     result = apply(actions)
 
-    if result.success:
-        log_operation("rm", cell_name=cell_name)
-        log_lifecycle("rm", cell_name)
-    else:
+    if not result.success:
         failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
         raise BrigError(f"Failed to remove cell '{cell_name}': {failed[1]}")
+
+    # Clean up host-side per-cell state (workspace + metadata file).
+    # Deletion is destructive but matches the principle that `rm` should
+    # leave nothing behind for the next cell with the same name to
+    # inadvertently inherit.
+    if not keep_workspace:
+        _remove_cell_state_dir(cell_name)
+
+    log_operation("rm", cell_name=cell_name)
+    log_lifecycle("rm", cell_name)
+
+
+def _remove_cell_state_dir(cell_name: str) -> None:
+    """Best-effort recursive removal of ~/.brig/state/<cell>/.
+
+    Contains the workspace + cell-metadata.json. Errors are logged at
+    debug level — a leftover dir isn't a correctness failure, just
+    leakage of disk and (in the symlink-bait case) attack surface for a
+    same-name reuse.
+    """
+    import shutil
+    from brig.config import HostPaths
+    from brig.ops.logging import debug
+    cell_state = HostPaths.STATE_DIR / cell_name
+    if not cell_state.exists():
+        return
+    try:
+        shutil.rmtree(cell_state)
+    except OSError as e:
+        debug(f"Could not remove cell state dir {cell_state}: {e}")

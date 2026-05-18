@@ -19,6 +19,33 @@ from brig.ops.logging import info, output
 from brig.vm.shell import vm_run, vm_run_interactive
 
 
+_DIGEST_RE = __import__("re").compile(r"@sha(?:256|512):[0-9a-f]{40,}$")
+
+
+def _warn_unverified_image(image: str) -> None:
+    """Stderr-only warning if `image` is from a registry and lacks a
+    digest pin. Local builds (localhost/* and dotless single names) and
+    digest-pinned refs are silent.
+
+    Brig doesn't refuse — verification is a publishing trust decision
+    that varies by user. We just make the absence visible so a careless
+    `brig run someorg/their-image:latest` doesn't slip through quietly.
+    """
+    if not image:
+        return
+    if image.startswith("localhost/"):
+        return
+    if _DIGEST_RE.search(image):
+        return
+    # No registry component (e.g. "alpine") is an implicit Docker Hub pull,
+    # which is the most common trust-by-default footgun. Warn anyway.
+    info(
+        f"WARN: image {image!r} is unpinned and unverified. "
+        f"Pin a digest (image@sha256:...) or verify with: "
+        f"brig image verify {image}"
+    )
+
+
 def cmd_run(args: Any) -> int:
     """Handle `brig run`."""
     # Catch the common foot-gun: `brig run alpine -m 512m sh` puts -m and 512m
@@ -32,6 +59,9 @@ def cmd_run(args: Any) -> int:
             suggestion="Brig flags must precede the image name. Did you forget '--' "
                        "before the container command? e.g. brig run --memory 512m alpine -- sh",
         )
+
+    if args.image:
+        _warn_unverified_image(args.image)
 
     # Strip leading -- from REMAINDER args.
     container_cmd = args.container_cmd or []
@@ -155,7 +185,11 @@ def cmd_kill(args: Any) -> int:
 
 
 def cmd_rm(args: Any) -> int:
-    rm_cell(args.name, force=args.force)
+    rm_cell(
+        args.name,
+        force=args.force,
+        keep_workspace=getattr(args, "keep_workspace", False),
+    )
     return 0
 
 

@@ -219,6 +219,12 @@ jobs:
         continue-on-error: true
         run: tests/test_stream_passthrough.sh
 
+      - name: "Test: Invariants 7+8 (foreign container / multi-homed cell)"
+        id: test_invariants_7_8
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_invariants_7_8.sh
+
       - name: "Benchmark: Stack Overhead"
         id: test_overhead
         timeout-minutes: 15
@@ -241,6 +247,7 @@ jobs:
             "${{ steps.test_per_cell_policy.outcome }}" \
             "${{ steps.test_warden_features.outcome }}" \
             "${{ steps.test_stream_passthrough.outcome }}" \
+            "${{ steps.test_invariants_7_8.outcome }}" \
             "${{ steps.test_overhead.outcome }}"
           do
             if [ "$step" = "failure" ]; then

@@ -109,6 +109,61 @@ class TestWriteMetadata(unittest.TestCase):
                     f"metadata file should be other-readable, got 0o{mode:o}")
 
 
+class TestRefreshMetadataIfPresent(unittest.TestCase):
+    """`refresh_metadata_if_present` rewrites the cell.json so its
+    `policy.host_services` reflects the latest per-cell ACL. No-op if
+    the cell's metadata file doesn't exist."""
+
+    def test_rewrites_existing_metadata_with_updated_policy(self):
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths:
+                host_paths.STATE_DIR = Path(td)
+                # Write initial metadata with empty host_services.
+                with patch("brig.cell.metadata.load_cell_policy",
+                           return_value=None):
+                    metadata.write_metadata("c1", "/work")
+
+                # Now imagine the user did `brig policy set c1 --host-service x`.
+                # The per-cell policy lookup returns the new list.
+                with patch("brig.cell.metadata.load_cell_policy",
+                           return_value={"host_services": ["svc-x"]}):
+                    refreshed = metadata.refresh_metadata_if_present("c1")
+
+                self.assertIsNotNone(refreshed)
+                payload = json.loads(refreshed.read_text())
+                self.assertEqual(payload["policy"]["host_services"], ["svc-x"])
+                # workspace_mount preserved from the original write.
+                self.assertEqual(payload["workspace"]["mount_point"], "/work")
+
+    def test_preserves_workspace_mount_from_existing_file(self):
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths:
+                host_paths.STATE_DIR = Path(td)
+                # Cell was created with a non-default workspace_mount.
+                with patch("brig.cell.metadata.load_cell_policy",
+                           return_value=None):
+                    metadata.write_metadata("c1", "/workspace")
+                # Refresh should preserve the original mount, not reset to /work.
+                with patch("brig.cell.metadata.load_cell_policy",
+                           return_value=None):
+                    metadata.refresh_metadata_if_present("c1")
+                payload = json.loads(
+                    metadata._host_metadata_path("c1").read_text()
+                )
+                self.assertEqual(payload["workspace"]["mount_point"], "/workspace")
+
+    def test_noop_when_no_metadata_file(self):
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths:
+                host_paths.STATE_DIR = Path(td)
+                # No prior write_metadata call.
+                result = metadata.refresh_metadata_if_present("ghost")
+                self.assertIsNone(result)
+
+
 class TestReconcilerBindMountsMetadata(unittest.TestCase):
     """build_run_command must include the `-v <metadata>:/run/brig/cell.json:ro`
     bind so the cell can read the file."""

@@ -123,9 +123,19 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
         p = cs.add_parser(name, help=help_text)
         p.add_argument("name", help="Cell name")
 
-    p_rm = cs.add_parser("rm", help="Remove a cell")
+    p_rm = cs.add_parser(
+        "rm",
+        help="Remove a cell (also deletes its workspace dir by default)",
+    )
     p_rm.add_argument("name", help="Cell name")
-    p_rm.add_argument("-f", "--force", action="store_true", help="Force removal")
+    p_rm.add_argument("-f", "--force", action="store_true",
+                      help="Stop the cell first if running")
+    p_rm.add_argument("--keep-workspace", action="store_true",
+                      help="Preserve ~/.brig/state/<cell>/ (workspace + "
+                           "metadata). Use if you want to brig cell cp files "
+                           "out later. Without this flag, the cell's "
+                           "workspace is deleted to prevent the next cell "
+                           "with the same name from inheriting planted files.")
 
     p_rename = cs.add_parser("rename", help="Rename a cell")
     p_rename.add_argument("old_name", help="Current name")

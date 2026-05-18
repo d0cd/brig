@@ -103,6 +103,29 @@ def _per_cell_host_services(cell_name: str) -> list[str]:
     return [s for s in services if isinstance(s, str)]
 
 
+def refresh_metadata_if_present(cell_name: str) -> Path | None:
+    """Rewrite the metadata file for `cell_name` if one already exists,
+    preserving the original `workspace_mount` value.
+
+    Called after per-cell policy changes so `policy.host_services` in
+    /run/brig/cell.json reflects the latest ACL. No-op if the cell has
+    no metadata file (cell was never started, or was removed).
+
+    Bind mounts are fixed at podman-create time, so the cell's running
+    container can't pick up a new workspace_mount — we preserve whatever
+    was originally set. The policy field is the only one that can drift
+    out of sync; that's what this fixes.
+    """
+    import json as _json
+    existing = _host_metadata_path(cell_name)
+    try:
+        prior = _json.loads(existing.read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return None
+    workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
+    return write_metadata(cell_name, workspace_mount)
+
+
 def write_metadata(cell_name: str, workspace_mount: str) -> Path:
     """Write the cell's metadata JSON to the host path. Returns the path.
 

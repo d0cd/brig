@@ -177,6 +177,12 @@ def cmd_policy_set(args: Any) -> int:
 
     save_cell_policy(name, policy)
     log_policy_change(name, "update", changes, old_policy, policy)
+    # Refresh /run/brig/cell.json so the cell sees the new
+    # policy.host_services list. Warden picks up the change from
+    # the per-cell policy file directly via its mtime watcher;
+    # the cell-side metadata otherwise goes stale until restart.
+    from brig.cell.metadata import refresh_metadata_if_present
+    refresh_metadata_if_present(name)
     info(f"Updated policy for cell '{name}'")
     return 0
 
@@ -347,6 +353,9 @@ def cmd_policy_rm(args: Any) -> int:
                         suggestion="Edit it instead: brig policy set global --remove-allow ...")
     if delete_cell_policy(args.name):
         log_policy_change(args.name, "delete", changes={})
+        # Refresh cell.json so the cell sees the host_services list emptied.
+        from brig.cell.metadata import refresh_metadata_if_present
+        refresh_metadata_if_present(args.name)
         info(f"Deleted per-cell policy for '{args.name}'")
         try:
             from warden.proxy import reload_policy
