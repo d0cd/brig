@@ -224,6 +224,41 @@ def cmd_files(args: Any) -> int:
     return vm_run_interactive(["podman", "exec", cn, "ls", "-la", path])
 
 
+def cmd_read(args: Any) -> int:
+    """Handle `brig cell read <cell> <relpath>` — stream a workspace file
+    to stdout via the race-free safe_open primitive.
+
+    This is the language-agnostic safe-read replacement for the (now
+    removed) workspace.host_path field in cell.json. Consumers in any
+    language can do:
+
+        brig cell read mycell input.json > /tmp/local-copy
+
+    instead of opening the host path directly. Each path component is
+    walked with O_NOFOLLOW so a cell-planted symlink raises
+    WorkspaceEscape rather than letting the host follow it.
+    """
+    import sys
+    from brig.workspace.validation import safe_open, WorkspaceEscape
+
+    try:
+        with safe_open(args.name, args.path, "rb") as f:
+            # Stream in chunks so a large file doesn't blow RAM.
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+        return 0
+    except WorkspaceEscape as e:
+        raise BrigError(
+            f"Refused: {e}",
+            suggestion="A path component is a symlink or escapes the workspace root.",
+        )
+    except FileNotFoundError:
+        raise BrigError(f"Not found: {args.path} in cell '{args.name}'")
+
+
 def cmd_logs(args: Any) -> int:
     cn = container_name(args.name)
     cmd = ["podman", "logs"]

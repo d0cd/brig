@@ -98,6 +98,12 @@ class TestBrigCliParsing(unittest.TestCase):
         self.assertTrue(args.follow)
         self.assertEqual(args.tail, 50)
 
+    def test_cell_read(self):
+        args = self.parser.parse_args(["cell", "read", "mycell", "data/foo.txt"])
+        self.assertEqual(args.cell_command, "read")
+        self.assertEqual(args.name, "mycell")
+        self.assertEqual(args.path, "data/foo.txt")
+
     def test_cell_top_diff_stats(self):
         for verb in ("top", "diff"):
             args = self.parser.parse_args(["cell", verb, "mycell"])

@@ -1,41 +1,47 @@
 """Cell metadata file — `/run/brig/cell.json` (downward API).
 
 A cell at startup needs to know its own identity to drive use cases
-like agent-delegation flows: the cell hands its `workspace.host_path`
-to a host-side worker that needs to open the same files the cell sees.
+like agent-delegation flows: the cell hands `(cell-name, relpath)` to
+a host-side worker that needs to open the same files the cell sees,
+and the worker uses one of brig's safe primitives to do the read.
 
 Modeled on Kubernetes' downward API / cloud instance metadata: brig
 writes a small JSON file on the host, podman bind-mounts it read-only
 into the cell at `/run/brig/cell.json`. The cell can read but not
 modify it.
 
-Schema (v1):
+Schema (v2):
     {
-      "version": 1,
+      "version": 2,
       "name": "<cell-name>",
       "started_at": "<RFC 3339 UTC>",
       "workspace": {
-        "mount_point": "/work",
-        "host_path":   "/Users/<user>/.brig/state/<name>/workspace"
+        "mount_point": "/work"
       },
       "policy": {
         "host_services": ["<svc-name>", ...]   // per-cell ACL (may be empty)
       }
     }
 
-Security note: `workspace.host_path` is published to the cell so it can
-hand the path to a host-side consumer. The path is derivable from the
-cell name + the brig install convention, so this leaks little.
-Consumers that *read* the workspace on the host MUST use the race-free
-`brig.workspace.validation.safe_open` primitive. The mount itself is
-not yet `nosymfollow`-protected (podman 4.x limitation; tracked in
-ROADMAP).
+Why v2 dropped `workspace.host_path`: publishing the absolute host
+path made it trivial for a consumer to do plain `open(host_path)`,
+which follows any symlink the cell planted in its workspace — letting
+the cell exfiltrate arbitrary host files by tricking the consumer
+into reading. There is no mount-side fix available on macOS (no
+`MS_NOSYMFOLLOW` equivalent). The principled answer is to make the
+host path inaccessible from the metadata and route all host-side
+workspace reads through brig's safe primitives — which derive the
+path from the cell name and walk it with `O_NOFOLLOW`.
+
+Safe consumer primitives:
+  - Python in-process:  `brig.workspace.validation.safe_open(cell, relpath)`
+  - Any language:       `brig cell read <cell> <relpath>` (streams to stdout)
+                        `brig cell cp <cell>:<relpath> <local>`
+                        `brig cell exec <cell> -- <cmd>` (runs in gVisor)
 """
 
 from __future__ import annotations
 
-import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,7 +50,7 @@ from brig.config import HostPaths, VMPaths
 from brig.ops.atomic import atomic_write_json
 from brig.policy.policy import load_cell_policy
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 IN_CELL_PATH = "/run/brig/cell.json"
 
 
@@ -60,12 +66,6 @@ def _vm_metadata_path(cell_name: str) -> Path:
     return VMPaths.STATE_DIR / cell_name / "cell-metadata.json"
 
 
-def _host_workspace_path(cell_name: str) -> str:
-    """Absolute host path of the per-cell workspace, expanded for the
-    current user. This is what `workspace.host_path` publishes."""
-    return str((HostPaths.STATE_DIR / cell_name / "workspace").expanduser())
-
-
 def build_metadata(
     cell_name: str,
     workspace_mount: str,
@@ -79,7 +79,6 @@ def build_metadata(
         "started_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "workspace": {
             "mount_point": workspace_mount,
-            "host_path": _host_workspace_path(cell_name),
         },
         "policy": {
             "host_services": _per_cell_host_services(cell_name),

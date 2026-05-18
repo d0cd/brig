@@ -26,11 +26,24 @@ class TestBuildMetadata(unittest.TestCase):
             m = build_metadata("test-cell", "/work")
 
         self.assertEqual(m["version"], SCHEMA_VERSION)
+        self.assertEqual(m["version"], 2,
+            "v2 schema (dropped workspace.host_path) — bump this when you "
+            "intentionally change the wire shape, not when you change "
+            "internals")
         self.assertEqual(m["name"], "test-cell")
         self.assertEqual(m["workspace"]["mount_point"], "/work")
-        self.assertTrue(m["workspace"]["host_path"].endswith("/state/test-cell/workspace"),
-            f"host_path should end with /state/test-cell/workspace, got {m['workspace']['host_path']}")
         self.assertEqual(m["policy"]["host_services"], [])
+
+    def test_v2_does_not_publish_host_path(self):
+        """Load-bearing security test: workspace.host_path is REMOVED in v2.
+        Publishing it gave a careless consumer an easy path to
+        `open(host_path)` and follow any symlink the cell planted —
+        the exact exploit the schema break exists to close."""
+        from brig.cell.metadata import build_metadata
+        with patch("brig.cell.metadata.load_cell_policy", return_value=None):
+            m = build_metadata("test-cell", "/work")
+        self.assertNotIn("host_path", m["workspace"],
+            "workspace.host_path must not be published in v2")
 
     def test_started_at_is_rfc3339_utc(self):
         from brig.cell.metadata import build_metadata
@@ -78,7 +91,8 @@ class TestWriteMetadata(unittest.TestCase):
         self.assertEqual(payload["name"], "test-cell")
         self.assertEqual(payload["workspace"]["mount_point"], "/work")
         self.assertIn("started_at", payload)
-        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["version"], 2)
+        self.assertNotIn("host_path", payload["workspace"])
 
     def test_metadata_file_is_world_readable_inside_cell(self):
         """The file gets bind-mounted into the cell, which may run as any uid.

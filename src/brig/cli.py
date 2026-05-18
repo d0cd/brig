@@ -144,6 +144,13 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
     p_files.add_argument("name", help="Cell name")
     p_files.add_argument("path", nargs="?", default="/work", help="Path inside cell")
 
+    p_read = cs.add_parser(
+        "read",
+        help="Stream a workspace file to stdout (race-free; refuses symlinks)",
+    )
+    p_read.add_argument("name", help="Cell name")
+    p_read.add_argument("path", help="Relative path inside the workspace")
+
     p_logs = cs.add_parser("logs", help="View cell logs")
     p_logs.add_argument("name", help="Cell name")
     p_logs.add_argument("-f", "--follow", action="store_true", help="Follow log output")
@@ -318,6 +325,7 @@ def main() -> None:
         ("cell", "rename"): lifecycle_cmd.cmd_rename,
         ("cell", "exec"): lifecycle_cmd.cmd_exec,
         ("cell", "files"): lifecycle_cmd.cmd_files,
+        ("cell", "read"): lifecycle_cmd.cmd_read,
         ("cell", "logs"): lifecycle_cmd.cmd_logs,
         ("cell", "top"): lifecycle_cmd.cmd_top,
         ("cell", "diff"): lifecycle_cmd.cmd_diff,
