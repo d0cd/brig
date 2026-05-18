@@ -265,31 +265,6 @@ def cmd_build(args: Any) -> int:
     return 0
 
 
-def cmd_load(args: Any) -> int:
-    """Handle `brig image load <tarball>` — side-load a prebuilt image.
-
-    For the CI-output / air-gapped / vendor-drop case where someone
-    has a `podman save` tarball and wants it visible inside the VM's
-    rootful podman without going through a registry.
-    """
-    tarball = Path(args.tarball).resolve()
-    if not tarball.is_file():
-        raise BrigError(f"Tarball not found: {tarball}")
-
-    info(f"Loading {tarball.name} into VM podman...")
-    with tarball.open("rb") as f:
-        result = subprocess.run(
-            ["limactl", "shell", "--workdir", "/", "brig", "--",
-             "sudo", "podman", "load"],
-            stdin=f, capture_output=True, text=True, check=False,
-        )
-    if result.returncode != 0:
-        raise BrigError(f"podman load failed: {result.stderr.strip()}")
-    # podman load's stdout is "Loaded image: <name:tag>"
-    output(result.stdout.strip() or f"Loaded {tarball.name}")
-    return 0
-
-
 def cmd_pull(args: Any) -> int:
     """Handle `brig pull` — pull and cache an image."""
     result = vm_run(

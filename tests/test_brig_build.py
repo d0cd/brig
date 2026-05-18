@@ -409,57 +409,5 @@ class TestBuildContextSizeCap(unittest.TestCase):
                 self.assertIn("exceeded", str(cm.exception))
 
 
-class TestBrigImageLoad(unittest.TestCase):
-    """`brig image load <tarball>` — side-load a prebuilt image."""
-
-    def test_rejects_missing_tarball(self):
-        from brig.commands.image_cmd import cmd_load
-        from brig.errors import BrigError
-        with self.assertRaises(BrigError) as ctx:
-            cmd_load(types.SimpleNamespace(tarball="/nonexistent.tar"))
-        self.assertIn("not found", str(ctx.exception))
-
-    def test_calls_podman_load_with_stdin(self):
-        from brig.commands.image_cmd import cmd_load
-        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as f:
-            f.write(b"fake tar data")
-            path = f.name
-        try:
-            captured = {}
-
-            def fake_run(cmd, **kw):
-                captured["cmd"] = cmd
-                captured["has_stdin"] = "stdin" in kw
-                return subprocess.CompletedProcess(
-                    [], 0, "Loaded image: localhost/foo:latest\n", "",
-                )
-
-            with patch("brig.commands.image_cmd.subprocess.run", side_effect=fake_run):
-                rc = cmd_load(types.SimpleNamespace(tarball=path))
-
-            self.assertEqual(rc, 0)
-            self.assertIn("podman", captured["cmd"])
-            self.assertIn("load", captured["cmd"])
-            self.assertTrue(captured["has_stdin"])
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-    def test_returns_nonzero_on_podman_failure(self):
-        from brig.commands.image_cmd import cmd_load
-        from brig.errors import BrigError
-        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as f:
-            f.write(b"bogus")
-            path = f.name
-        try:
-            with patch("brig.commands.image_cmd.subprocess.run") as mock_run:
-                mock_run.return_value = subprocess.CompletedProcess(
-                    [], 1, "", "Error: not a valid image tar",
-                )
-                with self.assertRaises(BrigError):
-                    cmd_load(types.SimpleNamespace(tarball=path))
-        finally:
-            Path(path).unlink(missing_ok=True)
-
-
 if __name__ == "__main__":
     unittest.main()

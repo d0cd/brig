@@ -150,11 +150,6 @@ class TestBrigCliParsing(unittest.TestCase):
         args = self.parser.parse_args(["image", "pull", "alpine:latest"])
         self.assertEqual(args.image, "alpine:latest")
 
-    def test_image_load(self):
-        args = self.parser.parse_args(["image", "load", "./img.tar"])
-        self.assertEqual(args.image_command, "load")
-        self.assertEqual(args.tarball, "./img.tar")
-
     def test_image_verify(self):
         args = self.parser.parse_args([
             "image", "verify", "myimage:latest", "--keyless",

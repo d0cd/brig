@@ -170,8 +170,8 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
 
 
 def _add_image_group(sub: argparse._SubParsersAction) -> None:
-    """`brig image <verb>` — image build / pull / load / verify."""
-    p_image = sub.add_parser("image", help="Image build / pull / load / verify")
+    """`brig image <verb>` — image build / pull / verify."""
+    p_image = sub.add_parser("image", help="Image build / pull / verify")
     isub = p_image.add_subparsers(dest="image_command", required=True)
 
     p_build = isub.add_parser(
@@ -188,13 +188,6 @@ def _add_image_group(sub: argparse._SubParsersAction) -> None:
 
     p_pull = isub.add_parser("pull", help="Pull and cache image")
     p_pull.add_argument("image", help="Image to pull")
-
-    p_load = isub.add_parser(
-        "load",
-        help="Side-load a prebuilt image tarball "
-             "(for CI output / air-gapped / vendor-drop)",
-    )
-    p_load.add_argument("tarball", help="Path to `podman save` tarball on the host")
 
     p_verify = isub.add_parser("verify", help="Verify image signature (cosign)")
     p_verify.add_argument("image", help="Image to verify")
@@ -337,7 +330,6 @@ def main() -> None:
         # image *
         ("image", "build"): image_cmd.cmd_build,
         ("image", "pull"): image_cmd.cmd_pull,
-        ("image", "load"): image_cmd.cmd_load,
         ("image", "verify"): image_cmd.cmd_verify_image,
         ("image", "warmup"): image_cmd.cmd_warmup,
 
