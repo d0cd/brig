@@ -60,6 +60,46 @@ def cmd_run(args: Any) -> int:
                        "before the container command? e.g. brig run --memory 512m alpine -- sh",
         )
 
+    # `brig run cells/foo` is a common confusion — that's a build context,
+    # not an image ref. If the arg looks like a host directory (contains
+    # '/' AND exists on disk as a dir), surface the build vs run distinction
+    # before podman tries to pull and fails opaquely.
+    if args.image and "/" in args.image and not args.image.startswith("localhost/"):
+        from pathlib import Path as _P
+        if _P(args.image).is_dir():
+            raise BrigError(
+                f"'{args.image}' is a directory, not an image reference",
+                suggestion=(
+                    f"Did you mean to build it first?\n"
+                    f"  brig image build {args.image}\n"
+                    f"  brig run localhost/{_P(args.image).name}:latest ..."
+                ),
+            )
+
+    # Catch the inverse: flags AFTER a valid image. nargs=REMAINDER swallows
+    # everything so `brig run alpine --memory 256m sh` puts `--memory 256m sh`
+    # into container_cmd. The cell starts and tries to exec `--memory` as the
+    # command, fails with "executable not found", and the user can't tell
+    # why. Flag a brig-style flag in container_cmd[0] before that happens.
+    _BRIG_FLAG_TOKENS = {
+        "--memory", "-m", "--cpus", "--name", "-n", "--env", "-e",
+        "--secret", "-s", "--profile", "--file", "-f", "--network",
+        "--detach", "-d", "--rm", "--timeout", "--workspace-quota",
+        "--label", "-l", "--pids-limit", "--image-digest", "--workdir",
+        "--policy-allow", "--policy-deny",
+    }
+    cmd_tail = args.container_cmd or []
+    # Strip the optional leading -- separator before checking.
+    first = cmd_tail[1] if cmd_tail and cmd_tail[0] == "--" else (cmd_tail[0] if cmd_tail else None)
+    if first in _BRIG_FLAG_TOKENS:
+        raise BrigError(
+            f"'{first}' looks like a brig flag but appears after the image",
+            suggestion=(
+                "Brig flags must precede the image. If you meant to pass it to "
+                f"the container, escape it: brig run ... {args.image} -- {first} ..."
+            ),
+        )
+
     if args.image:
         _warn_unverified_image(args.image)
 
@@ -171,7 +211,68 @@ def cmd_run(args: Any) -> int:
 
     if result.container_id:
         output(result.container_id[:12])
+
+    # Detect cells that exit immediately and turn the cryptic outcome into
+    # actionable feedback. The most common causes — image's CMD prints help
+    # and exits, or the image tried to write somewhere read-only — look like
+    # brig brokenness from the user's side.
+    if result.success and spec.detach:
+        _check_immediate_exit(spec.name)
     return 0
+
+
+def _check_immediate_exit(cell_name: str) -> None:
+    """Sleep briefly, then probe whether the cell already exited. If it
+    did, scan its stderr/stdout for known error patterns and append a
+    suggestion. Otherwise just note that it stopped quickly.
+
+    Called after detached `brig run` so users get a signal when the cell
+    they thought started is actually already gone. Best-effort: any
+    error here is swallowed (we don't want to fail the run on a
+    diagnostic).
+    """
+    import time
+    time.sleep(1.5)
+    try:
+        cn = container_name(cell_name)
+        status = vm_run(
+            ["podman", "inspect", cn, "--format", "{{.State.Status}}"],
+            timeout=5,
+        )
+        if status.returncode != 0:
+            return
+        if status.stdout.strip() == "running":
+            return  # All good — cell is still alive.
+
+        # Cell exited quickly. Pull recent logs and look for a known cause.
+        logs = vm_run(
+            ["podman", "logs", "--tail", "50", cn], timeout=5,
+        )
+        log_text = (logs.stdout or "") + (logs.stderr or "")
+        hint = _diagnose_exit(log_text)
+        info(
+            f"NOTE: cell '{cell_name}' exited shortly after start.{hint} "
+            f"See: brig cell logs {cell_name}"
+        )
+    except Exception:  # noqa: BLE001 — pure diagnostic, never fail the run
+        pass
+
+
+def _diagnose_exit(log_text: str) -> str:
+    """Heuristic — match common failure patterns and return an actionable
+    fragment that fits into the NOTE: line. Returns '' if no match."""
+    s = log_text.lower()
+    if "read-only file system" in s or "errno 30" in s:
+        return (
+            " Image tried to write to a read-only path. Set "
+            "writable_rootfs: true in the cell spec if the image legitimately "
+            "needs to write outside /work, /tmp, /run."
+        )
+    if "executable file not found" in s and "bash" in s:
+        return (
+            " The image likely doesn't ship /bin/bash; try sh."
+        )
+    return ""
 
 
 def cmd_stop(args: Any) -> int:
@@ -185,11 +286,39 @@ def cmd_kill(args: Any) -> int:
 
 
 def cmd_rm(args: Any) -> int:
-    rm_cell(
-        args.name,
-        force=args.force,
-        keep_workspace=getattr(args, "keep_workspace", False),
-    )
+    import sys
+    from brig.cell.lifecycle import _workspace_has_content
+
+    keep = getattr(args, "keep_workspace", False)
+    # If the cell's workspace has files and the user didn't explicitly
+    # opt to keep or force, ask before deleting. Closes the silent-data-loss
+    # foot-gun where the user expects docker semantics (rm preserves
+    # volumes) and loses unexpected data.
+    if not keep and not args.force and _workspace_has_content(args.name):
+        if not sys.stdin.isatty():
+            raise BrigError(
+                f"Cell '{args.name}' has files in its workspace; refusing to "
+                f"delete non-interactively.",
+                suggestion=(
+                    f"brig cell rm {args.name} --keep-workspace   # preserve files\n"
+                    f"  OR  brig cell rm -f {args.name}            # force delete"
+                ),
+            )
+        prompt = (
+            f"Cell '{args.name}' workspace contains files. "
+            f"Delete? [y/N/keep] "
+        )
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer in ("k", "keep"):
+            keep = True
+        elif answer not in ("y", "yes"):
+            output("Aborted.")
+            return 1
+
+    rm_cell(args.name, force=args.force, keep_workspace=keep)
     return 0
 
 
@@ -418,6 +547,24 @@ def _refresh_metadata_for_start(cell_name: str) -> None:
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         pass
     write_metadata(cell_name, workspace_mount)
+
+
+def cmd_restart(args: Any) -> int:
+    """Handle `brig cell restart <name>` — stop (if running) then start.
+
+    Composite of stop_cell + cmd_start. Refreshes the cell metadata's
+    started_at via cmd_start's existing path.
+    """
+    from brig.cell.lifecycle import observe, stop_cell
+    actual = observe(args.name)
+    if not actual.exists:
+        raise BrigError(
+            f"Cell '{args.name}' does not exist",
+            suggestion="brig cell list  # see what's there",
+        )
+    if actual.running:
+        stop_cell(args.name)
+    return cmd_start(args)
 
 
 def cmd_wait(args: Any) -> int:

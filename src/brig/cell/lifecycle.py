@@ -124,14 +124,21 @@ def run_cell(
     if actual.exists and actual.running:
         raise BrigError(
             f"Cell '{spec.name}' is already running",
-            suggestion=f"Use 'brig stop {spec.name}' first, or 'brig rm -f {spec.name}'",
+            suggestion=(
+                f"brig cell rm -f {spec.name}  # remove and re-run\n"
+                f"  OR  brig cell stop {spec.name}\n"
+                f"  OR  brig run --name <different-name> ..."
+            ),
         )
 
     actions = plan_run(spec, actual)
     if not actions:
         raise BrigError(
             f"Cell '{spec.name}' already exists",
-            suggestion=f"Remove it first with: brig rm {spec.name}",
+            suggestion=(
+                f"brig cell rm {spec.name}     # remove the old one first\n"
+                f"  OR  brig run --name <different-name> ..."
+            ),
         )
 
     debug(f"Reconciliation plan: {[a.type.name for a in actions]}")
@@ -259,6 +266,19 @@ def rm_cell(
 
     log_operation("rm", cell_name=cell_name)
     log_lifecycle("rm", cell_name)
+
+
+def _workspace_has_content(cell_name: str) -> bool:
+    """True if the cell's workspace dir contains any files. Used to gate
+    the rm confirmation prompt — empty workspaces don't warrant asking."""
+    from brig.config import HostPaths
+    ws = HostPaths.STATE_DIR / cell_name / "workspace"
+    if not ws.exists():
+        return False
+    try:
+        return any(ws.iterdir())
+    except OSError:
+        return False
 
 
 def _remove_cell_state_dir(cell_name: str) -> None:
