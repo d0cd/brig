@@ -10,7 +10,14 @@ Use with `brig run --file mycell.yaml`.
 name: my-cell                    # Lowercase alphanumeric, max 63 chars
 image: python:3.12               # Container image (OCI)
 
-# Command (optional — defaults to image entrypoint)
+# Command (optional — defaults to image entrypoint).
+# The cell stays running only as long as PID 1 (this command) is alive.
+# If your command prints help and exits (a common default for CLI tools),
+# the cell flips to `stopped` within milliseconds — which surprises users
+# who want to attach via `brig cell exec` repeatedly. Either give the
+# command its long-running mode (e.g. `["myapp", "serve"]`) or, for an
+# explicitly long-lived "exec into me" cell, use `["sleep", "infinity"]`
+# and drive work via `brig cell exec`.
 command: ["python", "app.py"]    # List of strings, or single string
 
 # Environment variables
