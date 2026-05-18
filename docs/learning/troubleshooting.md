@@ -6,11 +6,11 @@ Quick answers to the failures most users hit first.
 
 ```
 ERROR: Warden proxy is not running
-  Suggestion: Start with: brig up
+  Suggestion: Start with: brig system up
 ```
 
 `brig run` fails closed when warden isn't reachable (invariant 9). Run
-`brig up` to start the VM (if needed) and warden. If `brig up` itself
+`brig system up` to start the VM (if needed) and warden. If `brig system up` itself
 fails, see "Warden won't start" below.
 
 ## "limactl not found on PATH"
@@ -21,7 +21,7 @@ You need [Lima](https://lima-vm.io/):
 brew install lima
 ```
 
-Then `make setup` (or just `brig up` if you've already run setup once).
+Then `make setup` (or just `brig system up` if you've already run setup once).
 
 ## "Brig VM is not running"
 
@@ -32,7 +32,7 @@ limactl start brig          # If the VM exists.
 make setup                  # If you've never created it (idempotent).
 ```
 
-`brig doctor` reports both states with concrete fix suggestions.
+`brig system doctor` reports both states with concrete fix suggestions.
 
 ## Warden won't start
 
@@ -54,15 +54,15 @@ Common causes, in order of likelihood:
    limactl shell brig -- warden preflight
    ```
 
-4. **Image not pulled yet.** First `brig up` pulls the mitmproxy image and
+4. **Image not pulled yet.** First `brig system up` pulls the mitmproxy image and
    can take a minute. Re-run after the pull completes.
 
-`brig doctor` covers all of the above in one pass.
+`brig system doctor` covers all of the above in one pass.
 
 ## "Why was my request blocked?"
 
 ```bash
-brig network <cell> --blocked
+brig cell network <cell> --blocked
 ```
 
 Shows the most recent blocked requests with the block reason inline.
@@ -91,19 +91,19 @@ has its own disk allocation (default 100 GiB) for the container layer. If
 you're running out:
 
 ```bash
-brig list                     # Find candidate cells.
-brig rm -f <cell>             # Free workspace + container layer.
+brig cell list                     # Find candidate cells.
+brig cell rm -f <cell>             # Free workspace + container layer.
 limactl shell brig -- podman system prune -f   # Reclaim image layers.
 ```
 
-Or in one shot — `brig prune` cleans up stopped cells, old rotated logs
+Or in one shot — `brig system prune` cleans up stopped cells, old rotated logs
 (default >7 days), and orphan subnet allocations (cells whose podman
 network was removed outside brig):
 
 ```bash
-brig prune --dry-run          # see what would be removed
-brig prune                    # do it (all three categories)
-brig prune --logs --log-days 1  # just trim recent logs
+brig system prune --dry-run          # see what would be removed
+brig system prune                    # do it (all three categories)
+brig system prune --logs --log-days 1  # just trim recent logs
 ```
 
 ## "podman: command not found" inside the VM
@@ -136,17 +136,17 @@ rm -rf ~/.brig
 
 | What | Path | Notes |
 |---|---|---|
-| Warden network logs | `/var/log/brig/network/<cell>.jsonl` (inside VM) | Per-cell JSONL. View via `brig network <cell>`. |
+| Warden network logs | `/var/log/brig/network/<cell>.jsonl` (inside VM) | Per-cell JSONL. View via `brig cell network <cell>`. |
 | Warden container logs | `podman logs warden` (inside VM) | mitmproxy stdout. View via `limactl shell brig -- warden logs`. |
-| Cell stdout/stderr | `podman logs brig-<cell>` (inside VM) | View via `brig logs <cell>`. |
-| Brig CLI history | `~/.brig/state/system/operations.jsonl` | View via `brig history`. |
-| Lifecycle events | `~/.brig/state/system/lifecycle.jsonl` | View via `brig events`. |
+| Cell stdout/stderr | `podman logs brig-<cell>` (inside VM) | View via `brig cell logs <cell>`. |
+| Brig CLI history | `~/.brig/state/system/operations.jsonl` | View via `brig system history`. |
+| Lifecycle events | `~/.brig/state/system/lifecycle.jsonl` | View via `brig cell events`. |
 
 ## Still stuck
 
-Run `brig doctor` first — it covers most environment issues with concrete
-fix commands. If that comes up clean and the problem persists, `brig diagnose
+Run `brig system doctor` first — it covers most environment issues with concrete
+fix commands. If that comes up clean and the problem persists, `brig cell diagnose
 <cell>` shows per-cell state (status, runtime, networks).
 
-For deeper inspection: `brig inspect <cell>` dumps the full podman inspect
+For deeper inspection: `brig cell inspect <cell>` dumps the full podman inspect
 JSON.

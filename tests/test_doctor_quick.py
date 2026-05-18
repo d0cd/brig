@@ -1,14 +1,12 @@
-"""C5 from docs/plans/0.3-validation-plan.md: deprecate `brig health` in
-favor of `brig doctor --quick`. The two-essentials check is now shared;
-`brig health` is a thin wrapper that prints a deprecation note.
+"""C5 from docs/plans/0.3-validation-plan.md: `brig system doctor --quick`
+is the two-essentials check (formerly `brig health`, removed in the 0.3.0
+CLI rename).
 """
 
 from __future__ import annotations
 
-import io
 import types
 import unittest
-from contextlib import redirect_stderr
 from unittest.mock import patch
 
 
@@ -42,36 +40,17 @@ class TestDoctorQuickFlag(unittest.TestCase):
         self.assertEqual(rc, 1)
 
 
-class TestHealthDeprecation(unittest.TestCase):
-    @patch("brig.commands.system_cmd.vm_run")
-    @patch("brig.network.proxy.proxy_running", return_value=True)
-    def test_health_prints_deprecation_to_stderr(self, mock_pr, mock_vm):
-        import subprocess
-        mock_vm.return_value = subprocess.CompletedProcess([], 0, "linux\n", "")
-        from brig.commands.system_cmd import cmd_health
+class TestHealthRemoved(unittest.TestCase):
+    """Hard-rename guard: `brig health` is gone, both as a CLI command
+    and as an importable function."""
 
-        err = io.StringIO()
-        with redirect_stderr(err):
-            rc = cmd_health(_args(format="table"))
-
-        self.assertEqual(rc, 0)
-        self.assertIn("deprecated", err.getvalue().lower())
-        self.assertIn("brig doctor --quick", err.getvalue())
-
-    @patch("brig.commands.system_cmd.vm_run")
-    @patch("brig.network.proxy.proxy_running", return_value=True)
-    def test_health_and_quick_produce_same_result(self, mock_pr, mock_vm):
-        # Same backend, same exit code, same JSON output shape.
-        import subprocess
-        mock_vm.return_value = subprocess.CompletedProcess([], 0, "linux\n", "")
-        from brig.commands.system_cmd import cmd_doctor, cmd_health
-
-        err = io.StringIO()
-        with redirect_stderr(err):
-            rc_health = cmd_health(_args(format="json"))
-        rc_doctor_quick = cmd_doctor(_args(quick=True, format="json"))
-
-        self.assertEqual(rc_health, rc_doctor_quick)
+    def test_cmd_health_function_removed(self):
+        from brig.commands import system_cmd
+        self.assertFalse(
+            hasattr(system_cmd, "cmd_health"),
+            "cmd_health should have been removed; the replacement is "
+            "_cmd_doctor_quick (private) exposed via `brig system doctor --quick`",
+        )
 
 
 if __name__ == "__main__":

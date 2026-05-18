@@ -13,7 +13,7 @@ How we keep Brig's dependencies, container images, and CI infrastructure trustwo
 | **SAST** | Bandit scans `src/` on every PR. Skips B101 (assert), B104 (bind 0.0.0.0), B108 (hardcoded tmp). |
 | **Secrets** | TruffleHog scans git history for leaked credentials on every PR. |
 | **Dependabot** | Weekly PRs for pip + GitHub Actions dependency updates. |
-| **Image signatures** | `brig image-verify` requires `cosign`. The previous `podman image trust` fallback was removed — it returned a global policy that could vacuously accept any image when a single `accept` line was present anywhere. |
+| **Image signatures** | `brig image verify` requires `cosign`. The previous `podman image trust` fallback was removed — it returned a global policy that could vacuously accept any image when a single `accept` line was present anywhere. |
 
 ## Dependency inventory
 
@@ -76,10 +76,10 @@ curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/${RELEASE}/${
 
 1. Lima and Podman are system installs managed by Homebrew. Update via `brew upgrade lima podman`.
 2. gVisor is pinned in `scripts/provision-vm.sh`. Bump the version + sha512 (see above) and re-run `make setup`.
-3. Run `brig verify` to confirm invariants still hold.
+3. Run `brig system verify` to confirm invariants still hold.
 
 **Brig's own code:**
 
 1. Security issues should be reported via GitHub security advisories (private disclosure). See `SECURITY.md` at the repo root.
-2. All 9 invariants have tests — run `brig verify` after any security fix.
+2. All 9 invariants have tests — run `brig system verify` after any security fix.
 3. The audit trail is in `docs/INVARIANTS.md`.

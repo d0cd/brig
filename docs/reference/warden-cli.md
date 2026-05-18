@@ -1,7 +1,7 @@
 # Warden CLI Reference
 
 `warden` is the proxy lifecycle CLI. It runs inside the Lima VM. From the
-host, the standard pattern is to use `brig up` / `brig down` (which call
+host, the standard pattern is to use `brig system up` / `brig system down` (which call
 into warden) — but for diagnostics or policy authoring you can call warden
 directly via `limactl shell brig -- warden <subcommand>`.
 
@@ -39,7 +39,7 @@ For the host-side `brig` command, see [`brig-cli.md`](brig-cli.md).
 
 ```bash
 # Easiest: brig-side filter shows the block reason inline.
-brig network <cell> --blocked
+brig cell network <cell> --blocked
 
 # Or test a domain against the policy without actually fetching it.
 brig policy test example.com --path /api

@@ -238,19 +238,6 @@ def _cmd_doctor_quick(fmt: str = "table") -> int:
     return 0 if all_ok else 1
 
 
-def cmd_health(args: Any) -> int:
-    """Handle `brig health` — DEPRECATED, use `brig doctor --quick`.
-
-    Kept for one release cycle so existing scripts keep working. The
-    deprecation note goes to stderr so it doesn't corrupt JSON output
-    consumed by readiness probes.
-    """
-    import sys
-    print(
-        "WARN: `brig health` is deprecated; use `brig doctor --quick`",
-        file=sys.stderr,
-    )
-    return _cmd_doctor_quick(getattr(args, "format", "table"))
 
 
 def cmd_diagnose(args: Any) -> int:

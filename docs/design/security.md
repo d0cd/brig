@@ -139,7 +139,7 @@ xattr -w com.apple.quarantine "0181;$(printf %x $(date +%s));brig;$(uuidgen)" ~/
 **Rules:**
 
 1. **Default runtime is gVisor** — set in containers.conf, not just CLI flag
-2. **`brig list` shows runtime** — always visible which runtime a cell uses
+2. **`brig cell list` shows runtime** — always visible which runtime a cell uses
 3. **Native runtime requires explicit opt-in** — via `--profile dev` (or another non-gVisor profile)
 4. **Runtime is verified at startup** — don't rely solely on config defaults
 
@@ -237,7 +237,7 @@ done
 
 **Why this matters:** Attribution relies on source subnet. If a container joins multiple networks, it may have multiple IP addresses. The proxy cannot reliably attribute traffic to the correct cell.
 
-**Enforcement (in `brig verify`):**
+**Enforcement (in `brig system verify`):**
 
 ```bash
 verify_cell_single_homed() {
@@ -259,7 +259,7 @@ verify_cell_single_homed() {
 
 ### Invariant 9: Proxy Must Be Running Before Cells Start
 
-**Rule:** `brig run` and `brig start` must verify the proxy is running and healthy before starting any cell.
+**Rule:** `brig run` and `brig cell start` must verify the proxy is running and healthy before starting any cell.
 
 **Why this matters:** If cells start without a running proxy, they will have no network path. This creates a confusing debugging experience.
 
@@ -304,7 +304,7 @@ brig run --name cell-b --rm -- cat /work/secret.txt
 # Should fail: file not found
 
 # Cleanup
-brig kill cell-a && brig rm cell-a
+brig cell kill cell-a && brig cell rm cell-a
 ```
 
 ### Test 5: Cell Can't See Another Cell's Processes
@@ -318,7 +318,7 @@ brig run --name cell-b --rm -- ps aux
 # Should only show cell-b's own processes
 
 # Cleanup
-brig kill cell-a && brig rm cell-a
+brig cell kill cell-a && brig cell rm cell-a
 ```
 
 ### Test 6: No Foreign Containers Attached to Cell Networks
@@ -356,7 +356,7 @@ brig run --name cell-b --rm -- curl -m 5 http://cell-a:9000/
 echo "Exit code: $?"  # MUST be non-zero
 
 # Cleanup
-brig kill cell-a && brig rm cell-a
+brig cell kill cell-a && brig cell rm cell-a
 ```
 
 ### Test 9: Proxy Only Exposes Port 8080
@@ -436,7 +436,7 @@ else:
 brig run --name test-identity -d -- sleep 300
 
 # Make a request and check proxy log
-brig exec test-identity -- curl -s https://httpbin.org/ip
+brig cell exec test-identity -- curl -s https://httpbin.org/ip
 sleep 1
 
 # Check last log entry
@@ -444,7 +444,7 @@ limactl shell --workdir / brig -- sudo tail -1 /var/log/brig/network/test-identi
 # Should show src_ip within expected subnet
 
 # Cleanup
-brig kill test-identity && brig rm test-identity
+brig cell kill test-identity && brig cell rm test-identity
 ```
 
 ---
@@ -465,7 +465,7 @@ brig kill test-identity && brig rm test-identity
 
 3. Recreate the network:
    ```bash
-   brig rm my-cell
+   brig cell rm my-cell
    brig run -f cells/my-cell.yaml
    ```
 
@@ -485,7 +485,7 @@ brig kill test-identity && brig rm test-identity
 
 1. Run verification:
    ```bash
-   brig verify
+   brig system verify
    ```
 
 2. Disconnect the container:
@@ -500,19 +500,19 @@ brig kill test-identity && brig rm test-identity
 ### Soft Reset (restart cells and proxy)
 
 ```bash
-brig stop --all
+brig cell stop --all
 warden restart
-brig start --all
+brig cell start --all
 ```
 
 ### Hard Reset (kill everything, keep state)
 
 ```bash
-brig kill --all
+brig cell kill --all
 warden stop
 limactl shell --workdir / brig -- sudo 'for net in $(podman network ls -q | grep "^brig-"); do podman network rm "$net" 2>/dev/null; done'
-brig up
-brig start --all
+brig system up
+brig cell start --all
 ```
 
 ### VM Restart (preserves macOS state)
@@ -520,7 +520,7 @@ brig start --all
 ```bash
 limactl stop brig && limactl start brig
 # Proxy starts automatically via systemd
-brig start --all
+brig cell start --all
 ```
 
 ### VM Recreate (clean slate VM, preserves macOS state)
@@ -528,7 +528,7 @@ brig start --all
 ```bash
 limactl delete brig && make setup
 # All VM state destroyed and rebuilt
-brig start --all
+brig cell start --all
 ```
 
 ### Full Reset (destroy everything)

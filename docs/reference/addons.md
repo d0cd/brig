@@ -9,7 +9,7 @@ by `make _copy-addons`. They run inside the warden container at `/addons/`.
 
 ## Required addons
 
-These load on every `brig up`. Without them the proxy refuses to start.
+These load on every `brig system up`. Without them the proxy refuses to start.
 
 ### `_common.py`
 

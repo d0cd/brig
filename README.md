@@ -62,11 +62,11 @@ brig run --file mycell.yaml                            # from definition file
 ### Manage cells
 
 ```bash
-brig list                     # list all cells
-brig logs mycell -f           # follow logs
-brig exec mycell -- ls -la    # run command in cell
-brig stop mycell              # graceful stop
-brig rm mycell                # remove cell + network + subnet
+brig cell list                     # list all cells
+brig cell logs mycell -f           # follow logs
+brig cell exec mycell -- ls -la    # run command in cell
+brig cell stop mycell              # graceful stop
+brig cell rm mycell                # remove cell + network + subnet
 ```
 
 ### Secrets
@@ -81,7 +81,7 @@ brig run --secret api-key alpine cat /run/secrets/api-key
 ### Profiles
 
 ```bash
-brig profiles                               # list available profiles
+brig system profiles                               # list available profiles
 brig run --profile untrusted alpine sh      # 512m, 1 cpu, restricted
 brig run --profile dev alpine sh            # 4g, 4 cpus, generous
 brig run --network none alpine sh           # fully airgapped
@@ -99,12 +99,12 @@ brig policy show mycell --effective         # merged global + per-cell
 ### System
 
 ```bash
-brig up                       # start everything (VM + warden)
-brig down                     # stop everything
-brig down --vm                # also stop the VM
-brig verify                   # check all 9 security invariants
-brig health                   # system health check
-brig diagnose mycell          # debug a specific cell
+brig system up                       # start everything (VM + warden)
+brig system down                     # stop everything
+brig system down --vm                # also stop the VM
+brig system verify                   # check all 9 security invariants
+brig system doctor --quick                   # system health check
+brig cell diagnose mycell          # debug a specific cell
 ```
 
 ## Network Policy
@@ -131,7 +131,7 @@ Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
 | Per-cell networks | No lateral movement between cells |
 | Warden proxy | Egress filtering, logging, rate limiting |
 
-9 security invariants, all tested. Run `brig verify` to check.
+9 security invariants, all tested. Run `brig system verify` to check.
 
 ## Development
 

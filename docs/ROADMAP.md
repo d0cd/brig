@@ -13,7 +13,7 @@ have a clear trigger condition — build them when you hit the friction, not bef
 `ops.sh migrate` only captures `/work/.hermes/` (agent state), not runtime
 package installs.
 
-**Trigger:** You find yourself re-installing packages after `brig rm` + `brig run`.
+**Trigger:** You find yourself re-installing packages after `brig cell rm` + `brig run`.
 
 **Effort:** Low. `podman commit` + `podman save` + tarball glue.
 
@@ -78,14 +78,14 @@ upstream services they call.
 Two architectural options to evaluate when this is built:
 
 1. **Global toggle.** A separate `proxy-tor` external network with a Tor +
-   Privoxy stack. `brig up --tor` brings the stack up; all cells route
+   Privoxy stack. `brig system up --tor` brings the stack up; all cells route
    through it. Simple but coarse.
 2. **Per-cell toggle.** Cell spec field `egress: tor` selects a different
    upstream from warden. Requires warden to chain to per-cell upstreams,
    which mitmproxy supports via per-flow `set_upstream_proxy_*`.
 
 Either path needs: cosign-verified pinned Tor + Privoxy images, a
-`brig doctor` check that Tor exit-IP egress actually works, and
+`brig system doctor` check that Tor exit-IP egress actually works, and
 documentation that this only hides the cell from upstream — not the cell
 from the host (Lima VM still sees the cell, warden still policies it).
 
@@ -140,7 +140,7 @@ rewritten in ~200 lines.
 **Status:** Deferred — polish, not capability. Earlier `src/tui.py` and
 `src/dashboard.py` scaffolding was deleted because it was unwired and
 untested. The same Textual library is fine when this comes back; design
-fresh from `brig stats`, `brig network`, and `brig list` as data sources.
+fresh from `brig cell stats`, `brig cell network`, and `brig cell list` as data sources.
 
 **Trigger:** Running multiple agents daily and switching between commands is
 annoying.
@@ -149,7 +149,7 @@ annoying.
 **Status:** Deferred — earlier `summarizer.py` addon was deleted because
 nothing loaded it and it lived in the wrong place architecturally.
 
-If revived, build it as a host-side `brig logs compact` tool that reads
+If revived, build it as a host-side `brig cell logs compact` tool that reads
 the JSONL files outside the warden container. That keeps warden small,
 keeps the LLM API egress on the host (where it can be policied or routed
 through an existing gateway), and avoids putting an LLM dependency on the

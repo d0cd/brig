@@ -15,13 +15,13 @@ on the host.
 > names.
 
 > Prereqs (already done on this machine):
-> - Brig is installed and `brig up` succeeds.
+> - Brig is installed and `brig system up` succeeds.
 > - A model API server is listening on `127.0.0.1:$MODEL_PORT` on the host.
 > - Global policy already declares the host service:
 >   `brig policy set global --host-service model:$MODEL_PORT`
 >   (warden will forward `model.host.brig` → `host:$MODEL_PORT`).
 >
-> Verify with `brig health` → both checks `[OK]`.
+> Verify with `brig system doctor --quick` → both checks `[OK]`.
 
 ## 1. Build the agent image inside the VM
 
@@ -92,19 +92,19 @@ Notes:
 ## 5. Verify it's reaching the host service
 
 ```bash
-brig logs my-agent -f                    # agent stdout
-brig network my-agent --tail 20          # warden's view of the cell's egress
-brig network my-agent --blocked          # any requests warden refused
+brig cell logs my-agent -f                    # agent stdout
+brig cell network my-agent --tail 20          # warden's view of the cell's egress
+brig cell network my-agent --blocked          # any requests warden refused
 ```
 
-A working setup shows `GET /v1/... -> 200` lines in `brig network`, with
+A working setup shows `GET /v1/... -> 200` lines in `brig cell network`, with
 the cell's name in the warden log file inside the VM.
 
 ## 6. Cleanup
 
 ```bash
-brig stop my-agent
-brig rm my-agent
+brig cell stop my-agent
+brig cell rm my-agent
 brig policy rm my-agent      # remove per-cell ACL (drops back to global)
 brig secrets rm my-api-key
 ```
@@ -124,4 +124,4 @@ brig secrets rm my-api-key
   sure your profile mounts the cell workspace (the `dev` profile does).
 - **Stale subnet after a failed run** — re-running `brig run --name X`
   after the previous attempt errored out leaves the cell + network behind.
-  `brig rm -f X` clears it.
+  `brig cell rm -f X` clears it.

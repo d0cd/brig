@@ -1,14 +1,21 @@
 """
 Brig CLI — argparse setup and main entry point.
 
-No _BrigModule metaclass hack. No wildcard imports. Each command dispatches
-to a thin handler in brig.commands.*_cmd that calls domain modules.
+Command shape (since 0.3.0):
+  brig run <image> ...                 # primary verb
+  brig cell <verb> <name> ...          # per-cell operations
+  brig image <verb> ...                # image lifecycle
+  brig system <verb> ...               # VM + warden + diagnostics
+  brig policy <verb> ...               # network policy
+  brig secrets <verb> ...              # secret storage
+  brig config <verb> ...               # config file
+
+Hard rename — no aliases for the old flat names.
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import signal
 import sys
 
@@ -17,9 +24,18 @@ from brig.errors import BrigError
 from brig.ops.logging import configure as configure_logging, error as log_error
 from brig.ops.history import log_operation_start, log_operation_end
 
-# Commands that run on the macOS host without needing the Lima VM.
-_HOST_ONLY_COMMANDS = frozenset({
-    "init", "config", "history", "image-verify", "up", "profiles", "secrets",
+# Top-level commands that run on the macOS host without needing the Lima VM.
+# `system` is special — only a few of its subcommands need the VM (see below).
+_HOST_ONLY_TOP = frozenset({
+    "config", "secrets",
+})
+# `system` subcommands that don't touch the VM.
+_HOST_ONLY_SYSTEM = frozenset({
+    "init", "profiles", "up",  # up creates+starts the VM; doesn't need it pre-existing.
+})
+# `image` subcommands that don't touch the VM.
+_HOST_ONLY_IMAGE = frozenset({
+    "verify",
 })
 
 
@@ -36,37 +52,61 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # --- Cell lifecycle ---
-    p_run = sub.add_parser("run", help="Run a new cell",
+    _add_run_parser(sub)
+    _add_cell_group(sub)
+    _add_image_group(sub)
+    _add_system_group(sub)
+
+    # External groups registered by their command modules.
+    from brig.commands import secrets_cmd, policy_cmd, config_cmd
+    secrets_cmd.register_parser(sub)
+    policy_cmd.register_parser(sub)
+    config_cmd.register_parser(sub)
+
+    return parser
+
+
+def _add_run_parser(sub: argparse._SubParsersAction) -> None:
+    """`brig run` — the primary verb, kept flat to match docker/podman."""
+    p = sub.add_parser(
+        "run", help="Run a new cell",
         epilog="Examples:\n"
                "  brig run alpine echo hello\n"
                "  brig run --name test --profile untrusted python:3.12 python app.py\n"
                "  brig run --secret api-key alpine -- curl -H @/run/secrets/api-key $URL\n"
                "  brig run --file mycell.yaml\n",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p_run.add_argument("image", nargs="?", help="Container image (must precede 'command'; flags must come before image)")
-    p_run.add_argument("container_cmd", nargs=argparse.REMAINDER, metavar="command",
-                       help="Command to run (use -- before flags like -la)")
-    p_run.add_argument("--name", "-n", help="Cell name (auto-generated if omitted)")
-    p_run.add_argument("--env", "-e", action="append", help="Environment variable (KEY=VALUE)")
-    p_run.add_argument("--secret", "-s", action="append", help="Secret to mount")
-    p_run.add_argument("--memory", "-m", help="Memory limit (e.g. 512m, 2g)")
-    p_run.add_argument("--cpus", help="CPU limit")
-    p_run.add_argument("--pids-limit", type=int, help="PID limit")
-    p_run.add_argument("--network", help="Network mode (default or none)")
-    p_run.add_argument("--profile", help="Trust profile")
-    p_run.add_argument("--file", "-f", help="Cell definition file (YAML/JSON)")
-    p_run.add_argument("--policy-allow", action="append", help="Allowed domains")
-    p_run.add_argument("--policy-deny", action="append", help="Denied domains")
-    p_run.add_argument("--label", "-l", action="append", help="Labels (key=value)")
-    p_run.add_argument("--timeout", help="Container timeout (e.g. 30s, 5m)")
-    p_run.add_argument("--workspace-quota", help="Workspace size limit")
-    p_run.add_argument("-d", "--detach", action="store_true", help="Run in background")
-    p_run.add_argument("--rm", action="store_true", help="Remove on exit")
-    p_run.add_argument("--image-digest", help="Expected image digest")
-    p_run.add_argument("--workdir", help="Working directory override")
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("image", nargs="?", help="Container image (flags must precede image)")
+    p.add_argument("container_cmd", nargs=argparse.REMAINDER, metavar="command",
+                   help="Command to run (use -- before flags like -la)")
+    p.add_argument("--name", "-n", help="Cell name (auto-generated if omitted)")
+    p.add_argument("--env", "-e", action="append", help="Environment variable (KEY=VALUE)")
+    p.add_argument("--secret", "-s", action="append", help="Secret to mount")
+    p.add_argument("--memory", "-m", help="Memory limit (e.g. 512m, 2g)")
+    p.add_argument("--cpus", help="CPU limit")
+    p.add_argument("--pids-limit", type=int, help="PID limit")
+    p.add_argument("--network", help="Network mode (default or none)")
+    p.add_argument("--profile", help="Trust profile")
+    p.add_argument("--file", "-f", help="Cell definition file (YAML/JSON)")
+    p.add_argument("--policy-allow", action="append", help="Allowed domains")
+    p.add_argument("--policy-deny", action="append", help="Denied domains")
+    p.add_argument("--label", "-l", action="append", help="Labels (key=value)")
+    p.add_argument("--timeout", help="Container timeout (e.g. 30s, 5m)")
+    p.add_argument("--workspace-quota", help="Workspace size limit")
+    p.add_argument("-d", "--detach", action="store_true", help="Run in background")
+    p.add_argument("--rm", action="store_true", help="Remove on exit")
+    p.add_argument("--image-digest", help="Expected image digest")
+    p.add_argument("--workdir", help="Working directory override")
 
-    _LIFECYCLE_HELP = {
+
+def _add_cell_group(sub: argparse._SubParsersAction) -> None:
+    """`brig cell <verb>` — per-cell operations."""
+    p_cell = sub.add_parser("cell", help="Cell lifecycle and inspection")
+    cs = p_cell.add_subparsers(dest="cell_command", required=True)
+
+    # One-arg lifecycle verbs.
+    _ONE_ARG = {
         "stop": "Gracefully stop a running cell",
         "kill": "Immediately kill a running cell (SIGKILL)",
         "start": "Start a previously-stopped cell",
@@ -74,158 +114,160 @@ def _build_parser() -> argparse.ArgumentParser:
         "unpause": "Resume processes in a paused cell",
         "attach": "Attach stdio to a running cell",
         "shell": "Open an interactive /bin/sh inside a running cell",
+        "wait": "Block until a cell exits, then print its exit code",
+        "inspect": "Show cell details (raw podman inspect JSON)",
+        "diagnose": "Run diagnostic checks for a cell",
+        "export": "Export cell as reusable YAML definition",
+        "top": "Show processes in cell",
+        "diff": "Show filesystem changes since image base",
     }
-    for name, help_text in _LIFECYCLE_HELP.items():
-        p = sub.add_parser(name, help=help_text)
+    for name, help_text in _ONE_ARG.items():
+        p = cs.add_parser(name, help=help_text)
         p.add_argument("name", help="Cell name")
 
-    p_wait = sub.add_parser("wait", help="Block until a cell exits, then print its exit code")
-    p_wait.add_argument("name", help="Cell name")
-
-    p_rm = sub.add_parser("rm", help="Remove a cell")
+    p_rm = cs.add_parser("rm", help="Remove a cell")
     p_rm.add_argument("name", help="Cell name")
     p_rm.add_argument("-f", "--force", action="store_true", help="Force removal")
 
-    p_rename = sub.add_parser("rename", help="Rename a cell")
+    p_rename = cs.add_parser("rename", help="Rename a cell")
     p_rename.add_argument("old_name", help="Current name")
     p_rename.add_argument("new_name", help="New name")
 
-    p_exec = sub.add_parser("exec", help="Execute command in cell")
+    p_exec = cs.add_parser("exec", help="Execute command in cell")
     p_exec.add_argument("name", help="Cell name")
     p_exec.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
-    p_exec.add_argument("exec_cmd", nargs=argparse.REMAINDER, metavar="command", help="Command to execute")
+    p_exec.add_argument("exec_cmd", nargs=argparse.REMAINDER, metavar="command",
+                        help="Command to execute")
 
-    p_list = sub.add_parser("list", help="List all cells")
-    p_list.add_argument("--format", choices=["table", "wide", "json"], default="table",
-                        help="table (default), wide (more columns), or json")
+    p_list = cs.add_parser("list", help="List all cells")
+    p_list.add_argument("--format", choices=["table", "wide", "json"], default="table")
 
-    # --- Info ---
-    p_inspect = sub.add_parser("inspect", help="Show cell details")
-    p_inspect.add_argument("name", help="Cell name")
-
-    p_export = sub.add_parser("export", help="Export cell as reusable YAML definition")
-    p_export.add_argument("name", help="Cell name")
-
-    # --- Secrets / Policy / Config — registered by their command modules ---
-    from brig.commands import secrets_cmd, policy_cmd, config_cmd
-    secrets_cmd.register_parser(sub)
-
-    p_files = sub.add_parser("files", help="List workspace contents")
+    p_files = cs.add_parser("files", help="List workspace contents")
     p_files.add_argument("name", help="Cell name")
     p_files.add_argument("path", nargs="?", default="/work", help="Path inside cell")
 
-    p_logs = sub.add_parser("logs", help="View cell logs")
+    p_logs = cs.add_parser("logs", help="View cell logs")
     p_logs.add_argument("name", help="Cell name")
     p_logs.add_argument("-f", "--follow", action="store_true", help="Follow log output")
     p_logs.add_argument("--tail", type=int, help="Number of lines")
 
-    p_top = sub.add_parser("top", help="Show processes in cell")
-    p_top.add_argument("name", help="Cell name")
-
-    p_diff = sub.add_parser("diff", help="Show filesystem changes")
-    p_diff.add_argument("name", help="Cell name")
-
-    p_stats = sub.add_parser("stats", help="Show resource usage")
+    p_stats = cs.add_parser("stats", help="Show resource usage")
     p_stats.add_argument("name", nargs="?", help="Cell name (optional)")
 
-    # --- Workspace ---
-    p_cp = sub.add_parser("cp", help="Copy files to/from cell")
+    p_cp = cs.add_parser("cp", help="Copy files to/from cell")
     p_cp.add_argument("src", help="Source path")
     p_cp.add_argument("dst", help="Destination path")
 
-    # --- Network/Events ---
-    p_network = sub.add_parser("network", help="View network activity")
+    p_network = cs.add_parser("network", help="View network activity")
     p_network.add_argument("name", help="Cell name")
     p_network.add_argument("--tail", type=int, default=20, help="Number of entries")
     p_network.add_argument("--blocked", action="store_true",
-                           help="Show only requests that warden blocked (and why)")
+                           help="Show only requests warden blocked (and why)")
 
-    p_events = sub.add_parser("events", help="Stream lifecycle events")
+    p_events = cs.add_parser("events", help="Stream lifecycle events")
     p_events.add_argument("name", nargs="?", help="Cell name filter")
     p_events.add_argument("--tail", type=int, default=20, help="Number of entries")
     p_events.add_argument("-f", "--follow", action="store_true",
                           help="Block and print new events as they arrive")
 
-    # --- Image ---
-    p_build = sub.add_parser(
-        "build",
-        help="Build a container image from a directory with a Containerfile",
+
+def _add_image_group(sub: argparse._SubParsersAction) -> None:
+    """`brig image <verb>` — image build / pull / load / verify."""
+    p_image = sub.add_parser("image", help="Image build / pull / load / verify")
+    isub = p_image.add_subparsers(dest="image_command", required=True)
+
+    p_build = isub.add_parser(
+        "build", help="Build a container image from a directory",
     )
     p_build.add_argument("context", help="Build-context directory (host path)")
-    p_build.add_argument(
-        "--tag", "-t",
-        help="Image tag (default: localhost/<dir-basename>:latest)",
-    )
-    p_build.add_argument(
-        "--build-arg", action="append",
-        metavar="KEY=VALUE",
-        help="Build-time variable (passed through to podman build)",
-    )
+    p_build.add_argument("--tag", "-t",
+                         help="Image tag (default: localhost/<dir-basename>:latest)")
+    p_build.add_argument("--file", "-f",
+                         help="Containerfile path relative to context "
+                              "(default: auto-detect Containerfile/Dockerfile)")
+    p_build.add_argument("--build-arg", action="append", metavar="KEY=VALUE",
+                         help="Build-time variable (passed through to podman)")
 
-    p_pull = sub.add_parser("pull", help="Pull and cache image")
+    p_pull = isub.add_parser("pull", help="Pull and cache image")
     p_pull.add_argument("image", help="Image to pull")
 
-    p_warmup = sub.add_parser("warmup", help="Pre-pull images for profile")
+    p_load = isub.add_parser(
+        "load",
+        help="Side-load a prebuilt image tarball "
+             "(for CI output / air-gapped / vendor-drop)",
+    )
+    p_load.add_argument("tarball", help="Path to `podman save` tarball on the host")
+
+    p_verify = isub.add_parser("verify", help="Verify image signature (cosign)")
+    p_verify.add_argument("image", help="Image to verify")
+    p_verify.add_argument("--key", help="Cosign public key")
+    p_verify.add_argument("--keyless", action="store_true", help="Keyless verification")
+
+    p_warmup = isub.add_parser("warmup", help="Pre-pull images for a profile")
     p_warmup.add_argument("--profile", help="Profile name")
 
-    p_imgverify = sub.add_parser("image-verify", help="Verify image signature")
-    p_imgverify.add_argument("image", help="Image to verify")
-    p_imgverify.add_argument("--key", help="Cosign public key")
-    p_imgverify.add_argument("--keyless", action="store_true", help="Keyless verification")
 
+def _add_system_group(sub: argparse._SubParsersAction) -> None:
+    """`brig system <verb>` — VM, warden, diagnostics."""
+    p_system = sub.add_parser("system", help="VM, warden, diagnostics")
+    ss = p_system.add_subparsers(dest="system_command", required=True)
 
-    # --- Convenience ---
-    sub.add_parser("up", help="Ensure VM + warden are running (init if needed)")
-    p_down = sub.add_parser("down", help="Stop all cells + warden")
+    ss.add_parser("init", help="Initialize brig (create ~/.brig, default policy)")
+    ss.add_parser("up", help="Ensure VM + warden are running")
+    p_down = ss.add_parser("down", help="Stop all cells + warden")
     p_down.add_argument("--vm", action="store_true", help="Also stop the VM")
-    sub.add_parser("profiles", help="List available trust profiles")
-    p_watch = sub.add_parser("watchdog", help="Monitor warden, restart on failure")
-    p_watch.add_argument("--interval", type=int, default=30, help="Check interval (seconds)")
-    p_watch.add_argument("--max-restarts", type=int, default=5, help="Max restart attempts")
+    ss.add_parser("profiles", help="List available trust profiles")
+    ss.add_parser("preflight", help="Run pre-start checks")
+    ss.add_parser("metrics", help="Output Prometheus metrics")
 
-    # --- System ---
-    sub.add_parser("init", help="Initialize brig")
-
-    p_verify = sub.add_parser("verify", help="Verify security invariants")
+    p_verify = ss.add_parser("verify", help="Verify security invariants")
     p_verify.add_argument("--fix", action="store_true", help="Auto-fix issues")
 
-    p_health = sub.add_parser("health", help="Check system health")
-    p_health.add_argument("--format", choices=["table", "json"], default="table")
-
-    p_diagnose = sub.add_parser("diagnose", help="Run diagnostic checks")
-    p_diagnose.add_argument("name", help="Cell name")
-
-    p_doctor = sub.add_parser("doctor", help="Check environment and report fixable issues")
+    p_doctor = ss.add_parser(
+        "doctor", help="Check environment and report fixable issues",
+    )
     p_doctor.add_argument(
         "--quick", action="store_true",
-        help="Only check the two essentials (proxy + VM). Same as the "
-             "deprecated `brig health`.",
+        help="Only check the two essentials (proxy + VM).",
     )
 
-    sub.add_parser("preflight", help="Run pre-start checks")
-    sub.add_parser("metrics", help="Output Prometheus metrics")
+    p_watchdog = ss.add_parser("watchdog", help="Monitor warden, restart on failure")
+    p_watchdog.add_argument("--interval", type=int, default=30,
+                            help="Check interval (seconds)")
+    p_watchdog.add_argument("--max-restarts", type=int, default=5,
+                            help="Max restart attempts")
 
-    p_prune = sub.add_parser("prune",
-        help="Clean up stopped cells, old logs, orphan subnet allocations")
+    p_prune = ss.add_parser(
+        "prune",
+        help="Clean up stopped cells, old logs, orphan subnet allocations",
+    )
     p_prune.add_argument("--cells", action="store_true",
-                         help="Only prune stopped cells (default: all categories)")
+                         help="Only prune stopped cells (default: all)")
     p_prune.add_argument("--logs", action="store_true",
-                         help="Only prune old log files (default: all categories)")
+                         help="Only prune old log files (default: all)")
     p_prune.add_argument("--subnets", action="store_true",
-                         help="Only prune orphan subnet allocations (default: all categories)")
+                         help="Only prune orphan subnet allocations (default: all)")
     p_prune.add_argument("--log-days", type=int, default=7,
                          help="Drop rotated logs older than N days (default: 7)")
     p_prune.add_argument("-n", "--dry-run", action="store_true",
                          help="Show what would be removed without acting")
 
-    p_history = sub.add_parser("history", help="Show operation history")
+    p_history = ss.add_parser("history", help="Show brig CLI operation history")
     p_history.add_argument("--tail", type=int, default=20, help="Number of entries")
     p_history.add_argument("--cell", help="Filter by cell name")
 
-    policy_cmd.register_parser(sub)
-    config_cmd.register_parser(sub)
 
-    return parser
+def _is_host_only(args: argparse.Namespace) -> bool:
+    """Whether the command can run without the Lima VM."""
+    cmd = args.command
+    if cmd in _HOST_ONLY_TOP:
+        return True
+    if cmd == "system":
+        return getattr(args, "system_command", "") in _HOST_ONLY_SYSTEM
+    if cmd == "image":
+        return getattr(args, "image_command", "") in _HOST_ONLY_IMAGE
+    # `policy`, `config` — host-only.
+    return cmd in {"policy", "config"}
 
 
 def main() -> None:
@@ -242,7 +284,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(130))
 
     # Preflight: check Lima is available for commands that need the VM.
-    if args.command not in _HOST_ONLY_COMMANDS:
+    if not _is_host_only(args):
         import shutil
         if not shutil.which("limactl"):
             log_error("limactl not found on PATH")
@@ -250,64 +292,78 @@ def main() -> None:
             sys.exit(1)
         from brig.vm.shell import vm_running
         if not vm_running():
-            # Allow init-adjacent commands through with a warning.
-            if args.command not in {"health", "preflight"}:
+            # `system doctor` and `system preflight` are diagnostics — let
+            # them through so the user can find out *why* the VM isn't up.
+            sys_cmd = getattr(args, "system_command", "")
+            if not (args.command == "system" and sys_cmd in {"doctor", "preflight"}):
                 log_error("Brig VM is not running")
-                log_error("  Start it with: limactl start brig")
-                log_error("  Or initialize: brig init && limactl create --name=brig ~/.brig/lima.yaml")
+                log_error("  Start it with: brig system up")
+                log_error("  Or initialize: brig system init && brig system up")
                 sys.exit(1)
 
-    # Lazy imports to avoid loading all modules on every invocation.
     from brig.commands import (
         lifecycle_cmd, system_cmd, policy_cmd,
         network_cmd, config_cmd, image_cmd, convenience_cmd,
         secrets_cmd, watchdog_cmd,
     )
 
-    dispatch = {
+    # Two-level dispatch: keyed by (group, verb) for grouped commands,
+    # plain str for top-level commands.
+    dispatch: dict = {
         "run": lifecycle_cmd.cmd_run,
-        "stop": lifecycle_cmd.cmd_stop,
-        "kill": lifecycle_cmd.cmd_kill,
-        "rm": lifecycle_cmd.cmd_rm,
-        "start": lifecycle_cmd.cmd_start,
-        "wait": lifecycle_cmd.cmd_wait,
-        "pause": lifecycle_cmd.cmd_pause,
-        "unpause": lifecycle_cmd.cmd_unpause,
-        "exec": lifecycle_cmd.cmd_exec,
-        "shell": lifecycle_cmd.cmd_shell,
-        "attach": lifecycle_cmd.cmd_attach,
-        "rename": lifecycle_cmd.cmd_rename,
-        "list": lifecycle_cmd.cmd_list,
-        "inspect": lifecycle_cmd.cmd_inspect,
-        "export": lifecycle_cmd.cmd_export,
-        "files": lifecycle_cmd.cmd_files,
-        "logs": lifecycle_cmd.cmd_logs,
-        "top": lifecycle_cmd.cmd_top,
-        "diff": lifecycle_cmd.cmd_diff,
-        "stats": lifecycle_cmd.cmd_stats,
-        "cp": lifecycle_cmd.cmd_cp,
-        "network": network_cmd.cmd_network,
-        "events": network_cmd.cmd_events,
-        "build": image_cmd.cmd_build,
-        "pull": image_cmd.cmd_pull,
-        "warmup": image_cmd.cmd_warmup,
-        "image-verify": image_cmd.cmd_verify_image,
-        "init": system_cmd.cmd_init,
-        "verify": system_cmd.cmd_verify,
-        "health": system_cmd.cmd_health,
-        "diagnose": system_cmd.cmd_diagnose,
-        "doctor": system_cmd.cmd_doctor,
-        "preflight": system_cmd.cmd_preflight,
-        "metrics": system_cmd.cmd_metrics,
-        "prune": system_cmd.cmd_prune,
-        "history": system_cmd.cmd_history,
-        "up": convenience_cmd.cmd_up,
-        "down": convenience_cmd.cmd_down,
-        "profiles": convenience_cmd.cmd_profiles,
-        "watchdog": watchdog_cmd.cmd_watchdog,
+
+        # cell *
+        ("cell", "list"): lifecycle_cmd.cmd_list,
+        ("cell", "inspect"): lifecycle_cmd.cmd_inspect,
+        ("cell", "export"): lifecycle_cmd.cmd_export,
+        ("cell", "stop"): lifecycle_cmd.cmd_stop,
+        ("cell", "kill"): lifecycle_cmd.cmd_kill,
+        ("cell", "start"): lifecycle_cmd.cmd_start,
+        ("cell", "pause"): lifecycle_cmd.cmd_pause,
+        ("cell", "unpause"): lifecycle_cmd.cmd_unpause,
+        ("cell", "attach"): lifecycle_cmd.cmd_attach,
+        ("cell", "shell"): lifecycle_cmd.cmd_shell,
+        ("cell", "wait"): lifecycle_cmd.cmd_wait,
+        ("cell", "rm"): lifecycle_cmd.cmd_rm,
+        ("cell", "rename"): lifecycle_cmd.cmd_rename,
+        ("cell", "exec"): lifecycle_cmd.cmd_exec,
+        ("cell", "files"): lifecycle_cmd.cmd_files,
+        ("cell", "logs"): lifecycle_cmd.cmd_logs,
+        ("cell", "top"): lifecycle_cmd.cmd_top,
+        ("cell", "diff"): lifecycle_cmd.cmd_diff,
+        ("cell", "stats"): lifecycle_cmd.cmd_stats,
+        ("cell", "cp"): lifecycle_cmd.cmd_cp,
+        ("cell", "network"): network_cmd.cmd_network,
+        ("cell", "events"): network_cmd.cmd_events,
+        ("cell", "diagnose"): system_cmd.cmd_diagnose,
+
+        # image *
+        ("image", "build"): image_cmd.cmd_build,
+        ("image", "pull"): image_cmd.cmd_pull,
+        ("image", "load"): image_cmd.cmd_load,
+        ("image", "verify"): image_cmd.cmd_verify_image,
+        ("image", "warmup"): image_cmd.cmd_warmup,
+
+        # system *
+        ("system", "init"): system_cmd.cmd_init,
+        ("system", "up"): convenience_cmd.cmd_up,
+        ("system", "down"): convenience_cmd.cmd_down,
+        ("system", "profiles"): convenience_cmd.cmd_profiles,
+        ("system", "verify"): system_cmd.cmd_verify,
+        ("system", "doctor"): system_cmd.cmd_doctor,
+        ("system", "preflight"): system_cmd.cmd_preflight,
+        ("system", "metrics"): system_cmd.cmd_metrics,
+        ("system", "prune"): system_cmd.cmd_prune,
+        ("system", "watchdog"): watchdog_cmd.cmd_watchdog,
+        ("system", "history"): system_cmd.cmd_history,
     }
 
-    if args.command == "policy":
+    if args.command in {"cell", "image", "system"}:
+        sub_attr = f"{args.command}_command"
+        sub_value = getattr(args, sub_attr)
+        cmd_func = dispatch.get((args.command, sub_value))
+        cmd_name = f"{args.command}.{sub_value}"
+    elif args.command == "policy":
         cmd_func = policy_cmd.DISPATCH.get(args.policy_command)
         cmd_name = f"policy.{args.policy_command}"
     elif args.command == "config":
@@ -337,20 +393,20 @@ def main() -> None:
         if e.suggestion:
             log_error(f"  Suggestion: {e.suggestion}")
     except KeyboardInterrupt:
-        error_msg = "Interrupted by user"
+        error_msg = "interrupted"
         exit_code = 130
-    except SystemExit as e:
-        exit_code = e.code if isinstance(e.code, int) else 1
-    except Exception as e:
-        sanitized = re.sub(r'(/[^\s:]+)', '<path>', str(e))
-        error_msg = sanitized
+    except Exception as e:  # noqa: BLE001
+        error_msg = repr(e)
         exit_code = 1
+        log_error(f"Unexpected error: {e}")
         if args.debug:
             import traceback
             traceback.print_exc()
-        else:
-            log_error(sanitized)
     finally:
-        log_operation_end(op_context, exit_code, error_msg)
+        log_operation_end(op_context, exit_code=exit_code, error=error_msg)
 
     sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

@@ -190,7 +190,7 @@ class TestEventsFollowFlag(unittest.TestCase):
     def test_follow_flag_present_in_parser(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["events", "--follow", "--tail", "5"])
+        args = parser.parse_args(["cell", "events", "--follow", "--tail", "5"])
         self.assertTrue(args.follow)
         self.assertEqual(args.tail, 5)
 
@@ -199,7 +199,7 @@ class TestNetworkBlockedFilter(unittest.TestCase):
     def test_blocked_flag_present(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["network", "mycell", "--blocked"])
+        args = parser.parse_args(["cell", "network", "mycell", "--blocked"])
         self.assertTrue(args.blocked)
 
 
@@ -215,8 +215,9 @@ class TestDoctorRegistered(unittest.TestCase):
     def test_doctor_in_parser(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["doctor"])
-        self.assertEqual(args.command, "doctor")
+        args = parser.parse_args(["system", "doctor"])
+        self.assertEqual(args.command, "system")
+        self.assertEqual(args.system_command, "doctor")
 
 
 class TestDoctorCommand(unittest.TestCase):
@@ -329,8 +330,9 @@ class TestPruneCommand(unittest.TestCase):
     def test_prune_in_parser(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["prune"])
-        self.assertEqual(args.command, "prune")
+        args = parser.parse_args(["system", "prune"])
+        self.assertEqual(args.command, "system")
+        self.assertEqual(args.system_command, "prune")
         # Defaults: no scope flag set → all categories.
         self.assertFalse(args.cells)
         self.assertFalse(args.logs)
@@ -341,7 +343,9 @@ class TestPruneCommand(unittest.TestCase):
     def test_prune_flags(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["prune", "--cells", "--dry-run", "--log-days", "30"])
+        args = parser.parse_args([
+            "system", "prune", "--cells", "--dry-run", "--log-days", "30",
+        ])
         self.assertTrue(args.cells)
         self.assertTrue(args.dry_run)
         self.assertEqual(args.log_days, 30)

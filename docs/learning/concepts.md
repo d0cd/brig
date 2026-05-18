@@ -306,12 +306,12 @@ The `~/.brig/state/` directory contains untrusted output from cells.
 1. Review files inside the VM first:
    ```bash
    brig cat my-cell /work/output.txt
-   brig files my-cell
+   brig cell files my-cell
    ```
 
 2. Export with sanitization:
    ```bash
-   brig cp --sanitize my-cell:/work/report.html ./report.html
+   brig cell cp --sanitize my-cell:/work/report.html ./report.html
    ```
 
 3. Never run from state directory directly
