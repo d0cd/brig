@@ -401,10 +401,18 @@ def _v_host_socket_entry(
             f"'host_sockets[{i}].mount_point' must be a file path under "
             f"'{HOST_SOCKET_MOUNT_PREFIX}', not the directory itself{context}"
         )
-    elif mount_point in seen_mounts:
-        errors.append(f"Duplicate host_sockets mount_point '{mount_point}'{context}")
     else:
-        seen_mounts.add(mount_point)
+        # Normalize before duplicate-checking so /run/host/x and
+        # /run/host//x and /run/host/./x all collide. Audit fix M3.
+        import os.path as _ospath
+        normalized = _ospath.normpath(mount_point)
+        if normalized in seen_mounts:
+            errors.append(
+                f"Duplicate host_sockets mount_point '{mount_point}' "
+                f"(normalizes to '{normalized}'){context}"
+            )
+        else:
+            seen_mounts.add(normalized)
 
     mode = entry.get("mode", "ro")
     if not isinstance(mode, str) or mode not in HOST_SOCKET_MODES:
@@ -438,12 +446,28 @@ def _v_host_sockets(value: Any, cell_def: dict, context: str) -> list[str]:
     # The `untrusted` profile is brig's "I am running adversarial code"
     # toggle. Bypassing Warden via a kernel side channel defeats the
     # point — reject at parse time so the operator can't accidentally
-    # do it. Other profiles (supervised, dev) are unaffected.
-    if cell_def.get("profile") == "untrusted" and value:
+    # do it. We check both the declared name AND, for user-defined
+    # profiles, whether they shadow / inherit the untrusted profile.
+    # Audit fix C2.
+    if value and _profile_is_untrusted(cell_def.get("profile")):
         errors.append(
-            f"'host_sockets' is not allowed with profile='untrusted' — "
+            f"'host_sockets' is not allowed with the untrusted profile — "
             f"untrusted cells must not have side channels to host services"
             f"{context}"
+        )
+
+    # Cell name with dots breaks launchd label parsing: the bridge
+    # label is `com.brig.host-socket.<cell>.<socket>` and is split on
+    # `.`. A cell named `my.cell` would mis-derive socket names and,
+    # worse, a prefix-based stop_cell_bridges("my") would tear down
+    # bridges of `my.cell`. CELL_NAME_PATTERN allows dots for legacy
+    # reasons; we forbid them only when host_sockets are declared.
+    # Audit fix H1.
+    cell_name = cell_def.get("name", "")
+    if value and isinstance(cell_name, str) and "." in cell_name:
+        errors.append(
+            f"cell names with '.' may not declare host_sockets "
+            f"(launchd label ambiguity){context}"
         )
 
     seen_names: set = set()
@@ -454,6 +478,33 @@ def _v_host_sockets(value: Any, cell_def: dict, context: str) -> list[str]:
         )
 
     return errors
+
+
+def _profile_is_untrusted(profile_name: Any) -> bool:
+    """Decide whether a profile reference means the cell is untrusted.
+
+    Direct string match handles the common case. For user-defined
+    profiles that shadow the builtin name OR carry the same intent via
+    a different name, we also check the resolved profile's labels for
+    `brig.profile: untrusted` — the builtin signal. Audit fix C2.
+    """
+    if profile_name == "untrusted":
+        return True
+    if not isinstance(profile_name, str) or not profile_name:
+        return False
+    try:
+        from brig.cell.profiles import load_profile
+        prof = load_profile(profile_name)
+    except (ValueError, FileNotFoundError, OSError):
+        return False
+    labels = prof.get("labels", {})
+    if isinstance(labels, dict) and labels.get("brig.profile") == "untrusted":
+        return True
+    if isinstance(labels, list):
+        for item in labels:
+            if isinstance(item, str) and item == "brig.profile=untrusted":
+                return True
+    return False
 
 
 def _v_ingress_entry(i: int, entry: Any, seen_names: set, seen_prefixes: set,

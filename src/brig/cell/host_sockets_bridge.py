@@ -132,15 +132,32 @@ def generate_plist(
 def _validate_target(host_path: str) -> None:
     """Runtime guard: reject engine sockets and non-socket targets.
 
-    The spec validator already does this at yaml parse, but a direct
-    SDK caller could skip parse. Defense in depth.
+    Defense in depth (audit fixes C3 + M2):
+      - Realpath-resolve to defeat symlinks at ANY level (parent dir
+        symlinks would otherwise sneak past a leaf-only lstat check).
+      - Re-check the engine denylist against the realpath basename,
+        so a /tmp/postgres.sock → /var/run/docker.sock symlink fails
+        on the denylist match, not just on the symlink ban.
+      - Then lstat() the original path; reject leaf symlinks too.
+        Realpath alone would silently follow them.
     """
-    basename = host_path.rsplit("/", 1)[-1]
-    if basename in HOST_SOCKET_ENGINE_DENYLIST:
+    if not host_path or not isinstance(host_path, str):
+        raise BrigError("host_socket host_path must be a non-empty string")
+
+    # Realpath walks the entire chain. We do this BEFORE the lstat ban
+    # so the denylist check sees the true target. os.path.realpath
+    # doesn't raise on missing components; we follow with lstat which
+    # does the existence check explicitly.
+    real = os.path.realpath(host_path)
+    real_basename = real.rsplit("/", 1)[-1]
+    literal_basename = host_path.rsplit("/", 1)[-1]
+    if real_basename in HOST_SOCKET_ENGINE_DENYLIST or \
+       literal_basename in HOST_SOCKET_ENGINE_DENYLIST:
         raise BrigError(
-            f"refusing to bridge to engine socket '{basename}' — "
-            f"granting access is root-equivalent on the host",
+            f"refusing to bridge to engine socket "
+            f"'{real_basename}' — granting access is root-equivalent on the host",
         )
+
     try:
         st = os.lstat(host_path)
     except FileNotFoundError:
@@ -153,10 +170,25 @@ def _validate_target(host_path: str) -> None:
             f"host_socket target {host_path} is a symlink — "
             f"refusing to bridge through a symlink",
         )
-    if not _stat.S_ISSOCK(st.st_mode):
+    # Realpath canonicalizes the entire ancestor chain — any symlink
+    # at any level gets resolved here, so a post-validation swap of a
+    # parent directory can't redirect us to attacker-controlled
+    # storage. We then stat (NOT lstat) the realpath: realpath already
+    # collapsed any symlinks; we just want S_ISSOCK on the canonical
+    # path. A normal /tmp → /private/tmp Mac-ism is fine; what we
+    # reject is a final-target that isn't actually a socket.
+    real = os.path.realpath(host_path)
+    try:
+        real_st = os.stat(real)
+    except FileNotFoundError:
+        raise BrigError(
+            f"host_socket target {host_path} resolves to {real} "
+            f"which does not exist",
+        )
+    if not _stat.S_ISSOCK(real_st.st_mode):
         raise BrigError(
             f"host_socket target {host_path} is not a unix socket "
-            f"(mode={oct(st.st_mode)})",
+            f"(realpath={real}, mode={oct(real_st.st_mode)})",
         )
 
 

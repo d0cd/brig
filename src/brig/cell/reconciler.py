@@ -306,8 +306,15 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
         source = bridge_dir / f"{name}.sock"
 
         # lstat (NOT stat) so symlinks don't get followed silently.
-        # A symlink at the bridge path could redirect the bind-mount
-        # to anywhere on the host; require a real socket file.
+        # Symlinks AT the bridge path OR anywhere in its ancestor
+        # chain could redirect the bind-mount to attacker-controlled
+        # storage. We require:
+        #   - source exists, is a real socket, not a symlink
+        #   - every ancestor directory is also not a symlink
+        #   - realpath of source still lives under bridge_dir
+        # Audit fix C3.
+        import os as _os
+        import stat as _stat
         try:
             st = source.lstat()
         except FileNotFoundError:
@@ -316,7 +323,6 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
                 f"{source}. Is the launchd bridge running? "
                 f"Try: brig system up"
             )
-        import stat as _stat
         if _stat.S_ISLNK(st.st_mode):
             raise RuntimeError(
                 f"host_socket '{name}': bridge path {source} is a symlink. "
@@ -326,6 +332,20 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
             raise RuntimeError(
                 f"host_socket '{name}': bridge path {source} is not a "
                 f"unix socket (mode={oct(st.st_mode)})."
+            )
+        # Realpath canonicalizes the entire ancestor chain in one
+        # call — any symlinked parent dir (e.g. someone replaced the
+        # per-cell bridge dir with a link elsewhere) gets resolved
+        # here, defeating a post-lstat parent-dir swap. Then require
+        # the canonical path to live under the canonical bridge_dir
+        # (resolve both sides; macOS /tmp → /private/tmp makes a raw
+        # comparison falsely flag every real path as escaping).
+        real_source = _os.path.realpath(str(source))
+        real_root = _os.path.realpath(str(bridge_dir))
+        if not real_source.startswith(real_root + "/"):
+            raise RuntimeError(
+                f"host_socket '{name}': bridge socket realpath {real_source} "
+                f"escapes bridge dir {real_root}"
             )
 
         cmd.extend(["-v", f"{source}:{mount_point}:{mode}"])
