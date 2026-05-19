@@ -165,6 +165,8 @@ def cmd_run(args: Any) -> int:
         #     `not getattr(args, key, None)` check).
         #   - command: --container_cmd (positional) wins over yaml.
         #   - env: additive — yaml entries appended to --env entries.
+        #   - policy: nested {allow, deny} flattens to policy_allow /
+        #     policy_deny, extending whatever the profile contributed.
         # All other CellSpec-valid fields fall through to the generic merge.
         for key in ("image", "name"):
             if key in cell_def and not getattr(args, key, None):
@@ -177,10 +179,18 @@ def cmd_run(args: Any) -> int:
             if isinstance(env_list, dict):
                 env_list = [f"{k}={v}" for k, v in env_list.items()]
             spec_kwargs["env"] = (args.env or []) + env_list
+        if isinstance(cell_def.get("policy"), dict):
+            for src_key, dst_key in (("allow", "policy_allow"),
+                                      ("deny", "policy_deny")):
+                src = cell_def["policy"].get(src_key) or []
+                if src:
+                    spec_kwargs[dst_key] = list(spec_kwargs.get(dst_key) or []) + list(src)
         # Generic merge for everything else the validator accepts.
         import dataclasses as _dc
         _spec_field_names = {f.name for f in _dc.fields(CellSpec)}
-        _already_handled = {"image", "name", "command", "env", "ingress"}
+        _already_handled = {
+            "image", "name", "command", "env", "ingress", "policy",
+        }
         for key, val in cell_def.items():
             if key in _spec_field_names and key not in _already_handled:
                 spec_kwargs[key] = val
@@ -225,13 +235,7 @@ def cmd_run(args: Any) -> int:
     spec_kwargs = {k: v for k, v in spec_kwargs.items() if k in valid_fields}
 
     spec = CellSpec(**spec_kwargs)
-
-    # Sync per-cell host_services policy from the flattened yaml field.
-    # spec.host_services carries {name, port} dicts directly; we write
-    # them into the cell policy file with replace semantics. This is
-    # the sole authorization path now — the old global-registry-plus-
-    # per-cell-ACL two-step is gone (audit-driven flattening).
-    _sync_host_services_policy(spec)
+    _sync_cell_policy(spec)
 
     from brig.ops.logging import Spinner
     with Spinner(f"Starting cell '{spec.name}'...") as spinner:
@@ -312,40 +316,43 @@ def _diagnose_exit(log_text: str) -> str:
     return ""
 
 
-def _sync_host_services_policy(spec: CellSpec) -> None:
-    """Write spec.host_services to the cell's per-cell policy file.
+def _sync_cell_policy(spec: CellSpec) -> None:
+    """Write the cell's allow / deny / host_services to its per-cell
+    policy file. Replace semantics: the yaml is the source of truth,
+    so anything in the file that's no longer in the spec is dropped.
 
-    Single-tenant flattened model: the cell yaml is the sole source
-    of truth for which host services this cell may reach. We replace
-    (not union) the cell_policy's host_services with what the yaml
-    declared. Anything previously granted but no longer in yaml is
-    revoked. Loud log per add and remove.
+    Skips the write if the on-disk policy already matches the spec —
+    idempotent re-runs don't churn mtime or noise the audit log.
     """
-    desired = list(spec.host_services or [])
     from brig.policy.policy import load_cell_policy, save_cell_policy
-    cell_policy = load_cell_policy(spec.name) or {"allow": [], "deny": []}
-    existing = cell_policy.get("host_services") or []
 
-    def _names(items: list) -> set[str]:
-        names: set[str] = set()
-        for e in items:
-            if isinstance(e, dict) and "name" in e:
-                names.add(e["name"])
-            elif isinstance(e, str):  # legacy bare-name shape
-                names.add(e)
-        return names
-
-    desired_names = _names(desired)
-    existing_names = _names(existing)
-    # Compare full structures so a port change also triggers a write.
-    if desired == existing:
+    desired = {
+        "allow": list(spec.policy_allow or []),
+        "deny": list(spec.policy_deny or []),
+        "host_services": list(spec.host_services or []),
+    }
+    existing = load_cell_policy(spec.name) or {}
+    current = {
+        "allow": existing.get("allow", []),
+        "deny": existing.get("deny", []),
+        "host_services": existing.get("host_services", []),
+    }
+    if desired == current:
         return
 
-    cell_policy["host_services"] = desired
-    save_cell_policy(spec.name, cell_policy)
+    # Preserve any other keys the on-disk policy may carry (e.g.
+    # rate_limits) so we don't accidentally drop unrelated config.
+    merged = dict(existing)
+    merged.update(desired)
+    save_cell_policy(spec.name, merged)
 
-    added = desired_names - existing_names
-    removed = existing_names - desired_names
+    # Log host_services diffs (the only field with operator-visible
+    # semantics worth flagging — allow/deny changes are too noisy to
+    # log line-by-line).
+    def _names(items):
+        return {e["name"] for e in items if isinstance(e, dict) and "name" in e}
+    added = _names(desired["host_services"]) - _names(current["host_services"])
+    removed = _names(current["host_services"]) - _names(desired["host_services"])
     for n in sorted(added):
         info(f"host_service granted: {spec.name} → {n} (from cell yaml)")
     for n in sorted(removed):

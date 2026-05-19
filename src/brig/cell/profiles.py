@@ -96,25 +96,35 @@ def load_profile(name: str, profiles_dir: Path = PROFILES_DIR) -> dict[str, Any]
 def apply_profile(spec: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
     """Apply profile defaults to a cell spec dict.
 
-    Profile values only fill in fields not already set. Returns merged dict.
+    Profile values only fill in fields the spec hasn't already set.
+    Policy and host_services from the profile prepend to the spec's
+    own entries (profile = baseline, yaml = additions). Returns
+    merged dict.
     """
     merged = dict(spec)
 
-    # Simple fields: set if not present.
     for key in ("memory", "cpus", "pids_limit", "network"):
         if key in profile and key not in merged:
             merged[key] = profile[key]
 
-    # Policy: merge allow/deny lists.
+    # Profile's policy.allow / policy.deny prepend to the spec's flat
+    # policy_allow / policy_deny lists (cell yaml additions extend the
+    # profile baseline).
     if "policy" in profile:
-        if "policy" not in merged:
-            merged["policy"] = {}
         prof_policy = profile["policy"]
-        for key in ("allow", "deny"):
-            if key in prof_policy and key not in merged["policy"]:
-                merged["policy"][key] = prof_policy[key]
+        if isinstance(prof_policy, dict):
+            for src_key, dst_key in (("allow", "policy_allow"),
+                                      ("deny", "policy_deny")):
+                src = prof_policy.get(src_key) or []
+                if src:
+                    merged[dst_key] = list(src) + list(merged.get(dst_key) or [])
 
-    # Labels: prepend profile labels.
+    # Profile-declared host_services prepend to the cell's list.
+    if "host_services" in profile and isinstance(profile["host_services"], list):
+        merged["host_services"] = (
+            list(profile["host_services"]) + list(merged.get("host_services") or [])
+        )
+
     if "labels" in profile:
         profile_labels = profile["labels"]
         if isinstance(profile_labels, dict):

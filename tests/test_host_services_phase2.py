@@ -57,7 +57,7 @@ class TestPolicyParsesFlattenedShape(unittest.TestCase):
 
 class TestSyncHostServicesPolicy(unittest.TestCase):
     def _run(self, host_services, prior=None):
-        from brig.commands.lifecycle_cmd import _sync_host_services_policy
+        from brig.commands.lifecycle_cmd import _sync_cell_policy
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             policy_dir = td / "policies"
@@ -69,7 +69,7 @@ class TestSyncHostServicesPolicy(unittest.TestCase):
                        side_effect=lambda name, *a, **kw: policy_dir / f"{name}.json"), \
                  patch("brig.commands.lifecycle_cmd.info",
                        side_effect=logs.append):
-                _sync_host_services_policy(_spec(host_services=host_services))
+                _sync_cell_policy(_spec(host_services=host_services))
             after = None
             f = policy_dir / "alice.json"
             if f.exists():
