@@ -141,6 +141,12 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
                            "workspace is deleted to prevent the next cell "
                            "with the same name from inheriting planted files.")
 
+    p_preflight = cs.add_parser(
+        "preflight",
+        help="Dry-run check: verify a cell yaml's host-side requirements",
+    )
+    p_preflight.add_argument("file", help="Path to cell yaml/json")
+
     p_rename = cs.add_parser("rename", help="Rename a cell")
     p_rename.add_argument("old_name", help="Current name")
     p_rename.add_argument("new_name", help="New name")
@@ -374,6 +380,7 @@ def main() -> None:
         ("cell", "shell"): lifecycle_cmd.cmd_shell,
         ("cell", "wait"): lifecycle_cmd.cmd_wait,
         ("cell", "rm"): lifecycle_cmd.cmd_rm,
+        ("cell", "preflight"): lifecycle_cmd.cmd_preflight,
         ("cell", "rename"): lifecycle_cmd.cmd_rename,
         ("cell", "exec"): lifecycle_cmd.cmd_exec,
         ("cell", "files"): lifecycle_cmd.cmd_files,

@@ -192,6 +192,7 @@ class Brig:
         detach: bool = True,
         timeout: str | None = None,
         labels: list[str] | None = None,
+        host_sockets: list[dict[str, Any]] | None = None,
     ) -> Cell:
         """Run a new cell. Returns a Cell handle."""
         return await asyncio.to_thread(
@@ -200,6 +201,7 @@ class Brig:
             secrets=secrets, memory=memory, cpus=cpus,
             pids_limit=pids_limit, network=network, profile=profile,
             detach=detach, timeout=timeout, labels=labels,
+            host_sockets=host_sockets,
         )
 
     def run_sync(
@@ -217,8 +219,14 @@ class Brig:
         detach: bool = True,
         timeout: str | None = None,
         labels: list[str] | None = None,
+        host_sockets: list[dict[str, Any]] | None = None,
     ) -> Cell:
-        """Synchronous version of run()."""
+        """Synchronous version of run().
+
+        host_sockets: list of dicts with keys {name, host_path, mount_point,
+        mode?}. Same validation rules as the cell yaml (see
+        docs/design/cell-definition.md). Bypasses Warden by design.
+        """
         if not CELL_NAME_PATTERN.match(name):
             raise BrigError(f"Invalid cell name: {name}")
 
@@ -234,6 +242,7 @@ class Brig:
             "network": network,
             "detach": detach,
             "labels": labels or [],
+            "host_sockets": host_sockets or [],
         }
 
         if timeout:

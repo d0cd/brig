@@ -199,6 +199,12 @@ def cmd_doctor(args: Any) -> int:
     _check("warden proxy running", proxy_running(),
            suggestion="brig up")
 
+    # 7. host_socket bridges — if any plists exist under LaunchAgents,
+    # the corresponding bridge sockets must be present. Missing bridge
+    # = cell using that socket will fail to start. socat presence is
+    # also checked since the bridges require it.
+    _check_host_socket_bridges(_check)
+
     output("=" * 50)
     if failures:
         output(f"FAILED: {len(failures)} check(s)")
@@ -208,6 +214,45 @@ def cmd_doctor(args: Any) -> int:
         return 1
     output("All checks passed")
     return 0
+
+
+def _check_host_socket_bridges(check) -> None:
+    """Enumerate launchd host_socket plists and verify each bridge
+    socket file is present. Surfaces partial-up states (plist loaded
+    but socat crashed and didn't restart) before they manifest as
+    confusing cell-start failures.
+    """
+    import shutil as _shutil
+    from brig.cell.host_sockets_bridge import LABEL_PREFIX, PLIST_DIR
+    from brig.config import HostPaths
+
+    if not PLIST_DIR.exists():
+        return  # No bridges ever registered; nothing to check.
+    plists = [p for p in PLIST_DIR.iterdir()
+              if p.name.startswith(LABEL_PREFIX) and p.name.endswith(".plist")]
+    if not plists:
+        return
+
+    # If any plist exists, socat must too.
+    check("socat installed (host_socket bridges)",
+          bool(_shutil.which("socat")),
+          suggestion="brew install socat")
+
+    for plist in plists:
+        label = plist.stem
+        rest = label[len(LABEL_PREFIX):]
+        if "." not in rest:
+            continue
+        cell_name, sock_name = rest.split(".", 1)
+        bridge = HostPaths.HOST_SOCKETS_DIR / cell_name / f"{sock_name}.sock"
+        check(
+            f"bridge socket: {cell_name}/{sock_name}", bridge.exists(),
+            detail=str(bridge),
+            suggestion=(
+                f"Bridge process crashed. Tail /tmp/{label}.err.log "
+                f"then: brig cell rm {cell_name} && brig run --file <yaml>"
+            ),
+        )
 
 
 def _cmd_doctor_quick(fmt: str = "table") -> int:
