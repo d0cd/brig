@@ -16,6 +16,7 @@ from typing import Any
 from brig.config import (
     CELL_NAME_PATTERN,
     DOMAIN_PATTERN,
+    HOST_SERVICE_NAME_PATTERN,
     HOST_SOCKET_ENGINE_DENYLIST,
     HOST_SOCKET_MODES,
     HOST_SOCKET_MOUNT_PREFIX,
@@ -23,6 +24,7 @@ from brig.config import (
     INGRESS_AUTH_METHODS,
     INGRESS_NAME_PATTERN,
     INGRESS_PATH_PREFIX_PATTERN,
+    MAX_HOST_SERVICES_PER_CELL,
     MAX_HOST_SOCKETS_PER_CELL,
     MAX_INGRESS_PER_CELL,
     MEMORY_PATTERN,
@@ -115,6 +117,12 @@ class CellSpec:
     # for validation; bypasses Warden by design, so the validators here
     # are the entire security boundary on the cell-yaml → host-file path.
     host_sockets: list[dict[str, Any]] = field(default_factory=list)
+    # host_services — HTTP-only forwarding from cell to a macOS host
+    # port, through Warden. Each entry: {name, port}. Cell reaches
+    # <name>.host.brig and Warden rewrites to (host_ip, port).
+    # Declaring in yaml IS the grant — there is no separate global
+    # registry. See _v_host_services for validation.
+    host_services: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate inputs at construction time — the system boundary.
@@ -507,6 +515,83 @@ def _profile_is_untrusted(profile_name: Any) -> bool:
     return False
 
 
+def _v_host_service_entry(
+    i: int, entry: Any, seen_names: set, context: str,
+) -> list[str]:
+    """Validate one host_services entry. Single-tenant model: cell yaml
+    declares both name and port directly.
+
+    Rules:
+      - name: HOST_SERVICE_NAME_PATTERN, unique per cell
+      - port: int in [1, 65535]
+    No path/file checks (this is TCP-forwarding, not socket-mounting).
+    """
+    if not isinstance(entry, dict):
+        return [f"'host_services[{i}]' must be a dict{context}"]
+
+    errors: list[str] = []
+
+    name = entry.get("name")
+    if not name or not isinstance(name, str):
+        errors.append(
+            f"'host_services[{i}].name' is required and must be a string{context}"
+        )
+    elif not HOST_SERVICE_NAME_PATTERN.match(name):
+        errors.append(
+            f"'host_services[{i}].name' must be lowercase alphanumeric "
+            f"with hyphens, max 31 chars{context}"
+        )
+    elif name in seen_names:
+        errors.append(f"Duplicate host_services name '{name}'{context}")
+    else:
+        seen_names.add(name)
+
+    port = entry.get("port")
+    if port is None:
+        errors.append(f"'host_services[{i}].port' is required{context}")
+    elif not isinstance(port, int) or port < 1 or port > 65535:
+        errors.append(
+            f"'host_services[{i}].port' must be an integer 1-65535{context}"
+        )
+
+    return errors
+
+
+def _v_host_services(value: Any, cell_def: dict, context: str) -> list[str]:
+    """Validate the cell's host_services list as a whole.
+
+    Cross-cutting rules:
+      - must be a list
+      - count bounded by MAX_HOST_SERVICES_PER_CELL
+      - the `untrusted` profile may not declare host_services — same
+        reasoning as host_sockets (Warden bypass via name resolution
+        to host services defeats the profile)
+    """
+    if not isinstance(value, list):
+        return [f"'host_services' must be a list{context}"]
+
+    errors: list[str] = []
+    if len(value) > MAX_HOST_SERVICES_PER_CELL:
+        errors.append(
+            f"Too many host_services entries ({len(value)}), "
+            f"max {MAX_HOST_SERVICES_PER_CELL}{context}"
+        )
+
+    if value and _profile_is_untrusted(cell_def.get("profile")):
+        errors.append(
+            f"'host_services' is not allowed with the untrusted profile — "
+            f"untrusted cells must not reach host services{context}"
+        )
+
+    seen_names: set = set()
+    for i, entry in enumerate(value):
+        errors.extend(
+            _v_host_service_entry(i, entry, seen_names, context)
+        )
+
+    return errors
+
+
 def _v_ingress_entry(i: int, entry: Any, seen_names: set, seen_prefixes: set,
                      context: str) -> list[str]:
     """Validate one ingress entry. Mutates seen_* sets to track duplicates."""
@@ -625,6 +710,9 @@ def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> l
 
     if "host_sockets" in cell_def:
         errors.extend(_v_host_sockets(cell_def["host_sockets"], cell_def, context))
+
+    if "host_services" in cell_def:
+        errors.extend(_v_host_services(cell_def["host_services"], cell_def, context))
 
     return errors
 

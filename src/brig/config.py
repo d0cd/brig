@@ -67,8 +67,16 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
 # The .host.brig suffix is also defined as HOST_SERVICE_SUFFIX in
 # src/addons/enforce.py — addons can't import from brig.* so the suffix
 # lives in both places. Keep them in sync.
+#
+# Single-tenant flattened model (see also host_sockets): cell yaml
+# declares both the name AND the host port. There is no separate
+# global registry — declaring in yaml IS the authorization. The
+# operator who wrote the yaml is the trust principal.
 HOST_SERVICE_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
-MAX_HOST_SERVICES = 16
+MAX_HOST_SERVICES_PER_CELL = 16
+# Old name — still imported by policy_cmd.py which will be removed in
+# the same series of commits. Alias until then to keep the build green.
+MAX_HOST_SERVICES = MAX_HOST_SERVICES_PER_CELL
 
 # Ingress (authenticated reverse proxy through Warden).
 INGRESS_PORT = 8443
