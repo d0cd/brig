@@ -43,7 +43,8 @@ pids_limit: 512                  # Max processes (prevents fork bombs)
 network: default                 # "default" = per-cell isolated network via Warden
                                  # "none"    = air-gapped, no network access
 
-# Network policy (per-cell override, merged with global policy)
+# Network policy. Per-cell — no global file to merge with. Trust
+# profiles can contribute a baseline allow/deny that this block extends.
 policy:
   allow:
     - "api.github.com"           # Simple domain string

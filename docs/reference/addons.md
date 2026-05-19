@@ -28,12 +28,13 @@ from here rather than copying.
 The policy gate. For every request:
 
 1. Check listen port (egress on 8080, ingress on 8443).
-2. If the request targets `<name>.host.brig`, route to host services (per-cell ACL gated).
+2. If the request targets `<name>.host.brig`, route to host services
+   via the cell's own `host_services` map (declared in the cell yaml).
 3. Reject non-80/443 ports.
 4. Reject literal IPs and internal IP ranges.
 5. Reject Host-header smuggling (CR/LF/NUL or Host ≠ URL host).
-6. Apply per-cell policy (deny-then-allow); if the cell has no per-cell policy, fall through to global.
-7. Apply global policy; default deny.
+6. Apply per-cell policy (deny-then-allow). Cells with no per-cell
+   policy block everything — fail closed, no implicit global allow.
 
 Also installs `server_connected` and `responseheaders` hooks that close
 connections that resolve into `BLOCKED_NETWORKS` (DNS rebinding defense). The

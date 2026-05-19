@@ -28,8 +28,8 @@ directly via `limactl shell brig -- warden <subcommand>`.
 
 | Command | What it does |
 |---|---|
-| `warden policy validate [path]` | Loads the JSON/YAML policy file (defaults to the mounted `/cells/network-policy.json`) and reports parse errors and rule problems (invalid domains, suspicious patterns). |
-| `warden policy test <domain> [--path /...] [--method GET]` | Runs the same allow/deny logic the proxy uses against the global policy. From the host you can use the equivalent `brig policy test <domain>` instead. |
+| `warden policy validate [path]` | Loads a policy JSON/YAML file and reports parse errors and rule problems (invalid domains, suspicious patterns). Useful for linting per-cell policies before they're written. |
+| `warden policy test <path> <domain> [--path /...] [--method GET]` | Runs the proxy's allow/deny matcher against the policy at `<path>`. From the host the equivalent for a deployed cell is `brig policy test <cell> <domain>`. |
 
 For the host-side `brig` command, see [`brig-cli.md`](brig-cli.md).
 
