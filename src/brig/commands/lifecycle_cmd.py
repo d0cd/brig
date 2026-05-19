@@ -304,36 +304,34 @@ def _diagnose_exit(log_text: str) -> str:
 
 
 def _auto_grant_host_services(spec: CellSpec) -> None:
-    """When a cell yaml declares `policy.allow` entries pointing at
-    `<svc>.host.brig` for services that are registered globally,
-    auto-add them to the cell's per-cell host_services ACL.
+    """Sync the cell's per-cell host_services ACL with what's declared
+    in the cell yaml's policy.allow, using REPLACE semantics.
 
-    Feedback #3 from aitelier — without this, users get the cryptic
-    `cell has no host_services configured` from the warden side after
-    going to the trouble of declaring the right thing in their yaml.
+    For each *.host.brig domain in policy.allow that's also registered
+    globally: grant it. For each currently-granted service that's
+    registered globally but is NO LONGER in the yaml: revoke it.
+    Audit fix H5 (privilege accumulation).
 
-    Loud log line per grant with the revoke command, so the operator
-    sees what happened and can undo it. Opt-out via:
+    Services granted for names NOT currently registered globally are
+    left alone — those might be manual grants for services not yet
+    declared in the global registry, and we don't want to wipe them.
+
+    Loud log line per add AND per remove, so the operator sees both
+    sides of the diff and can intervene. Opt-out:
         brig config set auto_grant_host_services false
     """
-    if not spec.policy_allow:
-        return
     if not _auto_grant_enabled():
         return
 
     HOST_BRIG = ".host.brig"
-    requested: list[str] = []
-    for entry in spec.policy_allow:
+    requested: set[str] = set()
+    for entry in (spec.policy_allow or []):
         if isinstance(entry, str) and entry.endswith(HOST_BRIG):
             svc = entry[: -len(HOST_BRIG)]
             if svc and "." not in svc and "*" not in svc:
-                requested.append(svc)
-    if not requested:
-        return
+                requested.add(svc)
 
-    # Cross-check against global registry — only auto-grant services
-    # the operator has actually registered. Silently skip unregistered
-    # ones (validation will surface them at warden side).
+    # Cross-check against global registry.
     import json as _json
     from brig.config import HostPaths
     try:
@@ -344,25 +342,38 @@ def _auto_grant_host_services(spec: CellSpec) -> None:
     for svc in global_policy.get("host_services", []):
         if isinstance(svc, dict) and "name" in svc:
             registered.add(svc["name"])
-    grantable = [s for s in requested if s in registered]
-    if not grantable:
-        return
 
-    # Load (or initialize) per-cell policy and merge.
+    desired_auto = requested & registered  # the auto-grant subset
+
     from brig.policy.policy import load_cell_policy, save_cell_policy
     cell_policy = load_cell_policy(spec.name) or {"allow": [], "deny": []}
-    existing_services = set(cell_policy.get("host_services", []) or [])
-    new_grants = [s for s in grantable if s not in existing_services]
-    if not new_grants:
-        return  # All already granted.
-    cell_policy.setdefault("host_services", [])
-    cell_policy["host_services"] = sorted(existing_services | set(new_grants))
+    existing: set[str] = set(cell_policy.get("host_services", []) or [])
+
+    # Of the existing grants, which are AUTO-grant candidates? Those
+    # are services currently registered globally. Anything else is a
+    # manual grant for a service not in the registry — preserve it.
+    existing_auto = existing & registered
+    preserved = existing - registered
+
+    added = desired_auto - existing_auto
+    removed = existing_auto - desired_auto
+    if not added and not removed:
+        return  # Steady state, nothing to do.
+
+    final = sorted(desired_auto | preserved)
+    cell_policy["host_services"] = final
     save_cell_policy(spec.name, cell_policy)
-    for svc in new_grants:
+
+    for svc in sorted(added):
         info(
             f"auto-granted: {spec.name} → {svc} (declared in cell yaml, "
             f"registered globally). Revoke: brig policy set {spec.name} "
             f"--remove-host-service {svc}"
+        )
+    for svc in sorted(removed):
+        info(
+            f"auto-revoked: {spec.name} → {svc} (no longer in cell yaml). "
+            f"Re-grant: brig policy set {spec.name} --host-service {svc}"
         )
 
 

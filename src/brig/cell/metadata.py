@@ -78,11 +78,18 @@ def build_metadata(
     host_path stays out of the downward-API surface for the same
     reason workspace.host_path was dropped in v2 (no host paths
     leak through `/run/brig/cell.json`).
+
+    The projection only reads `name` and `mount_point`, so callers may
+    pass either full entries (from CellSpec.host_sockets, with
+    host_path/mode set) or pre-projected ones — both work. Don't add
+    fabricated values (the old `host_path: ""` placeholder was a lie
+    waiting to break if the projection ever extended).
     """
     ts = started_at or datetime.now(timezone.utc)
     sockets_published = [
         {"name": entry["name"], "mount_point": entry["mount_point"]}
         for entry in (host_sockets or [])
+        if isinstance(entry, dict) and "name" in entry and "mount_point" in entry
     ]
     payload: dict[str, Any] = {
         "version": SCHEMA_VERSION,
@@ -137,13 +144,12 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
     # Preserve host_sockets across refresh — bind mounts are fixed at
     # podman-create time, so this list can't change without a restart.
-    # Re-project to the original (name, mount_point) shape; we don't
-    # have host_path here, and the projection in build_metadata only
-    # uses those two fields.
+    # Pass the already-projected list straight through; build_metadata
+    # re-projects (idempotent) and only reads name + mount_point.
+    # Audit fix M1 — was passing `host_path: ""` placeholder which would
+    # have leaked empty strings if the projection ever extended.
     prior_sockets = [
-        {"name": s["name"], "mount_point": s["mount_point"],
-         "host_path": ""}  # placeholder; build_metadata only reads name/mount_point
-        for s in prior.get("host_sockets", [])
+        s for s in prior.get("host_sockets", [])
         if isinstance(s, dict) and "name" in s and "mount_point" in s
     ]
     return write_metadata(cell_name, workspace_mount, host_sockets=prior_sockets)
