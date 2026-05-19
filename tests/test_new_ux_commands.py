@@ -111,47 +111,11 @@ class TestCpColonParsing(unittest.TestCase):
         self.assertIsNone(_parse_cp_target("MYCELL:/work"))
 
 
-class TestHostServicePolicyShape(unittest.TestCase):
-    """Per-cell ACL stores bare names, global declaration stores name:port dicts.
-
-    See `_apply_host_service_additions(..., is_global=...)` in policy_cmd.py.
-    The addon's H1 enforcement reads `host_services_allowed: list[str]` from
-    per-cell policy; if the CLI wrote dicts here it would fail at runtime.
-    """
-
-    def test_global_writes_dicts(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        policy: dict = {}
-        _apply_host_service_additions(["mydb:5432"], policy, is_global=True)
-        self.assertEqual(policy["host_services"], [{"name": "mydb", "port": 5432}])
-
-    def test_per_cell_writes_strings(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        policy: dict = {}
-        _apply_host_service_additions(["mydb"], policy, is_global=False)
-        self.assertEqual(policy["host_services"], ["mydb"])
-
-    def test_per_cell_rejects_port_form(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        with self.assertRaises(BrigError) as ctx:
-            _apply_host_service_additions(["mydb:5432"], {}, is_global=False)
-        self.assertIn("name only", str(ctx.exception))
-
-    def test_global_rejects_bare_name(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        with self.assertRaises(BrigError) as ctx:
-            _apply_host_service_additions(["mydb"], {}, is_global=True)
-        self.assertIn("name:port", str(ctx.exception))
-
-    def test_remove_handles_both_schemas(self):
-        from brig.commands.policy_cmd import _apply_host_service_removals
-        global_policy = {"host_services": [{"name": "a", "port": 1}, {"name": "b", "port": 2}]}
-        _apply_host_service_removals(["a"], global_policy)
-        self.assertEqual(global_policy["host_services"], [{"name": "b", "port": 2}])
-
-        cell_policy = {"host_services": ["a", "b"]}
-        _apply_host_service_removals(["a"], cell_policy)
-        self.assertEqual(cell_policy["host_services"], ["b"])
+# TestHostServicePolicyShape removed: the _apply_host_service_*
+# helpers it covered were deleted in the host_services flattening
+# rollout. Per-cell host_services are now written by
+# _sync_host_services_policy in lifecycle_cmd from the cell yaml's
+# host_services field — covered by tests/test_host_services_phase2.py.
 
 
 class TestPolicyTest(unittest.TestCase):

@@ -40,10 +40,9 @@ def register_parser(sub) -> None:
     p_set.add_argument("--deny", action="append", help="Add denied domain")
     p_set.add_argument("--remove-allow", action="append", help="Remove allowed domain")
     p_set.add_argument("--remove-deny", action="append", help="Remove denied domain")
-    p_set.add_argument("--host-service", action="append",
-                       help="Add host service (name:port, e.g. model:7777)")
-    p_set.add_argument("--remove-host-service", action="append",
-                       help="Remove host service by name")
+    # --host-service / --remove-host-service removed in the flattened
+    # model: host_services live in the cell yaml directly. Edit the
+    # yaml and re-run with `brig run --file ...` to update.
 
     p_rm = s.add_parser("rm", help="Delete a cell's per-cell policy (falls back to global)")
     p_rm.add_argument("name", help="Cell name")
@@ -223,10 +222,11 @@ def _validate_domains(domains: list[str]) -> None:
 
 
 def _apply_policy_changes(args: Any, policy: dict, *, is_global: bool = False) -> dict:
-    """Apply --allow/--deny/--remove-allow/--remove-deny/--host-service to a policy dict.
+    """Apply --allow/--deny/--remove-allow/--remove-deny to a policy dict.
 
-    is_global selects the host-service schema (name:port dicts for global,
-    bare name strings for per-cell ACL).
+    Note: --host-service flags were removed in the host_services
+    flattening — host_services now live in the cell yaml directly,
+    edited there and synced into per-cell policy on `brig run`.
     """
     changes: dict[str, list[str]] = {}
 
@@ -254,91 +254,7 @@ def _apply_policy_changes(args: Any, policy: dict, *, is_global: bool = False) -
                 deny_list.remove(domain)
         changes["remove_deny"] = args.remove_deny
 
-    # Host services.
-    if getattr(args, "host_service", None):
-        _apply_host_service_additions(args.host_service, policy, is_global=is_global)
-        changes["add_host_services"] = args.host_service
-
-    if getattr(args, "remove_host_service", None):
-        _apply_host_service_removals(args.remove_host_service, policy)
-        changes["remove_host_services"] = args.remove_host_service
-
     return changes
-
-
-def _apply_host_service_additions(
-    services: list[str], policy: dict, *, is_global: bool,
-) -> None:
-    """Add host service entries.
-
-    For the **global** policy: each entry must be `name:port` (warden uses
-    this to know how to forward `<name>.host.brig`). Stored as a list of
-    `{name, port}` dicts.
-
-    For a **per-cell** policy: each entry is just `name` (an ACL grant
-    referencing a name declared in the global policy). Stored as a list of
-    string names. This is what the H1 enforcement in `enforce.py` reads
-    via `cell_policy.host_services_allowed`.
-    """
-    from brig.config import HOST_SERVICE_NAME_PATTERN, MAX_HOST_SERVICES
-
-    if is_global:
-        host_services = policy.setdefault("host_services", [])
-        for spec in services:
-            if ":" not in spec:
-                raise BrigError(
-                    f"Global host service requires name:port format: {spec}",
-                    suggestion="e.g. brig policy set global --host-service model:7777",
-                )
-            name, port_str = spec.rsplit(":", 1)
-            if not HOST_SERVICE_NAME_PATTERN.match(name):
-                raise BrigError(
-                    f"Invalid host service name: {name}",
-                    suggestion="Use lowercase alphanumeric with hyphens, max 31 chars",
-                )
-            try:
-                port = int(port_str)
-                if port < 1 or port > 65535:
-                    raise ValueError
-            except ValueError:
-                raise BrigError(f"Invalid port for host service '{name}': {port_str}")
-
-            # Remove existing entry with same name (idempotent update).
-            host_services[:] = [s for s in host_services if s.get("name") != name]
-            if len(host_services) >= MAX_HOST_SERVICES:
-                raise BrigError(f"Too many host services (max {MAX_HOST_SERVICES})")
-            host_services.append({"name": name, "port": port})
-    else:
-        # Per-cell ACL: list of names referencing global declarations.
-        host_services = policy.setdefault("host_services", [])
-        for spec in services:
-            if ":" in spec:
-                raise BrigError(
-                    f"Per-cell host service must be a name only (no port): {spec}",
-                    suggestion=(
-                        "Per-cell entries grant access to a service already declared "
-                        "in the global policy. e.g. brig policy set <cell> --host-service model"
-                    ),
-                )
-            if not HOST_SERVICE_NAME_PATTERN.match(spec):
-                raise BrigError(
-                    f"Invalid host service name: {spec}",
-                    suggestion="Use lowercase alphanumeric with hyphens, max 31 chars",
-                )
-            if spec not in host_services:
-                if len(host_services) >= MAX_HOST_SERVICES:
-                    raise BrigError(f"Too many host services (max {MAX_HOST_SERVICES})")
-                host_services.append(spec)
-
-
-def _apply_host_service_removals(names: list[str], policy: dict) -> None:
-    """Remove host services by name. Handles both schemas (global dicts and
-    per-cell strings) so the same flag works for either policy scope."""
-    host_services = policy.get("host_services", [])
-    policy["host_services"] = [
-        s for s in host_services
-        if (s.get("name") if isinstance(s, dict) else s) not in names
-    ]
 
 
 def cmd_policy_rm(args: Any) -> int:

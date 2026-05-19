@@ -84,8 +84,10 @@ class PolicyEnforcer:
         self.trace_config = PolicyTraceConfig()
         self._cell_policy_lock = threading.Lock()
         self._reload_lock = threading.RLock()
-        # Host services: name → port mapping for cell → host forwarding.
-        self.host_services: dict[str, int] = {}
+        # host_services: removed from the global registry in the
+        # flattening rollout. Per-cell policy now carries
+        # `host_services: [{name, port}]` straight from the cell yaml,
+        # and _handle_host_service reads ports from there.
         self._host_ip: str = ""
 
     def load(self, loader):
@@ -226,31 +228,11 @@ class PolicyEnforcer:
             trace_config = data.get("policy_trace", {})
             self.trace_config = PolicyTraceConfig(trace_config)
 
-            # Load host services with strict validation.
-            new_host_services: dict[str, int] = {}
-            for svc in data.get("host_services", []):
-                if not isinstance(svc, dict):
-                    continue
-                svc_name = svc.get("name")
-                svc_port = svc.get("port")
-                if not isinstance(svc_name, str) or not isinstance(svc_port, int):
-                    continue
-                # Validate name: lowercase alphanumeric + hyphens, max 31 chars.
-                if not re.match(r'^[a-z0-9][a-z0-9-]{0,30}$', svc_name):
-                    ctx.log.warn(
-                        f"PolicyEnforcer: Skipping host service with invalid name: "
-                        f"{svc_name!r}"
-                    )
-                    continue
-                # Validate port: 1-65535.
-                if svc_port < 1 or svc_port > 65535:
-                    ctx.log.warn(
-                        f"PolicyEnforcer: Skipping host service '{svc_name}' with "
-                        f"invalid port: {svc_port}"
-                    )
-                    continue
-                new_host_services[svc_name] = svc_port
-            self.host_services = new_host_services
+            # Note: global host_services was removed in the flattening
+            # rollout. Each cell now declares its own {name, port} pairs
+            # in its yaml, and those flow into the per-cell policy file
+            # consumed by _reload_cell_policies. There is no central
+            # registry to load here.
 
             self.policy_mtime = mtime
 
@@ -259,11 +241,6 @@ class PolicyEnforcer:
                 f"{len(self.global_policy.allow_rules)} allow, "
                 f"{len(self.global_policy.deny_rules)} deny rules"
             )
-            if self.host_services:
-                ctx.log.info(
-                    f"PolicyEnforcer: {len(self.host_services)} host services: "
-                    f"{', '.join(sorted(self.host_services))}"
-                )
             if self.trace_config.enabled:
                 ctx.log.info("PolicyEnforcer: Policy tracing enabled")
 

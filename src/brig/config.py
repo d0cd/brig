@@ -74,9 +74,6 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
 # operator who wrote the yaml is the trust principal.
 HOST_SERVICE_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
 MAX_HOST_SERVICES_PER_CELL = 16
-# Old name — still imported by policy_cmd.py which will be removed in
-# the same series of commits. Alias until then to keep the build green.
-MAX_HOST_SERVICES = MAX_HOST_SERVICES_PER_CELL
 
 # Ingress (authenticated reverse proxy through Warden).
 INGRESS_PORT = 8443
