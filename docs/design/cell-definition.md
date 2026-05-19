@@ -97,15 +97,16 @@ ingress:
     path_prefix: /webhooks
     auth: token
 
-# Host services — HTTP/HTTPS forwarding from cell to host port via
-# <name>.host.brig DNS through Warden. Declaring here IS the grant —
-# no separate registration step.
+# Host services — HTTP/HTTPS forwarding from cell to host port,
+# routed through Warden under the <name>.host.brig virtual domain.
+# Declaration here is the grant; no separate registration step.
 host_services:
   - {name: db, port: 5432}
   - {name: litellm, port: 4000}
 
 # Host sockets — bind-mount macOS unix sockets into the cell for
-# non-HTTP protocols (Postgres, Redis, ssh-agent). Bypasses Warden.
+# non-HTTP protocols (Postgres, Redis, ssh-agent). Bytes flow
+# kernel-direct; Warden is not in the path.
 host_sockets:
   - name: postgres
     host_path: /tmp/postgres.sock
@@ -172,10 +173,10 @@ process listings, or container inspect output.
 ## Host Sockets
 
 Bind-mount macOS-side unix sockets into the cell at a path under
-`/run/host/`. Bypasses Warden by design — bytes flow directly between
-the cell and the host service via the kernel, not through the proxy.
-Use this for non-HTTP services (Postgres, Redis, MySQL, ssh-agent)
-that can't traverse an HTTP proxy.
+`/run/host/`. Bytes flow directly between the cell and the host
+service through the kernel; Warden is not in the path. This is the
+mechanism for non-HTTP services (Postgres, Redis, MySQL, ssh-agent)
+that cannot traverse an HTTP proxy.
 
 ```yaml
 host_sockets:
@@ -199,8 +200,9 @@ Requirements:
 - `socat` must be installed (`brew install socat`) — used by the
   launchd bridge
 - Maximum 8 host_sockets per cell
-- The `untrusted` profile **rejects** host_sockets at parse time —
-  Warden bypass defeats the profile's purpose
+- The `untrusted` profile rejects `host_sockets` at parse time:
+  bypassing Warden via a kernel side channel is incompatible with
+  the profile's threat model.
 
 Security properties:
 
@@ -214,23 +216,24 @@ Security properties:
   `~/.brig/state/system/lifecycle.jsonl`)
 - Cell startup prints a NOTE that Warden does not see this traffic
 
-What this does **not** do:
+Limitations:
 
-- No per-request observability (Warden's HTTP audit doesn't apply to
-  raw TCP / binary protocols)
-- No automatic detection — every socket is explicit in the cell yaml
-- No coverage for services that don't expose a unix socket (Mongo,
-  gRPC, SSH) — those need a future raw-TCP option
+- No per-request observability. Warden's HTTP audit does not apply
+  to raw TCP or binary protocols.
+- No automatic detection: every socket is declared in the cell yaml.
+- Cannot expose services that lack a unix-socket transport. See
+  [Not supported: raw TCP host services](#not-supported-raw-tcp-host-services)
+  below for affected protocols and workarounds.
 
 ## Host Services
 
-Cells cannot reach the macOS host by default (private IPs are blocked).
-Host services allow cells to reach specific host-side services through
-virtual `.host.brig` domains, **routed through Warden** so every
-request is HTTP-audited.
+Cells cannot reach the macOS host by default; private IPs are blocked
+by Warden. Host services expose specific host-side HTTP/HTTPS services
+to a cell through virtual `<name>.host.brig` domains. Traffic is
+routed through Warden, so every request is HTTP-audited.
 
-Declaration lives entirely in the cell yaml — there is no separate
-global registry or per-cell ACL ceremony:
+Declaration lives entirely in the cell yaml; there is no separate
+global registry or per-cell ACL:
 
 ```yaml
 host_services:
@@ -249,17 +252,20 @@ cell's own host_services map, and rewrites to (host_ip, port). The cell
 never sees the real host IP.
 
 Security properties:
-- Only declared services are reachable (not a blanket private IP bypass)
-- The cell yaml IS the grant — no separate registration required
-- Cells with no host_services in yaml have **no** host-service access
-- All traffic logged with `host_service` attribution
-- Virtual domains only resolve through the proxy
-- Unknown `.host.brig` domains are blocked
-- Untrusted profile rejects host_services at parse time
+
+- Only declared services are reachable; this is not a blanket
+  private-IP bypass.
+- The cell yaml is the grant. No separate registration step is
+  required or supported.
+- Cells without `host_services` in yaml have no host-service access.
+- All traffic is logged with `host_service` attribution.
+- Virtual domains only resolve through the proxy.
+- Unknown `.host.brig` domains are blocked.
+- The `untrusted` profile rejects `host_services` at parse time.
 - DNS rebinding to `(host_ip, host_service_port)` from an allowlisted
-  domain is detected: the host-service skip on `BLOCKED_NETWORKS` is
-  gated on `flow.metadata["host_service"]`, not on the destination tuple
-  (audit fix H4)
+  domain is detected. The host-service skip on `BLOCKED_NETWORKS` is
+  gated on `flow.metadata["host_service"]`, not on the destination
+  tuple, so a poisoned DNS response cannot reuse the exemption.
 
 ### Choosing between host_services and host_sockets
 
@@ -271,41 +277,51 @@ Security properties:
 | Setup | `host_services: [{name, port}]` | `host_sockets: [{name, host_path, mount_point}]` + socat |
 | Use for | API gateways, model serving, anything HTTP | Postgres, Redis, MongoDB, MySQL, ssh-agent, anything with a unix socket |
 
-Most modern database and RPC clients support unix sockets — Postgres,
-MySQL, Redis, MongoDB, gRPC (most languages). The trilogy of (HTTP via
-host_services) + (HTTP ingress for inbound) + (unix-socket via
-host_sockets for everything else) covers ~95% of realistic cell→host
-needs.
+Most database and RPC clients in active development support unix
+sockets — Postgres, MySQL, Redis, MongoDB, and gRPC across most
+languages. Combined with HTTP via `host_services` (egress) and
+`ingress` (inbound), the unix-socket path via `host_sockets` covers
+the common cell-to-host access patterns.
 
-### Not supported: raw TCP host_services
+### Not supported: raw TCP host services
 
-A small set of host-access patterns cannot be expressed with either
-mechanism today:
+Brig does not currently expose raw TCP forwarding as a first-class
+cell-yaml feature. The following patterns therefore have no
+declarative form in brig today:
 
-- **SSH from a cell to a host.** Protocol fundamentally requires
-  a network endpoint; no unix-socket transport.
-- **Distributed/replica-set discovery.** Mongo replica sets, etcd,
-  Consul Connect — protocols whose connection setup probes other
-  servers by DNS. Single-instance Mongo works fine via unix socket;
-  replica-set discovery does not.
-- **TLS services that require strict SNI hostname verification**
-  when the client doesn't expose a way to override the expected
-  hostname (some enterprise JDBC drivers, some HTTPS libraries).
-- **Legacy TCP-only enterprise drivers** that never added unix-socket
-  support (e.g. older Oracle JDBC, some MSSQL TDS clients).
+- **SSH from a cell to a host.** The SSH protocol requires a network
+  endpoint and has no unix-socket transport.
+- **Distributed or replica-set service discovery.** Mongo replica
+  sets, etcd, Consul Connect, and similar protocols probe additional
+  servers by DNS during connection setup. Single-instance access via
+  unix socket works; replica-set discovery does not.
+- **TLS services requiring strict SNI hostname verification.** When
+  the client does not expose an option to override the expected
+  hostname, the unix-socket transport cannot satisfy verification.
+  This affects some enterprise JDBC drivers and some HTTPS libraries.
+- **Legacy TCP-only drivers.** Database drivers that have not added
+  unix-socket support (for example, older Oracle JDBC and some MSSQL
+  TDS clients).
 
-These are deliberately deferred. The right time to add first-class
-raw TCP host_services is when a concrete user is blocked by one of
-the above — the design decisions (per-cell port allocation vs SNI
-demux, TLS termination vs passthrough, connection-budget caps,
-audit shape) are best made against a real protocol's quirks rather
-than in the abstract.
+Adding first-class raw TCP host services is deferred pending a
+concrete consumer. The open design decisions — per-cell port
+allocation versus SNI demultiplexing, TLS termination versus
+passthrough, per-cell connection budgets, and the audit-log shape —
+are best resolved against the requirements of a specific protocol
+rather than in the abstract.
 
-If you hit one of these cases today, the escape hatch is to run a
-host-side tunnel (`socat TCP-LISTEN:N,fork TCP-CONNECT:remote:port`
-or ssh's `LocalForward`) and either bind it to a unix socket that
-host_sockets can mount, or accept that this particular access path
-sits outside brig's declarative model for now.
+Workarounds available today:
+
+- Run a host-side tunnel that exposes the remote TCP endpoint as a
+  unix socket, then declare that socket via `host_sockets`:
+
+      socat UNIX-LISTEN:/tmp/db.sock,fork TCP-CONNECT:remote:5432
+
+- Use SSH `LocalForward` to terminate at a unix socket on the host,
+  declared via `host_sockets` as above.
+
+- Run the dependent service inside the cell itself when isolation
+  from the host is acceptable.
 
 ## Examples
 

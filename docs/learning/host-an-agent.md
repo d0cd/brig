@@ -47,8 +47,9 @@ limactl shell brig -- sudo podman build \
 
 ## 2. Declare the host service in the cell yaml
 
-The cell yaml is the single source of truth — declaring the host
-service there IS the grant. No separate `brig policy` step.
+The cell yaml is the single source of truth. Declaring the host
+service in the yaml constitutes the grant; no separate `brig policy`
+step is required.
 
 ```yaml
 # my-agent.cell.yaml
