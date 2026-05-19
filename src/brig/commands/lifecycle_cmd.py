@@ -874,21 +874,106 @@ def cmd_export(args: Any) -> int:
     if pids and pids > 0:
         cell_def["pids_limit"] = pids
 
-    # Output as YAML-like format (no pyyaml dependency needed for output).
+    # Per-cell policy (allow / deny / host_services). The yaml is
+    # canonical, the per-cell policy file mirrors it, and warden
+    # reads that file — so it's the authoritative running state.
+    from brig.policy.policy import load_cell_policy
+    cell_policy = load_cell_policy(args.name) or {}
+    allow = cell_policy.get("allow") or []
+    deny = cell_policy.get("deny") or []
+    if allow or deny:
+        policy_block: dict = {}
+        if allow:
+            policy_block["allow"] = list(allow)
+        if deny:
+            policy_block["deny"] = list(deny)
+        cell_def["policy"] = policy_block
+    host_services = cell_policy.get("host_services") or []
+    if host_services:
+        cell_def["host_services"] = list(host_services)
+
+    # Ingress routes (from the host-side ingress-routes.json, written
+    # at cell start by lifecycle._register_cell_ingress).
+    from brig.config import HostPaths
+    ingress = _ingress_for_cell(args.name, HostPaths.INGRESS_ROUTES_FILE)
+    if ingress:
+        cell_def["ingress"] = ingress
+
+    # host_sockets — projected to {name, mount_point, mode} (host_path
+    # stays off the wire for the same reason it's omitted from the
+    # downward-API metadata).
+    sockets = _host_sockets_from_metadata(args.name)
+    if sockets:
+        cell_def["host_sockets"] = sockets
+
     output(f"# Cell definition exported from '{args.name}'")
-    output(f"# Save as: {args.name}.yaml")
-    output(f"# Run with: brig run --file {args.name}.yaml")
+    output("# Self-contained: brig run --file <this-file> will reproduce the cell.")
     output("")
-    for key, val in cell_def.items():
-        if isinstance(val, list):
-            output(f"{key}:")
-            for item in val:
-                output(f"  - {json.dumps(item) if not isinstance(item, str) else item}")
-        elif isinstance(val, dict):
+    _emit_yaml(cell_def)
+    return 0
+
+
+def _ingress_for_cell(cell_name: str, routes_file) -> list:
+    try:
+        data = json.loads(routes_file.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    routes = data.get("routes") or []
+    return [
+        {"name": r.get("name"),
+         "port": r.get("port"),
+         "path_prefix": r.get("path_prefix"),
+         "auth": "token"}
+        for r in routes
+        if isinstance(r, dict) and r.get("cell") == cell_name
+    ]
+
+
+def _host_sockets_from_metadata(cell_name: str) -> list:
+    from brig.cell.metadata import _host_metadata_path
+    try:
+        meta = json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    entries = meta.get("host_sockets") or []
+    return [
+        {"name": e["name"], "mount_point": e["mount_point"]}
+        for e in entries
+        if isinstance(e, dict) and "name" in e and "mount_point" in e
+    ]
+
+
+def _emit_yaml(d: dict) -> None:
+    """Minimal yaml emitter that handles the shapes cell_def uses
+    (scalars, list of scalars, list of dicts, nested dicts). Avoids
+    pulling in pyyaml just for output."""
+    def _scalar(v):
+        if isinstance(v, str):
+            return v
+        return json.dumps(v)
+
+    for key, val in d.items():
+        if isinstance(val, dict):
             output(f"{key}:")
             for k, v in val.items():
-                output(f"  {k}: {v}")
+                if isinstance(v, list):
+                    output(f"  {k}:")
+                    for item in v:
+                        output(f"    - {_scalar(item)}")
+                else:
+                    output(f"  {k}: {_scalar(v)}")
+        elif isinstance(val, list):
+            if val and all(isinstance(x, dict) for x in val):
+                output(f"{key}:")
+                for item in val:
+                    first = True
+                    for k, v in item.items():
+                        prefix = "  - " if first else "    "
+                        output(f"{prefix}{k}: {_scalar(v)}")
+                        first = False
+            else:
+                output(f"{key}:")
+                for item in val:
+                    output(f"  - {_scalar(item)}")
         else:
-            output(f"{key}: {val}")
-
-    return 0
+            output(f"{key}: {_scalar(val)}")
