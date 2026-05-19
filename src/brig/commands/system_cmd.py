@@ -17,20 +17,12 @@ from brig.ops.logging import info, output
 from brig.security.verify import verify_all
 
 
+# Seed for ~/.brig/cells/network-policy.json. Carries process-wide
+# warden settings only (rate limits, trace config). Allow/deny lives
+# per-cell — see `brig run --file <yaml>` and the policy section in
+# docs/design/cell-definition.md.
 _DEFAULT_POLICY = {
-    "allow": [
-        "pypi.org",
-        "*.pythonhosted.org",
-        "files.pythonhosted.org",
-        "github.com",
-        "api.github.com",
-        "*.githubusercontent.com",
-        "registry.npmjs.org",
-    ],
-    "deny": [],
-    "rate_limits": {
-        "default": {"rate": 100, "burst": 500}
-    },
+    "rate_limits": {"default": {"rate": 100, "burst": 500}},
 }
 
 

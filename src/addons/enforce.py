@@ -76,7 +76,6 @@ class PolicyEnforcer:
     """mitmproxy addon for policy enforcement."""
 
     def __init__(self):
-        self.global_policy = Policy()
         self.cell_policies: collections.OrderedDict[str, Policy] = collections.OrderedDict()
         self.subnets = SubnetResolver(SUBNET_MAP_FILE)
         self.policy_mtime = 0.0
@@ -84,10 +83,6 @@ class PolicyEnforcer:
         self.trace_config = PolicyTraceConfig()
         self._cell_policy_lock = threading.Lock()
         self._reload_lock = threading.RLock()
-        # host_services: removed from the global registry in the
-        # flattening rollout. Per-cell policy now carries
-        # `host_services: [{name, port}]` straight from the cell yaml,
-        # and _handle_host_service reads ports from there.
         self._host_ip: str = ""
 
     def load(self, loader):
@@ -209,38 +204,18 @@ class PolicyEnforcer:
                         f"Policy file not found: {POLICY_FILE}"
                     )
                 ctx.log.warn(f"PolicyEnforcer: Policy file not found: {POLICY_FILE}")
-                self.global_policy = Policy()
                 return
 
             mtime = POLICY_FILE.stat().st_mtime
             if mtime == self.policy_mtime:
-                return  # No change.
+                return
 
             with open(POLICY_FILE, "r") as f:
                 data = json.load(f)
 
-            self.global_policy = Policy(
-                allow=data.get("allow", []),
-                deny=data.get("deny", [])
-            )
-
-            # Load policy trace configuration.
-            trace_config = data.get("policy_trace", {})
-            self.trace_config = PolicyTraceConfig(trace_config)
-
-            # Note: global host_services was removed in the flattening
-            # rollout. Each cell now declares its own {name, port} pairs
-            # in its yaml, and those flow into the per-cell policy file
-            # consumed by _reload_cell_policies. There is no central
-            # registry to load here.
-
+            self.trace_config = PolicyTraceConfig(data.get("policy_trace", {}))
             self.policy_mtime = mtime
 
-            ctx.log.info(
-                f"PolicyEnforcer: Loaded policy - "
-                f"{len(self.global_policy.allow_rules)} allow, "
-                f"{len(self.global_policy.deny_rules)} deny rules"
-            )
             if self.trace_config.enabled:
                 ctx.log.info("PolicyEnforcer: Policy tracing enabled")
 
@@ -437,29 +412,22 @@ class PolicyEnforcer:
             )
             return
 
-        # Check 4: Per-cell policy (if exists).
         cell_policy = self._lookup_cell_policy(cell_name)
-        if cell_policy:
-            allowed, reason, trace = cell_policy.is_allowed(host, path, method, self.trace_config)
-            if trace and self.trace_config.enabled:
-                flow.metadata["policy_trace"] = trace
-            if allowed:
-                flow.metadata["policy_reason"] = f"cell:{reason}"
-                return
-            # Cell policy exists but didn't allow — block without falling through.
-            self._block(flow, f"cell policy: {reason}")
+        if cell_policy is None:
+            self._block(
+                flow,
+                f"cell '{cell_name or 'unknown'}' has no per-cell policy",
+            )
             return
-
-        # Check 5: Global policy.
-        allowed, reason, trace = self.global_policy.is_allowed(host, path, method, self.trace_config)
+        allowed, reason, trace = cell_policy.is_allowed(
+            host, path, method, self.trace_config,
+        )
         if trace and self.trace_config.enabled:
             flow.metadata["policy_trace"] = trace
         if allowed:
-            flow.metadata["policy_reason"] = f"global:{reason}"
+            flow.metadata["policy_reason"] = f"cell:{reason}"
             return
-
-        # Default: Block.
-        self._block(flow, f"global policy: {reason}")
+        self._block(flow, f"cell policy: {reason}")
 
     def _lookup_cell_policy(self, cell_name: Optional[str]) -> Optional[Policy]:
         """Look up the cell policy and update LRU position. Returns None if no policy."""
@@ -480,11 +448,7 @@ class PolicyEnforcer:
     ) -> None:
         """Route a .host.brig request to the macOS host.
 
-        Flattened (single-source) model: the cell's per-cell policy
-        carries `host_services: [{name, port}]` straight from the cell
-        yaml. The presence of (name → port) in the cell's map IS the
-        grant; there is no separate global registry to cross-check.
-
+        Looks up the port in the cell's per-cell host_services map.
         Blocks if host IP isn't discovered, the cell has no per-cell
         policy, or the requested name isn't in the cell's map.
         """
@@ -507,21 +471,11 @@ class PolicyEnforcer:
             return
         service_port = cell_policy.host_services_map.get(service_name)
         if service_port is None:
-            # Either the name isn't in the cell's map, or it's there
-            # without a port (legacy bare-name shape). Either way the
-            # flattened model can't route — fail closed.
-            if service_name not in cell_policy.host_services_map:
-                self._block(
-                    flow,
-                    f"host service '{safe_name}': not declared in cell "
-                    f"'{cell_name}' yaml",
-                )
-            else:
-                self._block(
-                    flow,
-                    f"host service '{safe_name}': legacy per-cell policy "
-                    f"lacks a port; re-run cell with host_services in yaml",
-                )
+            self._block(
+                flow,
+                f"host service '{safe_name}': not declared in cell "
+                f"'{cell_name}' yaml",
+            )
             return
 
         # Rewrite request to target the macOS host.
@@ -605,18 +559,16 @@ class PolicyEnforcer:
         client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
         cell_name = self.subnets.get_cell_name(client_ip)
 
-        # Check per-cell policy.
         cell_policy = self._lookup_cell_policy(cell_name)
-        if cell_policy:
-            allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
-            if not allowed:
-                self._block(flow, f"cell policy: {reason}")
+        if cell_policy is None:
+            self._block(
+                flow,
+                f"cell '{cell_name or 'unknown'}' has no per-cell policy",
+            )
             return
-
-        # Check global policy.
-        allowed, reason, _ = self.global_policy.is_allowed(host, "/", "CONNECT")
+        allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
         if not allowed:
-            self._block(flow, f"global policy: {reason}")
+            self._block(flow, f"cell policy: {reason}")
 
     def server_connected(self, data):
         """Check resolved IP against blocked ranges after DNS resolution.

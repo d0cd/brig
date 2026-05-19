@@ -120,21 +120,18 @@ class TestCpColonParsing(unittest.TestCase):
 
 class TestPolicyTest(unittest.TestCase):
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-        self.policy_file = Path(self.tmpdir) / "network-policy.json"
-        self.policy_file.write_text(json.dumps({
+        self.tmpdir = Path(tempfile.mkdtemp())
+        (self.tmpdir / "alice.json").write_text(json.dumps({
             "allow": ["pypi.org", "*.example.com"],
             "deny": ["evil.example.com"],
         }))
 
-    def _patch_paths(self):
-        from brig import config as cfg
-        return patch.object(cfg.HostPaths, "NETWORK_POLICY", self.policy_file)
-
     def _run(self, domain: str) -> int:
         from brig.commands.policy_cmd import cmd_policy_test
-        args = SimpleNamespace(domain=domain, path="/", method="GET")
-        with self._patch_paths():
+        args = SimpleNamespace(name="alice", domain=domain,
+                               path="/", method="GET")
+        with patch("brig.policy.policy.get_cell_policy_path",
+                   side_effect=lambda n, *a, **kw: self.tmpdir / f"{n}.json"):
             return cmd_policy_test(args)
 
     def test_allowed_domain(self):

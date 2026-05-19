@@ -33,9 +33,8 @@ class TestPolicyParsesFlattenedShape(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertEqual(p.host_services_map, {"db": 5432, "litellm": 4000})
-        self.assertEqual(p.host_services_allowed, {"db", "litellm"})
 
-    def test_legacy_bare_name_shape_still_loads(self):
+    def test_bare_name_entries_dropped(self):
         import sys
         sys.path.insert(0, "src/addons")
         try:
@@ -43,9 +42,7 @@ class TestPolicyParsesFlattenedShape(unittest.TestCase):
             p = Policy(host_services=["db", "redis"])
         finally:
             sys.path.pop(0)
-        # Legacy shape: ports unknown.
-        self.assertEqual(p.host_services_map, {"db": None, "redis": None})
-        self.assertEqual(p.host_services_allowed, {"db", "redis"})
+        self.assertEqual(p.host_services_map, {})
 
     def test_none_means_no_grant(self):
         import sys
@@ -56,7 +53,6 @@ class TestPolicyParsesFlattenedShape(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertIsNone(p.host_services_map)
-        self.assertIsNone(p.host_services_allowed)
 
 
 class TestSyncHostServicesPolicy(unittest.TestCase):

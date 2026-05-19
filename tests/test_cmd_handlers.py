@@ -133,25 +133,24 @@ class TestCmdRunValidation(unittest.TestCase):
 
 
 class TestCmdPolicySet(unittest.TestCase):
-    """Test policy set command handler."""
+    """Test policy set command handler — per-cell only."""
 
-    def test_global_policy_edit(self):
+    def test_per_cell_edit_appends_allow(self):
+        from brig.commands.policy_cmd import cmd_policy_set
         with tempfile.TemporaryDirectory() as tmpdir:
-            policy_path = Path(tmpdir) / "network-policy.json"
-            policy_path.write_text(json.dumps({"allow": ["existing.com"], "deny": []}))
-
-            with patch("brig.commands.policy_cmd.HostPaths") as mock_paths:
-                mock_paths.NETWORK_POLICY = policy_path
-                from brig.commands.policy_cmd import cmd_policy_set
-
-                args = types.SimpleNamespace(
-                    name="global", allow=["new.com"], deny=None,
-                    remove_allow=None, remove_deny=None,
-                )
-                with patch("brig.commands.policy_cmd.log_policy_change"):
-                    with patch("warden.proxy.reload_policy", return_value=True):
-                        cmd_policy_set(args)
-
-            policy = json.loads(policy_path.read_text())
+            policy_dir = Path(tmpdir)
+            (policy_dir / "alice.json").write_text(
+                json.dumps({"allow": ["existing.com"], "deny": []})
+            )
+            args = types.SimpleNamespace(
+                name="alice", allow=["new.com"], deny=None,
+                remove_allow=None, remove_deny=None,
+            )
+            with patch("brig.policy.policy.get_cell_policy_path",
+                       side_effect=lambda n, *a, **kw: policy_dir / f"{n}.json"), \
+                 patch("brig.commands.policy_cmd.log_policy_change"), \
+                 patch("brig.cell.metadata.refresh_metadata_if_present"):
+                cmd_policy_set(args)
+            policy = json.loads((policy_dir / "alice.json").read_text())
             self.assertIn("existing.com", policy["allow"])
             self.assertIn("new.com", policy["allow"])
