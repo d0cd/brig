@@ -77,6 +77,22 @@ INGRESS_AUTH_METHODS = {"token"}
 INGRESS_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
 INGRESS_PATH_PREFIX_PATTERN = re.compile(r'^/[a-zA-Z0-9/_-]+$')
 
+# Host sockets — kernel-side channel between a cell and a macOS host
+# service via a bind-mounted unix socket. Bypasses Warden by design
+# (the bytes never reach the proxy), so the validators here are the
+# only thing standing between a cell yaml and a host file.
+HOST_SOCKET_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}$')
+MAX_HOST_SOCKETS_PER_CELL = 8
+HOST_SOCKET_MOUNT_PREFIX = "/run/host/"
+HOST_SOCKET_MODES = {"ro", "rw"}
+# Container-engine sockets — granting these to a cell is root-equivalent
+# on the host. Denied at parse time unless the operator passes the
+# (future) --allow-engine-socket override.
+HOST_SOCKET_ENGINE_DENYLIST = (
+    "docker.sock", "podman.sock", "containerd.sock",
+    "crio.sock", "firecracker.sock", "limactl.sock",
+)
+
 # Unsafe file extensions for --sanitize mode.
 UNSAFE_EXTENSIONS = {
     ".app", ".command", ".scpt", ".dmg", ".pkg", ".webloc",

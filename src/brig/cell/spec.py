@@ -16,9 +16,14 @@ from typing import Any
 from brig.config import (
     CELL_NAME_PATTERN,
     DOMAIN_PATTERN,
+    HOST_SOCKET_ENGINE_DENYLIST,
+    HOST_SOCKET_MODES,
+    HOST_SOCKET_MOUNT_PREFIX,
+    HOST_SOCKET_NAME_PATTERN,
     INGRESS_AUTH_METHODS,
     INGRESS_NAME_PATTERN,
     INGRESS_PATH_PREFIX_PATTERN,
+    MAX_HOST_SOCKETS_PER_CELL,
     MAX_INGRESS_PER_CELL,
     MEMORY_PATTERN,
 )
@@ -105,6 +110,11 @@ class CellSpec:
     image_digest: str | None = None
     profile: str | None = None
     ingress: list[dict[str, Any]] = field(default_factory=list)
+    # host_sockets — bind-mount macOS-side unix sockets into the cell.
+    # Each entry: {name, host_path, mount_point, mode?}. See _v_host_sockets
+    # for validation; bypasses Warden by design, so the validators here
+    # are the entire security boundary on the cell-yaml → host-file path.
+    host_sockets: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Validate inputs at construction time — the system boundary.
@@ -314,6 +324,138 @@ def _v_detach(value: Any, context: str) -> list[str]:
     return []
 
 
+def _v_host_socket_entry(
+    i: int, entry: Any, seen_names: set, seen_mounts: set, context: str,
+) -> list[str]:
+    """Validate one host_socket entry. Mutates seen_* to track duplicates.
+
+    Static checks only — does NOT touch the filesystem (no realpath,
+    no S_ISSOCK). The runtime check happens in the reconciler at cell
+    start, where TOCTOU is unavoidable anyway. Static rules:
+      - name matches HOST_SOCKET_NAME_PATTERN, unique within cell
+      - host_path is absolute, no '..', not on the engine denylist
+      - mount_point starts with /run/host/, no '..', not literally /run/host/
+      - mode in {ro, rw} if provided
+    """
+    if not isinstance(entry, dict):
+        return [f"'host_sockets[{i}]' must be a dict{context}"]
+
+    errors: list[str] = []
+
+    name = entry.get("name")
+    if not name or not isinstance(name, str):
+        errors.append(
+            f"'host_sockets[{i}].name' is required and must be a string{context}"
+        )
+    elif not HOST_SOCKET_NAME_PATTERN.match(name):
+        errors.append(
+            f"'host_sockets[{i}].name' must be lowercase alphanumeric "
+            f"with hyphens, max 31 chars{context}"
+        )
+    elif name in seen_names:
+        errors.append(f"Duplicate host_sockets name '{name}'{context}")
+    else:
+        seen_names.add(name)
+
+    host_path = entry.get("host_path")
+    if not host_path or not isinstance(host_path, str):
+        errors.append(
+            f"'host_sockets[{i}].host_path' is required and must be a string{context}"
+        )
+    elif not host_path.startswith("/"):
+        errors.append(
+            f"'host_sockets[{i}].host_path' must be absolute{context}"
+        )
+    elif ".." in host_path.split("/"):
+        errors.append(
+            f"'host_sockets[{i}].host_path' must not contain '..' (path traversal){context}"
+        )
+    else:
+        # Engine-socket denylist: granting these is root-equivalent on
+        # the host (docker/podman socket = exec arbitrary containers as
+        # the daemon user, which is typically root).
+        basename = host_path.rsplit("/", 1)[-1]
+        if basename in HOST_SOCKET_ENGINE_DENYLIST:
+            errors.append(
+                f"'host_sockets[{i}].host_path' points at engine socket "
+                f"'{basename}' — granting this is root-equivalent on the "
+                f"host and is denied{context}"
+            )
+
+    mount_point = entry.get("mount_point")
+    if not mount_point or not isinstance(mount_point, str):
+        errors.append(
+            f"'host_sockets[{i}].mount_point' is required and must be a string{context}"
+        )
+    elif ".." in mount_point.split("/"):
+        errors.append(
+            f"'host_sockets[{i}].mount_point' must not contain '..' (path traversal){context}"
+        )
+    elif not mount_point.startswith(HOST_SOCKET_MOUNT_PREFIX):
+        errors.append(
+            f"'host_sockets[{i}].mount_point' must start with "
+            f"'{HOST_SOCKET_MOUNT_PREFIX}'{context}"
+        )
+    elif mount_point.rstrip("/") == HOST_SOCKET_MOUNT_PREFIX.rstrip("/"):
+        errors.append(
+            f"'host_sockets[{i}].mount_point' must be a file path under "
+            f"'{HOST_SOCKET_MOUNT_PREFIX}', not the directory itself{context}"
+        )
+    elif mount_point in seen_mounts:
+        errors.append(f"Duplicate host_sockets mount_point '{mount_point}'{context}")
+    else:
+        seen_mounts.add(mount_point)
+
+    mode = entry.get("mode", "ro")
+    if not isinstance(mode, str) or mode not in HOST_SOCKET_MODES:
+        errors.append(
+            f"'host_sockets[{i}].mode' must be one of: "
+            f"{', '.join(sorted(HOST_SOCKET_MODES))}{context}"
+        )
+
+    return errors
+
+
+def _v_host_sockets(value: Any, cell_def: dict, context: str) -> list[str]:
+    """Validate the cell's host_sockets list as a whole.
+
+    Cross-cutting rules (per-entry checks live in _v_host_socket_entry):
+      - must be a list
+      - count bounded by MAX_HOST_SOCKETS_PER_CELL
+      - the `untrusted` profile may not declare any host_sockets — the
+        profile exists specifically to deny side channels like this
+    """
+    if not isinstance(value, list):
+        return [f"'host_sockets' must be a list{context}"]
+
+    errors: list[str] = []
+    if len(value) > MAX_HOST_SOCKETS_PER_CELL:
+        errors.append(
+            f"Too many host_sockets entries ({len(value)}), "
+            f"max {MAX_HOST_SOCKETS_PER_CELL}{context}"
+        )
+
+    # The `untrusted` profile is brig's "I am running adversarial code"
+    # toggle. Bypassing Warden via a kernel side channel defeats the
+    # point — reject at parse time so the operator can't accidentally
+    # do it. Other profiles (supervised, dev) are unaffected.
+    if cell_def.get("profile") == "untrusted" and value:
+        errors.append(
+            f"'host_sockets' is not allowed with profile='untrusted' — "
+            f"untrusted cells must not have side channels to host services"
+            f"{context}"
+        )
+
+    seen_names: set = set()
+    seen_mounts: set = set()
+    for i, entry in enumerate(value):
+        errors.extend(
+            _v_host_socket_entry(i, entry, seen_names, seen_mounts, context)
+        )
+
+    return errors
+
+
 def _v_ingress_entry(i: int, entry: Any, seen_names: set, seen_prefixes: set,
                      context: str) -> list[str]:
     """Validate one ingress entry. Mutates seen_* sets to track duplicates."""
@@ -429,6 +571,9 @@ def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> l
 
     if "ingress" in cell_def:
         errors.extend(_v_ingress(cell_def["ingress"], cell_def, context))
+
+    if "host_sockets" in cell_def:
+        errors.extend(_v_host_sockets(cell_def["host_sockets"], cell_def, context))
 
     return errors
 
