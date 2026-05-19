@@ -13,8 +13,17 @@ from brig.cell.spec import (
     load_cell_definition,
     parse_duration,
     parse_size,
-    validate_cell_definition,
+    validate_cell_definition as _validate_raw,
 )
+
+
+def validate_cell_definition(cell_def, file_path=""):
+    """Test wrapper that supplies a default `name` if the caller is
+    only exercising another field — the per-field tests below predate
+    the "name is required" rule and shouldn't have to repeat it."""
+    if isinstance(cell_def, dict) and "name" not in cell_def:
+        cell_def = {"name": "test", **cell_def}
+    return _validate_raw(cell_def, file_path)
 
 
 class TestValidateCellDefinition(unittest.TestCase):

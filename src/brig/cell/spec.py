@@ -699,6 +699,9 @@ def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> l
     errors: list[str] = []
     context = f" in {file_path}" if file_path else ""
 
+    if "name" not in cell_def:
+        errors.append(f"'name' is required{context}")
+
     for field_name, validator in _SIMPLE_VALIDATORS.items():
         if field_name in cell_def:
             errors.extend(validator(cell_def[field_name], context))

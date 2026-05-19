@@ -183,7 +183,8 @@ def cmd_doctor(args: Any) -> int:
             _check(f"policy: {policy_path.name}", True)
         except json.JSONDecodeError as e:
             _check(f"policy: {policy_path.name}", False,
-                   detail=str(e), suggestion="brig policy show global")
+                   detail=str(e),
+                   suggestion=f"Fix {policy_path} or re-seed: brig init")
     else:
         _check(f"policy: {policy_path.name}", False, suggestion="brig init")
 

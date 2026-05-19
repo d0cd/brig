@@ -56,9 +56,10 @@ class TestExportResolved(unittest.TestCase):
 
     def test_minimal_emits_image_and_resources(self):
         text = self._captured_output(_args(), self._inspect())
-        self.assertIn("name: alice", text)
-        self.assertIn("image: alpine", text)
-        self.assertIn("memory: 2g", text)
+        # Strings are JSON-quoted in output for yaml-safety.
+        self.assertIn('name: "alice"', text)
+        self.assertIn('image: "alpine"', text)
+        self.assertIn('memory: "2g"', text)
 
     def test_includes_allow_and_deny(self):
         text = self._captured_output(_args(), self._inspect(), cell_policy={
@@ -74,8 +75,8 @@ class TestExportResolved(unittest.TestCase):
             "host_services": [{"name": "db", "port": 5432}],
         })
         self.assertIn("host_services:", text)
-        self.assertIn("name: db", text)
-        self.assertIn("port: 5432", text)
+        self.assertIn('"db"', text)
+        self.assertIn("5432", text)
 
     def test_includes_ingress_routes(self):
         text = self._captured_output(_args(), self._inspect(),
@@ -86,8 +87,8 @@ class TestExportResolved(unittest.TestCase):
             ],
         )
         self.assertIn("ingress:", text)
-        self.assertIn("name: api", text)
-        self.assertNotIn("/x", text)  # other cell's route not included
+        self.assertIn('"api"', text)
+        self.assertNotIn("port: 1\n", text)  # other cell's route not included
 
     def test_includes_host_sockets_without_host_path(self):
         text = self._captured_output(_args(), self._inspect(),
@@ -97,8 +98,26 @@ class TestExportResolved(unittest.TestCase):
             ],
         )
         self.assertIn("host_sockets:", text)
-        self.assertIn("mount_point: /run/host/pg.sock", text)
+        self.assertIn("/run/host/pg.sock", text)
         self.assertNotIn("SHOULD-NOT-LEAK", text)
+
+    def test_export_wildcard_round_trips(self):
+        """Regression: bare `*.example.com` would emit unquoted and
+        pyyaml would parse it as an alias. JSON-quoted strings keep
+        round-trip working."""
+        text = self._captured_output(_args(), self._inspect(), cell_policy={
+            "allow": ["*.example.com", "api.x"], "deny": [],
+        })
+        # Each wildcard must be quoted in the output.
+        self.assertIn('"*.example.com"', text)
+        # And the resulting yaml block must parse cleanly.
+        try:
+            import yaml
+            yaml.safe_load(text)
+        except (ImportError, ModuleNotFoundError):
+            self.skipTest("pyyaml not installed")
+        except Exception as e:
+            self.fail(f"emitted yaml does not parse: {e}\n{text}")
 
 
 if __name__ == "__main__":

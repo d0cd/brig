@@ -164,7 +164,7 @@ class TestIngressSpecValidation(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_empty_ingress_is_valid(self):
-        errors = validate_cell_definition({"ingress": []})
+        errors = validate_cell_definition({"name": "x", "ingress": []})
         self.assertEqual(errors, [])
 
 

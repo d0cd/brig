@@ -593,11 +593,17 @@ class TestResponseHeadersDnsRebinding(unittest.TestCase):
 
 
 class TestConnectMethodEnforcement(unittest.TestCase):
-    """CONNECT tunnels must respect the same port and policy gates."""
+    """CONNECT tunnels must respect the same port and policy gates.
+    Per-cell policy is the sole authority, so each test installs a
+    policy for the cell that owns 10.60.1.2 (the default client_ip)."""
 
     def setUp(self):
         self.enforcer = PolicyEnforcer()
-        self.enforcer.global_policy = Policy(allow=["example.com"])
+        # Bind 10.60.1.0/24 → cell "alice" so flows from 10.60.1.2 get
+        # attributed to a real cell name during policy lookup.
+        self.enforcer.subnets = MagicMock()
+        self.enforcer.subnets.get_cell_name = lambda ip: "alice"
+        self.enforcer.cell_policies["alice"] = Policy(allow=["example.com"])
 
     def test_connect_to_disallowed_port_blocked(self):
         flow = _make_flow(host="example.com", port=22, listen_port=8080)
@@ -617,6 +623,25 @@ class TestConnectMethodEnforcement(unittest.TestCase):
 
     def test_connect_to_disallowed_domain_blocked(self):
         flow = _make_flow(host="evil.com", port=443, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+        # Specifically: blocked by the cell's policy, not because no
+        # cell policy existed.
+        self.assertIn("cell policy", flow.metadata.get("block_reason", ""))
+
+    def test_connect_to_allowed_domain_passes(self):
+        """Allowed domain through the per-cell policy should not be
+        blocked. Regression for tests that previously passed for the
+        wrong reason (no cell policy → default deny)."""
+        flow = _make_flow(host="example.com", port=443, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertFalse(flow.metadata.get("blocked"),
+            f"expected pass, got {flow.metadata.get('block_reason')}")
+
+    def test_connect_when_cell_has_no_policy_blocked(self):
+        """No per-cell policy = fail closed."""
+        self.enforcer.cell_policies.clear()
+        flow = _make_flow(host="example.com", port=443, listen_port=8080)
         self.enforcer.http_connect(flow)
         self.assertTrue(flow.metadata.get("blocked"))
 

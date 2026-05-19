@@ -44,10 +44,13 @@ def register_parser(sub) -> None:
 def cmd_policy_show(args: Any) -> int:
     policy = load_cell_policy(args.name)
     if policy is None:
-        raise BrigError(
-            f"No policy for cell '{args.name}'",
-            suggestion=f"brig policy set {args.name} --allow <domain>",
-        )
+        # No per-cell policy file = default deny. Don't error — show
+        # the effective contents (empty) with a note so the operator
+        # understands the cell is reachable-by-nothing.
+        output(json.dumps({"allow": [], "deny": [], "host_services": []},
+                          indent=2))
+        output(f"# (no policy file for '{args.name}' — cell blocks all egress)")
+        return 0
     output(json.dumps(policy, indent=2))
     return 0
 

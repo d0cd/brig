@@ -185,11 +185,20 @@ def cmd_run(args: Any) -> int:
                 src = cell_def["policy"].get(src_key) or []
                 if src:
                     spec_kwargs[dst_key] = list(spec_kwargs.get(dst_key) or []) + list(src)
+        # host_services from yaml EXTEND the profile baseline, same as
+        # policy.allow/deny. A plain generic-merge would replace, which
+        # silently drops profile-declared services when the yaml has any.
+        if isinstance(cell_def.get("host_services"), list):
+            spec_kwargs["host_services"] = (
+                list(spec_kwargs.get("host_services") or [])
+                + list(cell_def["host_services"])
+            )
         # Generic merge for everything else the validator accepts.
         import dataclasses as _dc
         _spec_field_names = {f.name for f in _dc.fields(CellSpec)}
         _already_handled = {
             "image", "name", "command", "env", "ingress", "policy",
+            "host_services",
         }
         for key, val in cell_def.items():
             if key in _spec_field_names and key not in _already_handled:
@@ -945,10 +954,15 @@ def _host_sockets_from_metadata(cell_name: str) -> list:
 def _emit_yaml(d: dict) -> None:
     """Minimal yaml emitter that handles the shapes cell_def uses
     (scalars, list of scalars, list of dicts, nested dicts). Avoids
-    pulling in pyyaml just for output."""
+    pulling in pyyaml just for output.
+
+    Strings are always JSON-quoted to dodge yaml metachars: bare
+    `*.example.com` parses as a yaml alias reference, bare `1.0` as
+    a float, leading-`!`/`&`/`>`/`|`/`#` as tag/anchor/block-scalar
+    markers. JSON quoting is yaml-valid for any string and keeps the
+    round-trip through load_cell_definition correct.
+    """
     def _scalar(v):
-        if isinstance(v, str):
-            return v
         return json.dumps(v)
 
     for key, val in d.items():
