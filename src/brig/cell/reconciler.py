@@ -272,10 +272,60 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.workdir:
         cmd.extend(["--workdir", spec.workdir])
 
+    _attach_host_sockets(spec, cmd)
+
     cmd.append(spec.image)
     cmd.extend(spec.command)
 
     return cmd
+
+
+def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
+    """Append `--volume` args for each declared host_socket, after
+    re-checking that the bridge socket is actually present and is a
+    real unix socket file (not a symlink, not a regular file).
+
+    This is the runtime TOCTOU defense — the static checks at yaml
+    parse time can't see the bridge directory, and the bridge is
+    populated by the macOS-side launchd unit (Phase 4). If the bridge
+    is missing, refuse cell start with a clear error rather than
+    letting podman create an empty dir at the source path.
+    """
+    if not spec.host_sockets:
+        return
+
+    from brig.config import VMPaths
+    bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR))
+    for entry in spec.host_sockets:
+        name = entry["name"]
+        mount_point = entry["mount_point"]
+        mode = entry.get("mode", "ro")
+        source = bridge_dir / f"{name}.sock"
+
+        # lstat (NOT stat) so symlinks don't get followed silently.
+        # A symlink at the bridge path could redirect the bind-mount
+        # to anywhere on the host; require a real socket file.
+        try:
+            st = source.lstat()
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"host_socket '{name}': bridge socket not found at "
+                f"{source}. Is the launchd bridge running? "
+                f"Try: brig system up"
+            )
+        import stat as _stat
+        if _stat.S_ISLNK(st.st_mode):
+            raise RuntimeError(
+                f"host_socket '{name}': bridge path {source} is a symlink. "
+                f"Refusing to mount — bridge sockets must be real files."
+            )
+        if not _stat.S_ISSOCK(st.st_mode):
+            raise RuntimeError(
+                f"host_socket '{name}': bridge path {source} is not a "
+                f"unix socket (mode={oct(st.st_mode)})."
+            )
+
+        cmd.extend(["-v", f"{source}:{mount_point}:{mode}"])
 
 
 _ROLLBACK_MAP = {
@@ -347,7 +397,8 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         _run_cmd(["mkdir", "-p", str(workspace)])
         # Write the cell metadata file (downward API) so it's in place when
         # podman creates the read-only bind mount at /run/brig/cell.json.
-        write_metadata(spec.name, spec.workspace_mount)
+        write_metadata(spec.name, spec.workspace_mount,
+                       host_sockets=spec.host_sockets)
         proxy_ip = None
         if not spec.is_airgapped:
             # Retry — network connect may not have propagated yet.

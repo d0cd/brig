@@ -125,6 +125,12 @@ class HostPaths:
     POLICY_DIR = SYSTEM_DIR / "policies"
     INGRESS_ROUTES_FILE = SYSTEM_DIR / "ingress-routes.json"
 
+    # host_sockets bridge dir — macOS-side launchd unit creates a socket
+    # here that proxies to the operator's host_path; Lima exposes
+    # ~/.brig under /state in the VM, so the same path is reachable
+    # from inside the VM without a separate forward.
+    HOST_SOCKETS_DIR = STATE_DIR / "system" / "host-sockets"
+
     # Rate limit state (host-side, used before entering VM).
     RATE_LIMIT_FILE = STATE_DIR / "system" / "rate_limit.json"
 
@@ -162,6 +168,10 @@ class VMPaths:
 
     # Logs (inside VM).
     LOG_DIR = Path("/var/log/brig/network")
+
+    # host_sockets bridge dir — same files as HostPaths.HOST_SOCKETS_DIR,
+    # reached via the /state virtiofs mount.
+    HOST_SOCKETS_DIR = SYSTEM_DIR / "host-sockets"
 
 
 # Backward-compatible aliases used by modules that haven't been updated.

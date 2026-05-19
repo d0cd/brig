@@ -156,6 +156,21 @@ def run_cell(
         # Register ingress routes if the cell has ingress endpoints.
         if spec.ingress:
             _register_cell_ingress(spec, result)
+        # Audit any host_sockets that were mounted. The bytes flowing
+        # over these sockets bypass Warden, so the attach event is the
+        # only thing we can record — make sure it's loud.
+        if spec.host_sockets:
+            for entry in spec.host_sockets:
+                log_lifecycle(
+                    "host_socket_attach", spec.name,
+                    details={"socket": entry["name"],
+                             "mount_point": entry["mount_point"],
+                             "mode": entry.get("mode", "ro")},
+                )
+            info(
+                f"NOTE: cell '{spec.name}' has {len(spec.host_sockets)} "
+                f"host_sockets — Warden does not see traffic over these."
+            )
         info(f"Cell '{spec.name}' started")
     else:
         failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")

@@ -70,9 +70,20 @@ def build_metadata(
     cell_name: str,
     workspace_mount: str,
     started_at: datetime | None = None,
+    host_sockets: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Compose the cell metadata payload. Pure function for testability."""
+    """Compose the cell metadata payload. Pure function for testability.
+
+    host_sockets entries are projected to {name, mount_point} only —
+    host_path stays out of the downward-API surface for the same
+    reason workspace.host_path was dropped in v2 (no host paths
+    leak through `/run/brig/cell.json`).
+    """
     ts = started_at or datetime.now(timezone.utc)
+    sockets_published = [
+        {"name": entry["name"], "mount_point": entry["mount_point"]}
+        for entry in (host_sockets or [])
+    ]
     payload: dict[str, Any] = {
         "version": SCHEMA_VERSION,
         "name": cell_name,
@@ -80,6 +91,7 @@ def build_metadata(
         "workspace": {
             "mount_point": workspace_mount,
         },
+        "host_sockets": sockets_published,
         "policy": {
             "host_services": _per_cell_host_services(cell_name),
         },
@@ -123,10 +135,25 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
     workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
-    return write_metadata(cell_name, workspace_mount)
+    # Preserve host_sockets across refresh — bind mounts are fixed at
+    # podman-create time, so this list can't change without a restart.
+    # Re-project to the original (name, mount_point) shape; we don't
+    # have host_path here, and the projection in build_metadata only
+    # uses those two fields.
+    prior_sockets = [
+        {"name": s["name"], "mount_point": s["mount_point"],
+         "host_path": ""}  # placeholder; build_metadata only reads name/mount_point
+        for s in prior.get("host_sockets", [])
+        if isinstance(s, dict) and "name" in s and "mount_point" in s
+    ]
+    return write_metadata(cell_name, workspace_mount, host_sockets=prior_sockets)
 
 
-def write_metadata(cell_name: str, workspace_mount: str) -> Path:
+def write_metadata(
+    cell_name: str,
+    workspace_mount: str,
+    host_sockets: list[dict[str, Any]] | None = None,
+) -> Path:
     """Write the cell's metadata JSON to the host path. Returns the path.
 
     Called from reconciler.PODMAN_RUN before launching the cell, so the
@@ -138,7 +165,7 @@ def write_metadata(cell_name: str, workspace_mount: str) -> Path:
     `try: ... except OSError: pass` could silently leave the file at
     mkstemp's default 0600 and the cell couldn't read its own metadata.
     """
-    payload = build_metadata(cell_name, workspace_mount)
+    payload = build_metadata(cell_name, workspace_mount, host_sockets=host_sockets)
     target = _host_metadata_path(cell_name)
     atomic_write_json(target, payload, mode=0o644)
     return target
