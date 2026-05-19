@@ -269,7 +269,43 @@ Security properties:
 | Audit | Per-request through Warden | Connect/disconnect only |
 | Address from cell | `<name>.host.brig` (DNS) | `/run/host/<name>.sock` (filesystem) |
 | Setup | `host_services: [{name, port}]` | `host_sockets: [{name, host_path, mount_point}]` + socat |
-| Use for | API gateways, model serving, anything HTTP | Postgres, Redis, ssh-agent, anything with a unix socket |
+| Use for | API gateways, model serving, anything HTTP | Postgres, Redis, MongoDB, MySQL, ssh-agent, anything with a unix socket |
+
+Most modern database and RPC clients support unix sockets — Postgres,
+MySQL, Redis, MongoDB, gRPC (most languages). The trilogy of (HTTP via
+host_services) + (HTTP ingress for inbound) + (unix-socket via
+host_sockets for everything else) covers ~95% of realistic cell→host
+needs.
+
+### Not supported: raw TCP host_services
+
+A small set of host-access patterns cannot be expressed with either
+mechanism today:
+
+- **SSH from a cell to a host.** Protocol fundamentally requires
+  a network endpoint; no unix-socket transport.
+- **Distributed/replica-set discovery.** Mongo replica sets, etcd,
+  Consul Connect — protocols whose connection setup probes other
+  servers by DNS. Single-instance Mongo works fine via unix socket;
+  replica-set discovery does not.
+- **TLS services that require strict SNI hostname verification**
+  when the client doesn't expose a way to override the expected
+  hostname (some enterprise JDBC drivers, some HTTPS libraries).
+- **Legacy TCP-only enterprise drivers** that never added unix-socket
+  support (e.g. older Oracle JDBC, some MSSQL TDS clients).
+
+These are deliberately deferred. The right time to add first-class
+raw TCP host_services is when a concrete user is blocked by one of
+the above — the design decisions (per-cell port allocation vs SNI
+demux, TLS termination vs passthrough, connection-budget caps,
+audit shape) are best made against a real protocol's quirks rather
+than in the abstract.
+
+If you hit one of these cases today, the escape hatch is to run a
+host-side tunnel (`socat TCP-LISTEN:N,fork TCP-CONNECT:remote:port`
+or ssh's `LocalForward`) and either bind it to a unix socket that
+host_sockets can mount, or accept that this particular access path
+sits outside brig's declarative model for now.
 
 ## Examples
 
