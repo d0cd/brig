@@ -523,6 +523,18 @@ class TestServerConnectedDnsRebinding(unittest.TestCase):
         self.enforcer.server_connected(data)
         data.server.close.assert_not_called()
 
+    def test_ingress_route_skip_when_metadata_set(self):
+        """Ingress flows (routed by ingress.py to a cell IP in
+        BLOCKED_NETWORKS) must NOT be killed by the rebinding check —
+        warden picked that IP itself, it's not a poisoned DNS response.
+        Regression for aitelier-feedback #1."""
+        flow = MagicMock()
+        flow.metadata = {"ingress_route": "aitelier:/api"}
+        # Cell IP in 10.60.0.0/16 (BLOCKED_NETWORKS).
+        data = self._make_server_data("10.60.1.15", port=7777, flow=flow)
+        self.enforcer.server_connected(data)
+        data.server.close.assert_not_called()
+
 
 class TestResponseHeadersDnsRebinding(unittest.TestCase):
     """Inv. 2: responseheaders blocks responses from blocked-IP servers."""
@@ -551,6 +563,15 @@ class TestResponseHeadersDnsRebinding(unittest.TestCase):
 
     def test_skips_when_host_service_metadata_set(self):
         flow = self._make_flow("192.168.64.1", port=5432, host_service="mydb")
+        self.enforcer.responseheaders(flow)
+        self.assertFalse(flow.metadata.get("blocked"))
+
+    def test_skips_when_ingress_route_metadata_set(self):
+        """Ingress response from a cell IP in BLOCKED_NETWORKS must NOT
+        be killed — warden routed there itself. Regression for
+        aitelier-feedback #1."""
+        flow = self._make_flow("10.60.1.15", port=7777)
+        flow.metadata["ingress_route"] = "aitelier:/api"
         self.enforcer.responseheaders(flow)
         self.assertFalse(flow.metadata.get("blocked"))
 

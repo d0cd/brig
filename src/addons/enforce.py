@@ -644,7 +644,14 @@ class PolicyEnforcer:
             # we rewrote in _handle_host_service. The flow attribute is
             # populated for HTTP flows in mitmproxy >= 10.
             flow = getattr(data, "flow", None)
-            if flow is not None and flow.metadata.get("host_service"):
+            # Skip the rebinding check for flows warden's own addon chain
+            # routed: host_service rewrites (handled here in enforce.py)
+            # and ingress flows (ingress.py picked the cell IP itself).
+            # Both are warden's choices, not poisoned DNS responses.
+            if flow is not None and (
+                flow.metadata.get("host_service")
+                or flow.metadata.get("ingress_route")
+            ):
                 return
 
             peername = data.server.peername
@@ -691,8 +698,11 @@ class PolicyEnforcer:
         """
         if not flow.server_conn or not flow.server_conn.peername:
             return
-        # Skip blocked-IP check ONLY for our own host-service rewrites.
-        if flow.metadata.get("host_service"):
+        # Skip blocked-IP check for flows warden's own addon chain
+        # routed: host_service rewrites (this addon) and ingress flows
+        # (ingress.py routed to cell IP). Both are warden's choices.
+        if (flow.metadata.get("host_service")
+                or flow.metadata.get("ingress_route")):
             return
         try:
             ip_str = flow.server_conn.peername[0]

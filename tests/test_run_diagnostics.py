@@ -89,6 +89,17 @@ class TestDiagnoseExit(unittest.TestCase):
         )
         self.assertIn("writable_rootfs: true", hint)
 
+    def test_read_only_filesystem_lists_writable_paths(self):
+        """Feedback #4: the writable paths should appear in the hint so
+        users know HOME=/tmp/home is the lighter fix than writable_rootfs."""
+        from brig.commands.lifecycle_cmd import _diagnose_exit
+        hint = _diagnose_exit(
+            "mkdir: cannot create directory '/var/log/app': Read-only file system"
+        )
+        for path in ("/work", "/tmp", "/run"):
+            self.assertIn(path, hint)
+        self.assertIn("HOME=/tmp/home", hint)
+
     def test_errno_30_also_matches(self):
         from brig.commands.lifecycle_cmd import _diagnose_exit
         hint = _diagnose_exit("OSError: [Errno 30] Read-only file system: '/etc/foo'")

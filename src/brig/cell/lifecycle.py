@@ -61,6 +61,12 @@ def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
     from brig.config import HostPaths
     from brig.security.secrets import validate_secret_path
 
+    # Every ingress entry today uses auth: token (the only supported
+    # method). A missing token means routes get registered but every
+    # request 401s — silent failure that aitelier flagged. Promote to
+    # a hard error: the cell starts (containers are already up), but
+    # ingress registration refuses, and the operator gets a clear
+    # message instead of a buried WARN line.
     token_name = f"{spec.name}-ingress-token"
     try:
         token_path = validate_secret_path(token_name, HostPaths.SECRETS_DIR)
@@ -68,16 +74,23 @@ def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
         try:
             token_path = validate_secret_path("ingress-token", HostPaths.SECRETS_DIR)
         except (ValueError, FileNotFoundError):
-            info(
-                f"WARNING: No ingress token found for '{spec.name}'. "
-                f"Create one with: brig secrets add {token_name}"
+            raise BrigError(
+                f"Cell '{spec.name}' declares ingress with auth: token "
+                f"but no token secret exists. Ingress would register "
+                f"routes that reject every request.",
+                suggestion=(
+                    f"Create the token (32+ random chars), then re-run:\n"
+                    f"  openssl rand -hex 32 | brig secrets add {token_name} -\n"
+                    f"  brig cell rm {spec.name} && brig run --file <yaml>"
+                ),
             )
-            return
 
     auth_token = token_path.read_text().strip()
     if not auth_token:
-        info(f"WARNING: Ingress token for '{spec.name}' is empty")
-        return
+        raise BrigError(
+            f"Ingress token for '{spec.name}' is empty",
+            suggestion=f"openssl rand -hex 32 | brig secrets add {token_name} -",
+        )
     if len(auth_token) < 32:
         info(
             f"WARNING: Ingress token for '{spec.name}' is short. "

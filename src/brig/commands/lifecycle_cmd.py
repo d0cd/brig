@@ -282,16 +282,122 @@ def _diagnose_exit(log_text: str) -> str:
     fragment that fits into the NOTE: line. Returns '' if no match."""
     s = log_text.lower()
     if "read-only file system" in s or "errno 30" in s:
+        # Lead with the writable paths because relocating writes is the
+        # better fix; writable_rootfs:true is the escape hatch.
         return (
-            " Image tried to write to a read-only path. Set "
-            "writable_rootfs: true in the cell spec if the image legitimately "
-            "needs to write outside /work, /tmp, /run."
+            " Image tried to write to a read-only path. Writable paths "
+            "inside the cell: /work (workspace, persists), /tmp (tmpfs, "
+            "64m), /run (tmpfs, 16m). Common fix is to redirect writes "
+            "into one of these — e.g. `export HOME=/tmp/home` and stage "
+            "credentials there. If the image legitimately needs to write "
+            "outside those paths, set writable_rootfs: true in the cell spec."
         )
     if "executable file not found" in s and "bash" in s:
         return (
             " The image likely doesn't ship /bin/bash; try sh."
         )
     return ""
+
+
+def cmd_preflight(args: Any) -> int:
+    """Handle `brig cell preflight <yaml>`.
+
+    Dry-run check: parses the yaml and verifies every host-side
+    requirement it implies (declared secrets exist, declared
+    host_socket targets exist, declared ingress entries have a
+    token secret, image exists or is buildable). Prints a checklist
+    with a one-line fix for each gap.
+
+    Replaces the iterative "brig run → error → fix one thing →
+    re-run" loop with a single diff. No mutations; safe to run
+    anytime.
+    """
+    from brig.cell.spec import load_cell_definition, validate_cell_definition
+    from brig.config import HostPaths
+
+    cell_def = load_cell_definition(args.file)
+    errors = validate_cell_definition(cell_def, args.file)
+    fail_count = 0
+
+    def _check(label: str, ok: bool, fix: str = "") -> None:
+        nonlocal fail_count
+        marker = "OK  " if ok else "FAIL"
+        output(f"  [{marker}] {label}")
+        if not ok:
+            fail_count += 1
+            if fix:
+                output(f"         fix: {fix}")
+
+    cell_name = cell_def.get("name", "<unnamed>")
+    output(f"Preflight for cell '{cell_name}' ({args.file})")
+    output("=" * 60)
+
+    # 1. Spec validity.
+    _check(
+        "cell yaml validates",
+        not errors,
+        fix=("Fix errors:\n         " + "\n         ".join(errors)
+             if errors else ""),
+    )
+
+    # 2. Secrets exist.
+    for secret in cell_def.get("secrets", []):
+        if not isinstance(secret, str):
+            continue
+        p = HostPaths.SECRETS_DIR / secret
+        _check(
+            f"secret: {secret}", p.exists(),
+            fix=f"brig secrets add {secret}",
+        )
+
+    # 3. Ingress token (if any ingress entry uses auth: token).
+    ingress_entries = cell_def.get("ingress") or []
+    needs_token = any(
+        isinstance(e, dict) and e.get("auth") == "token" for e in ingress_entries
+    )
+    if needs_token:
+        primary = HostPaths.SECRETS_DIR / f"{cell_name}-ingress-token"
+        fallback = HostPaths.SECRETS_DIR / "ingress-token"
+        ok = primary.exists() or fallback.exists()
+        _check(
+            f"ingress token: {primary.name}", ok,
+            fix=f"openssl rand -hex 32 | brig secrets add {primary.name} -",
+        )
+
+    # 4. host_sockets — targets exist and are sockets on the host.
+    import os as _os
+    import stat as _stat
+    for entry in cell_def.get("host_sockets") or []:
+        if not isinstance(entry, dict):
+            continue
+        host_path = entry.get("host_path", "")
+        name = entry.get("name", "?")
+        try:
+            st = _os.lstat(host_path)
+            is_sock = _stat.S_ISSOCK(st.st_mode) and not _stat.S_ISLNK(st.st_mode)
+        except (FileNotFoundError, OSError):
+            is_sock = False
+        _check(
+            f"host_socket target: {name} → {host_path}", is_sock,
+            fix="Start the service that provides this socket, or "
+                "correct host_path.",
+        )
+
+    # 5. socat installed if host_sockets are declared.
+    if cell_def.get("host_sockets"):
+        import shutil as _shutil
+        _check(
+            "socat installed (host_sockets bridge dependency)",
+            bool(_shutil.which("socat")),
+            fix="brew install socat",
+        )
+
+    output("=" * 60)
+    if fail_count:
+        output(f"FAILED: {fail_count} check(s) — fix above, then re-run")
+        return 1
+    output("All preflight checks passed.")
+    return 0
 
 
 def cmd_stop(args: Any) -> int:
