@@ -223,6 +223,12 @@ def cmd_run(args: Any) -> int:
     # Auto-grant per-cell host_services ACL from yaml-declared policy.allow.
     # Closes the gap where users had to call `brig policy set` separately.
     _auto_grant_host_services(spec)
+    # Sync per-cell host_services policy from the flattened yaml field —
+    # spec.host_services carries the {name, port} dicts directly, write
+    # them into the cell policy file (replace semantics). Phase 3 will
+    # remove _auto_grant_host_services entirely once nothing references
+    # the .host.brig auto-grant path.
+    _sync_host_services_policy(spec)
 
     from brig.ops.logging import Spinner
     with Spinner(f"Starting cell '{spec.name}'...") as spinner:
@@ -375,6 +381,46 @@ def _auto_grant_host_services(spec: CellSpec) -> None:
             f"auto-revoked: {spec.name} → {svc} (no longer in cell yaml). "
             f"Re-grant: brig policy set {spec.name} --host-service {svc}"
         )
+
+
+def _sync_host_services_policy(spec: CellSpec) -> None:
+    """Write spec.host_services to the cell's per-cell policy file.
+
+    Single-tenant flattened model: the cell yaml is the sole source
+    of truth for which host services this cell may reach. We replace
+    (not union) the cell_policy's host_services with what the yaml
+    declared. Anything previously granted but no longer in yaml is
+    revoked. Loud log per add and remove.
+    """
+    desired = list(spec.host_services or [])
+    from brig.policy.policy import load_cell_policy, save_cell_policy
+    cell_policy = load_cell_policy(spec.name) or {"allow": [], "deny": []}
+    existing = cell_policy.get("host_services") or []
+
+    def _names(items: list) -> set[str]:
+        names: set[str] = set()
+        for e in items:
+            if isinstance(e, dict) and "name" in e:
+                names.add(e["name"])
+            elif isinstance(e, str):  # legacy bare-name shape
+                names.add(e)
+        return names
+
+    desired_names = _names(desired)
+    existing_names = _names(existing)
+    # Compare full structures so a port change also triggers a write.
+    if desired == existing:
+        return
+
+    cell_policy["host_services"] = desired
+    save_cell_policy(spec.name, cell_policy)
+
+    added = desired_names - existing_names
+    removed = existing_names - desired_names
+    for n in sorted(added):
+        info(f"host_service granted: {spec.name} → {n} (from cell yaml)")
+    for n in sorted(removed):
+        info(f"host_service revoked: {spec.name} → {n} (no longer in cell yaml)")
 
 
 def _auto_grant_enabled() -> bool:

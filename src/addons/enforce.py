@@ -503,10 +503,13 @@ class PolicyEnforcer:
     ) -> None:
         """Route a .host.brig request to the macOS host.
 
-        Validates the service name, rewrites host/port, tags metadata.
-        Blocks if service is unknown, host IP is not discovered, or the
-        cell's policy does not include the service in its host_services
-        allowlist (per-cell ACL).
+        Flattened (single-source) model: the cell's per-cell policy
+        carries `host_services: [{name, port}]` straight from the cell
+        yaml. The presence of (name → port) in the cell's map IS the
+        grant; there is no separate global registry to cross-check.
+
+        Blocks if host IP isn't discovered, the cell has no per-cell
+        policy, or the requested name isn't in the cell's map.
         """
         service_name = host[: -len(HOST_SERVICE_SUFFIX)]
         safe_name = re.sub(r'[\x00-\x1f\x7f]', '', service_name)
@@ -515,25 +518,33 @@ class PolicyEnforcer:
             self._block(flow, f"host service '{safe_name}': host IP not discovered")
             return
 
-        service_port = self.host_services.get(service_name)
-        if service_port is None:
-            self._block(flow, f"unknown host service: {safe_name}")
-            return
-
-        # Per-cell host_services ACL. Cells without a per-cell policy have
-        # no host-service access — host services must be granted explicitly.
-        if cell_policy is None or cell_policy.host_services_allowed is None:
+        # Per-cell host_services map. Cells without a per-cell policy have
+        # no host-service access — host services must be declared in the
+        # cell yaml.
+        if cell_policy is None or cell_policy.host_services_map is None:
             self._block(
                 flow,
                 f"host service '{safe_name}': cell '{cell_name or 'unknown'}' "
-                f"has no host_services configured",
+                f"has no host_services declared",
             )
             return
-        if service_name not in cell_policy.host_services_allowed:
-            self._block(
-                flow,
-                f"host service '{safe_name}': not in cell '{cell_name}' allowlist",
-            )
+        service_port = cell_policy.host_services_map.get(service_name)
+        if service_port is None:
+            # Either the name isn't in the cell's map, or it's there
+            # without a port (legacy bare-name shape). Either way the
+            # flattened model can't route — fail closed.
+            if service_name not in cell_policy.host_services_map:
+                self._block(
+                    flow,
+                    f"host service '{safe_name}': not declared in cell "
+                    f"'{cell_name}' yaml",
+                )
+            else:
+                self._block(
+                    flow,
+                    f"host service '{safe_name}': legacy per-cell policy "
+                    f"lacks a port; re-run cell with host_services in yaml",
+                )
             return
 
         # Rewrite request to target the macOS host.

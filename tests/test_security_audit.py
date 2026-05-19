@@ -67,10 +67,15 @@ class TestHandleHostService(unittest.TestCase):
     def setUp(self):
         self.enforcer = PolicyEnforcer()
         self.enforcer._host_ip = "192.168.64.1"
-        self.enforcer.host_services = {"mydb": 5432, "redis": 6379}
-        # Per-cell policy that grants access to mydb and redis (H1).
+        # Flattened model: per-cell policy carries {name, port} dicts
+        # directly. There is no separate global host_services registry
+        # in the flattened model — enforce.py looks up ports from the
+        # cell's own policy.
         self.allow_policy = Policy(
-            allow=[], deny=[], host_services=["mydb", "redis"],
+            allow=[], deny=[], host_services=[
+                {"name": "mydb", "port": 5432},
+                {"name": "redis", "port": 6379},
+            ],
         )
 
     def test_valid_host_service_rewrites(self):
@@ -85,14 +90,16 @@ class TestHandleHostService(unittest.TestCase):
         self.assertEqual(flow.metadata["host_service"], "mydb")
 
     def test_unknown_service_blocked(self):
-        """Unknown .host.brig service is blocked."""
+        """Service not in cell's per-cell host_services map is blocked
+        (flattened model — no separate global registry to fall back to)."""
         flow = _make_flow(host="unknown-svc.host.brig", port=443)
         self.enforcer._handle_host_service(
             flow, "unknown-svc.host.brig", "cell-a", self.allow_policy,
         )
 
         self.assertTrue(flow.metadata.get("blocked"))
-        self.assertIn("unknown host service", flow.metadata.get("block_reason", ""))
+        reason = flow.metadata.get("block_reason", "")
+        self.assertTrue("not declared" in reason or "unknown" in reason)
 
     def test_no_host_ip_blocked(self):
         """When host IP is not discovered, host service requests are blocked."""
@@ -121,17 +128,20 @@ class TestHandleHostService(unittest.TestCase):
             flow, "mydb.host.brig", "cell-without-policy", None,
         )
         self.assertTrue(flow.metadata.get("blocked"))
-        self.assertIn("no host_services configured", flow.metadata.get("block_reason", ""))
+        self.assertIn("no host_services declared", flow.metadata.get("block_reason", ""))
 
     def test_cell_policy_without_service_blocked(self):
         """H1: cell whose policy doesn't list the service is blocked."""
-        deny_policy = Policy(allow=[], deny=[], host_services=["redis"])
+        deny_policy = Policy(
+            allow=[], deny=[],
+            host_services=[{"name": "redis", "port": 6379}],
+        )
         flow = _make_flow(host="mydb.host.brig", port=443)
         self.enforcer._handle_host_service(
             flow, "mydb.host.brig", "cell-a", deny_policy,
         )
         self.assertTrue(flow.metadata.get("blocked"))
-        self.assertIn("not in cell", flow.metadata.get("block_reason", ""))
+        self.assertIn("not declared", flow.metadata.get("block_reason", ""))
 
 
 # ---------------------------------------------------------------------------

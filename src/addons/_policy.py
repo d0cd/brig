@@ -205,17 +205,47 @@ class PolicyTraceConfig:
 
 
 class Policy:
-    """Parsed policy with allow/deny rules and optional host-service ACL."""
+    """Parsed policy with allow/deny rules and optional host-service map.
+
+    host_services accepts two shapes for forward+backward parsing
+    convenience during the flattening rollout:
+      - list of dicts {"name": str, "port": int} — new flattened form,
+        carries the port mapping per-cell (no global registry)
+      - list of bare name strings (legacy) — names only; port resolved
+        elsewhere. Kept for one release so policy files from the prior
+        version load without error
+    Either shape populates host_services_map: dict[name, port|None].
+    None as a value means "name granted, port resolved elsewhere"
+    (legacy shape); enforce.py blocks if the cell tries to reach a
+    None-port service in the flattened model.
+    """
 
     def __init__(self, allow: list = None, deny: list = None,
                  host_services: list = None):
         self.allow_rules = [PolicyRule(r) for r in (allow or [])]
         self.deny_rules = [PolicyRule(r) for r in (deny or [])]
-        # host_services: list of allowed host-service names. None means
-        # "no per-cell ACL configured"; empty list means "deny all".
-        self.host_services_allowed: Optional[set[str]] = (
-            set(host_services) if host_services is not None else None
-        )
+        # Parse host_services into both shapes:
+        #   host_services_map: name → port (or None if legacy bare-name)
+        #   host_services_allowed: set of names (preserved for any caller
+        #     still using "is X allowed" semantics)
+        self.host_services_map: Optional[dict] = None
+        self.host_services_allowed: Optional[set[str]] = None
+        if host_services is not None:
+            self.host_services_map = {}
+            self.host_services_allowed = set()
+            for item in host_services:
+                if isinstance(item, dict):
+                    name = item.get("name")
+                    port = item.get("port")
+                    if isinstance(name, str):
+                        self.host_services_map[name] = (
+                            port if isinstance(port, int) else None
+                        )
+                        self.host_services_allowed.add(name)
+                elif isinstance(item, str):
+                    # Legacy bare-name shape.
+                    self.host_services_map[item] = None
+                    self.host_services_allowed.add(item)
         # Build reverse-label tries for O(k) domain lookup.
         self._allow_trie = DomainTrie()
         for rule in self.allow_rules:
