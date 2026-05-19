@@ -79,12 +79,17 @@ class TestNameResolution(unittest.TestCase):
         # Auto-generated names follow the adjective-noun-N pattern.
         self.assertRegex(spec.name, r"^[a-z]+-[a-z]+-\d+$")
 
-    def test_yaml_without_name_field_autogenerates(self):
+    def test_yaml_without_name_field_raises(self):
+        """Yaml is canonical: missing `name:` is a hard error, not a
+        silent auto-generate. CLI shorthand without --file still
+        auto-names (covered by test_autogenerate_when_neither)."""
+        from brig.errors import BrigError
         with tempfile.TemporaryDirectory() as td:
-            yml = _write_cell_yaml(Path(td), image="alpine")  # no name:
+            yml = _write_cell_yaml(Path(td), image="alpine")
             args = _args(file=str(yml))
-            spec = self._captured_spec(args)
-            self.assertRegex(spec.name, r"^[a-z]+-[a-z]+-\d+$")
+            with self.assertRaises(BrigError) as ctx:
+                self._captured_spec(args)
+            self.assertIn("name", str(ctx.exception))
 
 
 class TestYamlFieldsActuallyMerge(unittest.TestCase):
@@ -109,20 +114,20 @@ class TestYamlFieldsActuallyMerge(unittest.TestCase):
 
     def test_yaml_memory_honored(self):
         with tempfile.TemporaryDirectory() as td:
-            yml = _write_cell_yaml(Path(td), image="alpine", memory="4g")
+            yml = _write_cell_yaml(Path(td), name="x", image="alpine", memory="4g")
             spec = self._captured_spec(_args(file=str(yml)))
             self.assertEqual(spec.memory, "4g")
 
     def test_yaml_cpus_honored(self):
         with tempfile.TemporaryDirectory() as td:
-            yml = _write_cell_yaml(Path(td), image="alpine", cpus="4")
+            yml = _write_cell_yaml(Path(td), name="x", image="alpine", cpus="4")
             spec = self._captured_spec(_args(file=str(yml)))
             self.assertEqual(spec.cpus, "4")
 
     def test_yaml_workspace_mount_honored(self):
         with tempfile.TemporaryDirectory() as td:
             yml = _write_cell_yaml(
-                Path(td), image="alpine", workspace_mount="/workspace",
+                Path(td), name="x", image="alpine", workspace_mount="/workspace",
             )
             spec = self._captured_spec(_args(file=str(yml)))
             self.assertEqual(spec.workspace_mount, "/workspace")
@@ -130,7 +135,7 @@ class TestYamlFieldsActuallyMerge(unittest.TestCase):
     def test_yaml_secrets_honored(self):
         with tempfile.TemporaryDirectory() as td:
             yml = _write_cell_yaml(
-                Path(td), image="alpine", secrets=["api-key", "token"],
+                Path(td), name="x", image="alpine", secrets=["api-key", "token"],
             )
             spec = self._captured_spec(_args(file=str(yml)))
             self.assertEqual(spec.secrets, ["api-key", "token"])
@@ -139,7 +144,7 @@ class TestYamlFieldsActuallyMerge(unittest.TestCase):
         """Precedence: --flag > yaml. The CLI flag check fires after the
         yaml merge, so passing both gives the flag."""
         with tempfile.TemporaryDirectory() as td:
-            yml = _write_cell_yaml(Path(td), image="alpine", memory="4g")
+            yml = _write_cell_yaml(Path(td), name="x", image="alpine", memory="4g")
             spec = self._captured_spec(_args(file=str(yml), memory="8g"))
             self.assertEqual(spec.memory, "8g")
 
@@ -151,7 +156,7 @@ class TestYamlFieldsActuallyMerge(unittest.TestCase):
         unknown keys; rejecting them is a separate UX question.)"""
         with tempfile.TemporaryDirectory() as td:
             yml = _write_cell_yaml(
-                Path(td), image="alpine", random_unknown_field="x",
+                Path(td), name="x", image="alpine", random_unknown_field="x",
             )
             spec = self._captured_spec(_args(file=str(yml)))
             self.assertEqual(spec.image, "alpine")

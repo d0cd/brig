@@ -207,8 +207,14 @@ def cmd_run(args: Any) -> int:
         if "ingress" in cell_def:
             spec_kwargs["ingress"] = cell_def["ingress"]
 
-    # Last resort: auto-generate name if neither --name nor yaml provided one.
+    # Yaml is canonical: a `--file <yaml>` invocation must spell its
+    # name. CLI shorthand (`brig run alpine echo hi`) still auto-names.
     if not spec_kwargs.get("name"):
+        if args.file:
+            raise BrigError(
+                f"Cell yaml {args.file} is missing required field: name",
+                suggestion="Add `name: <cell-name>` to the yaml",
+            )
         from brig.cell.names import generate_name
         spec_kwargs["name"] = generate_name()
         info(f"Auto-generated name: {spec_kwargs['name']}")
