@@ -141,6 +141,13 @@ def run_cell(
             ),
         )
 
+    # Bring up host_socket bridges BEFORE reconcile — the reconciler's
+    # runtime check needs the bridge sockets to exist. start_cell_bridges
+    # is idempotent and a no-op if spec.host_sockets is empty.
+    if spec.host_sockets:
+        from brig.cell.host_sockets_bridge import start_cell_bridges
+        start_cell_bridges(spec.name, spec.host_sockets)
+
     debug(f"Reconciliation plan: {[a.type.name for a in actions]}")
     result = apply(actions)
 
@@ -198,6 +205,12 @@ def stop_cell(cell_name: str) -> None:
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
+    # Tear down any host_socket bridges (idempotent — no-op if there
+    # are none). Done before the podman stop so launchd doesn't keep
+    # trying to forward to a dead cell.
+    from brig.cell.host_sockets_bridge import stop_cell_bridges
+    stop_cell_bridges(cell_name)
+
     actions = plan_stop(cell_name, actual)
     result = apply(actions)
 
@@ -221,6 +234,10 @@ def kill_cell(cell_name: str) -> None:
     # Deregister ingress routes before killing.
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
+
+    # Tear down host_socket bridges (idempotent).
+    from brig.cell.host_sockets_bridge import stop_cell_bridges
+    stop_cell_bridges(cell_name)
 
     actions = [Action(ActionType.PODMAN_KILL, cell_name)] if actual.running else []
     result = apply(actions)
@@ -264,6 +281,10 @@ def rm_cell(
     # Deregister ingress routes before destroying the cell.
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
+
+    # Tear down host_socket bridges (idempotent).
+    from brig.cell.host_sockets_bridge import stop_cell_bridges
+    stop_cell_bridges(cell_name)
 
     actions = plan_destroy(cell_name, actual)
     result = apply(actions)

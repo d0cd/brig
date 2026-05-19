@@ -52,9 +52,11 @@ class TestHostSocketVolumeEmitted(unittest.TestCase):
     def test_volume_emitted_with_correct_shape(self):
         from brig.cell.reconciler import build_run_command
         with tempfile.TemporaryDirectory() as td:
-            bridge_dir = Path(td)
+            root = Path(td)
+            bridge_dir = root / "c"
+            bridge_dir.mkdir()
             _sock(bridge_dir, "pg.sock")
-            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", bridge_dir):
+            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", root):
                 spec = _spec(host_sockets=[{
                     "name": "pg", "host_path": "/tmp/postgres.sock",
                     "mount_point": "/run/host/pg.sock", "mode": "rw",
@@ -68,9 +70,11 @@ class TestHostSocketVolumeEmitted(unittest.TestCase):
     def test_default_mode_is_ro(self):
         from brig.cell.reconciler import build_run_command
         with tempfile.TemporaryDirectory() as td:
-            bridge_dir = Path(td)
+            root = Path(td)
+            bridge_dir = root / "c"
+            bridge_dir.mkdir()
             _sock(bridge_dir, "pg.sock")
-            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", bridge_dir):
+            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", root):
                 spec = _spec(host_sockets=[{
                     "name": "pg", "host_path": "/tmp/postgres.sock",
                     "mount_point": "/run/host/pg.sock",
@@ -122,11 +126,13 @@ class TestRuntimeTOCTOUDefense(unittest.TestCase):
         host. Reject — the launchd bridge writes a real socket file."""
         from brig.cell.reconciler import build_run_command
         with tempfile.TemporaryDirectory() as td:
-            bridge_dir = Path(td)
+            root = Path(td)
+            bridge_dir = root / "c"
+            bridge_dir.mkdir()
             target = _sock(bridge_dir, "real.sock")
             link = bridge_dir / "pg.sock"
             os.symlink(target, link)
-            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", bridge_dir):
+            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", root):
                 spec = _spec(host_sockets=[{
                     "name": "pg", "host_path": "/tmp/postgres.sock",
                     "mount_point": "/run/host/pg.sock",
@@ -141,10 +147,12 @@ class TestMultipleSockets(unittest.TestCase):
     def test_two_sockets_two_volume_args(self):
         from brig.cell.reconciler import build_run_command
         with tempfile.TemporaryDirectory() as td:
-            bridge_dir = Path(td)
+            root = Path(td)
+            bridge_dir = root / "c"
+            bridge_dir.mkdir()
             _sock(bridge_dir, "pg.sock")
             _sock(bridge_dir, "redis.sock")
-            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", bridge_dir):
+            with patch("brig.config.VMPaths.HOST_SOCKETS_DIR", root):
                 spec = _spec(host_sockets=[
                     {"name": "pg", "host_path": "/tmp/pg.sock",
                      "mount_point": "/run/host/pg.sock", "mode": "rw"},

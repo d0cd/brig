@@ -295,7 +295,10 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
         return
 
     from brig.config import VMPaths
-    bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR))
+    # Per-cell bridge dir so two cells declaring the same physical host
+    # service (e.g. both want /tmp/postgres.sock) each get their own
+    # bridge socket. No reference counting; bridges live with the cell.
+    bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR)) / spec.name
     for entry in spec.host_sockets:
         name = entry["name"]
         mount_point = entry["mount_point"]
