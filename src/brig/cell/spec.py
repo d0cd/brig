@@ -411,7 +411,7 @@ def _v_host_socket_entry(
         )
     else:
         # Normalize before duplicate-checking so /run/host/x and
-        # /run/host//x and /run/host/./x all collide. Audit fix M3.
+        # /run/host//x and /run/host/./x all collide.
         import os.path as _ospath
         normalized = _ospath.normpath(mount_point)
         if normalized in seen_mounts:
@@ -456,7 +456,6 @@ def _v_host_sockets(value: Any, cell_def: dict, context: str) -> list[str]:
     # point — reject at parse time so the operator can't accidentally
     # do it. We check both the declared name AND, for user-defined
     # profiles, whether they shadow / inherit the untrusted profile.
-    # Audit fix C2.
     if value and _profile_is_untrusted(cell_def.get("profile")):
         errors.append(
             f"'host_sockets' is not allowed with the untrusted profile — "
@@ -466,11 +465,10 @@ def _v_host_sockets(value: Any, cell_def: dict, context: str) -> list[str]:
 
     # Cell name with dots breaks launchd label parsing: the bridge
     # label is `com.brig.host-socket.<cell>.<socket>` and is split on
-    # `.`. A cell named `my.cell` would mis-derive socket names and,
-    # worse, a prefix-based stop_cell_bridges("my") would tear down
-    # bridges of `my.cell`. CELL_NAME_PATTERN allows dots for legacy
-    # reasons; we forbid them only when host_sockets are declared.
-    # Audit fix H1.
+    # `.`. A cell named `my.cell` would mis-derive socket names; a
+    # prefix-based stop_cell_bridges("my") would tear down bridges of
+    # `my.cell`. CELL_NAME_PATTERN allows dots, so we forbid them
+    # only when host_sockets are declared.
     cell_name = cell_def.get("name", "")
     if value and isinstance(cell_name, str) and "." in cell_name:
         errors.append(
@@ -494,7 +492,7 @@ def _profile_is_untrusted(profile_name: Any) -> bool:
     Direct string match handles the common case. For user-defined
     profiles that shadow the builtin name OR carry the same intent via
     a different name, we also check the resolved profile's labels for
-    `brig.profile: untrusted` — the builtin signal. Audit fix C2.
+    `brig.profile: untrusted` — the builtin signal.
     """
     if profile_name == "untrusted":
         return True

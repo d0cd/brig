@@ -255,13 +255,11 @@ class Brig:
             except ValueError as e:
                 raise ProfileError(str(e))
 
-        # Run the same validators the CLI runs via load_cell_definition.
         # CellSpec.__post_init__ only validates name + coerces numeric
-        # strings, so calling CellSpec(...) is NOT enough — the
-        # security boundary for host_sockets / ingress / policy lives in
-        # validate_cell_definition. Skip this and an SDK caller can
-        # bypass the engine-socket denylist, traversal checks, and the
-        # untrusted-profile rejection. Audit fix C1.
+        # strings. The security boundary for host_sockets / ingress /
+        # policy lives in validate_cell_definition — without this call,
+        # an SDK caller bypasses the engine-socket denylist, path
+        # traversal checks, and the untrusted-profile rejection.
         from brig.cell.spec import validate_cell_definition
         validation_errors = validate_cell_definition(spec_kwargs)
         if validation_errors:

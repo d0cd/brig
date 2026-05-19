@@ -167,7 +167,7 @@ def run_cell(
     except Exception:
         # apply() rolled back its own actions, but it doesn't know about
         # bridges. Tear them down so we don't leak a socat process for
-        # a cell that never started. Audit fix H3.
+        # a cell that never started.
         if spec.host_sockets:
             from brig.cell.host_sockets_bridge import stop_cell_bridges
             stop_cell_bridges(spec.name)
@@ -182,10 +182,10 @@ def run_cell(
         failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
         raise BrigError(f"Failed to start cell '{spec.name}': {failed[1]}")
 
-    # From here the cell is up. Any post-start step that fails (ingress
-    # registration with no token) must roll the whole cell back —
+    # From here the cell is up. Any post-start step that fails (e.g.
+    # ingress registration with no token) must roll the cell back —
     # leaving a partially-configured cell running is worse than failing
-    # to start at all. Audit fix H2.
+    # to start at all.
     try:
         log_operation("run", cell_name=spec.name, details={"image": spec.image})
         log_lifecycle("start", spec.name, details={"image": spec.image})

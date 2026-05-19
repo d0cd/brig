@@ -144,10 +144,8 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
     # Preserve host_sockets across refresh — bind mounts are fixed at
     # podman-create time, so this list can't change without a restart.
-    # Pass the already-projected list straight through; build_metadata
-    # re-projects (idempotent) and only reads name + mount_point.
-    # Audit fix M1 — was passing `host_path: ""` placeholder which would
-    # have leaked empty strings if the projection ever extended.
+    # The already-projected list goes straight through; build_metadata
+    # only reads name + mount_point.
     prior_sockets = [
         s for s in prior.get("host_sockets", [])
         if isinstance(s, dict) and "name" in s and "mount_point" in s

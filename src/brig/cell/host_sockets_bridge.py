@@ -132,12 +132,12 @@ def generate_plist(
 def _validate_target(host_path: str) -> None:
     """Runtime guard: reject engine sockets and non-socket targets.
 
-    Defense in depth (audit fixes C3 + M2):
+    Defense in depth:
       - Realpath-resolve to defeat symlinks at ANY level (parent dir
         symlinks would otherwise sneak past a leaf-only lstat check).
-      - Re-check the engine denylist against the realpath basename,
-        so a /tmp/postgres.sock → /var/run/docker.sock symlink fails
-        on the denylist match, not just on the symlink ban.
+      - Re-check the engine denylist against the realpath basename so
+        a /tmp/postgres.sock → /var/run/docker.sock symlink fails on
+        the denylist, not just on the symlink ban.
       - Then lstat() the original path; reject leaf symlinks too.
         Realpath alone would silently follow them.
     """

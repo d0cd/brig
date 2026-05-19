@@ -312,7 +312,6 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
         #   - source exists, is a real socket, not a symlink
         #   - every ancestor directory is also not a symlink
         #   - realpath of source still lives under bridge_dir
-        # Audit fix C3.
         import os as _os
         import stat as _stat
         try:

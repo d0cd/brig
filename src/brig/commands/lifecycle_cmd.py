@@ -697,7 +697,6 @@ def cmd_start(args: Any) -> int:
     # reflects this start, not the original create. workspace_mount is
     # preserved from whatever the cell was created with (bind mounts are
     # fixed at container-create time; we can't change them on start).
-    # Audit L5.
     _refresh_metadata_for_start(args.name)
     cn = container_name(args.name)
     result = vm_run(["podman", "start", cn])

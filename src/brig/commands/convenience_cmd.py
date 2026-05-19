@@ -91,9 +91,8 @@ def cmd_down(args: Any) -> int:
                 vm_run(["podman", "stop", "-t", "5", name])
 
     # Tear down ALL host_socket bridges — not just the cells we know
-    # about, but every loaded launchd plist with our prefix. Without
-    # this, `brig down` left socat processes running forever, pointing
-    # at host services for cells that no longer exist. Audit fix H4.
+    # about, but every loaded launchd plist with our prefix. Otherwise
+    # socat keeps running across `brig down` for cells that are gone.
     _bootout_all_host_socket_bridges()
 
     # Stop warden.
