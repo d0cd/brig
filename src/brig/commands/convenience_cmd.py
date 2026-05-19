@@ -90,6 +90,12 @@ def cmd_down(args: Any) -> int:
                 output(f"Stopping {name}...")
                 vm_run(["podman", "stop", "-t", "5", name])
 
+    # Tear down ALL host_socket bridges — not just the cells we know
+    # about, but every loaded launchd plist with our prefix. Without
+    # this, `brig down` left socat processes running forever, pointing
+    # at host services for cells that no longer exist. Audit fix H4.
+    _bootout_all_host_socket_bridges()
+
     # Stop warden.
     from warden.proxy import stop
     output("Stopping warden...")
@@ -102,6 +108,34 @@ def cmd_down(args: Any) -> int:
 
     output("Brig stopped")
     return 0
+
+
+def _bootout_all_host_socket_bridges() -> None:
+    """Enumerate every loaded host_socket bridge plist and bootout it,
+    regardless of which cell it belongs to. Used by `brig down` so we
+    don't leak orphan bridges across system restarts.
+    """
+    from brig.cell.host_sockets_bridge import (
+        LABEL_PREFIX, PLIST_DIR, stop_cell_bridges,
+    )
+    if not PLIST_DIR.exists():
+        return
+    cells_with_bridges: set[str] = set()
+    for plist in PLIST_DIR.iterdir():
+        name = plist.name
+        if not name.startswith(LABEL_PREFIX) or not name.endswith(".plist"):
+            continue
+        rest = name[len(LABEL_PREFIX):-len(".plist")]
+        if "." not in rest:
+            continue
+        cell_name = rest.split(".", 1)[0]
+        cells_with_bridges.add(cell_name)
+    for cell_name in cells_with_bridges:
+        output(f"Tearing down host_socket bridges for {cell_name}...")
+        try:
+            stop_cell_bridges(cell_name)
+        except Exception as e:
+            output(f"  (warn) failed to bootout bridges for {cell_name}: {e}")
 
 
 def cmd_profiles(args: Any) -> int:

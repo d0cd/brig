@@ -162,9 +162,31 @@ def run_cell(
         start_cell_bridges(spec.name, spec.host_sockets)
 
     debug(f"Reconciliation plan: {[a.type.name for a in actions]}")
-    result = apply(actions)
+    try:
+        result = apply(actions)
+    except Exception:
+        # apply() rolled back its own actions, but it doesn't know about
+        # bridges. Tear them down so we don't leak a socat process for
+        # a cell that never started. Audit fix H3.
+        if spec.host_sockets:
+            from brig.cell.host_sockets_bridge import stop_cell_bridges
+            stop_cell_bridges(spec.name)
+        raise
 
-    if result.success:
+    if not result.success:
+        # Same rollback as the exception path: apply()'s _rollback handles
+        # network/subnet/podman actions, but bridges are ours to clean up.
+        if spec.host_sockets:
+            from brig.cell.host_sockets_bridge import stop_cell_bridges
+            stop_cell_bridges(spec.name)
+        failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
+        raise BrigError(f"Failed to start cell '{spec.name}': {failed[1]}")
+
+    # From here the cell is up. Any post-start step that fails (ingress
+    # registration with no token) must roll the whole cell back —
+    # leaving a partially-configured cell running is worse than failing
+    # to start at all. Audit fix H2.
+    try:
         log_operation("run", cell_name=spec.name, details={"image": spec.image})
         log_lifecycle("start", spec.name, details={"image": spec.image})
         # Log per-cell policy if specified (audit trail gap fix).
@@ -192,9 +214,15 @@ def run_cell(
                 f"host_sockets — Warden does not see traffic over these."
             )
         info(f"Cell '{spec.name}' started")
-    else:
-        failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
-        raise BrigError(f"Failed to start cell '{spec.name}': {failed[1]}")
+    except BrigError:
+        # Roll the cell back — container is running, but post-start
+        # config failed. Better to fail clean than ship a half-cell.
+        info(f"post-start failure for '{spec.name}'; rolling back cell")
+        try:
+            rm_cell(spec.name, force=True)
+        except Exception as cleanup_err:
+            debug(f"rollback rm_cell failed: {cleanup_err}")
+        raise
 
     return result
 
