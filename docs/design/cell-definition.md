@@ -95,6 +95,21 @@ ingress:
     port: 8642
     path_prefix: /webhooks
     auth: token
+
+# Host services — HTTP/HTTPS forwarding from cell to host port via
+# <name>.host.brig DNS through Warden. Declaring here IS the grant —
+# no separate registration step.
+host_services:
+  - {name: db, port: 5432}
+  - {name: litellm, port: 4000}
+
+# Host sockets — bind-mount macOS unix sockets into the cell for
+# non-HTTP protocols (Postgres, Redis, ssh-agent). Bypasses Warden.
+host_sockets:
+  - name: postgres
+    host_path: /tmp/postgres.sock
+    mount_point: /run/host/postgres.sock
+    mode: rw
 ```
 
 ## Ingress
@@ -204,59 +219,56 @@ What this does **not** do:
   raw TCP / binary protocols)
 - No automatic detection — every socket is explicit in the cell yaml
 - No coverage for services that don't expose a unix socket (Mongo,
-  gRPC, SSH) — those need a future raw-TCP `host_services` option
+  gRPC, SSH) — those need a future raw-TCP option
 
 ## Host Services
 
 Cells cannot reach the macOS host by default (private IPs are blocked).
 Host services allow cells to reach specific host-side services through
-virtual `.host.brig` domains.
+virtual `.host.brig` domains, **routed through Warden** so every
+request is HTTP-audited.
 
-Declaration is two-step:
+Declaration lives entirely in the cell yaml — there is no separate
+global registry or per-cell ACL ceremony:
 
-1. **Global policy** declares the (name → port) mapping that warden knows
-   how to forward:
-   ```bash
-   brig policy set global --host-service db:5432
-   brig policy set global --host-service model:7777
-   ```
-
-2. **Per-cell policy** opts the cell into reaching specific services. By
-   default a cell has *no* host-service access; you must add the names you
-   want it to reach (audit fix H1):
-   ```bash
-   brig policy set my-cell --host-service db
-   ```
-
-   Or write the per-cell policy file directly:
-   ```json
-   {
-     "allow": ["api.github.com"],
-     "deny": [],
-     "host_services": ["db"]
-   }
-   ```
+```yaml
+host_services:
+  - {name: db, port: 5432}
+  - {name: litellm, port: 4000}
+```
 
 From inside the cell:
 ```bash
 curl http://db.host.brig/health
+curl http://litellm.host.brig/v1/chat/completions
 ```
 
-Warden intercepts `.host.brig` requests and rewrites them to the macOS
-host IP + declared port. The cell never sees the real host IP.
+Warden intercepts `<name>.host.brig` requests, looks up the port in the
+cell's own host_services map, and rewrites to (host_ip, port). The cell
+never sees the real host IP.
 
 Security properties:
 - Only declared services are reachable (not a blanket private IP bypass)
-- A cell can only reach services in **its own** `host_services` list
-  (per-cell ACL — global declaration is necessary but not sufficient)
-- Cells with no per-cell policy have **no** host-service access
+- The cell yaml IS the grant — no separate registration required
+- Cells with no host_services in yaml have **no** host-service access
 - All traffic logged with `host_service` attribution
 - Virtual domains only resolve through the proxy
 - Unknown `.host.brig` domains are blocked
+- Untrusted profile rejects host_services at parse time
 - DNS rebinding to `(host_ip, host_service_port)` from an allowlisted
   domain is detected: the host-service skip on `BLOCKED_NETWORKS` is
   gated on `flow.metadata["host_service"]`, not on the destination tuple
   (audit fix H4)
+
+### Choosing between host_services and host_sockets
+
+| | host_services | host_sockets |
+|---|---|---|
+| Protocol | HTTP/HTTPS only | Anything (TCP via unix socket) |
+| Audit | Per-request through Warden | Connect/disconnect only |
+| Address from cell | `<name>.host.brig` (DNS) | `/run/host/<name>.sock` (filesystem) |
+| Setup | `host_services: [{name, port}]` | `host_sockets: [{name, host_path, mount_point}]` + socat |
+| Use for | API gateways, model serving, anything HTTP | Postgres, Redis, ssh-agent, anything with a unix socket |
 
 ## Examples
 
