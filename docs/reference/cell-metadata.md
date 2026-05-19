@@ -32,7 +32,8 @@ it read-only into the cell. The cell can read but cannot modify it.
 | `name` | string | Cell name, matches `--name` / yaml `name:`. |
 | `started_at` | string | RFC 3339 UTC timestamp of cell creation. |
 | `workspace.mount_point` | string | Path inside the cell, default `/work`, overridable via `workspace_mount` in the cell spec. |
-| `policy.host_services` | string[] | Per-cell host-service ACL (bare names; the global declares ports). |
+| `policy.host_services` | string[] | Per-cell host-service ACL — the names of host services this cell may reach. Ports live in the per-cell policy file on disk; metadata exposes names only. |
+| `host_sockets[]` | `[{name, mount_point}]` | Unix sockets bind-mounted into the cell from the host (host_path is intentionally omitted). |
 
 ### What changed in v2
 

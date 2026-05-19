@@ -59,11 +59,15 @@ brig system down --vm   # also stop the VM
 
 ## Policy management
 
+Policy lives per-cell. Shared defaults belong in a trust profile
+referenced from the cell yaml's `profile:` field.
+
 ```bash
-brig policy show                                # global policy
-brig policy set global --allow '*.example.com'  # add to allowlist
-brig policy set mycell --deny 'evil.com'        # per-cell deny
-brig policy show mycell --effective             # merged view
+brig policy show mycell                         # show this cell's policy
+brig policy set mycell --allow '*.example.com'  # extend allowlist
+brig policy set mycell --deny 'evil.com'        # extend denylist
+brig policy test mycell api.github.com          # simulate a request
+brig policy rm mycell                           # clear (cell will block all egress)
 ```
 
 ## Troubleshooting

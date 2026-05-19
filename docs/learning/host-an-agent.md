@@ -17,8 +17,8 @@ on the host.
 > Prereqs (already done on this machine):
 > - Brig is installed and `brig system up` succeeds.
 > - A model API server is listening on `127.0.0.1:$MODEL_PORT` on the host.
-> - Global policy already declares the host service:
->   `brig policy set global --host-service model:$MODEL_PORT`
+> - The cell yaml declares the host service:
+>   `host_services: [{name: model, port: $MODEL_PORT}]`
 >   (warden will forward `model.host.brig` → `host:$MODEL_PORT`).
 >
 > Verify with `brig system doctor --quick` → both checks `[OK]`.
@@ -45,21 +45,24 @@ limactl shell brig -- sudo podman build \
     "$HOME/path/to/agent"
 ```
 
-## 2. Grant the cell access to the host service
+## 2. Declare the host service in the cell yaml
 
-Per-cell ACL: a cell can only reach a `.host.brig` service if its per-cell
-policy lists the name explicitly. Global policy declares the port; the
-per-cell policy declares the grant.
+The cell yaml is the single source of truth — declaring the host
+service there IS the grant. No separate `brig policy` step.
 
-```bash
-brig policy set my-agent --host-service model
+```yaml
+# my-agent.cell.yaml
+name: my-agent
+image: localhost/my-agent:dev
+host_services:
+  - {name: model, port: 4000}
 ```
 
-Verify:
+Verify after running:
 
 ```bash
 cat ~/.brig/state/system/policies/my-agent.json
-# Should show: "host_services": ["model"]
+# Should show: "host_services": [{"name": "model", "port": 4000}]
 ```
 
 ## 3. Add any required secrets
@@ -121,12 +124,11 @@ brig secrets rm my-api-key
 
 ## Troubleshooting
 
-- **`unknown host service: <name>`** — global policy missing the
-  `host_services` entry. Re-add:
-  `brig policy set global --host-service <name>:<port>`.
-- **`host service '<name>': cell '<cell>' has no host_services configured`** —
-  per-cell ACL missing.
-  `brig policy set <cell> --host-service <name>`.
+- **`host service '<name>': not declared in cell '<cell>' yaml`** — the
+  cell yaml's `host_services` list doesn't include `<name>`. Add it,
+  then `brig cell rm <cell> && brig run --file <yaml>`.
+- **`cell '<cell>' has no host_services declared`** — no per-cell
+  policy at all. The cell yaml needs a `host_services:` block.
 - **`Connection refused` on host** — the service isn't listening. Confirm
   with `curl http://127.0.0.1:<port>/`.
 - **`Cell exited (1)` with no useful logs** — the agent entrypoint likely

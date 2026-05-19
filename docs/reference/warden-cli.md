@@ -41,8 +41,8 @@ For the host-side `brig` command, see [`brig-cli.md`](brig-cli.md).
 # Easiest: brig-side filter shows the block reason inline.
 brig cell network <cell> --blocked
 
-# Or test a domain against the policy without actually fetching it.
-brig policy test example.com --path /api
+# Or test a domain against a cell's policy without actually fetching it.
+brig policy test mycell example.com --path /api
 ```
 
 **"My policy edit doesn't seem to be applied."**

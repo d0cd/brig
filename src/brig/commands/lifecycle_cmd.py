@@ -216,10 +216,18 @@ def cmd_run(args: Any) -> int:
         spec_kwargs["timeout"] = args.timeout
     if args.workspace_quota:
         spec_kwargs["workspace_quota"] = args.workspace_quota
+    # --policy-allow / --policy-deny EXTEND profile + yaml entries
+    # (consistent with how yaml extends the profile baseline). To
+    # replace, edit the yaml. Single-tenant: there's no security gain
+    # from "CLI clobbers all" because the operator owns every layer.
     if args.policy_allow:
-        spec_kwargs["policy_allow"] = args.policy_allow
+        spec_kwargs["policy_allow"] = (
+            list(spec_kwargs.get("policy_allow") or []) + list(args.policy_allow)
+        )
     if args.policy_deny:
-        spec_kwargs["policy_deny"] = args.policy_deny
+        spec_kwargs["policy_deny"] = (
+            list(spec_kwargs.get("policy_deny") or []) + list(args.policy_deny)
+        )
 
     # Ingress from cell definition file (no CLI flag — file-only).
     if args.file:

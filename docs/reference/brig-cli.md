@@ -46,12 +46,10 @@ output; `--no-color` disables ANSI colors.
 | `brig cell network <cell> [--tail N] [--blocked]` | Warden's per-cell request log. `--blocked` filters to only the requests warden denied, with the block reason on the same line. |
 | `brig cell events [cell] [--tail N] [-f]` | Lifecycle events stream. `-f` follows; default is one-shot. |
 | `brig system history [--tail N] [--cell <name>]` | Operations history (every `brig` invocation with exit code + duration). |
-| `brig policy show [name] [--effective]` | Print policy. `global` or omitted: global; `<cell>`: per-cell override; `--effective <cell>`: merged view. |
-| `brig policy set <name> --allow DOMAIN [...] --deny DOMAIN [...]` | Add/remove `allow`/`deny` rules. Use `--remove-allow` / `--remove-deny` to drop. |
-| `brig policy set global --host-service name:port` | Declare a host service (warden forwards `<name>.host.brig` → host:port). |
-| `brig policy set <cell> --host-service <name>` | Grant a cell access to a globally-declared host service. Per-cell ACL — cells without this entry cannot reach the service. |
-| `brig policy test <domain> [--path /...] [--method GET]` | Dry-run the global policy against a domain. Same logic warden uses. |
-| `brig policy rm <cell>` | Drop a cell's per-cell policy override. The cell falls back to the global policy on the next request. Refuses to delete the global policy. |
+| `brig policy show <cell>` | Print the cell's policy. Cells with no policy file show the empty default (cell blocks all egress). |
+| `brig policy set <cell> --allow DOMAIN [...] --deny DOMAIN [...]` | Extend a cell's allow/deny lists. Use `--remove-allow` / `--remove-deny` to drop. To declare host_services, edit the cell yaml. |
+| `brig policy test <cell> <domain> [--path /...] [--method GET]` | Dry-run the cell's policy against a request. Same matcher warden uses. |
+| `brig policy rm <cell>` | Delete the cell's per-cell policy. The cell will block all egress until reconfigured. |
 
 ## Secrets
 

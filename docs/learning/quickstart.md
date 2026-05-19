@@ -86,10 +86,15 @@ brig cell cp ./input.txt my-cell:/work/input.txt
 ## 7. Edit Policy
 
 ```bash
-brig policy show                              # view global policy
-brig policy set global --allow '*.example.com'  # add to allowlist
-brig policy set my-cell --deny evil.com       # per-cell deny
+brig policy show my-cell                       # view a cell's policy
+brig policy set my-cell --allow '*.example.com'  # extend allowlist
+brig policy set my-cell --deny evil.com          # extend denylist
+brig policy test my-cell api.github.com          # simulate a request
 ```
+
+Policy lives per-cell. For shared defaults across many cells, declare
+them in a trust profile and reference it from the cell yaml's
+`profile:` field.
 
 ## 8. Shutdown
 
