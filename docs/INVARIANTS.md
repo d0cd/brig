@@ -116,6 +116,41 @@ proxy logs, not prevention.
 | E2E test | `tests/test_cell_lifecycle.sh` |
 | CI | Unit + E2E |
 
+### 10. host_sockets Bypass Warden by Design
+
+The prior nine invariants imply "Warden sees all cell traffic." That is
+not literally true once host_sockets are declared. The bytes flowing
+over a bind-mounted unix socket move through the kernel directly between
+the cell and the host service — no proxy interposition possible. This
+is the trade-off for supporting non-HTTP services (Postgres, Redis,
+ssh-agent) that cannot meaningfully traverse an HTTP proxy.
+
+The invariant we DO uphold:
+
+  - host_sockets are opt-in per cell yaml (no default access)
+  - The `untrusted` profile cannot declare them at all (parse-time reject)
+  - Engine sockets (docker.sock, podman.sock, etc.) are denylisted at
+    parse time AND at bridge start (defense in depth)
+  - Bridge sockets are real unix sockets, never symlinks (lstat check)
+  - Per-cell namespacing — cell A's bridge cannot be reused by cell B
+  - Every attach is audited (`log_lifecycle("host_socket_attach", ...)`)
+  - The cell startup banner explicitly says Warden does not see the
+    traffic, so operators internalize the trade-off
+
+| Surface | Location |
+|---|---|
+| Parse-time guards | `src/brig/cell/spec.py:_v_host_socket_entry`, `_v_host_sockets` |
+| Engine denylist | `src/brig/config.py:HOST_SOCKET_ENGINE_DENYLIST` |
+| Runtime TOCTOU | `src/brig/cell/reconciler.py:_attach_host_sockets` (lstat, S_ISSOCK) |
+| Bridge defense | `src/brig/cell/host_sockets_bridge.py:_validate_target` |
+| Audit | `src/brig/cell/lifecycle.py:run_cell` emits `host_socket_attach` |
+| Banner | `src/brig/cell/lifecycle.py:run_cell` prints NOTE on cells with sockets |
+| Unit tests | `tests/test_host_sockets_spec.py` (19 cases) |
+| Unit tests | `tests/test_reconciler_host_sockets.py` (7 cases) |
+| Unit tests | `tests/test_host_sockets_bridge.py` (9 cases) |
+| Unit tests | `tests/test_metadata_host_sockets.py` (3 cases) |
+| CI | Unit |
+
 ## State-consistency invariants
 
 ### Warden's in-memory state must match on-disk allocator state

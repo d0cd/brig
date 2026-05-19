@@ -153,6 +153,59 @@ The env var name is derived from the filename:
 Application reads the file at runtime — secret values never appear in env vars,
 process listings, or container inspect output.
 
+## Host Sockets
+
+Bind-mount macOS-side unix sockets into the cell at a path under
+`/run/host/`. Bypasses Warden by design — bytes flow directly between
+the cell and the host service via the kernel, not through the proxy.
+Use this for non-HTTP services (Postgres, Redis, MySQL, ssh-agent)
+that can't traverse an HTTP proxy.
+
+```yaml
+host_sockets:
+  - name: postgres                       # alphanumeric+hyphens, max 31 chars
+    host_path: /tmp/postgres.sock        # absolute, must be a real unix socket
+    mount_point: /run/host/postgres.sock # must start with /run/host/
+    mode: rw                             # ro (default) or rw
+```
+
+Then from inside the cell:
+
+```python
+import psycopg
+psycopg.connect("host=/run/host/postgres.sock dbname=app")
+```
+
+Requirements:
+
+- `host_path` must exist on the macOS host and be a real unix socket
+  (not a symlink, not a regular file)
+- `socat` must be installed (`brew install socat`) — used by the
+  launchd bridge
+- Maximum 8 host_sockets per cell
+- The `untrusted` profile **rejects** host_sockets at parse time —
+  Warden bypass defeats the profile's purpose
+
+Security properties:
+
+- Opt-in per cell yaml (no default access)
+- Engine sockets (`docker.sock`, `podman.sock`, `containerd.sock`,
+  `crio.sock`, `firecracker.sock`, `limactl.sock`) are denied
+- Bridge sockets are real unix sockets — symlinks rejected at runtime
+- Per-cell namespacing: two cells declaring the same physical service
+  each get their own bridge instance
+- Every attach is logged (`brig system history` or
+  `~/.brig/state/system/lifecycle.jsonl`)
+- Cell startup prints a NOTE that Warden does not see this traffic
+
+What this does **not** do:
+
+- No per-request observability (Warden's HTTP audit doesn't apply to
+  raw TCP / binary protocols)
+- No automatic detection — every socket is explicit in the cell yaml
+- No coverage for services that don't expose a unix socket (Mongo,
+  gRPC, SSH) — those need a future raw-TCP `host_services` option
+
 ## Host Services
 
 Cells cannot reach the macOS host by default (private IPs are blocked).
