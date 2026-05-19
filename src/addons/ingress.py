@@ -376,8 +376,11 @@ class IngressRouter:
         # in the target cell application.
         flow.request.headers["Host"] = f"{route.cell_ip}:{route.port}"
 
-        # Tag for logging.
+        # Tag for logging. `cell` is what the logger keys log files on,
+        # so setting it here makes ingress hits appear in
+        # `brig cell network <cell>` instead of going to unknown.jsonl.
         flow.metadata["ingress"] = True
+        flow.metadata["cell"] = route.cell
         flow.metadata["ingress_cell"] = route.cell
         flow.metadata["ingress_route"] = route.name
         flow.metadata["ingress_client_ip"] = client_ip

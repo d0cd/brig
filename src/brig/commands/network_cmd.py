@@ -61,7 +61,17 @@ def cmd_network(args: Any) -> int:
             blocked = entry.get("blocked")
             tag = " [BLOCKED]" if blocked else ""
             reason = f" ({entry.get('block_reason', '')})" if blocked else ""
-            output(f"{ts} {method} {host}{path} -> {status}{tag}{reason}")
+            # Ingress hits are inbound, not egress — flag distinctly so
+            # operators can grep INGRESS: / OUT: cleanly (feedback #5).
+            ingress_route = entry.get("ingress_route")
+            if ingress_route:
+                ingress_src = entry.get("ingress_src_ip", entry.get("src_ip", "?"))
+                output(
+                    f"{ts} INGRESS: {ingress_src} -> {method} {host}{path} "
+                    f"-> {status} (route={ingress_route}){tag}{reason}"
+                )
+            else:
+                output(f"{ts} OUT: {method} {host}{path} -> {status}{tag}{reason}")
     except IOError as e:
         raise BrigError(f"Failed to read logs: {e}")
 

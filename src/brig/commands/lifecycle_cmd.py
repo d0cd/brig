@@ -220,6 +220,10 @@ def cmd_run(args: Any) -> int:
 
     spec = CellSpec(**spec_kwargs)
 
+    # Auto-grant per-cell host_services ACL from yaml-declared policy.allow.
+    # Closes the gap where users had to call `brig policy set` separately.
+    _auto_grant_host_services(spec)
+
     from brig.ops.logging import Spinner
     with Spinner(f"Starting cell '{spec.name}'...") as spinner:
         result = run_cell(spec)
@@ -297,6 +301,82 @@ def _diagnose_exit(log_text: str) -> str:
             " The image likely doesn't ship /bin/bash; try sh."
         )
     return ""
+
+
+def _auto_grant_host_services(spec: CellSpec) -> None:
+    """When a cell yaml declares `policy.allow` entries pointing at
+    `<svc>.host.brig` for services that are registered globally,
+    auto-add them to the cell's per-cell host_services ACL.
+
+    Feedback #3 from aitelier — without this, users get the cryptic
+    `cell has no host_services configured` from the warden side after
+    going to the trouble of declaring the right thing in their yaml.
+
+    Loud log line per grant with the revoke command, so the operator
+    sees what happened and can undo it. Opt-out via:
+        brig config set auto_grant_host_services false
+    """
+    if not spec.policy_allow:
+        return
+    if not _auto_grant_enabled():
+        return
+
+    HOST_BRIG = ".host.brig"
+    requested: list[str] = []
+    for entry in spec.policy_allow:
+        if isinstance(entry, str) and entry.endswith(HOST_BRIG):
+            svc = entry[: -len(HOST_BRIG)]
+            if svc and "." not in svc and "*" not in svc:
+                requested.append(svc)
+    if not requested:
+        return
+
+    # Cross-check against global registry — only auto-grant services
+    # the operator has actually registered. Silently skip unregistered
+    # ones (validation will surface them at warden side).
+    import json as _json
+    from brig.config import HostPaths
+    try:
+        global_policy = _json.loads(HostPaths.NETWORK_POLICY.read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return
+    registered: set[str] = set()
+    for svc in global_policy.get("host_services", []):
+        if isinstance(svc, dict) and "name" in svc:
+            registered.add(svc["name"])
+    grantable = [s for s in requested if s in registered]
+    if not grantable:
+        return
+
+    # Load (or initialize) per-cell policy and merge.
+    from brig.policy.policy import load_cell_policy, save_cell_policy
+    cell_policy = load_cell_policy(spec.name) or {"allow": [], "deny": []}
+    existing_services = set(cell_policy.get("host_services", []) or [])
+    new_grants = [s for s in grantable if s not in existing_services]
+    if not new_grants:
+        return  # All already granted.
+    cell_policy.setdefault("host_services", [])
+    cell_policy["host_services"] = sorted(existing_services | set(new_grants))
+    save_cell_policy(spec.name, cell_policy)
+    for svc in new_grants:
+        info(
+            f"auto-granted: {spec.name} → {svc} (declared in cell yaml, "
+            f"registered globally). Revoke: brig policy set {spec.name} "
+            f"--remove-host-service {svc}"
+        )
+
+
+def _auto_grant_enabled() -> bool:
+    """Read auto_grant_host_services config flag. Default True."""
+    import json as _json
+    from brig.config import CONFIG_FILE
+    try:
+        with open(CONFIG_FILE) as f:
+            data = _json.load(f)
+        # Explicit False disables; missing or other = enabled.
+        return data.get("auto_grant_host_services", True) is not False
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return True
 
 
 def cmd_preflight(args: Any) -> int:

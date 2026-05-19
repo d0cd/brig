@@ -247,6 +247,14 @@ class RequestLogger:
         if host_service:
             entry["host_service"] = host_service
 
+        # Mark ingress hits so `brig cell network` can tag them.
+        ingress_route = flow.metadata.get("ingress_route")
+        if ingress_route:
+            entry["ingress_route"] = ingress_route
+            entry["ingress_src_ip"] = flow.metadata.get(
+                "ingress_client_ip", entry["src_ip"],
+            )
+
         self._write_log(cell_name, entry)
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
