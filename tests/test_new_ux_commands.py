@@ -325,6 +325,46 @@ class TestPruneCommand(unittest.TestCase):
             ))
         self.assertEqual(rc, 0)
 
+    def test_prune_removes_orphan_workspaces(self):
+        """State dirs with no corresponding podman container are
+        orphans; cmd_prune --cells must remove them (and leave the
+        system/ coordination dir and any live cell alone)."""
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from brig.commands.system_cmd import cmd_prune
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "system").mkdir()
+            (state / "alice" / "workspace").mkdir(parents=True)
+            (state / "ghost-1" / "workspace").mkdir(parents=True)
+            (state / "ghost-2" / "workspace").mkdir(parents=True)
+            # podman ps shows only alice as a known cell. vm_run auto-
+            # prepends sudo to podman commands, so match by membership.
+            def fake_vm(cmd, **kw):
+                if "podman" in cmd and "ps" in cmd:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {"Names": ["brig-alice"], "State": "running"},
+                        ]),
+                    )
+                return SimpleNamespace(returncode=0, stdout="")
+            with patch("brig.commands.system_cmd.vm_run", side_effect=fake_vm), \
+                 patch("brig.network.subnet.list_all", return_value=[]), \
+                 patch("brig.config.HostPaths.STATE_DIR", state):
+                cmd_prune(SimpleNamespace(
+                    cells=True, logs=False, subnets=False,
+                    dry_run=False, log_days=7,
+                ))
+                # Assert while tempdir is still alive (the `with`
+                # block tears it down on exit).
+                self.assertTrue((state / "alice").exists(), "live cell removed")
+                self.assertTrue((state / "system").exists(), "system dir removed")
+                self.assertFalse((state / "ghost-1").exists(), "orphan not pruned")
+                self.assertFalse((state / "ghost-2").exists(), "orphan not pruned")
+
 
 class TestVersionFlag(unittest.TestCase):
     def test_version_flag_prints_and_exits(self):

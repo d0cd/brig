@@ -13,7 +13,7 @@ from typing import Any
 from brig.config import BRIG_HOME, CONTAINER_PREFIX, PROXY_NAME, STATE_DIR, container_name
 from brig.errors import BrigError
 from brig.ops.atomic import atomic_write_json
-from brig.ops.logging import info, output
+from brig.ops.logging import debug, info, output
 from brig.security.verify import verify_all
 
 
@@ -377,12 +377,15 @@ def cmd_prune(args: Any) -> int:
     removed_logs = 0
     freed_subnets = 0
 
-    # 1. Stopped cells.
+    # 1. Stopped cells AND orphan workspace dirs (state dirs with no
+    # container, left by `brig rm` versions before the workspace
+    # cleanup landed, or by externally-killed containers).
     if do_cells:
         result = vm_run(
             ["podman", "ps", "-a", "--format", "json",
              "--filter", f"name=^{CONTAINER_PREFIX}"],
         )
+        live_cells: set[str] = set()
         if result.returncode == 0 and result.stdout.strip():
             try:
                 containers = json.loads(result.stdout)
@@ -393,15 +396,33 @@ def cmd_prune(args: Any) -> int:
                 name = names[0] if isinstance(names, list) else names
                 if name == PROXY_NAME:
                     continue
+                cell_name = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+                live_cells.add(cell_name)
                 state = (c.get("State") or "").lower()
                 if state in ("exited", "stopped", "created", "configured"):
                     output(f"  {'would remove' if dry_run else 'removing'} cell: {name}")
                     if not dry_run:
                         vm_run(["podman", "rm", "-f", name])
-                        # Also remove the network if it exists; subnet stays
-                        # allocated until the subnets phase below cleans it.
                         vm_run(["podman", "network", "rm", name])
                     removed_cells += 1
+
+        # Orphan workspaces — directories under ~/.brig/state/ whose
+        # name doesn't correspond to any podman container. system/ is
+        # brig's own coordination dir; skip.
+        if HostPaths.STATE_DIR.exists():
+            import shutil as _shutil
+            for entry in HostPaths.STATE_DIR.iterdir():
+                if not entry.is_dir() or entry.name == "system":
+                    continue
+                if entry.name in live_cells:
+                    continue
+                output(f"  {'would remove' if dry_run else 'removing'} orphan workspace: {entry}")
+                if not dry_run:
+                    try:
+                        _shutil.rmtree(entry)
+                    except OSError as e:
+                        debug(f"failed to remove {entry}: {e}")
+                removed_cells += 1
 
     # 2. Old log files (network logs are inside the VM).
     if do_logs:
