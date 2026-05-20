@@ -18,13 +18,18 @@ import time
 from mitmproxy import ctx, http
 
 try:
-    from opentelemetry import metrics, trace
+    from opentelemetry import _logs, metrics, trace
+    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+        OTLPLogExporter,
+    )
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
         OTLPMetricExporter,
     )
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
         OTLPSpanExporter,
     )
+    from opentelemetry.sdk._logs import LoggerProvider, LogRecord
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.resources import Resource
@@ -44,6 +49,7 @@ class OtelExporter:
     def __init__(self) -> None:
         self.meter = None
         self.tracer = None
+        self.logger = None
         self.requests_total = None
         self.request_duration_ms = None
         self.blocked_total = None
@@ -80,6 +86,13 @@ class OtelExporter:
         ))
         trace.set_tracer_provider(tracer_provider)
         self.tracer = trace.get_tracer("brig.warden")
+
+        logger_provider = LoggerProvider(resource=resource)
+        logger_provider.add_log_record_processor(BatchLogRecordProcessor(
+            OTLPLogExporter(endpoint=endpoint, insecure=True),
+        ))
+        _logs.set_logger_provider(logger_provider)
+        self.logger = _logs.get_logger("brig.warden")
 
         self.requests_total = self.meter.create_counter(
             "warden_requests_total",
@@ -139,6 +152,30 @@ class OtelExporter:
             self.bytes_in_total.add(req_bytes, attributes={"cell": cell})
         if resp_bytes:
             self.bytes_out_total.add(resp_bytes, attributes={"cell": cell})
+
+        # Emit a structured log record per request so brig cell network
+        # can read the same shape it gets from JSONL files today.
+        # OTel logs records carry both severity + a body, plus
+        # arbitrary attributes for downstream filtering.
+        if self.logger is not None:
+            self.logger.emit(LogRecord(
+                timestamp=time.time_ns(),
+                severity_text="WARN" if blocked else "INFO",
+                body=f"{method} {flow.request.host}{flow.request.path}",
+                attributes={
+                    "cell": cell,
+                    "decision": decision,
+                    "method": method,
+                    "host": flow.request.host,
+                    "path": flow.request.path,
+                    "status": flow.response.status_code if flow.response else 0,
+                    "duration_ms": duration_ms,
+                    "bytes_in": req_bytes,
+                    "bytes_out": resp_bytes,
+                    "block_reason": flow.metadata.get("block_reason", "") if blocked else "",
+                    "ingress_route": flow.metadata.get("ingress_route", ""),
+                },
+            ))
 
 
 addons = [OtelExporter()]

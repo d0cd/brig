@@ -171,6 +171,12 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
     p_read.add_argument("name", help="Cell name")
     p_read.add_argument("path", help="Relative path inside the workspace")
 
+    p_trace = cs.add_parser(
+        "trace",
+        help="Show a request trace from the OTel collector by trace_id",
+    )
+    p_trace.add_argument("trace_id", help="Trace ID (or prefix; first match wins)")
+
     p_logs = cs.add_parser("logs", help="View cell logs")
     p_logs.add_argument("name", help="Cell name")
     p_logs.add_argument("-f", "--follow", action="store_true", help="Follow log output")
@@ -188,6 +194,9 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
     p_network.add_argument("--tail", type=int, default=20, help="Number of entries")
     p_network.add_argument("--blocked", action="store_true",
                            help="Show only requests warden blocked (and why)")
+    p_network.add_argument("--otel", action="store_true",
+                           help="Read from the OTel collector instead of "
+                                "per-cell JSONL files")
 
     p_events = cs.add_parser("events", help="Stream lifecycle events")
     p_events.add_argument("name", nargs="?", help="Cell name filter")
@@ -325,6 +334,12 @@ def _stats_dispatch(args):
     return cmd_stats(args)
 
 
+def _trace_dispatch(args):
+    """Lazy import for the same reason as _stats_dispatch."""
+    from brig.observability.traces import cmd_trace
+    return cmd_trace(args)
+
+
 def main() -> None:
     """CLI entry point."""
     parser = _build_parser()
@@ -392,6 +407,7 @@ def main() -> None:
         ("cell", "exec"): lifecycle_cmd.cmd_exec,
         ("cell", "files"): lifecycle_cmd.cmd_files,
         ("cell", "read"): lifecycle_cmd.cmd_read,
+        ("cell", "trace"): _trace_dispatch,
         ("cell", "logs"): lifecycle_cmd.cmd_logs,
         ("cell", "top"): lifecycle_cmd.cmd_top,
         ("cell", "diff"): lifecycle_cmd.cmd_diff,
