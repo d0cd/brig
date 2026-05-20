@@ -36,10 +36,18 @@ The policy gate. For every request:
 6. Apply per-cell policy (deny-then-allow). Cells with no per-cell
    policy block everything — fail closed, no implicit global allow.
 
-Also installs `server_connected` and `responseheaders` hooks that close
-connections that resolve into `BLOCKED_NETWORKS` (DNS rebinding defense). The
-skip for host-service rewrites is gated on `flow.metadata["host_service"]`,
-not on a `(ip, port)` tuple.
+Also installs a `responseheaders` hook that blocks responses whose
+server peer resolved into `BLOCKED_NETWORKS` (DNS rebinding defense).
+The skip for warden-routed flows is gated on `flow.metadata["host_service"]`
+/ `["ingress_route"]`, not on a `(ip, port)` tuple. (Prior versions also
+ran the check in `server_connected`, but mitmproxy ≥ 10 removed
+`data.server.close()` so the kill silently no-op'd and `data.flow` was
+None there anyway — see `docs/INVARIANTS.md` invariant 2.)
+
+A `tls_clienthello` hook implements invariant 11 (TLS passthrough): for
+hosts that match both `policy.allow` and `policy.tls_passthrough` AND
+whose SNI equals the CONNECT host, warden tunnels TCP raw instead of
+MITM-ing.
 
 Configured via `~/.brig/cells/network-policy.json`:
 

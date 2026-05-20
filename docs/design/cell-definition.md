@@ -54,6 +54,23 @@ policy:
       methods: ["GET", "POST"]
   deny:
     - "*.evil.com"               # Deny rules take precedence over allow
+  # Optional: hosts to skip Warden MITM for. Each entry must be covered
+  # by an allow entry (exact or wildcard). Warden tunnels TCP raw after
+  # the CONNECT, routed by SNI — for hosts whose TLS won't survive
+  # mitmproxy (HPKP, ECH, Cloudflare bot-fp). Trades per-URL audit for
+  # handshake compat + credential confidentiality. See invariant 11.
+  tls_passthrough:
+    - "chatgpt.com"
+    - "auth.openai.com"
+
+# Trust Warden's MITM CA out of the box. When true (default), brig stages
+# a combined bundle (system roots + Warden CA) inside the VM and bind-
+# mounts it read-only at /run/brig/ca-bundle.crt, plus sets SSL_CERT_FILE
+# / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS to point
+# at it — only for env vars the cell didn't already declare. Set to
+# false for cells with strict cert pinning or that manage their own
+# trust store. See invariant 12.
+trust_warden_ca: true
 
 # Timeout
 timeout: "30m"                   # Auto-kill after duration (30s, 5m, 2h, 1d)

@@ -206,8 +206,6 @@ The invariants we DO uphold for passthrough hosts:
 **Not yet landed** (tracked separately):
 
   - E2E: `tests/test_passthrough_tls.sh` against a Cloudflare-fronted host (e.g. chatgpt.com), validating both the handshake-survives path and the SNI/CONNECT-mismatch rejection.
-  - `brig system stats` rendering of passthrough flows in the per-cell summary.
-  - Security doc update in `docs/design/security.md` walking through the MITM-vs-passthrough trade-off table for a downstream reader.
 
 ### 12. Warden CA Auto-Mount Is Per-Cell, Re-Extracted From Container, Opt-Out-Able
 
