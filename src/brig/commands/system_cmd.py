@@ -270,6 +270,67 @@ def _check_warden_ca_consistency(check) -> None:
             suggestion=f"brig cell restart {entry.name}",
         )
 
+        # Foot-gun catch (aitelier-flagged): a cell's image may set
+        # SSL_CERT_FILE in its Config.Env, pointing at a path that
+        # ISN'T brig's auto-mounted bundle. The TLS handshake against
+        # warden's MITM cert then succeeds on the client side (whatever
+        # cached cert the entrypoint points at), but the upstream
+        # handshake fails silently — multi-minute debugging waste.
+        # Inspect the running container's effective env if available.
+        _check_entrypoint_ssl_cert_override(check, entry.name)
+
+
+def _check_entrypoint_ssl_cert_override(check, cell_name: str) -> None:
+    """Warn if a cell's effective env sets SSL_CERT_FILE differently
+    from brig's auto-mount target. Foot-gun aitelier diagnosed —
+    silent TLS hangs result when warden's CA rotates and the cell
+    trusts whatever the entrypoint pointed at.
+
+    Inspects the live container's env via `podman inspect`. No-op if
+    the cell isn't running (the bundle mtime check above already
+    covers the persisted state — running containers are where the env
+    actually matters)."""
+    from brig.cell.ca_bundle import IN_CELL_PATH
+    from brig.config import container_name
+    cn = container_name(cell_name)
+    result = vm_run(
+        ["podman", "inspect", cn, "--format", "{{json .Config.Env}}"],
+        timeout=5,
+    )
+    if result.returncode != 0:
+        # Cell isn't running — nothing to inspect. Don't surface as
+        # FAIL; the bundle check above handles persisted state.
+        return
+    try:
+        env_list = json.loads(result.stdout.strip())
+    except json.JSONDecodeError:
+        return
+    if not isinstance(env_list, list):
+        return
+    for entry in env_list:
+        if not isinstance(entry, str) or "=" not in entry:
+            continue
+        key, _, value = entry.partition("=")
+        if key == "SSL_CERT_FILE" and value != IN_CELL_PATH:
+            check(
+                f"cell '{cell_name}' SSL_CERT_FILE matches brig auto-mount",
+                False,
+                detail=f"image sets SSL_CERT_FILE={value!r}, "
+                       f"expected {IN_CELL_PATH!r}",
+                suggestion=(
+                    "Remove SSL_CERT_FILE from the image's ENV/entrypoint "
+                    "OR set trust_warden_ca: false in cell yaml and "
+                    "manage trust yourself"
+                ),
+            )
+            return  # one warning per cell is enough
+    # If we get here, no override or it matches — emit a positive
+    # signal so the operator can grep `[OK]` lines.
+    check(
+        f"cell '{cell_name}' SSL_CERT_FILE matches brig auto-mount",
+        True,
+    )
+
 
 def _check_host_socket_bridges(check) -> None:
     """Enumerate launchd host_socket plists and verify each bridge

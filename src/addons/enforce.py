@@ -686,6 +686,100 @@ class PolicyEnforcer:
     # http_connect() populate metadata, so the exemptions actually
     # gate correctly. Aitelier diagnosed this; see INVARIANTS doc.
 
+    def tcp_start(self, flow) -> None:
+        """Per-cell access control for TCP host_service flows.
+
+        Warden listens on `--mode reverse:tcp://host.lima.internal:<port>@<port>`
+        for every TCP host_service port that ANY cell has declared.
+        That makes the listener reachable from every cell network —
+        but per-cell access must come from the cell's own policy:
+        only cells that declared the service in their cell yaml should
+        be able to use the listener.
+
+        Decision (defense in depth, matches the HTTP host_service
+        check in http_connect/_handle_host_service):
+          1. Resolve cell from peer IP (existing subnet-map lookup).
+          2. Load cell's per-cell policy.
+          3. If the listening port isn't in cell.tcp_host_services_map,
+             kill the flow.
+          4. Otherwise tag metadata so otel_export's tcp_* hooks can
+             emit per-cell + per-service counters and the audit log
+             distinguishes TCP-host-service from TLS-passthrough flows.
+
+        Cells that wouldn't have policy (system flows, unknown peer)
+        are killed fail-closed. The TLS passthrough flow uses
+        tls_clienthello to flip `client_conn.tls_passthrough` BEFORE
+        tcp_start fires; this hook still runs for those flows, but
+        the existing passthrough metadata tells us to skip the
+        host_service check.
+        """
+        try:
+            client = getattr(flow, "client_conn", None)
+            # Skip if this is a TLS-passthrough flow — different
+            # mechanism (invariant 11), gated by SNI not host_service.
+            meta = getattr(client, "metadata", None) or {}
+            if meta.get("tls_mode") == "passthrough":
+                return
+            peer = getattr(client, "peername", None)
+            client_ip = peer[0] if peer else None
+            if not client_ip:
+                self._kill_tcp(flow, "no peer IP")
+                return
+            server = getattr(flow, "server_conn", None)
+            address = getattr(server, "address", None) if server else None
+            listen_port = address[1] if address and len(address) >= 2 else None
+            if not isinstance(listen_port, int):
+                self._kill_tcp(flow, "no listen port")
+                return
+            cell_name = self.subnets.get_cell_name(client_ip)
+            cell_policy = self._lookup_cell_policy(cell_name)
+            if cell_policy is None:
+                self._kill_tcp(
+                    flow,
+                    f"cell '{cell_name or 'unknown'}' has no per-cell policy",
+                )
+                return
+            tcp_map = getattr(cell_policy, "tcp_host_services_map", None) or {}
+            allowed_ports = set(tcp_map.values())
+            if listen_port not in allowed_ports:
+                self._kill_tcp(
+                    flow,
+                    f"cell '{cell_name}' did not declare TCP "
+                    f"host_service on port {listen_port}",
+                )
+                return
+            # Identify which service this is (first name with the
+            # matching port — operators usually have one service per
+            # port; ties get the lexically-first name).
+            svc_name = next(
+                (n for n, p in sorted(tcp_map.items()) if p == listen_port),
+                "unknown",
+            )
+            flow.metadata["cell"] = cell_name
+            flow.metadata["host_service"] = svc_name
+            flow.metadata["host_service_protocol"] = "tcp"
+            flow.metadata["host_service_port"] = listen_port
+            ctx.log.info(
+                f"TCP HOST_SERVICE: {cell_name} -> {svc_name}:{listen_port}"
+            )
+        except Exception as e:
+            # Fail closed on any unexpected mitmproxy API shape change.
+            ctx.log.warn(f"tcp_start error, killing flow: {e}")
+            self._kill_tcp(flow, "tcp_start internal error")
+
+    def _kill_tcp(self, flow, reason: str) -> None:
+        """Kill a TCP flow with an audit log entry. mitmproxy's flow.kill()
+        terminates both ends; we tag metadata first so the logger addon
+        records the denial in the same shape as HTTP blocks."""
+        safe_reason = re.sub(r'[\x00-\x1f\x7f]', '', reason)
+        ctx.log.warn(f"BLOCKED tcp: {safe_reason}")
+        flow.metadata["blocked"] = True
+        flow.metadata["block_reason"] = safe_reason
+        try:
+            flow.kill()
+        except Exception:
+            pass
+
     def websocket_message(self, flow: http.HTTPFlow) -> None:
         """Log WebSocket messages on established connections.
 

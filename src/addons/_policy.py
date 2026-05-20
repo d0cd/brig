@@ -243,8 +243,24 @@ class Policy:
                 if isinstance(name, str) and isinstance(port, int):
                     if protocol == "tcp":
                         self.tcp_host_services_map[name] = port
-                    else:
+                    elif protocol == "http":
                         self.host_services_map[name] = port
+                    else:
+                        # Unknown protocol on a tampered on-disk policy
+                        # (invariant 4: state dir untrusted). Fail-safe:
+                        # drop the entry entirely rather than degrade to
+                        # HTTP. Log so the operator sees it during
+                        # warden-log inspection.
+                        try:
+                            import logging
+                            logging.getLogger("brig.warden").warning(
+                                "Policy: dropping host_service '%s' with "
+                                "unknown protocol %r — only http/tcp "
+                                "are valid",
+                                name, protocol,
+                            )
+                        except Exception:
+                            pass
         # Build reverse-label tries for O(k) domain lookup.
         self._allow_trie = DomainTrie()
         for rule in self.allow_rules:

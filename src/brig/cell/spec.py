@@ -624,6 +624,23 @@ def _v_host_service_entry(
             f"'host_services[{i}].protocol' must be 'http' or 'tcp'{context}"
         )
 
+    # Reject TCP services on warden's reserved ports — those collide
+    # with warden's own HTTP forward proxy (8080) and ingress reverse
+    # proxy (8443). Hardcoded as the schema validator (which can't
+    # easily import warden constants) — kept in lockstep with
+    # src/warden/proxy.py:WARDEN_RESERVED_PORTS, and a constant-mirror
+    # test pins the two.
+    if (
+        protocol == "tcp"
+        and isinstance(port, int)
+        and port in (8080, 8443)
+    ):
+        errors.append(
+            f"'host_services[{i}].port' {port} is reserved by warden "
+            f"(HTTP proxy / ingress); pick a different upstream port"
+            f"{context}"
+        )
+
     return errors
 
 

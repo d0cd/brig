@@ -100,6 +100,19 @@ VM_WARDEN_STATE_DIR = Path("/var/lib/warden/mitmproxy-state")
 # here directly via `cat` (no `podman exec`) — see VM_WARDEN_STATE_DIR
 # block above for the rationale.
 VM_WARDEN_CA_FILE = VM_WARDEN_STATE_DIR / "mitmproxy-ca-cert.pem"
+
+# Ports we won't bind as TCP host_services listeners — they collide with
+# warden's own HTTP forward proxy or ingress reverse proxy, or with
+# privileged-only ranges that the mitmproxy user can't bind. Cells that
+# declare these for a TCP host_service get a clear validation error in
+# the schema, and warden also refuses to bind here as defense in depth.
+WARDEN_RESERVED_PORTS = frozenset({8080, INGRESS_PORT})
+
+# TCP host_service listeners forward through `host.lima.internal`, which
+# every Lima-provisioned VM resolves to the macOS host. mitmproxy
+# resolves this at connect time, so the constant doesn't need to be an
+# IP at warden-start time.
+TCP_UPSTREAM_HOST = "host.lima.internal"
 # Warden bind-mounts /state/system → /var/run/cells so it sees the same
 # subnet-map / per-cell policies / ingress routes the host CLI writes.
 VM_SYSTEM_DIR = VMPaths.SYSTEM_DIR
@@ -274,14 +287,33 @@ def start() -> bool:
     # Image.
     cmd.append(_warden_image())
 
+    # TCP host_service listeners — one --mode reverse:tcp per unique
+    # declared port. Each cell's per-cell policy gates which ports it
+    # can actually reach via enforce.py's tcp_start hook (defense in
+    # depth: warden binds the listener, the addon does the access
+    # check using the cell's per-cell policy). Cells reach warden via
+    # warden's IP on their joined cell network — same path as HTTP
+    # egress on 8080 — so no -p host publish is needed.
+    tcp_mode_args: list[str] = []
+    for port in _collect_tcp_host_service_ports():
+        # mitmproxy resolves TCP_UPSTREAM_HOST at connection time
+        # inside the VM. Listener port == upstream port — cells write
+        # `psql -h db.host.brig -p 5432` and connect normally.
+        tcp_mode_args.extend([
+            "--mode",
+            f"reverse:tcp://{TCP_UPSTREAM_HOST}:{port}@{port}",
+        ])
+
     if has_ingress:
-        # Multi-mode: forward proxy on 8080, ingress on INGRESS_PORT.
+        # Multi-mode: forward proxy on 8080, ingress on INGRESS_PORT,
+        # plus any TCP host_service ports collected above.
         # mitmproxy 10+ supports multiple --mode flags with port binding.
         # ingress.py MUST load before enforce.py so it can authenticate
         # and tag requests before enforce.py checks the ingress flag.
         cmd.extend([
             "--mode", "regular@8080",
             "--mode", f"regular@{INGRESS_PORT}",
+            *tcp_mode_args,
             "--set", "block_global=false",
             "-s", "/addons/ingress.py",
             "-s", "/addons/enforce.py",
@@ -291,6 +323,7 @@ def start() -> bool:
         cmd.extend([
             "--listen-host", "0.0.0.0",
             "--listen-port", "8080",
+            *tcp_mode_args,
             "--set", "block_global=false",
             "-s", "/addons/enforce.py",
             "-s", "/addons/logger.py",
@@ -343,6 +376,42 @@ def start() -> bool:
         pass
     info("Proxy started")
     return True
+
+
+def _collect_tcp_host_service_ports() -> list[int]:
+    """Return the sorted, deduplicated list of TCP host_service ports
+    declared across every cell's per-cell policy file.
+
+    Warden binds one `--mode reverse:tcp://...:<port>@<port>` listener
+    per unique port (all cells that declare the same port share the
+    listener; the addon's tcp_start hook enforces per-cell access).
+    Returns an empty list if no cell has declared a TCP service —
+    warden launches without any TCP listeners in that case.
+
+    Excludes WARDEN_RESERVED_PORTS as defense in depth. The cell-spec
+    validator should also reject these at parse time, but the addon
+    chain runs against on-disk policy files (invariant 4: state dir
+    untrusted) — so a tampered policy that lists a reserved port
+    doesn't poison warden's startup.
+    """
+    ports: set[int] = set()
+    if not HostPaths.POLICY_DIR.exists():
+        return []
+    for policy_file in HostPaths.POLICY_DIR.glob("*.json"):
+        try:
+            data = json.loads(policy_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        for entry in data.get("host_services") or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("protocol") != "tcp":
+                continue
+            port = entry.get("port")
+            if isinstance(port, int) and 1 <= port <= 65535 \
+                    and port not in WARDEN_RESERVED_PORTS:
+                ports.add(port)
+    return sorted(ports)
 
 
 def _ensure_warden_ca_exists(timeout_s: float = 30.0) -> bool:

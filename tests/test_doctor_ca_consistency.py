@@ -45,7 +45,17 @@ class TestDoctorCaConsistency(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_matching_bundle_passes(self):
-        ca = "-----BEGIN CERTIFICATE-----\nWARDEN_CA_PEM\n-----END CERTIFICATE-----"
+        # Use a realistic PEM block — proves substring containment
+        # works against PEM-headered certs (the production shape),
+        # not just bare placeholders.
+        ca = (
+            "-----BEGIN CERTIFICATE-----\n"
+            "MIIBkTCB+wIJAKzWFwzG2c1FMA0GCSqGSIb3DQEBCwUAMBQxEjAQBgNVBAMM\n"
+            "CXdhcmRlbi1jYTAeFw0yNjA1MjAwMDAwMDBaFw0zNjA1MjAwMDAwMDBaMBQx\n"
+            "EjAQBgNVBAMMCXdhcmRlbi1jYTBcMA0GCSqGSIb3DQEBAQUAA0sAMEgCQQC9\n"
+            "WARDEN_TEST_CERT_NOT_REAL_KEY_MATERIAL_FOR_TESTS_ONLY_xxxxxx\n"
+            "-----END CERTIFICATE-----\n"
+        )
         with tempfile.TemporaryDirectory() as td:
             state = Path(td)
             (state / "alice").mkdir()
@@ -64,8 +74,16 @@ class TestDoctorCaConsistency(unittest.TestCase):
     def test_stale_bundle_fails(self):
         """A cell whose staged bundle was last written against a prior
         Warden CA reports FAIL with a `brig cell restart` suggestion."""
-        current_ca = "-----BEGIN CERTIFICATE-----\nNEW_CA\n-----END CERTIFICATE-----"
-        old_ca = "-----BEGIN CERTIFICATE-----\nOLD_CA\n-----END CERTIFICATE-----"
+        current_ca = (
+            "-----BEGIN CERTIFICATE-----\n"
+            "NEW_CA_TEST_FINGERPRINT_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "-----END CERTIFICATE-----\n"
+        )
+        old_ca = (
+            "-----BEGIN CERTIFICATE-----\n"
+            "OLD_CA_TEST_FINGERPRINT_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            "-----END CERTIFICATE-----\n"
+        )
         with tempfile.TemporaryDirectory() as td:
             state = Path(td)
             (state / "alice").mkdir()
