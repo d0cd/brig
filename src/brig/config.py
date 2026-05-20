@@ -35,6 +35,24 @@ RUNTIME = "runsc"
 # Warden proxy container name.
 PROXY_NAME = "warden"
 
+# OpenTelemetry collector — sibling container to warden. Runs inside
+# the Lima VM, receives metrics/traces/logs from warden over OTLP,
+# serves Prometheus + log queries to the host CLI.
+#
+# Image digest must be pinned before any release that ships this
+# code path. The provisioning step (scripts/pin-collector-image.sh,
+# pending) fetches the published 0.96.0 image, prints its sha256,
+# and the operator commits the result here. Until that step runs,
+# COLLECTOR_IMAGE_DIGEST is the empty string and start_collector()
+# refuses to launch — fail closed, no unverified pulls.
+COLLECTOR_NAME = "brig-otel"
+COLLECTOR_IMAGE_REPO = "docker.io/otel/opentelemetry-collector-contrib"
+COLLECTOR_IMAGE_TAG = "0.96.0"
+COLLECTOR_IMAGE_DIGEST = ""  # MUST be filled in via scripts/pin-collector-image.sh
+COLLECTOR_OTLP_GRPC_PORT = 4317
+COLLECTOR_OTLP_HTTP_PORT = 4318
+COLLECTOR_PROMETHEUS_PORT = 9464
+
 # External network for proxy egress.
 PROXY_EXTERNAL_NETWORK = "proxy-external"
 

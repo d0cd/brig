@@ -58,6 +58,7 @@ include = ["brig*", "warden*"]
 
 [tool.setuptools.package-data]
 "brig.vm" = ["*.template"]
+"brig.observability" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 100
