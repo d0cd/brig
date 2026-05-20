@@ -44,11 +44,15 @@ class CellStats:
     p95_ms: float = 0.0
     p99_ms: float = 0.0
     # Passthrough audit surface — these are NOT a subset of `requests`;
-    # passthrough connections never produce HTTP records. Rendered as a
-    # separate column so MITM vs un-inspected egress are visually
-    # distinct in `brig system stats` (invariant 11).
+    # passthrough connections never produce HTTP records. Rendered as
+    # separate columns so MITM vs un-inspected egress are visually
+    # distinct in `brig system stats` (invariant 11). Bytes are split
+    # by direction so operators can spot asymmetric flows (e.g. large
+    # uploads = potential exfil through an opaque tunnel); collapsing
+    # them into one number would mask that signal.
     passthrough_conns: int = 0
-    passthrough_bytes: int = 0
+    passthrough_bytes_in: int = 0
+    passthrough_bytes_out: int = 0
 
 
 def fetch_metrics() -> str:
@@ -86,7 +90,18 @@ def aggregate(scalars: dict[str, list[Sample]],
     _bump(COUNTER_BYTES_IN, "bytes_in")
     _bump(COUNTER_BYTES_OUT, "bytes_out")
     _bump(COUNTER_PASSTHROUGH_CONNS, "passthrough_conns")
-    _bump(COUNTER_PASSTHROUGH_BYTES, "passthrough_bytes")
+    # passthrough_bytes carries a "direction" label (in/out). Split it
+    # by reading the label rather than collapsing into one counter,
+    # so asymmetric flows are visible in `brig system stats`.
+    for s in scalars.get(COUNTER_PASSTHROUGH_BYTES, []):
+        cell = s.labels.get("cell", "unknown")
+        cs = cells.setdefault(cell, CellStats(cell=cell))
+        cs.cell = cell
+        direction = s.labels.get("direction", "")
+        if direction == "in":
+            cs.passthrough_bytes_in = int(cs.passthrough_bytes_in + s.value)
+        elif direction == "out":
+            cs.passthrough_bytes_out = int(cs.passthrough_bytes_out + s.value)
 
     for h in histos.get(HISTOGRAM_DURATION, []):
         cell = h.labels.get("cell", "unknown")
@@ -109,7 +124,8 @@ def render_text(by_cell: dict[str, CellStats]) -> str:
 
     header = (
         f"  {'CELL':<20} {'REQ':>6} {'BLOCKED':>8} {'IN':>10} {'OUT':>10} "
-        f"{'p50ms':>8} {'p95ms':>8} {'p99ms':>8} {'PT/CONN':>9} {'PT/BYTES':>10}"
+        f"{'p50ms':>8} {'p95ms':>8} {'p99ms':>8} {'PT/CONN':>9} "
+        f"{'PT/IN':>10} {'PT/OUT':>10}"
     )
     lines.append(header)
     any_passthrough = False
@@ -123,7 +139,9 @@ def render_text(by_cell: dict[str, CellStats]) -> str:
             f"  {c.cell:<20} {c.requests:>6} {blocked_cell:>8} "
             f"{_human_bytes(c.bytes_in):>10} {_human_bytes(c.bytes_out):>10} "
             f"{c.p50_ms:>8.1f} {c.p95_ms:>8.1f} {c.p99_ms:>8.1f} "
-            f"{c.passthrough_conns:>9} {_human_bytes(c.passthrough_bytes):>10}"
+            f"{c.passthrough_conns:>9} "
+            f"{_human_bytes(c.passthrough_bytes_in):>10} "
+            f"{_human_bytes(c.passthrough_bytes_out):>10}"
         )
     if any_passthrough:
         lines.append(

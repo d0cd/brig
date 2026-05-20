@@ -122,10 +122,12 @@ class TestRenderText(unittest.TestCase):
 
         out_with_pt = render_text({"codex": CellStats(
             cell="codex", requests=5, passthrough_conns=2,
-            passthrough_bytes=8192,
+            passthrough_bytes_in=4096,
+            passthrough_bytes_out=8192,
         )})
         self.assertIn("PT/* =", out_with_pt)
         self.assertIn("invariant 11", out_with_pt)
+        self.assertIn("4K", out_with_pt)
         self.assertIn("8K", out_with_pt)
 
 

@@ -55,28 +55,34 @@ def vm_bundle_path(cell_name: str) -> Path:
 def stage_bundle(cell_name: str) -> None:
     """Build the cell's combined CA bundle inside the VM.
 
-    Runs sequentially in the VM via vm_run so Warden's CA extraction
-    and the concat happen on the same trust boundary the cell will
-    see. Atomic write (temp + mv) so cell start never sees a torn
-    file. Raises RuntimeError if Warden isn't reachable — that's also
-    invariant 9 (proxy must be running), so cell start would fail
-    further down anyway; this is a friendlier early signal.
+    Runs in the VM via vm_run so Warden's CA extraction and the concat
+    happen on the same trust boundary the cell will see. Atomic write
+    (write to .tmp, mv into place) so cell start never sees a torn
+    file. No intermediate /tmp file: we pipe Warden's exec stdout
+    straight into the concat to avoid a race on `/tmp/<cell>-...pem`
+    when two cells of the same name start in parallel. Raises
+    RuntimeError if Warden isn't reachable — that's also invariant 9
+    (proxy must be running), so cell start would fail further down
+    anyway; this is a friendlier early signal.
     """
     bundle = vm_bundle_path(cell_name)
     tmp = bundle.with_suffix(".crt.tmp")
-    # Use shell composition inside the VM: extract Warden CA to a temp
-    # file, concat with system roots, mv into place. All under sudo
-    # because /state/<cell>/ is owned by the brig user (uid 1000),
-    # and warden's container exec needs root in the VM.
+    # `{ cat <roots>; podman exec <warden> cat <ca>; }` collects both
+    # streams in order into the same redirect. set -o pipefail isn't
+    # portable across sh, but `set -e` plus the explicit failure-of-
+    # subshell trap is enough — the brace-group fails the whole script
+    # if either cat fails, and `mv` of a partial file is harmless
+    # because we'd re-stage on next start. All under sudo because
+    # /state/<cell>/ is owned by the brig user (uid 1000), and
+    # warden's container exec needs root in the VM.
     script = (
         f"set -e; "
         f"mkdir -p {bundle.parent}; "
-        f"podman exec {PROXY_NAME} cat {WARDEN_CA_PATH_IN_CONTAINER} "
-        f"  > /tmp/{cell_name}-warden-ca.pem; "
-        f"cat {SYSTEM_CA_BUNDLE_IN_VM} /tmp/{cell_name}-warden-ca.pem > {tmp}; "
-        f"mv {tmp} {bundle}; "
-        f"rm -f /tmp/{cell_name}-warden-ca.pem; "
-        f"chmod 0644 {bundle}"
+        f"{{ cat {SYSTEM_CA_BUNDLE_IN_VM}; "
+        f"  podman exec {PROXY_NAME} cat {WARDEN_CA_PATH_IN_CONTAINER}; "
+        f"}} > {tmp}; "
+        f"chmod 0644 {tmp}; "
+        f"mv {tmp} {bundle}"
     )
     result = vm_run(["sh", "-c", script], timeout=15)
     if result.returncode != 0:

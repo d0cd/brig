@@ -625,15 +625,26 @@ class PolicyEnforcer:
             if address and len(address) >= 1 and isinstance(address[0], str):
                 connect_host = address[0].strip().lower()
 
-            if connect_host and sni != connect_host:
+            # FAIL CLOSED: if we couldn't read the CONNECT host, we
+            # cannot verify SNI/CONNECT match. Treat as a mismatch —
+            # don't flip passthrough. Otherwise a cell could exploit
+            # a mitmproxy-API quirk that leaves context.server.address
+            # unpopulated to ship arbitrary SNI through the tunnel
+            # (would let warden tunnel to attacker.com after CONNECT to
+            # allowed.com). The cell-visible failure is identical to
+            # the SNI≠CONNECT case: TLS handshake fails because
+            # mitmproxy will present its own MITM cert for the host
+            # in the CONNECT, which won't match the SNI the cell sent.
+            if connect_host is None:
+                ctx.log.warn(
+                    f"PASSTHROUGH skipped: CONNECT host unreadable, "
+                    f"sni={sni}, falling through to MITM"
+                )
+                return
+            if sni != connect_host:
                 ctx.log.warn(
                     f"BLOCKED: SNI/CONNECT mismatch sni={sni} connect={connect_host}"
                 )
-                # Don't close — mitmproxy will fail the handshake when we
-                # don't tag passthrough and the cert mismatches. Logging
-                # surfaces the attempt; the existing host-allow check in
-                # http_connect already blocked the CONNECT if the host
-                # wasn't permitted.
                 return
 
             cell_name = self.subnets.get_cell_name(client_ip)

@@ -136,8 +136,12 @@ class HostPaths:
     # $BRIG_HOME environment variable. Tests use this to point at a
     # tmpdir (see tests/conftest.py); operators can use it for
     # multi-profile setups. Resolved at class-definition time, so set
-    # the env var before any `import brig` happens.
-    BRIG_HOME = Path(os.environ.get("BRIG_HOME") or Path.home() / ".brig")
+    # the env var before any `import brig` happens. `.strip()` so
+    # `BRIG_HOME="  "` doesn't silently route every path to a
+    # relative dir named two spaces.
+    BRIG_HOME = Path(
+        os.environ.get("BRIG_HOME", "").strip() or Path.home() / ".brig"
+    )
     CELLS_DIR = BRIG_HOME / "cells"
     ADDONS_DIR = CELLS_DIR / "addons"
     SECRETS_DIR = BRIG_HOME / "secrets"

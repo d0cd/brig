@@ -265,19 +265,31 @@ def _v_policy(value: Any, cell_def: dict, context: str) -> list[str]:
                 suspicious = is_suspicious_domain(domain)
                 if suspicious:
                     errors.append(f"Security: {suspicious}{context}")
-    # Cross-field: every tls_passthrough host must also appear in allow.
-    # Passthrough is a TLS-handling override, not a policy bypass. Without
-    # this guard, an operator could opt a host out of MITM without ever
-    # granting it allow — silently leaking egress past the policy.
+    # Cross-field: every tls_passthrough host must be COVERED by an
+    # allow entry — exact match OR a wildcard like *.example.com that
+    # matches the passthrough host. Passthrough is a TLS-handling
+    # override, not a policy bypass. Without this guard, an operator
+    # could opt a host out of MITM without ever granting it allow —
+    # silently leaking egress past the policy.
+    #
+    # Wildcard-aware match here mirrors the runtime semantics (allow
+    # ["*.openai.com"] + passthrough ["auth.openai.com"] is a valid
+    # config, and at runtime is_passthrough() looks up both via the
+    # domain trie). Using exact-string match would force the operator
+    # to duplicate the wildcard in both lists or list every subdomain
+    # explicitly — and would diverge from runtime.
+    from brig.policy.policy import domain_matches_rule
     passthrough = value.get("tls_passthrough") or []
     allow = value.get("allow") or []
     if isinstance(passthrough, list) and isinstance(allow, list):
-        allow_set = {a for a in allow if isinstance(a, str)}
+        allow_strs = [a for a in allow if isinstance(a, str)]
         for host in passthrough:
-            if isinstance(host, str) and host not in allow_set:
+            if not isinstance(host, str):
+                continue
+            if not any(domain_matches_rule(rule, host) for rule in allow_strs):
                 errors.append(
-                    f"'policy.tls_passthrough' host '{host}' must also appear "
-                    f"in 'policy.allow'{context}"
+                    f"'policy.tls_passthrough' host '{host}' must be covered by "
+                    f"an entry in 'policy.allow' (exact or wildcard match){context}"
                 )
     # Invariant 11: passthrough is an informed-consent security trade-off
     # (loses per-URL audit + body inspection). Untrusted cells don't get

@@ -128,7 +128,8 @@ class TestValidateCellDefinition(unittest.TestCase):
             "tls_passthrough": ["chatgpt.com"],
         }})
         self.assertTrue(
-            any("must also appear in 'policy.allow'" in e for e in errors),
+            any("must be covered by an entry in 'policy.allow'" in e
+                for e in errors),
             errors,
         )
 

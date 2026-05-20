@@ -73,6 +73,55 @@ class TestPolicyIsPassthrough(unittest.TestCase):
         self.assertFalse(p.is_passthrough("api.anthropic.com"))
 
 
+class TestPassthroughAllowWildcardCoverage(unittest.TestCase):
+    """Audit H1: validator must accept passthrough hosts covered by an
+    allow wildcard, not just exact-string allow entries. Runtime
+    is_passthrough() uses wildcard-aware lookup; exact-string-only
+    parse-time validation diverged from runtime and rejected legitimate
+    configs (e.g. allow: ['*.openai.com'] + tls_passthrough:
+    ['auth.openai.com'])."""
+
+    def test_passthrough_subdomain_covered_by_wildcard_accepted(self):
+        from brig.cell.spec import validate_cell_definition
+        errors = validate_cell_definition({
+            "name": "codex", "image": "alpine",
+            "policy": {
+                "allow": ["*.openai.com"],
+                "tls_passthrough": ["auth.openai.com"],
+            },
+        })
+        self.assertEqual(errors, [])
+
+    def test_passthrough_wildcard_matching_allow_wildcard_accepted(self):
+        from brig.cell.spec import validate_cell_definition
+        errors = validate_cell_definition({
+            "name": "codex", "image": "alpine",
+            "policy": {
+                "allow": ["*.openai.com"],
+                "tls_passthrough": ["*.openai.com"],
+            },
+        })
+        self.assertEqual(errors, [])
+
+    def test_passthrough_bare_domain_not_covered_by_wildcard_rejected(self):
+        """Wildcard *.openai.com does NOT cover openai.com itself
+        (dot-boundary, same as runtime). Passthrough of openai.com
+        must be rejected when only *.openai.com is allowed."""
+        from brig.cell.spec import validate_cell_definition
+        errors = validate_cell_definition({
+            "name": "codex", "image": "alpine",
+            "policy": {
+                "allow": ["*.openai.com"],
+                "tls_passthrough": ["openai.com"],
+            },
+        })
+        self.assertTrue(
+            any("must be covered by an entry in 'policy.allow'" in e
+                for e in errors),
+            errors,
+        )
+
+
 class TestUntrustedProfileRejectsPassthrough(unittest.TestCase):
     def test_untrusted_profile_rejects_tls_passthrough(self):
         """Invariant 11: untrusted profile cannot declare passthrough."""
@@ -150,6 +199,69 @@ class TestPrintNetworkLineRendersPassthrough(unittest.TestCase):
         # refactor that accidentally adds them gets caught.
         self.assertNotIn("GET", line)
         self.assertNotIn("OUT:", line)
+
+
+class TestTlsClientHelloFailsClosed(unittest.TestCase):
+    """Audit C1: tls_clienthello MUST NOT flip passthrough when the
+    CONNECT host can't be read (e.g. mitmproxy didn't populate
+    context.server.address). Otherwise a malicious cell could ship
+    arbitrary SNI through warden as a tunnel after CONNECTing to an
+    allowed host."""
+
+    def _enforcer(self):
+        import sys
+        sys.path.insert(0, "src/addons")
+        try:
+            from enforce import PolicyEnforcer
+            from _policy import Policy
+        finally:
+            sys.path.pop(0)
+        enf = PolicyEnforcer()
+        enf.cell_policies["codex"] = Policy(
+            allow=["chatgpt.com"], tls_passthrough=["chatgpt.com"],
+        )
+        enf.subnets = type("S", (), {
+            "get_cell_name": staticmethod(lambda ip: "codex"),
+        })()
+        return enf
+
+    def _make_data(self, sni, connect_host):
+        """Build a mitmproxy-shaped ClientHelloData mock. Pass
+        connect_host=None to simulate the missing-address case."""
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        client = MagicMock()
+        client.peername = ("10.60.1.5", 54321)
+        client.metadata = {}
+        client.tls_passthrough = False
+        server = SimpleNamespace(
+            address=(connect_host, 443) if connect_host else None,
+        )
+        context = SimpleNamespace(client=client, server=server)
+        hello = SimpleNamespace(sni=sni)
+        return SimpleNamespace(client_hello=hello, context=context), client
+
+    def test_passthrough_flips_when_sni_matches_connect(self):
+        enf = self._enforcer()
+        data, client = self._make_data("chatgpt.com", "chatgpt.com")
+        enf.tls_clienthello(data)
+        self.assertTrue(client.tls_passthrough)
+        self.assertEqual(client.metadata.get("tls_mode"), "passthrough")
+
+    def test_passthrough_not_flipped_when_connect_host_missing(self):
+        """Fail closed: no CONNECT host = can't verify, don't flip."""
+        enf = self._enforcer()
+        data, client = self._make_data("chatgpt.com", None)
+        enf.tls_clienthello(data)
+        self.assertFalse(client.tls_passthrough)
+        self.assertNotIn("tls_mode", client.metadata)
+
+    def test_passthrough_not_flipped_on_sni_connect_mismatch(self):
+        enf = self._enforcer()
+        # Cell CONNECTs to allowed host but ships SNI of disallowed host.
+        data, client = self._make_data("attacker.com", "chatgpt.com")
+        enf.tls_clienthello(data)
+        self.assertFalse(client.tls_passthrough)
 
 
 if __name__ == "__main__":
