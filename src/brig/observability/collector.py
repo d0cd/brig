@@ -23,13 +23,19 @@ from brig.config import (
     COLLECTOR_OTLP_HTTP_PORT,
     COLLECTOR_PROMETHEUS_PORT,
     HostPaths,
+    VMPaths,
 )
 from brig.errors import BrigError
 from brig.ops.logging import debug, info
 from brig.vm.shell import vm_run
 
 CONFIG_RESOURCE = "collector_config.yaml"
-VM_CONFIG_PATH = "/etc/brig-otel/config.yaml"
+# Where the staged config lives on the host (and, via the /cells
+# virtiofs mount, inside the VM at the corresponding /cells path).
+# Operator's project tree is NOT visible inside the VM; only
+# ~/.brig is.
+HOST_CONFIG_PATH = HostPaths.CELLS_DIR / "otel-collector.yaml"
+VM_CONFIG_PATH = VMPaths.CELLS_DIR / "otel-collector.yaml"
 VM_DATA_DIR = "/var/lib/otel"
 HEALTH_TIMEOUT_S = 10
 HEALTH_POLL_S = 0.5
@@ -99,20 +105,18 @@ def start() -> bool:
         debug(f"removing stale {COLLECTOR_NAME} container")
         stop()
 
-    # Stage the config inside the VM. The collector binary reads it
-    # at startup; the file must exist on the VM filesystem (not just
-    # in a bind mount from host) because /etc is rootful.
+    # Stage the config into ~/.brig/cells/ on the host. Lima mounts
+    # ~/.brig/cells at /cells inside the VM (ro virtiofs), so the
+    # collector container can bind-mount the file directly from
+    # /cells/otel-collector.yaml. Operator's project tree itself is
+    # NOT mounted into the VM — staging into the brig home is the
+    # only way to make a host-managed file visible there.
     config_src = _config_source()
     if not config_src.exists():
         raise BrigError(f"collector config template missing: {config_src}")
-    vm_run(["mkdir", "-p", "/etc/brig-otel"], timeout=5)
+    HostPaths.CELLS_DIR.mkdir(parents=True, exist_ok=True)
+    HOST_CONFIG_PATH.write_bytes(config_src.read_bytes())
     vm_run(["mkdir", "-p", VM_DATA_DIR], timeout=5)
-    # Lima exposes the host file at /Users/<user>/... inside the VM
-    # via virtiofs; copy that into /etc to escape the user mount.
-    vm_run(
-        ["cp", str(config_src), VM_CONFIG_PATH],
-        timeout=10,
-    )
 
     cmd = [
         "podman", "run", "-d",

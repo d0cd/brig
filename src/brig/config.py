@@ -39,16 +39,14 @@ PROXY_NAME = "warden"
 # the Lima VM, receives metrics/traces/logs from warden over OTLP,
 # serves Prometheus + log queries to the host CLI.
 #
-# Image digest must be pinned before any release that ships this
-# code path. The provisioning step (scripts/pin-collector-image.sh,
-# pending) fetches the published 0.96.0 image, prints its sha256,
-# and the operator commits the result here. Until that step runs,
-# COLLECTOR_IMAGE_DIGEST is the empty string and start_collector()
-# refuses to launch — fail closed, no unverified pulls.
+# Bump COLLECTOR_IMAGE_TAG then run `./scripts/pin-collector-image.sh`
+# to refresh COLLECTOR_IMAGE_DIGEST against the published image. The
+# collector lifecycle (observability/collector.py) refuses to start
+# if the digest is empty — fail closed, no unverified pulls.
 COLLECTOR_NAME = "brig-otel"
 COLLECTOR_IMAGE_REPO = "docker.io/otel/opentelemetry-collector-contrib"
 COLLECTOR_IMAGE_TAG = "0.96.0"
-COLLECTOR_IMAGE_DIGEST = ""  # MUST be filled in via scripts/pin-collector-image.sh
+COLLECTOR_IMAGE_DIGEST = "sha256:7d165be14571ef423f0394756bfa8b377a882d3ca8052394c69402fa68305158"
 COLLECTOR_OTLP_GRPC_PORT = 4317
 COLLECTOR_OTLP_HTTP_PORT = 4318
 COLLECTOR_PROMETHEUS_PORT = 9464

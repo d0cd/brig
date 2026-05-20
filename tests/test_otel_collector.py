@@ -123,30 +123,40 @@ class TestStart(unittest.TestCase):
                 return _ok()
             return _ok()
 
+        import tempfile
+        from pathlib import Path
         for p in self._patches():
             p.start()
         try:
-            with patch.object(collector, "vm_run", side_effect=fake), \
-                 patch("brig.observability.collector._config_source") as src:
-                src.return_value.exists.return_value = True
-                src.return_value.__str__ = lambda self: "/fake/config.yaml"
-                self.assertTrue(collector.start())
+            with tempfile.TemporaryDirectory() as td:
+                td = Path(td)
+                src = td / "src.yaml"
+                src.write_text("dummy: config\n")
+                dest = td / "cells" / "otel-collector.yaml"
+                fake_cells_dir = td / "cells"
+                with patch.object(collector, "vm_run", side_effect=fake), \
+                     patch.object(collector, "_config_source", return_value=src), \
+                     patch.object(collector, "HOST_CONFIG_PATH", dest), \
+                     patch("brig.observability.collector.HostPaths.CELLS_DIR",
+                           fake_cells_dir):
+                    self.assertTrue(collector.start())
+                self.assertTrue(dest.exists())
         finally:
             for p in self._patches():
                 p.stop()
         self.assertEqual(len(run_invoked), 1)
 
     def test_missing_config_template_raises(self):
+        from pathlib import Path
         from brig.observability import collector
         from brig.errors import BrigError
         for p in self._patches():
             p.start()
         try:
+            ghost = Path("/no/such/template.yaml")
             with patch.object(collector, "vm_run",
                               return_value=_ok(stdout="missing\n")), \
-                 patch("brig.observability.collector._config_source") as src:
-                src.return_value.exists.return_value = False
-                src.return_value.__str__ = lambda self: "/no/such.yaml"
+                 patch.object(collector, "_config_source", return_value=ghost):
                 with self.assertRaises(BrigError) as ctx:
                     collector.start()
             self.assertIn("collector config template", str(ctx.exception))

@@ -57,7 +57,7 @@ def vm_run(
         timeout: Timeout in seconds (None for no timeout).
     """
     # Rootful podman and system commands inside Lima need sudo.
-    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown"):
+    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown", "cp", "rm"):
         cmd = ["sudo"] + cmd
 
     full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
