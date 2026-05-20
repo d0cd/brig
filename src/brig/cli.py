@@ -75,7 +75,14 @@ def _add_run_parser(sub: argparse._SubParsersAction) -> None:
                "  brig run alpine echo hello\n"
                "  brig run --name test --profile untrusted python:3.12 python app.py\n"
                "  brig run --secret api-key alpine -- curl -H @/run/secrets/api-key $URL\n"
-               "  brig run --file mycell.yaml\n",
+               "  brig run --file mycell.yaml\n"
+               "\n"
+               "Cell yaml notes:\n"
+               "  - ingress with auth: token requires a secret named\n"
+               "    <cell-name>-ingress-token (preferred) or ingress-token (fallback).\n"
+               "    Register it with: brig secrets add <cell-name>-ingress-token.\n"
+               "  - policy.tls_passthrough: list hosts to skip warden MITM (SNI-routed).\n"
+               "    Each entry must also appear in policy.allow.\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("image", nargs="?", help="Container image (flags must precede image)")

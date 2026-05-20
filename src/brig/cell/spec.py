@@ -131,6 +131,14 @@ class CellSpec:
     # Declaring in yaml IS the grant — there is no separate global
     # registry. See _v_host_services for validation.
     host_services: list[dict[str, Any]] = field(default_factory=list)
+    # Trust Warden's MITM CA out of the box. When true (default), brig
+    # stages a combined bundle (system roots + Warden CA) inside the VM
+    # and mounts it at /run/brig/ca-bundle.crt, plus sets SSL_CERT_FILE /
+    # REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS to point
+    # at it (only when the cell didn't already set them). Set to false
+    # for cells with strict cert pinning or that manage their own trust
+    # store. See brig.cell.ca_bundle.
+    trust_warden_ca: bool = True
 
     def __post_init__(self) -> None:
         """Validate inputs at construction time — the system boundary.
@@ -313,6 +321,12 @@ def _v_workspace_quota(value: Any, context: str) -> list[str]:
 def _v_writable_rootfs(value: Any, context: str) -> list[str]:
     if not isinstance(value, bool):
         return [f"'writable_rootfs' must be a boolean{context}"]
+    return []
+
+
+def _v_trust_warden_ca(value: Any, context: str) -> list[str]:
+    if not isinstance(value, bool):
+        return [f"'trust_warden_ca' must be a boolean{context}"]
     return []
 
 
@@ -715,6 +729,7 @@ _SIMPLE_VALIDATORS = {
     "workspace_quota": _v_workspace_quota,
     "workspace_mount": _v_workspace_mount,
     "writable_rootfs": _v_writable_rootfs,
+    "trust_warden_ca": _v_trust_warden_ca,
     "detach": _v_detach,
 }
 

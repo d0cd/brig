@@ -666,46 +666,14 @@ class PolicyEnforcer:
             # silently leaking through.
             ctx.log.warn(f"tls_clienthello error, defaulting to MITM: {e}")
 
-    def server_connected(self, data):
-        """Check resolved IP against blocked ranges after DNS resolution.
-
-        Fails closed: if IP validation raises an exception, kill the connection.
-        Skips check for connections we explicitly rewrote to a host service
-        (gated by flow.metadata, not just by the (ip, port) tuple — a tuple
-        match alone would let a DNS-rebinding allowlisted domain reach a
-        host service that resolves to the same private (ip, port) pair).
-        """
-        try:
-            # Skip ONLY if this server connection was created for a flow that
-            # we rewrote in _handle_host_service. The flow attribute is
-            # populated for HTTP flows in mitmproxy >= 10.
-            flow = getattr(data, "flow", None)
-            # Skip the rebinding check for flows warden's own addon chain
-            # routed: host_service rewrites (handled here in enforce.py)
-            # and ingress flows (ingress.py picked the cell IP itself).
-            # Both are warden's choices, not poisoned DNS responses.
-            if flow is not None and (
-                flow.metadata.get("host_service")
-                or flow.metadata.get("ingress_route")
-            ):
-                return
-
-            peername = data.server.peername
-            if peername:
-                ip_str = peername[0]
-                ip = ipaddress.ip_address(ip_str)
-                for net in BLOCKED_NETWORKS:
-                    if ip in net:
-                        ctx.log.warn(f"BLOCKED: DNS rebinding detected - resolved to {ip_str}")
-                        data.server.close()
-                        return
-        except Exception:
-            # Fail closed: kill the connection on any parse/validation error.
-            ctx.log.warn("BLOCKED: server_connected failed to validate IP, closing connection")
-            try:
-                data.server.close()
-            except OSError:
-                pass
+    # DNS-rebinding check lives in responseheaders() only. The earlier
+    # server_connected variant depended on a latent mitmproxy-API bug
+    # (`data.server.close()` no longer exists on >= 10, AttributeError
+    # masked the would-be block), and `data.flow` was None at that hook
+    # for warden-routed flows so the host_service / ingress exemptions
+    # were a no-op too. responseheaders fires after request() and
+    # http_connect() populate metadata, so the exemptions actually
+    # gate correctly. Aitelier diagnosed this; see INVARIANTS doc.
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
         """Log WebSocket messages on established connections.

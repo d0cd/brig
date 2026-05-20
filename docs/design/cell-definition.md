@@ -126,7 +126,17 @@ https://warden:8443/{cell_name}/{path_prefix}/...
 
 Requirements:
 - Each request must include `Authorization: Bearer <token>`
-- Token is stored as a Brig secret: `brig secrets add {cell}-ingress-token`
+- Token is stored as a Brig secret with a strict naming convention:
+  - **Preferred:** `<cell-name>-ingress-token` — per-cell token, rotate
+    independently of other cells. Example: cell named `aitelier` reads
+    `~/.brig/secrets/aitelier-ingress-token`.
+  - **Fallback:** `ingress-token` — a single shared token across all
+    cells. Convenient for dev, not recommended for prod.
+  - The cell-name-prefixed file wins when both exist.
+  - If a cell declares `ingress` with `auth: token` and **neither**
+    secret exists, `brig run` fails with a hard error pointing at the
+    expected filename (see `brig cell preflight`).
+  - Register with: `openssl rand -hex 32 | brig secrets add <cell-name>-ingress-token -`
 - `network` must be `default` (ingress is incompatible with airgapped cells)
 - Maximum 8 ingress entries per cell
 

@@ -18,6 +18,11 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
+from brig.cell.ca_bundle import (
+    IN_CELL_PATH as CA_BUNDLE_IN_CELL_PATH,
+    default_env as ca_bundle_default_env,
+    vm_bundle_path as ca_bundle_vm_path,
+)
 from brig.cell.metadata import IN_CELL_PATH, vm_source_path, write_metadata
 from brig.cell.spec import CellSpec
 from brig.config import PROXY_NAME, RUNTIME, VMPaths, container_name
@@ -261,6 +266,19 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     # to learn its own name, workspace host path, and policy ACL.
     cmd.extend(["-v", f"{vm_source_path(spec.name)}:{IN_CELL_PATH}:ro"])
 
+    # Warden CA bundle (system roots + Warden's MITM CA) — auto-mounted
+    # so HTTPS clients trust Warden out of the box. Skipped for airgapped
+    # cells (no egress to validate) and when the cell opts out via
+    # trust_warden_ca: false. The bundle file is staged by the PODMAN_RUN
+    # action (brig.cell.ca_bundle.stage_bundle). See INVARIANTS doc.
+    if spec.trust_warden_ca and not spec.is_airgapped:
+        cmd.extend([
+            "-v",
+            f"{ca_bundle_vm_path(spec.name)}:{CA_BUNDLE_IN_CELL_PATH}:ro",
+        ])
+        for env in ca_bundle_default_env(spec.env):
+            cmd.extend(["-e", env])
+
     if spec.secrets:
         secrets_dir = Path("/secrets")
         for secret_name in spec.secrets:
@@ -421,6 +439,13 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # podman creates the read-only bind mount at /run/brig/cell.json.
         write_metadata(spec.name, spec.workspace_mount,
                        host_sockets=spec.host_sockets)
+        # Stage the combined CA bundle inside the VM so HTTPS clients in
+        # the cell trust Warden's MITM cert. Re-extracted from Warden
+        # every start so a CA rotation doesn't leave cells with stale
+        # trust. Skipped for airgapped cells and explicit opt-outs.
+        if spec.trust_warden_ca and not spec.is_airgapped:
+            from brig.cell.ca_bundle import stage_bundle
+            stage_bundle(spec.name)
         proxy_ip = None
         if not spec.is_airgapped:
             # Retry — network connect may not have propagated yet.

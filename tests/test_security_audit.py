@@ -453,88 +453,16 @@ class TestLoggerCellNameValidation(unittest.TestCase):
 # 7. Invariant tests added per audit (closes documented gaps in INVARIANTS.md)
 # ---------------------------------------------------------------------------
 
-class TestServerConnectedDnsRebinding(unittest.TestCase):
-    """Inv. 2: server_connected/responseheaders close connections that resolve
-    into BLOCKED_NETWORKS (DNS rebinding defense). Skip ONLY when the flow we
-    rewrote ourselves carries the host_service metadata flag.
-    """
-
-    def setUp(self):
-        self.enforcer = PolicyEnforcer()
-        self.enforcer._host_ip = "192.168.64.1"
-
-    def _make_server_data(self, ip: str, port: int = 443, flow=None):
-        data = MagicMock()
-        data.server.peername = (ip, port)
-        # mitmproxy 10+: data.flow is the associated HTTP flow when applicable.
-        if flow is not None:
-            data.flow = flow
-        else:
-            # Explicitly remove `flow` so getattr returns None.
-            del data.flow
-        return data
-
-    def test_rfc1918_blocked(self):
-        data = self._make_server_data("10.0.0.5")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_localhost_blocked(self):
-        data = self._make_server_data("127.0.0.1")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_link_local_blocked(self):
-        data = self._make_server_data("169.254.169.254")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_ipv4_mapped_ipv6_blocked(self):
-        data = self._make_server_data("::ffff:10.0.0.5")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_ipv6_link_local_blocked(self):
-        data = self._make_server_data("fe80::1")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_public_ip_allowed(self):
-        data = self._make_server_data("93.184.216.34")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_not_called()
-
-    def test_host_service_skip_requires_flow_metadata(self):
-        """Host-service skip is keyed on flow.metadata, not (ip,port) tuple.
-        A naked tuple match (no metadata) must NOT bypass the BLOCKED check.
-        """
-        data = self._make_server_data("192.168.64.1", port=5432)
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_host_service_skip_when_metadata_set(self):
-        """When the rewritten flow has host_service metadata, skip the check."""
-        flow = MagicMock()
-        flow.metadata = {"host_service": "mydb"}
-        data = self._make_server_data("192.168.64.1", port=5432, flow=flow)
-        self.enforcer.server_connected(data)
-        data.server.close.assert_not_called()
-
-    def test_ingress_route_skip_when_metadata_set(self):
-        """Ingress flows (routed by ingress.py to a cell IP in
-        BLOCKED_NETWORKS) must NOT be killed by the rebinding check —
-        warden picked that IP itself, it's not a poisoned DNS response.
-        Regression for aitelier-feedback #1."""
-        flow = MagicMock()
-        flow.metadata = {"ingress_route": "aitelier:/api"}
-        # Cell IP in 10.60.0.0/16 (BLOCKED_NETWORKS).
-        data = self._make_server_data("10.60.1.15", port=7777, flow=flow)
-        self.enforcer.server_connected(data)
-        data.server.close.assert_not_called()
-
-
 class TestResponseHeadersDnsRebinding(unittest.TestCase):
-    """Inv. 2: responseheaders blocks responses from blocked-IP servers."""
+    """Inv. 2: responseheaders blocks responses from blocked-IP servers.
+
+    This is the SINGLE rebinding-check enforcement point in enforce.py.
+    The check used to ALSO run in server_connected, but mitmproxy >= 10
+    removed `data.server.close()`, so that path silently no-op'd. We
+    consolidated to responseheaders (where flow.metadata is populated
+    and the host_service / ingress_route exemptions actually fire).
+    Aitelier diagnosed the latent bug.
+    """
 
     def setUp(self):
         self.enforcer = PolicyEnforcer()
@@ -553,10 +481,30 @@ class TestResponseHeadersDnsRebinding(unittest.TestCase):
         self.enforcer.responseheaders(flow)
         self.assertTrue(flow.metadata.get("blocked"))
 
+    def test_blocks_localhost_response(self):
+        flow = self._make_flow("127.0.0.1")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_blocks_link_local_response(self):
+        flow = self._make_flow("169.254.169.254")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
     def test_blocks_ipv4_mapped_response(self):
         flow = self._make_flow("::ffff:192.168.0.5")
         self.enforcer.responseheaders(flow)
         self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_blocks_ipv6_link_local_response(self):
+        flow = self._make_flow("fe80::1")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_public_ip_allowed(self):
+        flow = self._make_flow("93.184.216.34")
+        self.enforcer.responseheaders(flow)
+        self.assertFalse(flow.metadata.get("blocked"))
 
     def test_skips_when_host_service_metadata_set(self):
         flow = self._make_flow("192.168.64.1", port=5432, host_service="mydb")
@@ -573,7 +521,9 @@ class TestResponseHeadersDnsRebinding(unittest.TestCase):
         self.assertFalse(flow.metadata.get("blocked"))
 
     def test_does_not_skip_without_metadata(self):
-        """Without host_service metadata, even host-IP-tuple matches block."""
+        """Naked (ip, port) tuple match without flow.metadata must
+        still block. Otherwise a DNS-rebinding allowlisted domain could
+        reach a host service whose IP happens to be in BLOCKED_NETWORKS."""
         flow = self._make_flow("192.168.64.1", port=5432)
         self.enforcer.responseheaders(flow)
         self.assertTrue(flow.metadata.get("blocked"))
