@@ -18,6 +18,40 @@ from brig.ops.logging import info, output
 from brig.security.image import verify_image_signature
 
 
+def _resolve_warden_ip() -> str:
+    """Return warden's IP on the proxy-external network for use as the
+    build-time HTTPS_PROXY target.
+
+    The build container runs in the VM with host networking (no per-cell
+    isolation), so warden is reachable at the proxy-external bridge's
+    gateway IP. We inspect rather than assume because podman networks
+    pick a random /24 unless configured.
+    """
+    import json as _json
+    from brig.config import PROXY_NAME
+    result = vm_run(
+        ["podman", "inspect", PROXY_NAME, "--format", "json"], timeout=5,
+    )
+    if result.returncode != 0:
+        raise BrigError(
+            "Could not inspect warden to learn its IP",
+            suggestion="Check warden is up: brig system doctor",
+        )
+    try:
+        info_list = _json.loads(result.stdout)
+        nets = info_list[0]["NetworkSettings"]["Networks"]
+        for _net_name, net in nets.items():
+            ip = net.get("IPAddress", "")
+            if ip:
+                return ip
+    except (KeyError, IndexError, _json.JSONDecodeError):
+        pass
+    raise BrigError(
+        "Could not determine warden's IP from podman inspect",
+        suggestion="brig system doctor",
+    )
+
+
 def _load_ignore_patterns(ctx: Path) -> list[str]:
     """Read `.containerignore` (preferred) or `.dockerignore` from `ctx`.
 
@@ -236,6 +270,50 @@ def cmd_build(args: Any) -> int:
     for ba in getattr(args, "build_arg", None) or []:
         build_args += ["--build-arg", ba]
 
+    # --use-warden routes build-time HTTP(S) traffic through warden
+    # using the standard HTTPS_PROXY pattern. Closes the build/runtime
+    # asymmetry aitelier reported: today's build path is fast+unfiltered,
+    # runtime is slow+MITM'd, so operators pre-bake ~230 MB binaries to
+    # avoid timeouts. With --use-warden the build hits the same warden
+    # path as runtime; subsequent layer caches amortize the warden
+    # overhead.
+    extra_mounts: list[str] = []
+    if getattr(args, "use_warden", False):
+        from brig.network.proxy import proxy_running
+        if not proxy_running():
+            raise BrigError(
+                "Warden proxy is not running",
+                suggestion="Start with: brig up  (or omit --use-warden)",
+            )
+        # Use the VM-side warden bridge IP. Build container runs with
+        # host networking inside the VM, so warden is reachable at the
+        # container's own gateway IP on the proxy-external network.
+        # We pass the gateway IP literal — DNS for `warden.brig` isn't
+        # plumbed into the build container's resolv.conf.
+        warden_ip = _resolve_warden_ip()
+        proxy_url = f"http://{warden_ip}:8080"
+        # NO_PROXY excludes localhost so build-time sidecars (test
+        # servers, etc.) don't try to proxy through warden. The list is
+        # what apt/curl/npm/pip all recognize.
+        no_proxy = "localhost,127.0.0.1,::1"
+        for var in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            build_args += ["--build-arg", f"{var}={proxy_url}"]
+        for var in ("NO_PROXY", "no_proxy"):
+            build_args += ["--build-arg", f"{var}={no_proxy}"]
+        # Mount the current warden CA into the build container so that
+        # any tool which honors SSL_CERT_FILE / the system trust store
+        # accepts the MITM cert. Build steps that COPY the CA into the
+        # final image are an anti-pattern (it bakes a soon-to-rotate
+        # cert) — see docs/design/cell-definition.md.
+        from brig.cell.ca_bundle import VM_WARDEN_CA_FILE
+        extra_mounts += [
+            "-v", f"{VM_WARDEN_CA_FILE}:/etc/ssl/certs/warden-ca.crt:ro",
+        ]
+        build_args += [
+            "--build-arg", "SSL_CERT_FILE=/etc/ssl/certs/warden-ca.crt",
+        ]
+        info(f"Routing build through warden at {proxy_url}")
+
     patterns = _load_ignore_patterns(ctx)
     if patterns:
         info(f"Honoring {len(patterns)} ignore pattern(s) from "
@@ -253,6 +331,7 @@ def cmd_build(args: Any) -> int:
         [
             "limactl", "shell", "--workdir", "/", "brig", "--",
             "sudo", "podman", "build", "--runtime", "crun",
+            *extra_mounts,
             "-t", tag, *cfile_arg, *build_args, "-",
         ],
         input=tar_bytes,

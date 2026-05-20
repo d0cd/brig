@@ -145,6 +145,14 @@ def stop(timeout: int = 10) -> bool:
     vm_run(
         ["podman", "rm", PROXY_NAME],
     )
+    # Lifecycle event — pairs with the warden_start event so operators
+    # can grep `brig events` for the exact window when live TCP
+    # connections would have been dropped.
+    try:
+        from brig.ops.history import log_lifecycle
+        log_lifecycle("warden_stop", PROXY_NAME)
+    except Exception:
+        pass
     return True
 
 
@@ -320,6 +328,18 @@ def start() -> bool:
 
     # Reconnect to existing cell networks.
     _reconnect_cell_networks()
+    # Lifecycle event so operators can correlate cell-side TCP/HTTP
+    # connection failures with warden restarts. Aitelier-driven —
+    # any restart drops every live TCP host_service connection (cells
+    # need reconnect logic), and `brig events` is where they'd look
+    # to confirm "yeah, warden was restarted at T".
+    try:
+        from brig.ops.history import log_lifecycle
+        log_lifecycle("warden_start", PROXY_NAME)
+    except Exception:
+        # Lifecycle logging is best-effort — don't fail warden start
+        # because the audit-log directory perm got weird.
+        pass
     info("Proxy started")
     return True
 

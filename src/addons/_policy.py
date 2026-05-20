@@ -223,16 +223,28 @@ class Policy:
         self.allow_rules = [PolicyRule(r) for r in (allow or [])]
         self.deny_rules = [PolicyRule(r) for r in (deny or [])]
         self.passthrough_rules = [PolicyRule(r) for r in (tls_passthrough or [])]
+        # HTTP host_services: name -> port. Used by enforce.py to rewrite
+        # `<name>.host.brig` requests at L7.
         self.host_services_map: Optional[dict] = None
+        # TCP host_services: name -> port. Same shape, separate dict so
+        # enforce.py can quickly distinguish: HTTP entries get the L7
+        # rewrite, TCP entries are forwarded by warden's `--mode tcp@PORT`
+        # listener with a tcp_start hook checking this map.
+        self.tcp_host_services_map: Optional[dict] = None
         if host_services is not None:
             self.host_services_map = {}
+            self.tcp_host_services_map = {}
             for item in host_services:
                 if not isinstance(item, dict):
                     continue
                 name = item.get("name")
                 port = item.get("port")
+                protocol = item.get("protocol", "http")
                 if isinstance(name, str) and isinstance(port, int):
-                    self.host_services_map[name] = port
+                    if protocol == "tcp":
+                        self.tcp_host_services_map[name] = port
+                    else:
+                        self.host_services_map[name] = port
         # Build reverse-label tries for O(k) domain lookup.
         self._allow_trie = DomainTrie()
         for rule in self.allow_rules:

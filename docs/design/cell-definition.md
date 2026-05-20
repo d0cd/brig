@@ -80,6 +80,11 @@ policy:
 # now flags this by comparing each cell's staged ca-bundle.crt against
 # Warden's current CA; run it if a previously-working cell starts
 # hanging on HTTPS after a `brig system up/down` cycle.
+#
+# Related: if you `brig image build --use-warden`, do NOT COPY the
+# warden CA from /etc/ssl/certs/warden-ca.crt into the final image.
+# That bakes a soon-to-rotate CA into the layer; runtime cells then
+# trust a stale cert. Mount-at-runtime is the supported pattern.
 trust_warden_ca: true
 
 # Timeout
@@ -124,12 +129,23 @@ ingress:
     path_prefix: /webhooks
     auth: token
 
-# Host services — HTTP/HTTPS forwarding from cell to host port,
-# routed through Warden under the <name>.host.brig virtual domain.
+# Host services — forwarding from cell to host port, through Warden.
 # Declaration here is the grant; no separate registration step.
+#
+# protocol: http (default) — L7 rewrite at <name>.host.brig (any path),
+#                            full URL+method audit, MITM applies.
+# protocol: tcp             — L4 forward via warden TCP listener.
+#                            Cell connects to <name>.host.brig:<port>
+#                            with a normal TCP client (psql, redis-cli,
+#                            etc.). Audit is connection-level (cell,
+#                            service, bytes, duration); no per-request
+#                            inspection. Same trust boundary as HTTP
+#                            host_services — warden stays in the path.
+# Untrusted profile rejects both at parse time.
 host_services:
-  - {name: db, port: 5432}
-  - {name: litellm, port: 4000}
+  - {name: litellm, port: 4000}                          # HTTP (default)
+  - {name: db, port: 5432, protocol: tcp}                # TCP — Postgres
+  - {name: redis, port: 6379, protocol: tcp}             # TCP — Redis
 
 # Host sockets — bind-mount macOS unix sockets into the cell for
 # non-HTTP protocols (Postgres, Redis, ssh-agent). Bytes flow

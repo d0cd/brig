@@ -579,6 +579,15 @@ def _v_host_service_entry(
     Rules:
       - name: HOST_SERVICE_NAME_PATTERN, unique per cell
       - port: int in [1, 65535]
+      - protocol (optional): "http" (default) or "tcp". HTTP entries go
+        through warden's mitmproxy as today — cell reaches `<name>.host.brig`
+        and warden rewrites/proxies HTTP at L7. TCP entries are forwarded
+        at L4 by a warden TCP listener (mitmproxy `--mode tcp@PORT`);
+        cells use the upstream's native protocol over a normal TCP
+        connection to `<name>.host.brig:<port>`. Trust model: warden
+        stays in the path (same audit boundary as HTTP), but inspection
+        is connection-level (bytes, duration, peer) rather than
+        per-request — DB wire protocols are opaque to mitmproxy anyway.
     No path/file checks (this is TCP-forwarding, not socket-mounting).
     """
     if not isinstance(entry, dict):
@@ -607,6 +616,12 @@ def _v_host_service_entry(
     elif not isinstance(port, int) or port < 1 or port > 65535:
         errors.append(
             f"'host_services[{i}].port' must be an integer 1-65535{context}"
+        )
+
+    protocol = entry.get("protocol", "http")
+    if protocol not in ("http", "tcp"):
+        errors.append(
+            f"'host_services[{i}].protocol' must be 'http' or 'tcp'{context}"
         )
 
     return errors

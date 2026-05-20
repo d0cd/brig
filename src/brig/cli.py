@@ -228,6 +228,16 @@ def _add_image_group(sub: argparse._SubParsersAction) -> None:
                               "(default: auto-detect Containerfile/Dockerfile)")
     p_build.add_argument("--build-arg", action="append", metavar="KEY=VALUE",
                          help="Build-time variable (passed through to podman)")
+    p_build.add_argument(
+        "--use-warden", action="store_true",
+        help="Route the build's HTTP(S) traffic through warden. Injects "
+             "HTTPS_PROXY/HTTP_PROXY/NO_PROXY build args and mounts the "
+             "warden CA at /etc/ssl/certs/warden-ca.crt in the build "
+             "container. Requires the Containerfile to forward those "
+             "args via ARG+ENV (standard proxy pattern). Same policy "
+             "applies as the runtime — eliminates the build/runtime "
+             "asymmetry that forces pre-baking binaries.",
+    )
 
     p_pull = isub.add_parser("pull", help="Pull and cache image")
     p_pull.add_argument("image", help="Image to pull")
