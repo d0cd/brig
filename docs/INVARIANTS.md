@@ -220,11 +220,24 @@ already set those env vars.
 
 The invariants we DO uphold:
 
-  - **Bundle source of truth is the Warden container's filesystem.** We
-    re-extract via `podman exec warden cat .../mitmproxy-ca-cert.pem` on
-    every cell start. A tamperer who writes to `~/.brig/state/` (invariant
-    4: untrusted) cannot poison the bundle because brig re-stages from
-    Warden each time.
+  - **Bundle source of truth is a persistent VM-side dir owned by uid 1000.**
+    Warden's mitmproxy state lives at `/var/lib/warden/mitmproxy-state/`
+    (chowned to 1000:1000 by `warden start` before the bind mount, so
+    mitmproxy can write its CA + key). Brig reads the cert from there
+    via a direct `cat`, no `podman exec` — eliminates the auto-sudo trap
+    in vm_run (only specific cmd[0] values get sudo'd; `sh -c '...'`
+    wrappers don't) AND removes the dependency on warden being live at
+    cell-start time. A tamperer who writes to `~/.brig/state/` (invariant
+    4: untrusted) still cannot poison the bundle because the bundle is
+    staged into `/state/<cell>/` which is on the VM trust boundary, not
+    macOS.
+  - **CA generated eagerly at `warden start`, not on first proxied
+    request.** `warden start` polls `/var/lib/warden/mitmproxy-state/
+    mitmproxy-ca-cert.pem` for up to 30s after the container is healthy
+    and refuses to declare warden ready until the cert exists. Cells
+    that race a fresh `brig up` can no longer get an empty / missing
+    bundle. (Aitelier diagnosed all three of: lazy CA gen, root-owned
+    tmpfs, and sh-c bypassing auto-sudo. Each is structurally fixed.)
   - **Bundle staged inside the VM, not on macOS.** Lima's `/state` virtio
     mount is the trust boundary; the file lives at `/state/<cell>/ca-bundle.crt`.
   - **Cell mount is read-only.** A compromised cell can't tamper with its

@@ -85,6 +85,20 @@ PIDS_LIMIT = "256"
 VM_POLICY_FILE = VMPaths.NETWORK_POLICY
 VM_LOG_DIR = VMPaths.LOG_DIR
 VM_ADDONS_DIR = VMPaths.ADDONS_DIR
+# Persistent home for warden's mitmproxy state (CA cert + private key).
+# Bind-mounted into warden at /home/mitmproxy/.mitmproxy, owned by uid
+# 1000 (mitmproxy user inside the container). Persistent so:
+#   - the CA survives warden restarts (cells trust the same cert across
+#     up/down cycles instead of seeing a new CA every time)
+#   - brig.cell.ca_bundle reads it directly via `cat` from the VM
+#     filesystem, no `podman exec` needed (eliminates the auto-sudo
+#     trap where vm_run only sudo's for cmd[0] in a small whitelist —
+#     `sh -c '...podman exec...'` falls through and silently runs
+#     unprivileged, which aitelier hit hard on fresh installs)
+VM_WARDEN_STATE_DIR = Path("/var/lib/warden/mitmproxy-state")
+# Path inside the VM to warden's CA cert. brig.cell.ca_bundle reads from
+# here. Stays in lockstep with WARDEN_CA_PATH_IN_CONTAINER if you bump.
+VM_WARDEN_CA_FILE = VM_WARDEN_STATE_DIR / "mitmproxy-ca-cert.pem"
 # Warden bind-mounts /state/system → /var/run/cells so it sees the same
 # subnet-map / per-cell policies / ingress routes the host CLI writes.
 VM_SYSTEM_DIR = VMPaths.SYSTEM_DIR
@@ -193,6 +207,12 @@ def start() -> bool:
     # log writer hits EACCES on /logs/<cell>.jsonl.
     vm_run(["mkdir", "-p", str(VM_LOG_DIR)], timeout=5)
     vm_run(["chown", "1000:1000", str(VM_LOG_DIR)], timeout=5)
+    # Warden's mitmproxy-state dir. Persistent + uid-1000-owned so
+    # mitmproxy can write the CA cert + key it generates on first run.
+    # We force-generate the cert at the end of start() so brig.cell.ca_bundle
+    # can rely on the file existing before any cell starts.
+    vm_run(["mkdir", "-p", str(VM_WARDEN_STATE_DIR)], timeout=5)
+    vm_run(["chown", "1000:1000", str(VM_WARDEN_STATE_DIR)], timeout=5)
     # Ensure host-side coordination dirs exist; warden bind-mounts them in
     # via the /state virtiofs mount.
     HostPaths.SYSTEM_DIR.mkdir(parents=True, exist_ok=True)
@@ -210,7 +230,6 @@ def start() -> bool:
         "--security-opt", "no-new-privileges",
         "--read-only",
         "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
-        "--tmpfs", "/home/mitmproxy/.mitmproxy:rw,size=32m",
         "--user", "mitmproxy",
         "--memory", MEMORY_LIMIT,
         "--cpus", CPU_LIMIT,
@@ -225,6 +244,8 @@ def start() -> bool:
     cmd.extend(["-v", f"{VM_SYSTEM_DIR}:/var/run/cells:rw"])
     cmd.extend(["-v", f"{VM_ADDONS_DIR}:/addons:ro"])
     cmd.extend(["-v", f"{VM_POLICY_FILE}:/policy.json:ro"])
+    # Persistent mitmproxy state — CA cert + key go here.
+    cmd.extend(["-v", f"{VM_WARDEN_STATE_DIR}:/home/mitmproxy/.mitmproxy:rw"])
 
     # Expose ingress port if addon exists.
     if has_ingress:
@@ -285,10 +306,47 @@ def start() -> bool:
         debug("Proxy did not become healthy in 5 seconds")
         return False
 
+    # Eager CA generation. mitmproxy creates its CA on first traffic, not
+    # at container start — which makes brig.cell.ca_bundle.stage_bundle
+    # race the first cell start (the cert file doesn't exist yet, so the
+    # bundle gets silently truncated to just system roots and HTTPS in
+    # the cell fails with "unknown ca"). Force generation here so cells
+    # can rely on the CA being on disk by the time they're staged.
+    # Idempotent: if the cert already exists (warden restart on a
+    # persisted state dir), this is a no-op fast-path.
+    if not _ensure_warden_ca_exists():
+        debug("Warden CA generation failed — cells will not trust warden")
+        return False
+
     # Reconnect to existing cell networks.
     _reconnect_cell_networks()
     info("Proxy started")
     return True
+
+
+def _ensure_warden_ca_exists(timeout_s: float = 30.0) -> bool:
+    """Wait for mitmproxy's CertStore init to write the CA cert.
+
+    The mitmproxy daemon emits the CA + private key under
+    /home/mitmproxy/.mitmproxy at startup as part of CertStore
+    initialization — NOT lazily on first proxied request, contrary
+    to common belief. So we just poll VM_WARDEN_CA_FILE; no need to
+    spawn a separate mitmdump (which would race the main one for the
+    same state dir and may even deadlock on a file lock).
+
+    Fast-path: if the cert already exists from a prior `warden start`
+    on the persisted state dir, returns immediately.
+
+    Generous timeout because warden start = podman pull-or-verify +
+    container init + mitmproxy boot (which compiles certificates
+    using OpenSSL). On a cold VM this is ~5–15s; we cap at 30s.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if vm_run(["test", "-f", str(VM_WARDEN_CA_FILE)], timeout=5).returncode == 0:
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def _reconnect_cell_networks() -> None:

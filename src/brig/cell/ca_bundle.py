@@ -33,10 +33,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from brig.config import PROXY_NAME, VMPaths
+from brig.config import VMPaths
+from brig.errors import BrigError
 from brig.vm.shell import vm_run
 
-WARDEN_CA_PATH_IN_CONTAINER = "/home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem"
+# Warden's CA cert lives in a persistent bind-mounted dir inside the
+# VM (see src/warden/proxy.py VM_WARDEN_STATE_DIR). brig reads it from
+# the VM filesystem directly — no `podman exec`. The previous design
+# went through `podman exec warden cat ...` and hit three compounding
+# bugs aitelier diagnosed (sh -c skipping auto-sudo, lazy CA gen, root-
+# owned tmpfs). The current design eliminates all three by structure:
+#   - direct filesystem read uses vm_run([cat, ...]) which is on the
+#     sudo whitelist
+#   - eager CA gen at `warden start` (proxy.py:_ensure_warden_ca_exists)
+#     materializes the file before any cell start can race it
+#   - the bind-mount is host-side chowned to uid 1000 so mitmproxy can
+#     write its CA + key without root
+VM_WARDEN_CA_FILE = "/var/lib/warden/mitmproxy-state/mitmproxy-ca-cert.pem"
 
 # Lima's Ubuntu image keeps the system CA bundle here. If a future
 # base image moves it (Alpine, RHEL-style), we'll need to detect.
@@ -55,39 +68,43 @@ def vm_bundle_path(cell_name: str) -> Path:
 def stage_bundle(cell_name: str) -> None:
     """Build the cell's combined CA bundle inside the VM.
 
-    Runs in the VM via vm_run so Warden's CA extraction and the concat
-    happen on the same trust boundary the cell will see. Atomic write
-    (write to .tmp, mv into place) so cell start never sees a torn
-    file. No intermediate /tmp file: we pipe Warden's exec stdout
-    straight into the concat to avoid a race on `/tmp/<cell>-...pem`
-    when two cells of the same name start in parallel. Raises
-    RuntimeError if Warden isn't reachable — that's also invariant 9
-    (proxy must be running), so cell start would fail further down
-    anyway; this is a friendlier early signal.
+    Concatenates the system root CAs + warden's MITM CA into a single
+    file under /state/<cell>/, atomic-rename'd into place so cell start
+    never sees a torn write. Raises BrigError if warden's CA file is
+    missing — that means `brig system up` hasn't run yet (or warden
+    failed to generate its cert at start, which would have already
+    surfaced as a `brig up` failure).
     """
     bundle = vm_bundle_path(cell_name)
     tmp = bundle.with_suffix(".crt.tmp")
-    # `{ cat <roots>; podman exec <warden> cat <ca>; }` collects both
-    # streams in order into the same redirect. set -o pipefail isn't
-    # portable across sh, but `set -e` plus the explicit failure-of-
-    # subshell trap is enough — the brace-group fails the whole script
-    # if either cat fails, and `mv` of a partial file is harmless
-    # because we'd re-stage on next start. All under sudo because
-    # /state/<cell>/ is owned by the brig user (uid 1000), and
-    # warden's container exec needs root in the VM.
+    # Pre-check the CA file exists. Cleaner error than a `cat: ...: No
+    # such file or directory` buried in stage_bundle's stderr.
+    if vm_run(["test", "-f", VM_WARDEN_CA_FILE], timeout=5).returncode != 0:
+        raise BrigError(
+            f"Warden CA cert is missing at {VM_WARDEN_CA_FILE}",
+            suggestion=(
+                "Bring warden up first: brig up\n"
+                f"  (Cell '{cell_name}' aborted before any state was created.)"
+            ),
+        )
+    # Plain shell concat, no podman in sight. `sh -c` is fine without
+    # sudo because both source files are world-readable on the VM and
+    # the dest dir is chmod'd by vm_run's `mkdir -p` (which is on the
+    # sudo whitelist when invoked separately, but here we mkdir inside
+    # the same sh -c — so we route through sudo explicitly for the
+    # rare case the state dir doesn't yet exist with the right perms).
     script = (
         f"set -e; "
         f"mkdir -p {bundle.parent}; "
-        f"{{ cat {SYSTEM_CA_BUNDLE_IN_VM}; "
-        f"  podman exec {PROXY_NAME} cat {WARDEN_CA_PATH_IN_CONTAINER}; "
-        f"}} > {tmp}; "
+        f"cat {SYSTEM_CA_BUNDLE_IN_VM} {VM_WARDEN_CA_FILE} > {tmp}; "
         f"chmod 0644 {tmp}; "
         f"mv {tmp} {bundle}"
     )
-    result = vm_run(["sh", "-c", script], timeout=15)
+    result = vm_run(["sudo", "sh", "-c", script], timeout=15)
     if result.returncode != 0:
         raise RuntimeError(
-            f"Failed to stage CA bundle for {cell_name}: {result.stderr.strip()}"
+            f"Failed to stage CA bundle for {cell_name}: "
+            f"{result.stderr.strip()}"
         )
 
 

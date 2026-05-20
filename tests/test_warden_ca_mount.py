@@ -80,19 +80,49 @@ class TestBuildRunCommandCAMount(unittest.TestCase):
 
 
 class TestStageBundleErrorPath(unittest.TestCase):
-    """stage_bundle raises a friendly RuntimeError if vm_run fails so the
-    operator gets a clear message instead of a generic 'cell start failed'."""
+    """stage_bundle pre-checks that warden's CA file exists on the VM
+    before attempting the concat. A missing CA cert means `brig system up`
+    didn't run (or warden's eager-CA-gen failed at start), so we raise
+    a BrigError pointing at the recovery command instead of bubbling up
+    a raw shell-stderr from the concat step.
 
-    def test_raises_when_vm_run_returns_nonzero(self):
+    The CA file is now read directly from a VM-side bind-mounted dir
+    (see warden/proxy.py:VM_WARDEN_STATE_DIR), not via `podman exec`,
+    so the prior chain of failure modes aitelier reported — sh-c
+    skipping auto-sudo, lazy CA generation, root-owned tmpfs — is
+    eliminated by structure, not patched."""
+
+    def test_raises_brigerror_when_ca_file_missing(self):
         from brig.cell import ca_bundle
-        fake = MagicMock()
-        fake.returncode = 1
-        fake.stderr = "podman: warden not running\n"
-        with patch.object(ca_bundle, "vm_run", return_value=fake):
+        from brig.errors import BrigError
+        # Simulate `test -f` returning non-zero (file missing).
+        missing = MagicMock(returncode=1, stderr="", stdout="")
+        with patch.object(ca_bundle, "vm_run", return_value=missing):
+            with self.assertRaises(BrigError) as ctx:
+                ca_bundle.stage_bundle("alice")
+        msg = str(ctx.exception)
+        self.assertIn("Warden CA cert is missing", msg)
+        self.assertIn("brig up", ctx.exception.suggestion or "")
+
+    def test_raises_runtime_error_when_concat_fails(self):
+        """If the CA file IS there but the concat step itself fails
+        (disk full, perms), surface the raw stderr so operators can grep."""
+        from brig.cell import ca_bundle
+        # First call (test -f) succeeds; second call (sudo sh -c concat) fails.
+        calls = [
+            MagicMock(returncode=0, stderr="", stdout=""),
+            MagicMock(
+                returncode=1,
+                stderr="mv: /state/alice/ca-bundle.crt: Read-only file system\n",
+                stdout="",
+            ),
+        ]
+        with patch.object(ca_bundle, "vm_run", side_effect=calls):
             with self.assertRaises(RuntimeError) as ctx:
                 ca_bundle.stage_bundle("alice")
         self.assertIn("Failed to stage CA bundle", str(ctx.exception))
         self.assertIn("alice", str(ctx.exception))
+        self.assertIn("Read-only file system", str(ctx.exception))
 
 
 if __name__ == "__main__":
