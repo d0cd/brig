@@ -198,6 +198,17 @@ def cmd_doctor(args: Any) -> int:
     # also checked since the bridges require it.
     _check_host_socket_bridges(_check)
 
+    # 8. Warden CA staleness — aitelier hit a silent-TLS-hang foot-gun:
+    # a cell entrypoint that ALSO sets SSL_CERT_FILE clobbers brig's
+    # auto-mounted bundle. On the next warden restart, mitmproxy
+    # regenerates its CA, brig re-stages bundles, but the cell's
+    # cached bundle (whatever the entrypoint pointed at) goes stale.
+    # MITM client-side handshake "succeeds" against the cell's cached
+    # cert; upstream handshake fails and warden drops with no signal.
+    # This check compares each cell's staged ca-bundle.crt against
+    # the current warden CA cert; a mismatch is a strong signal.
+    _check_warden_ca_consistency(_check)
+
     output("=" * 50)
     if failures:
         output(f"FAILED: {len(failures)} check(s)")
@@ -207,6 +218,57 @@ def cmd_doctor(args: Any) -> int:
         return 1
     output("All checks passed")
     return 0
+
+
+def _check_warden_ca_consistency(check) -> None:
+    """Verify every cell's staged CA bundle ends with the current warden CA.
+
+    Reads warden's CA from `/var/lib/warden/mitmproxy-state/mitmproxy-ca-cert.pem`,
+    then for each state dir under `~/.brig/state/<cell>/` with a
+    `ca-bundle.crt`, confirms the bundle contains the warden CA's last
+    cert block. A mismatch means a cell will silently fail TLS on the
+    next request — either because warden's CA rotated or because the
+    cell's entrypoint clobbered our SSL_CERT_FILE.
+
+    No-op when warden isn't running OR no cells exist — silence is the
+    right default for those legitimate cases.
+    """
+    from brig.config import HostPaths
+
+    ca_path = "/var/lib/warden/mitmproxy-state/mitmproxy-ca-cert.pem"
+    result = vm_run(["sudo", "cat", ca_path], timeout=5)
+    if result.returncode != 0:
+        # Warden hasn't run yet, or CA missing — separate check (#6
+        # "warden proxy running") handles that case loudly.
+        return
+    current_ca = result.stdout.strip()
+    if not current_ca:
+        return
+
+    if not HostPaths.STATE_DIR.exists():
+        return
+
+    for entry in HostPaths.STATE_DIR.iterdir():
+        if not entry.is_dir() or entry.name == "system":
+            continue
+        bundle = entry / "ca-bundle.crt"
+        if not bundle.exists():
+            continue
+        try:
+            staged = bundle.read_text()
+        except OSError:
+            continue
+        # Bundle is `<system roots> + <warden CA>`; the cell trusts the
+        # whole thing. We need only confirm that the WARDEN portion of
+        # the bundle matches the current warden CA — system roots can
+        # legitimately differ (Lima base image update, etc.).
+        ok = current_ca in staged
+        check(
+            f"cell '{entry.name}' CA bundle matches current Warden CA",
+            ok,
+            detail=("re-stage on next start" if ok else "stale; restart cell"),
+            suggestion=f"brig cell restart {entry.name}",
+        )
 
 
 def _check_host_socket_bridges(check) -> None:

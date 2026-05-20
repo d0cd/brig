@@ -10,10 +10,20 @@ Covers:
 
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+# Mock mitmproxy so `from ingress import IngressRouter` works no matter
+# what order pytest invokes the test files in. Without this, test_ingress.py
+# silently relied on an earlier file (test_addons_ops.py et al.) setting
+# the same mock first — running test_ingress.py in isolation crashed.
+for _mod in (
+    "mitmproxy", "mitmproxy.http", "mitmproxy.ctx", "mitmproxy.connection",
+):
+    sys.modules.setdefault(_mod, MagicMock())
 
 from brig.cell.spec import CellSpec, validate_cell_definition
 
@@ -487,3 +497,71 @@ class TestIngressWebSocketLogging(unittest.TestCase):
         finally:
             sys.path.pop(0)
         self.assertTrue(hasattr(RequestLogger, "websocket_message"))
+
+
+class TestIngressSseStreaming(unittest.TestCase):
+    """Ingress responseheaders flips flow.response.stream=True for
+    text/event-stream so mitmproxy passes SSE bytes through unbuffered.
+
+    Aitelier diagnosed this — SA's ACP bridge emits notifications via
+    SSE, and without streaming the client sees nothing until the
+    upstream closes the connection. Egress flows are unaffected; only
+    ingress flows opt into streaming."""
+
+    def _router(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+        try:
+            from ingress import IngressRouter
+        finally:
+            sys.path.pop(0)
+        return IngressRouter()
+
+    def _flow(self, content_type, *, is_ingress=True):
+        from unittest.mock import MagicMock
+        flow = MagicMock()
+        flow.metadata = {"ingress_route": "api"} if is_ingress else {}
+        flow.metadata.update({"cell": "alice"} if is_ingress else {})
+        flow.response = MagicMock()
+        flow.response.headers = {"Content-Type": content_type}
+        flow.response.stream = False
+        return flow
+
+    def test_sse_response_enables_streaming(self):
+        router = self._router()
+        flow = self._flow("text/event-stream")
+        router.responseheaders(flow)
+        self.assertTrue(flow.response.stream)
+
+    def test_sse_response_with_charset_suffix_enables_streaming(self):
+        """Some servers send `Content-Type: text/event-stream; charset=utf-8`.
+        The semicolon-suffixed form must still be detected."""
+        router = self._router()
+        flow = self._flow("text/event-stream; charset=utf-8")
+        router.responseheaders(flow)
+        self.assertTrue(flow.response.stream)
+
+    def test_non_sse_response_keeps_buffering(self):
+        router = self._router()
+        flow = self._flow("application/json")
+        router.responseheaders(flow)
+        self.assertFalse(flow.response.stream)
+
+    def test_egress_sse_not_touched_by_ingress_addon(self):
+        """Egress flows (no ingress_route metadata) must not be affected;
+        the egress path keeps buffering so enforce.py's body-side checks
+        still see complete responses."""
+        router = self._router()
+        flow = self._flow("text/event-stream", is_ingress=False)
+        router.responseheaders(flow)
+        self.assertFalse(flow.response.stream)
+
+    def test_no_response_safely_returns(self):
+        """If a flow reaches responseheaders without a response object
+        (early termination, mock test conditions), don't crash."""
+        from unittest.mock import MagicMock
+        router = self._router()
+        flow = MagicMock()
+        flow.metadata = {"ingress_route": "api"}
+        flow.response = None
+        router.responseheaders(flow)  # must not raise

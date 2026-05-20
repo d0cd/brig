@@ -390,5 +390,41 @@ class IngressRouter:
             f"{remaining_path} ({route.name})"
         )
 
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        """Pass SSE / streaming responses through unbuffered.
+
+        mitmproxy buffers response bodies by default so addons can
+        inspect them. For Server-Sent-Events (Content-Type:
+        text/event-stream) and other long-lived streaming protocols
+        (chunked agent message streams, NDJSON), buffering is fatal —
+        the proxy holds bytes until the server closes, so the client
+        sees "everything at once at session close" instead of a
+        stream. Setting `flow.response.stream = True` in this hook
+        flips mitmproxy into pass-through mode for the response body.
+
+        Scoped to ingress flows only: egress (cell → outside) still
+        buffers so enforce.py's response-side checks (DNS rebinding,
+        etc.) keep working on per-request bodies. Ingress responses
+        come from cells we already trust on this listener and don't
+        need body inspection.
+
+        Aitelier diagnosed this — SA's ACP bridge emits
+        `agent_message_chunk` notifications via SSE; without
+        passthrough the client never sees them before session close.
+        """
+        if not flow.metadata.get("ingress_route"):
+            return
+        if flow.response is None:
+            return
+        content_type = flow.response.headers.get("Content-Type", "").lower()
+        # Strip any `; charset=...` suffix before comparing.
+        media_type = content_type.split(";", 1)[0].strip()
+        if media_type == "text/event-stream":
+            flow.response.stream = True
+            ctx.log.info(
+                f"INGRESS STREAM: passthrough for "
+                f"{flow.metadata.get('cell')}:{flow.metadata.get('ingress_route')}"
+            )
+
 
 addons = [IngressRouter()]

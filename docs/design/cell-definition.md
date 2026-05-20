@@ -70,6 +70,16 @@ policy:
 # at it — only for env vars the cell didn't already declare. Set to
 # false for cells with strict cert pinning or that manage their own
 # trust store. See invariant 12.
+#
+# Foot-gun: do NOT also set SSL_CERT_FILE in your image's entrypoint
+# or ENV. Brig's auto-mount only fills vars the cell didn't already
+# declare — an entrypoint-side override points cells at a cached or
+# stale CA, and silent TLS hangs follow when Warden's CA rotates
+# (mitmproxy presents a valid cert client-side, the upstream handshake
+# fails, the proxy drops with no signal back). `brig system doctor`
+# now flags this by comparing each cell's staged ca-bundle.crt against
+# Warden's current CA; run it if a previously-working cell starts
+# hanging on HTTPS after a `brig system up/down` cycle.
 trust_warden_ca: true
 
 # Timeout
