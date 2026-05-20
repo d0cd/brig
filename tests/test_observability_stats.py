@@ -111,6 +111,23 @@ class TestRenderText(unittest.TestCase):
         self.assertIn("4K", out)
         self.assertIn("32K", out)
 
+    def test_passthrough_columns_only_called_out_when_present(self):
+        """The PT/* explainer line only appears when a cell actually had
+        passthrough connections — otherwise it'd noise the common case."""
+        from brig.observability.stats import CellStats, render_text
+        out_no_pt = render_text({"alice": CellStats(
+            cell="alice", requests=10,
+        )})
+        self.assertNotIn("PT/* =", out_no_pt)
+
+        out_with_pt = render_text({"codex": CellStats(
+            cell="codex", requests=5, passthrough_conns=2,
+            passthrough_bytes=8192,
+        )})
+        self.assertIn("PT/* =", out_with_pt)
+        self.assertIn("invariant 11", out_with_pt)
+        self.assertIn("8K", out_with_pt)
+
 
 class TestCmdStats(unittest.TestCase):
     def test_fetch_failure_raises(self):

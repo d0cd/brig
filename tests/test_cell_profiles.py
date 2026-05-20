@@ -72,6 +72,17 @@ class TestApplyProfile(unittest.TestCase):
         merged = apply_profile(spec, profile)
         self.assertEqual(merged["policy_allow"], ["base.com", "cell.com"])
 
+    def test_policy_tls_passthrough_propagates_from_profile(self):
+        """Profile's policy.tls_passthrough prepends to the spec's flat
+        policy_passthrough_tls list, same shape as allow/deny."""
+        spec = {"name": "test"}
+        profile = {"policy": {
+            "allow": ["chatgpt.com"],
+            "tls_passthrough": ["chatgpt.com"],
+        }}
+        merged = apply_profile(spec, profile)
+        self.assertEqual(merged["policy_passthrough_tls"], ["chatgpt.com"])
+
     def test_labels_merge(self):
         spec = {"labels": {"custom": "value"}}
         profile = {"labels": {"brig.profile": "test"}}

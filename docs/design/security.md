@@ -265,6 +265,52 @@ verify_cell_single_homed() {
 
 ---
 
+### Invariant 11: TLS Passthrough Is an Explicit, Opt-In TLS-Handling Override
+
+**Rule:** A cell that declares `policy.tls_passthrough: [<host>]` in its yaml — *with* the same host listed in `policy.allow` — tells Warden to tunnel that host's TLS traffic raw, without decrypting. Warden routes by SNI; no MITM, no body inspection, no per-URL log entry.
+
+**Why this matters:** Some hosts can't survive mitmproxy. Sites using HTTP Public Key Pinning, Encrypted Client Hello, strict ALPN/cipher pinning, or Cloudflare's bot-fingerprinting TLS (e.g. `chatgpt.com`) refuse the relayed handshake. Brig's default mode keeps full audit visibility but loses on these endpoints. Passthrough flips the trade-off explicitly.
+
+**The trade-off table** — operators who add an entry to `tls_passthrough` are choosing column 2 for that host:
+
+| Concern | MITM (default) | Passthrough (opt-in) |
+|---|---|---|
+| Host allowlist enforcement | via Host header | via SNI in client hello |
+| Per-URL/method audit log | yes | no — only SNI + bytes + duration |
+| Body inspection / DLP | yes | no |
+| Warden sees credentials in cleartext | yes | no |
+| Survives HPKP / ECH / strict ALPN | no | yes |
+| Detect runaway exfil by volume | yes (bytes counter) | yes (same counter) |
+| Detect *specific URL* exfil | yes | no |
+
+For an agent runtime holding the operator's provider credentials (Claude OAuth, OpenAI keys), passthrough is arguably *more* secure than MITM in a multi-tenant world — Warden never sees the bearer token. Today's single-operator model treats this as an opt-in trade-off; multi-tenant brig will eventually require passthrough for credentialed flows.
+
+**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 11):
+
+1. Passthrough is opt-in per cell per host. No default.
+2. Passthrough hosts MUST also appear in `policy.allow`. The schema validator rejects entries that aren't. Passthrough is a TLS-handling override, never a policy bypass.
+3. At runtime, Warden's `Policy.is_passthrough` re-checks both lists — a tampered policy file that lists a host *only* in `tls_passthrough` cannot bypass MITM (defense in depth against invariant 4: state dir untrusted).
+4. SNI in the client hello must match the CONNECT host. Otherwise a malicious cell could CONNECT to allowed-host:443 and SNI=attacker.com to abuse Warden as a generic tunnel.
+5. Untrusted profile cannot declare passthrough. Adversarial cells must remain inspectable.
+6. Audit log entries are tagged `tls_mode=mitm` or `tls_mode=passthrough`. Passthrough entries omit method/path/status BY CONSTRUCTION (Warden never decrypted them). `brig cell network` renders passthrough lines as `PASSTHROUGH <host> (NB in / NB out)`; `brig system stats` shows `PT/CONN` and `PT/BYTES` columns.
+
+**Cell yaml shape:**
+
+```yaml
+policy:
+  allow:
+    - api.anthropic.com         # MITM (default)
+    - registry.npmjs.org
+    - chatgpt.com               # required: passthrough hosts MUST be allow'd
+  tls_passthrough:
+    - chatgpt.com               # turns off MITM for this host
+    - auth.openai.com
+```
+
+Two lists, not one with attributes, so `grep -l tls_passthrough cells/*.yaml` answers "which cells have un-inspected egress?" in a single command.
+
+---
+
 ## Verification Tests
 
 Run these to verify isolation is working correctly.

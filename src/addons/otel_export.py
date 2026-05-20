@@ -41,10 +41,21 @@ except ImportError:
 
 
 _REQUEST_START_KEY = "otel_request_start"
+_PASSTHROUGH_START_KEY = "otel_passthrough_start"
+_PASSTHROUGH_BYTES_IN_KEY = "otel_passthrough_bytes_in"
+_PASSTHROUGH_BYTES_OUT_KEY = "otel_passthrough_bytes_out"
 
 
 class OtelExporter:
-    """mitmproxy addon: emit request metrics + spans to OTLP."""
+    """mitmproxy addon: emit request metrics + spans to OTLP.
+
+    HTTP flows (default MITM mode) emit the full per-request shape:
+    method, host, path, status, bytes, duration. Passthrough flows
+    (invariant 11) tunnel raw TCP, so warden never sees the request
+    line or response — only SNI, total bytes, and duration. They
+    emit through the warden_passthrough_* counters with tls_mode
+    explicitly tagged so audits never confuse the two modes.
+    """
 
     def __init__(self) -> None:
         self.meter = None
@@ -55,6 +66,9 @@ class OtelExporter:
         self.blocked_total = None
         self.bytes_in_total = None
         self.bytes_out_total = None
+        self.passthrough_connections_total = None
+        self.passthrough_bytes_total = None
+        self.passthrough_duration_ms = None
 
     def load(self, loader) -> None:
         if not _OTEL_AVAILABLE:
@@ -117,11 +131,107 @@ class OtelExporter:
             description="Response body bytes sent to cells, by cell",
             unit="By",
         )
+        self.passthrough_connections_total = self.meter.create_counter(
+            "warden_passthrough_connections_total",
+            description="TLS passthrough connections (un-MITM'd), by cell + host",
+        )
+        self.passthrough_bytes_total = self.meter.create_counter(
+            "warden_passthrough_bytes_total",
+            description="Bytes through passthrough connections, by cell + host + direction",
+            unit="By",
+        )
+        self.passthrough_duration_ms = self.meter.create_histogram(
+            "warden_passthrough_duration_ms",
+            description="Passthrough connection duration in milliseconds, by cell + host",
+            unit="ms",
+        )
 
         ctx.log.info(f"OtelExporter: emitting to {endpoint}")
 
     def request(self, flow: http.HTTPFlow) -> None:
         flow.metadata[_REQUEST_START_KEY] = time.monotonic()
+
+    def tcp_start(self, flow) -> None:
+        """Tag passthrough flows at TCP-tunnel start.
+
+        When enforce.py flips `client_conn.tls_passthrough = True` in
+        tls_clienthello, the connection becomes a TCPFlow instead of an
+        HTTPFlow — request()/response() never fire. We snapshot the
+        start time + SNI here, accumulate bytes in tcp_message, emit in
+        tcp_end. Non-passthrough TCPFlows (CONNECT tunnels in MITM
+        mode produce HTTPFlows, so this only fires for passthrough)
+        get a defensive no-op early return so partial init can't crash.
+        """
+        if self.passthrough_connections_total is None:
+            return
+        client = getattr(flow, "client_conn", None)
+        metadata = getattr(client, "metadata", None)
+        if not isinstance(metadata, dict) or metadata.get("tls_mode") != "passthrough":
+            return
+        flow.metadata[_PASSTHROUGH_START_KEY] = time.monotonic()
+        flow.metadata[_PASSTHROUGH_BYTES_IN_KEY] = 0
+        flow.metadata[_PASSTHROUGH_BYTES_OUT_KEY] = 0
+
+    def tcp_message(self, flow) -> None:
+        """Accumulate per-direction bytes for passthrough audits."""
+        if _PASSTHROUGH_START_KEY not in flow.metadata:
+            return
+        try:
+            msg = flow.messages[-1]
+            # mitmproxy: from_client True = cell→host, False = host→cell.
+            key = (_PASSTHROUGH_BYTES_IN_KEY if msg.from_client
+                   else _PASSTHROUGH_BYTES_OUT_KEY)
+            flow.metadata[key] = (
+                flow.metadata.get(key, 0) + len(msg.content or b"")
+            )
+        except (AttributeError, IndexError):
+            pass
+
+    def tcp_end(self, flow) -> None:
+        """Emit one audit record per passthrough connection at teardown."""
+        start = flow.metadata.get(_PASSTHROUGH_START_KEY)
+        if start is None or self.passthrough_connections_total is None:
+            return
+        duration_ms = (time.monotonic() - start) * 1000.0
+        client = getattr(flow, "client_conn", None)
+        metadata = getattr(client, "metadata", {}) or {}
+        sni = metadata.get("passthrough_sni") or "unknown"
+        cell = flow.metadata.get("cell") or "unknown"
+        bytes_in = flow.metadata.get(_PASSTHROUGH_BYTES_IN_KEY, 0)
+        bytes_out = flow.metadata.get(_PASSTHROUGH_BYTES_OUT_KEY, 0)
+
+        labels = {"cell": cell, "host": sni}
+        self.passthrough_connections_total.add(1, attributes=labels)
+        self.passthrough_duration_ms.record(duration_ms, attributes=labels)
+        if bytes_in:
+            self.passthrough_bytes_total.add(
+                bytes_in,
+                attributes={"cell": cell, "host": sni, "direction": "in"},
+            )
+        if bytes_out:
+            self.passthrough_bytes_total.add(
+                bytes_out,
+                attributes={"cell": cell, "host": sni, "direction": "out"},
+            )
+
+        if self.logger is not None:
+            self.logger.emit(LogRecord(
+                timestamp=time.time_ns(),
+                severity_text="INFO",
+                body=f"PASSTHROUGH {sni}",
+                attributes={
+                    "cell": cell,
+                    "decision": "allowed",
+                    "tls_mode": "passthrough",
+                    "host": sni,
+                    "duration_ms": duration_ms,
+                    "bytes_in": bytes_in,
+                    "bytes_out": bytes_out,
+                    # method/path/status absent BY CONSTRUCTION — warden
+                    # never saw the cleartext. Operators reading the
+                    # log must rely on host (SNI) + bytes for audit.
+                },
+            ))
 
     def response(self, flow: http.HTTPFlow) -> None:
         if self.requests_total is None:
@@ -156,7 +266,9 @@ class OtelExporter:
         # Emit a structured log record per request so brig cell network
         # can read the same shape it gets from JSONL files today.
         # OTel logs records carry both severity + a body, plus
-        # arbitrary attributes for downstream filtering.
+        # arbitrary attributes for downstream filtering. tls_mode=mitm
+        # is the default for HTTP flows; passthrough flows emit through
+        # tcp_end and have tls_mode=passthrough.
         if self.logger is not None:
             self.logger.emit(LogRecord(
                 timestamp=time.time_ns(),
@@ -165,6 +277,7 @@ class OtelExporter:
                 attributes={
                     "cell": cell,
                     "decision": decision,
+                    "tls_mode": "mitm",
                     "method": method,
                     "host": flow.request.host,
                     "path": flow.request.path,

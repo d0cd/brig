@@ -112,6 +112,40 @@ class TestValidateCellDefinition(unittest.TestCase):
         errors = validate_cell_definition({"policy": {"allow": ["*.localhost"]}})
         self.assertTrue(any("Security:" in e for e in errors))
 
+    def test_policy_tls_passthrough_accepted_when_in_allow(self):
+        errors = validate_cell_definition({"policy": {
+            "allow": ["chatgpt.com", "api.openai.com"],
+            "tls_passthrough": ["chatgpt.com"],
+        }})
+        self.assertEqual(errors, [])
+
+    def test_policy_tls_passthrough_rejected_when_not_in_allow(self):
+        """Invariant 11: passthrough hosts MUST also appear in allow,
+        otherwise an operator could opt a host out of MITM without ever
+        granting it — silently bypassing policy."""
+        errors = validate_cell_definition({"policy": {
+            "allow": ["api.anthropic.com"],
+            "tls_passthrough": ["chatgpt.com"],
+        }})
+        self.assertTrue(
+            any("must also appear in 'policy.allow'" in e for e in errors),
+            errors,
+        )
+
+    def test_policy_tls_passthrough_must_be_list(self):
+        errors = validate_cell_definition({"policy": {
+            "allow": ["chatgpt.com"],
+            "tls_passthrough": "chatgpt.com",
+        }})
+        self.assertTrue(any("tls_passthrough" in e and "list" in e for e in errors))
+
+    def test_policy_tls_passthrough_rejects_bad_domain(self):
+        errors = validate_cell_definition({"policy": {
+            "allow": ["chatgpt.com"],
+            "tls_passthrough": ["not a domain!"],
+        }})
+        self.assertTrue(any("Invalid domain" in e for e in errors))
+
     def test_workspace_quota_valid(self):
         errors = validate_cell_definition({"workspace_quota": "500m"})
         self.assertEqual(errors, [])

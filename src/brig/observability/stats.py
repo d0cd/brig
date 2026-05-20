@@ -29,6 +29,8 @@ COUNTER_BLOCKED = "brig_warden_blocked_total"
 COUNTER_BYTES_IN = "brig_warden_bytes_in_total"
 COUNTER_BYTES_OUT = "brig_warden_bytes_out_total"
 HISTOGRAM_DURATION = "brig_warden_request_duration_ms_milliseconds"
+COUNTER_PASSTHROUGH_CONNS = "brig_warden_passthrough_connections_total"
+COUNTER_PASSTHROUGH_BYTES = "brig_warden_passthrough_bytes_total"
 
 
 @dataclass
@@ -41,6 +43,12 @@ class CellStats:
     p50_ms: float = 0.0
     p95_ms: float = 0.0
     p99_ms: float = 0.0
+    # Passthrough audit surface — these are NOT a subset of `requests`;
+    # passthrough connections never produce HTTP records. Rendered as a
+    # separate column so MITM vs un-inspected egress are visually
+    # distinct in `brig system stats` (invariant 11).
+    passthrough_conns: int = 0
+    passthrough_bytes: int = 0
 
 
 def fetch_metrics() -> str:
@@ -77,6 +85,8 @@ def aggregate(scalars: dict[str, list[Sample]],
     _bump(COUNTER_BLOCKED, "blocked")
     _bump(COUNTER_BYTES_IN, "bytes_in")
     _bump(COUNTER_BYTES_OUT, "bytes_out")
+    _bump(COUNTER_PASSTHROUGH_CONNS, "passthrough_conns")
+    _bump(COUNTER_PASSTHROUGH_BYTES, "passthrough_bytes")
 
     for h in histos.get(HISTOGRAM_DURATION, []):
         cell = h.labels.get("cell", "unknown")
@@ -97,16 +107,28 @@ def render_text(by_cell: dict[str, CellStats]) -> str:
         lines.append("  (no metrics yet — drive some traffic, then re-run)")
         return "\n".join(lines)
 
-    header = f"  {'CELL':<20} {'REQ':>6} {'BLOCKED':>8} {'IN':>10} {'OUT':>10} {'p50ms':>8} {'p95ms':>8} {'p99ms':>8}"
+    header = (
+        f"  {'CELL':<20} {'REQ':>6} {'BLOCKED':>8} {'IN':>10} {'OUT':>10} "
+        f"{'p50ms':>8} {'p95ms':>8} {'p99ms':>8} {'PT/CONN':>9} {'PT/BYTES':>10}"
+    )
     lines.append(header)
+    any_passthrough = False
     for cell in sorted(by_cell):
         c = by_cell[cell]
         blocked_pct = (c.blocked / c.requests * 100) if c.requests else 0.0
         blocked_cell = f"{c.blocked} ({blocked_pct:.1f}%)" if c.blocked else "0"
+        if c.passthrough_conns:
+            any_passthrough = True
         lines.append(
             f"  {c.cell:<20} {c.requests:>6} {blocked_cell:>8} "
             f"{_human_bytes(c.bytes_in):>10} {_human_bytes(c.bytes_out):>10} "
-            f"{c.p50_ms:>8.1f} {c.p95_ms:>8.1f} {c.p99_ms:>8.1f}"
+            f"{c.p50_ms:>8.1f} {c.p95_ms:>8.1f} {c.p99_ms:>8.1f} "
+            f"{c.passthrough_conns:>9} {_human_bytes(c.passthrough_bytes):>10}"
+        )
+    if any_passthrough:
+        lines.append(
+            "  (PT/* = TLS passthrough; warden did not inspect these flows — "
+            "see docs/INVARIANTS.md invariant 11)"
         )
     return "\n".join(lines)
 

@@ -151,6 +151,65 @@ The invariant we DO uphold:
 | Unit tests | `tests/test_metadata_host_sockets.py` (3 cases) |
 | CI | Unit |
 
+### 11. TLS Passthrough Is an Explicit, Opt-In TLS-Handling Override
+
+Some hosts (Cloudflare-fronted endpoints, sites with HPKP / Encrypted Client
+Hello / strict ALPN-cipher pinning) refuse mitmproxy's relayed TLS
+handshake. The operator can opt the cell out of MITM for a specific host
+by adding it to `policy.tls_passthrough` in the cell yaml. The host then
+flows through Warden as a raw TCP tunnel after the CONNECT, routed by SNI.
+
+This is a deliberate **security model shift** for that host. Brig's MITM
+default offers full URL/body audit but loses on (a) strict-TLS compat and
+(b) credential confidentiality vs. Warden. Passthrough flips both — gains
+compat + confidentiality, loses per-URL audit + body inspection. The
+trade-off is documented and opt-in per host so the operator's act of
+adding the entry IS the security review.
+
+The invariants we DO uphold for passthrough hosts:
+
+  - **Passthrough is opt-in per cell per host.** No default-passthrough
+    list. A cell with no `tls_passthrough:` block behaves exactly as today.
+  - **Passthrough hosts MUST also appear in `policy.allow`.** Passthrough
+    is a TLS-handling override, NOT a policy bypass. Validated at parse
+    time — a `tls_passthrough` entry without a matching `allow` entry is
+    a hard validation error. Without this guard, an operator could opt a
+    host out of MITM without ever granting it allow, silently leaking
+    egress past the policy.
+  - **SNI in the client hello must match the CONNECT host** (Phase 2).
+    Otherwise a malicious cell could CONNECT to allowed-host:443 then
+    send SNI=attacker.com to abuse Warden as a generic TLS tunnel.
+  - **Audit log entries are tls_mode-tagged.** Passthrough records carry
+    SNI + bytes + duration; per-URL/body attributes are absent **by
+    construction** (Warden never decrypted them). Operators can grep for
+    `tls_mode=passthrough` to enumerate uninspected flows (Phase 3).
+  - **Untrusted profile cannot declare passthrough** (Phase 1 follow-up).
+    The trade-off requires informed operator consent; untrusted profiles
+    don't get to make that choice.
+
+| Surface | Location |
+|---|---|
+| Cell-def guard | `src/brig/cell/spec.py:_v_policy` — cross-field check that every `tls_passthrough` host appears in `allow`; rejects passthrough under the untrusted profile |
+| Spec field | `src/brig/cell/spec.py:CellSpec.policy_passthrough_tls` |
+| YAML flattening | `src/brig/commands/lifecycle_cmd.py` (`policy.tls_passthrough` → `policy_passthrough_tls`) |
+| Profile propagation | `src/brig/cell/profiles.py` (profile-level `policy.tls_passthrough` prepends to cell's list) |
+| Per-cell policy write | `src/brig/commands/lifecycle_cmd.py:_sync_cell_policy` writes `tls_passthrough` to `<cell>.json` |
+| Policy class | `src/addons/_policy.py:Policy.is_passthrough` — defense-in-depth: a host must match BOTH passthrough rules AND allow rules (a tampered policy file can't opt a host out of MITM without allow coverage) |
+| Addon hook | `src/addons/enforce.py:tls_clienthello` — reads SNI, flips `client_conn.tls_passthrough` when matched, blocks SNI/CONNECT mismatches |
+| OTel counters | `src/addons/otel_export.py:tcp_start/tcp_message/tcp_end` — `warden_passthrough_connections_total`, `warden_passthrough_bytes_total{direction}`, `warden_passthrough_duration_ms` |
+| Log shape | `src/addons/otel_export.py` tags MITM records with `tls_mode=mitm`, passthrough records with `tls_mode=passthrough`. Passthrough records omit method/path/status BY CONSTRUCTION (warden never saw them) |
+| CLI rendering | `src/brig/commands/network_cmd.py:_print_network_line` renders passthrough lines as `PASSTHROUGH <host> (NB in / NB out)` — visually distinct from `OUT:` and `INGRESS:` |
+| Unit tests | `tests/test_cell_spec.py::TestValidateCellDefinition::test_policy_tls_passthrough_*` (4 cases) |
+| Unit tests | `tests/test_passthrough_tls.py` (10 cases — `is_passthrough` defense-in-depth, wildcard semantics, untrusted-profile rejection, per-cell-policy persistence, CLI render) |
+| Unit tests | `tests/test_cell_profiles.py::test_policy_tls_passthrough_propagates_from_profile` |
+| CI | Unit |
+
+**Not yet landed** (tracked separately):
+
+  - E2E: `tests/test_passthrough_tls.sh` against a Cloudflare-fronted host (e.g. chatgpt.com), validating both the handshake-survives path and the SNI/CONNECT-mismatch rejection.
+  - `brig system stats` rendering of passthrough flows in the per-cell summary.
+  - Security doc update in `docs/design/security.md` walking through the MITM-vs-passthrough trade-off table for a downstream reader.
+
 ## State-consistency invariants
 
 ### Warden's in-memory state must match on-disk allocator state

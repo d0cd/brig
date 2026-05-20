@@ -258,6 +258,7 @@ class PolicyEnforcer:
                             allow=data.get("allow", []),
                             deny=data.get("deny", []),
                             host_services=data.get("host_services"),
+                            tls_passthrough=data.get("tls_passthrough", []),
                         )
                         self.cell_policy_mtimes[cell_name] = mtime
                         ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
@@ -569,6 +570,101 @@ class PolicyEnforcer:
         allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
         if not allowed:
             self._block(flow, f"cell policy: {reason}")
+
+    def tls_clienthello(self, data) -> None:
+        """Decide MITM vs passthrough at TLS client-hello time.
+
+        Invariant 11 (docs/INVARIANTS.md): a cell that has declared
+        `policy.tls_passthrough: [host]` AND has `host` in
+        `policy.allow` opts that host out of MITM. Warden tunnels TCP
+        bytes after the CONNECT, routed by SNI; never sees cleartext.
+
+        Two security checks here:
+
+        1. **SNI/CONNECT match.** Reject if the SNI in the client hello
+           doesn't equal the host from the preceding CONNECT request.
+           Otherwise a malicious cell could CONNECT to allowed-host:443,
+           then send SNI=attacker.com to abuse warden as a generic TLS
+           tunnel for arbitrary hosts.
+
+        2. **Passthrough requires both lists.** `is_passthrough` is
+           defense-in-depth — it only returns True when the SNI matches
+           BOTH a passthrough rule AND an allow rule. A tampered policy
+           file that lists a host only in `tls_passthrough` cannot
+           bypass the allow gate.
+
+        On error we leave passthrough off and let MITM proceed; that
+        fails closed (cell sees a TLS error rather than silently
+        leaking past inspection).
+        """
+        try:
+            sni = getattr(getattr(data, "client_hello", None), "sni", None)
+            if not sni:
+                return
+            sni = sni.strip().lower()
+            client_conn = getattr(data, "context", None)
+            client_conn = getattr(client_conn, "client", None)
+            # mitmproxy populates context.client.sni from the hello once
+            # parsed, but we read directly from the hello to get the
+            # raw value before any normalization.
+            peer = getattr(client_conn, "peername", None) if client_conn else None
+            client_ip = peer[0] if peer else None
+            if not client_ip:
+                return
+
+            # CONNECT host comes from the http_connect flow; mitmproxy
+            # stores it on the client connection's sni/alpn context, but
+            # the most reliable cross-version source is the proxy's
+            # server-address-resolution metadata. mitmproxy 10+ sets
+            # data.context.client.proxy_mode / sni / etc. — use the
+            # server-side address pre-resolution, which is the CONNECT
+            # target.
+            connect_host = None
+            server = getattr(getattr(data, "context", None), "server", None)
+            address = getattr(server, "address", None) if server else None
+            if address and len(address) >= 1 and isinstance(address[0], str):
+                connect_host = address[0].strip().lower()
+
+            if connect_host and sni != connect_host:
+                ctx.log.warn(
+                    f"BLOCKED: SNI/CONNECT mismatch sni={sni} connect={connect_host}"
+                )
+                # Don't close — mitmproxy will fail the handshake when we
+                # don't tag passthrough and the cert mismatches. Logging
+                # surfaces the attempt; the existing host-allow check in
+                # http_connect already blocked the CONNECT if the host
+                # wasn't permitted.
+                return
+
+            cell_name = self.subnets.get_cell_name(client_ip)
+            cell_policy = self._lookup_cell_policy(cell_name)
+            if cell_policy is None:
+                return
+
+            if cell_policy.is_passthrough(sni):
+                # Flip mitmproxy's passthrough switch — connection is
+                # tunneled raw after this point. Tag context so audit
+                # log lines (server_connected, response*) can mark
+                # tls_mode=passthrough.
+                if client_conn is not None:
+                    setattr(client_conn, "tls_passthrough", True)
+                # Persist for later hooks. Use a dict on data.context if
+                # mitmproxy exposes one; otherwise set an attribute on
+                # the client connection.
+                if client_conn is not None:
+                    metadata = getattr(client_conn, "metadata", None)
+                    if isinstance(metadata, dict):
+                        metadata["tls_mode"] = "passthrough"
+                        metadata["passthrough_sni"] = sni
+                ctx.log.info(
+                    f"PASSTHROUGH: cell={cell_name} sni={sni} (no MITM, SNI-routed)"
+                )
+        except Exception as e:
+            # Fail closed by NOT flipping passthrough. The TLS handshake
+            # will then proceed in MITM mode; the cell will hit the cert
+            # error (existing behavior pre-passthrough) rather than
+            # silently leaking through.
+            ctx.log.warn(f"tls_clienthello error, defaulting to MITM: {e}")
 
     def server_connected(self, data):
         """Check resolved IP against blocked ranges after DNS resolution.

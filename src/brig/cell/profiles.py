@@ -114,7 +114,8 @@ def apply_profile(spec: dict[str, Any], profile: dict[str, Any]) -> dict[str, An
         prof_policy = profile["policy"]
         if isinstance(prof_policy, dict):
             for src_key, dst_key in (("allow", "policy_allow"),
-                                      ("deny", "policy_deny")):
+                                      ("deny", "policy_deny"),
+                                      ("tls_passthrough", "policy_passthrough_tls")):
                 src = prof_policy.get(src_key) or []
                 if src:
                     merged[dst_key] = list(src) + list(merged.get(dst_key) or [])

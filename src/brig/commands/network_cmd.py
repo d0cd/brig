@@ -111,6 +111,9 @@ def _cmd_network_from_otel(args: Any) -> int:
                         "block_reason": attrs.get("block_reason", ""),
                         "ingress_route": attrs.get("ingress_route", ""),
                         "src_ip": attrs.get("src_ip", ""),
+                        "tls_mode": attrs.get("tls_mode", ""),
+                        "bytes_in": attrs.get("bytes_in", 0),
+                        "bytes_out": attrs.get("bytes_out", 0),
                     })
                     if len(matches) >= tail:
                         break
@@ -131,6 +134,17 @@ def _print_network_line(entry: dict) -> None:
     blocked = entry.get("blocked")
     tag = " [BLOCKED]" if blocked else ""
     reason = f" ({entry.get('block_reason', '')})" if blocked else ""
+    # Invariant 11: passthrough flows have no method/path/status — only
+    # SNI (host) + bytes. Render distinctly so operators can grep them
+    # from MITM lines.
+    if entry.get("tls_mode") == "passthrough":
+        bytes_in = entry.get("bytes_in", 0)
+        bytes_out = entry.get("bytes_out", 0)
+        output(
+            f"{ts} PASSTHROUGH: {host} "
+            f"({bytes_in}B in / {bytes_out}B out){tag}{reason}"
+        )
+        return
     ingress_route = entry.get("ingress_route")
     if ingress_route:
         ingress_src = entry.get("ingress_src_ip", entry.get("src_ip", "?"))

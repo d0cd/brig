@@ -88,6 +88,14 @@ class CellSpec:
     network: str = "default"  # "default" (per-cell isolated) or "none" (airgapped)
     policy_allow: list[str] = field(default_factory=list)
     policy_deny: list[str] = field(default_factory=list)
+    # Hosts where Warden tunnels TLS without decrypting (no MITM). Each
+    # entry must also appear in policy_allow — passthrough is a TLS-handling
+    # override, NEVER an allow shortcut. Operators opt in here when a host's
+    # TLS stack (HPKP/ECH/Cloudflare bot-fp) refuses mitmproxy's relayed
+    # handshake. The security trade-off is explicit: passthrough flows lose
+    # per-URL audit + body inspection, gain handshake compat + credential
+    # confidentiality. See docs/INVARIANTS.md invariant 11.
+    policy_passthrough_tls: list[str] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     timeout: str | None = None
     workspace_quota: str | None = None
@@ -230,11 +238,11 @@ def _v_pids_limit(value: Any, context: str) -> list[str]:
     return []
 
 
-def _v_policy(value: Any, context: str) -> list[str]:
+def _v_policy(value: Any, cell_def: dict, context: str) -> list[str]:
     if not isinstance(value, dict):
         return [f"'policy' must be a dict{context}"]
     errors: list[str] = []
-    for key in ("allow", "deny"):
+    for key in ("allow", "deny", "tls_passthrough"):
         if key not in value:
             continue
         if not isinstance(value[key], list):
@@ -249,6 +257,29 @@ def _v_policy(value: Any, context: str) -> list[str]:
                 suspicious = is_suspicious_domain(domain)
                 if suspicious:
                     errors.append(f"Security: {suspicious}{context}")
+    # Cross-field: every tls_passthrough host must also appear in allow.
+    # Passthrough is a TLS-handling override, not a policy bypass. Without
+    # this guard, an operator could opt a host out of MITM without ever
+    # granting it allow — silently leaking egress past the policy.
+    passthrough = value.get("tls_passthrough") or []
+    allow = value.get("allow") or []
+    if isinstance(passthrough, list) and isinstance(allow, list):
+        allow_set = {a for a in allow if isinstance(a, str)}
+        for host in passthrough:
+            if isinstance(host, str) and host not in allow_set:
+                errors.append(
+                    f"'policy.tls_passthrough' host '{host}' must also appear "
+                    f"in 'policy.allow'{context}"
+                )
+    # Invariant 11: passthrough is an informed-consent security trade-off
+    # (loses per-URL audit + body inspection). Untrusted cells don't get
+    # to make that choice — they're declared adversarial, so all their
+    # egress must remain inspectable.
+    if passthrough and _profile_is_untrusted(cell_def.get("profile")):
+        errors.append(
+            f"'policy.tls_passthrough' is not allowed with the untrusted profile — "
+            f"untrusted cells must have all egress MITM-inspected{context}"
+        )
     return errors
 
 
@@ -680,7 +711,6 @@ _SIMPLE_VALIDATORS = {
     "memory": _v_memory,
     "cpus": _v_cpus,
     "pids_limit": _v_pids_limit,
-    "policy": _v_policy,
     "network": _v_network,
     "workspace_quota": _v_workspace_quota,
     "workspace_mount": _v_workspace_mount,
@@ -705,6 +735,9 @@ def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> l
     for field_name, validator in _SIMPLE_VALIDATORS.items():
         if field_name in cell_def:
             errors.extend(validator(cell_def[field_name], context))
+
+    if "policy" in cell_def:
+        errors.extend(_v_policy(cell_def["policy"], cell_def, context))
 
     if "ingress" in cell_def:
         errors.extend(_v_ingress(cell_def["ingress"], cell_def, context))

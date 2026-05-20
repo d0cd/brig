@@ -210,12 +210,19 @@ class Policy:
     host_services entries are dicts {"name": str, "port": int}; the
     dict shape is the only supported form. Populates
     host_services_map: dict[name, port].
+
+    tls_passthrough is a list of host patterns (same wildcard semantics
+    as allow/deny). When a passthrough host's SNI is seen at TLS
+    client-hello time, Warden tunnels TCP without decrypting (no MITM).
+    See is_passthrough() for the defense-in-depth allow-list check.
     """
 
     def __init__(self, allow: list = None, deny: list = None,
-                 host_services: list = None):
+                 host_services: list = None,
+                 tls_passthrough: list = None):
         self.allow_rules = [PolicyRule(r) for r in (allow or [])]
         self.deny_rules = [PolicyRule(r) for r in (deny or [])]
+        self.passthrough_rules = [PolicyRule(r) for r in (tls_passthrough or [])]
         self.host_services_map: Optional[dict] = None
         if host_services is not None:
             self.host_services_map = {}
@@ -233,9 +240,31 @@ class Policy:
         self._deny_trie = DomainTrie()
         for rule in self.deny_rules:
             self._deny_trie.insert(rule)
+        self._passthrough_trie = DomainTrie()
+        for rule in self.passthrough_rules:
+            self._passthrough_trie.insert(rule)
         # Pre-build rule -> index map for O(1) trace lookups.
         self._rule_index = {id(r): i for i, r in enumerate(self.deny_rules)}
         self._rule_index.update({id(r): i for i, r in enumerate(self.allow_rules)})
+
+    def is_passthrough(self, host: str) -> bool:
+        """True iff host matches a passthrough rule AND an allow rule.
+
+        Defense in depth: the brig CLI's schema validator already enforces
+        that passthrough hosts appear in allow at parse time. Re-checking
+        here means a tampered on-disk policy file cannot opt a host out
+        of MITM without also having allow coverage. Without this, an
+        attacker who can write a per-cell policy file (invariant 4: macOS
+        state dir is untrusted) could bypass policy by adding ONLY a
+        passthrough entry. Fail closed if either check misses.
+        """
+        if not self.passthrough_rules:
+            return False
+        pt_matches = self._passthrough_trie.lookup(host)
+        if not any(r.matches_domain(host) for r in pt_matches):
+            return False
+        allow_matches = self._allow_trie.lookup(host)
+        return any(r.matches_domain(host) for r in allow_matches)
 
     def is_allowed(self, host: str, path: str, method: str,
                    trace_config: PolicyTraceConfig = None) -> tuple[bool, str, dict]:

@@ -181,7 +181,8 @@ def cmd_run(args: Any) -> int:
             spec_kwargs["env"] = (args.env or []) + env_list
         if isinstance(cell_def.get("policy"), dict):
             for src_key, dst_key in (("allow", "policy_allow"),
-                                      ("deny", "policy_deny")):
+                                      ("deny", "policy_deny"),
+                                      ("tls_passthrough", "policy_passthrough_tls")):
                 src = cell_def["policy"].get(src_key) or []
                 if src:
                     spec_kwargs[dst_key] = list(spec_kwargs.get(dst_key) or []) + list(src)
@@ -347,12 +348,14 @@ def _sync_cell_policy(spec: CellSpec) -> None:
         "allow": list(spec.policy_allow or []),
         "deny": list(spec.policy_deny or []),
         "host_services": list(spec.host_services or []),
+        "tls_passthrough": list(spec.policy_passthrough_tls or []),
     }
     existing = load_cell_policy(spec.name) or {}
     current = {
         "allow": existing.get("allow", []),
         "deny": existing.get("deny", []),
         "host_services": existing.get("host_services", []),
+        "tls_passthrough": existing.get("tls_passthrough", []),
     }
     if desired == current:
         return
