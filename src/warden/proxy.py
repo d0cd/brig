@@ -21,7 +21,62 @@ from brig.config import (
 from brig.ops.logging import debug, info
 from brig.vm.shell import vm_run, vm_run_interactive
 
-IMAGE = "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268"
+# Warden runs a thin custom image: mitmproxy + OpenTelemetry SDK.
+# Build with `./scripts/build-warden-image.sh` (runs inside the VM
+# so wheels match arch), commit the resulting WARDEN_IMAGE_DIGEST.
+# Until the digest is populated, warden falls back to the bare
+# mitmproxy image — no OTel exports, but proxy still works.
+WARDEN_IMAGE_TAG = "0.4.0-otel-1.27"
+WARDEN_IMAGE_DIGEST = "sha256:d6e66f7c196e7d89a92858da2fc62e4c92fe725d605ef5daa99432d19cf9cb38"
+BASE_IMAGE = "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268"
+
+
+def _warden_image() -> str:
+    """The image reference passed to podman run.
+
+    For the OTel-enabled build, returns the local tag form (the
+    digest can't be used directly with `podman run` against a
+    locally-built image — podman tries to pull from a "localhost"
+    registry). Caller is expected to verify the local image's id
+    matches WARDEN_IMAGE_DIGEST first; see _verify_warden_image.
+    Falls back to the upstream mitmproxy image when no digest is
+    pinned (no OTel exports in that mode).
+    """
+    if WARDEN_IMAGE_DIGEST and WARDEN_IMAGE_DIGEST.startswith("sha256:"):
+        return f"localhost/brig-warden:{WARDEN_IMAGE_TAG}"
+    return BASE_IMAGE
+
+
+def _verify_warden_image() -> bool:
+    """If a digest is pinned, confirm the local image's id matches.
+    Returns True if no digest is pinned (nothing to verify) or if
+    the local image matches the pin. False on mismatch.
+    """
+    if not WARDEN_IMAGE_DIGEST or not WARDEN_IMAGE_DIGEST.startswith("sha256:"):
+        return True  # No pin → no verification needed.
+    expected = WARDEN_IMAGE_DIGEST[len("sha256:"):]
+    tag = f"localhost/brig-warden:{WARDEN_IMAGE_TAG}"
+    result = vm_run(
+        ["podman", "inspect", tag, "--format", "{{.Id}}"],
+        timeout=10,
+    )
+    if result.returncode != 0:
+        info(
+            f"warden image {tag} not found in VM. "
+            f"Build it: ./scripts/build-warden-image.sh"
+        )
+        return False
+    actual = result.stdout.strip()
+    if actual != expected:
+        info(
+            f"warden image digest mismatch: "
+            f"expected {expected}, local has {actual}. "
+            f"Rebuild: ./scripts/build-warden-image.sh"
+        )
+        return False
+    return True
+
+
 MEMORY_LIMIT = "1g"
 CPU_LIMIT = "1"
 PIDS_LIMIT = "256"
@@ -124,6 +179,12 @@ def start() -> bool:
         debug(f"Policy file invalid: {e}")
         return False
 
+    # If running the pinned OTel image, verify the local build matches
+    # the recorded digest before launching (since locally-built images
+    # can't be digest-pulled, we verify by inspect).
+    if not _verify_warden_image():
+        return False
+
     # Ensure proxy-external network exists in VM.
     vm_run(["podman", "network", "create", PROXY_EXTERNAL_NETWORK], timeout=10)
     # Ensure VM-side log directory exists (rootful, so created here, not on
@@ -142,6 +203,7 @@ def start() -> bool:
         "podman", "run", "-d",
         "--name", PROXY_NAME,
         "--runtime", "crun",
+        "--pull=never",  # local image is verified by digest above
         "--network", PROXY_EXTERNAL_NETWORK,
         "--entrypoint", "mitmdump",
         "--cap-drop", "ALL",
@@ -168,8 +230,19 @@ def start() -> bool:
     if has_ingress:
         cmd.extend(["-p", f"{INGRESS_PORT}:{INGRESS_PORT}"])
 
+    # Point warden at the OTel collector if it's a sibling container.
+    # The exporter is no-op if these env vars are missing (no metrics
+    # produced), so it's safe to always set them; they only take
+    # effect when the OTel-enabled warden image is in use.
+    from brig.config import COLLECTOR_NAME, COLLECTOR_OTLP_GRPC_PORT
+    cmd.extend([
+        "-e", f"OTEL_EXPORTER_OTLP_ENDPOINT=http://{COLLECTOR_NAME}:{COLLECTOR_OTLP_GRPC_PORT}",
+        "-e", "OTEL_SERVICE_NAME=warden",
+        "-e", "OTEL_RESOURCE_ATTRIBUTES=service.namespace=brig",
+    ])
+
     # Image.
-    cmd.append(IMAGE)
+    cmd.append(_warden_image())
 
     if has_ingress:
         # Multi-mode: forward proxy on 8080, ingress on INGRESS_PORT.
@@ -194,7 +267,7 @@ def start() -> bool:
         ])
 
     # Optional addons (check host-side, mount VM-side).
-    for addon in ["ops.py", "notifier.py"]:
+    for addon in ["ops.py", "notifier.py", "otel_export.py"]:
         if (HostPaths.ADDONS_DIR / addon).exists():
             cmd.extend(["-s", f"/addons/{addon}"])
 

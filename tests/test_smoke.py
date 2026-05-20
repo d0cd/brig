@@ -160,6 +160,7 @@ class TestReconcilerPlanToApply(unittest.TestCase):
 class TestWardenStartCommand(unittest.TestCase):
     """Test that warden start builds the right container command."""
 
+    @patch("warden.proxy.WARDEN_IMAGE_DIGEST", "")
     @patch("warden.proxy.vm_run")
     def test_start_command_has_hardening(self, mock_vm_run):
         """Warden start includes read-only, cap-drop, non-root, resource limits."""

@@ -23,6 +23,7 @@ from brig.config import (
     COLLECTOR_OTLP_HTTP_PORT,
     COLLECTOR_PROMETHEUS_PORT,
     HostPaths,
+    PROXY_EXTERNAL_NETWORK,
     VMPaths,
 )
 from brig.errors import BrigError
@@ -122,6 +123,9 @@ def start() -> bool:
         "podman", "run", "-d",
         "--name", COLLECTOR_NAME,
         "--runtime", "crun",
+        # Same network as warden so warden can resolve us by container
+        # name (OTEL_EXPORTER_OTLP_ENDPOINT points at brig-otel:4317).
+        "--network", PROXY_EXTERNAL_NETWORK,
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges",
         "--read-only",

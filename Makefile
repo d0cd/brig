@@ -73,7 +73,7 @@ _copy-addons:
 	@mkdir -p ~/.brig/cells/addons
 	@chmod 0700 ~/.brig/cells/addons
 	@cp src/addons/_common.py src/addons/_policy.py src/addons/_log_writer.py src/addons/enforce.py src/addons/logger.py src/addons/ops.py ~/.brig/cells/addons/
-	@for f in src/addons/_notifier_state.py src/addons/notifier.py src/addons/ingress.py; do \
+	@for f in src/addons/_notifier_state.py src/addons/notifier.py src/addons/ingress.py src/addons/otel_export.py; do \
 		[ -f "$$f" ] && cp "$$f" ~/.brig/cells/addons/ || true; \
 	done
 	@# Seccomp profiles are referenced by reconciler.build_run_command as
