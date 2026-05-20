@@ -237,6 +237,7 @@ def _add_system_group(sub: argparse._SubParsersAction) -> None:
     ss.add_parser("profiles", help="List available trust profiles")
     ss.add_parser("preflight", help="Run pre-start checks")
     ss.add_parser("metrics", help="Output Prometheus metrics")
+    ss.add_parser("stats", help="Per-cell summary from the OTel collector")
 
     p_verify = ss.add_parser("verify", help="Verify security invariants")
     p_verify.add_argument("--fix", action="store_true", help="Auto-fix issues")
@@ -316,6 +317,12 @@ def _print_quickstart() -> None:
     no subcommand. Replaces argparse's bare 'required: command' error
     (which dumped a wall of flags) with a verb-grouped index."""
     sys.stdout.write(_QUICKSTART)
+
+
+def _stats_dispatch(args):
+    """Lazy import — keeps cli.py startup fast on unrelated commands."""
+    from brig.observability.stats import cmd_stats
+    return cmd_stats(args)
 
 
 def main() -> None:
@@ -409,6 +416,7 @@ def main() -> None:
         ("system", "doctor"): system_cmd.cmd_doctor,
         ("system", "preflight"): system_cmd.cmd_preflight,
         ("system", "metrics"): system_cmd.cmd_metrics,
+        ("system", "stats"): _stats_dispatch,
         ("system", "prune"): system_cmd.cmd_prune,
         ("system", "watchdog"): watchdog_cmd.cmd_watchdog,
         ("system", "history"): system_cmd.cmd_history,
