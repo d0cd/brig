@@ -106,6 +106,11 @@ def _add_run_parser(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--rm", action="store_true", help="Remove on exit")
     p.add_argument("--image-digest", help="Expected image digest")
     p.add_argument("--workdir", help="Working directory override")
+    p.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Auto-confirm prompts (e.g. warden restart when adding a new "
+             "TCP host_service that needs a listener bound)",
+    )
 
 
 def _add_cell_group(sub: argparse._SubParsersAction) -> None:

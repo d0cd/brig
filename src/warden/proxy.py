@@ -101,6 +101,13 @@ VM_WARDEN_STATE_DIR = Path("/var/lib/warden/mitmproxy-state")
 # block above for the rationale.
 VM_WARDEN_CA_FILE = VM_WARDEN_STATE_DIR / "mitmproxy-ca-cert.pem"
 
+# Runtime state file — records what TCP host_service ports warden is
+# CURRENTLY bound to, so the cell-lifecycle apply path can detect a
+# diff against the desired set and prompt to restart warden. Lives
+# under SYSTEM_DIR so it's host-visible (brig CLI reads it) and is
+# rewritten by start() / cleared by stop().
+WARDEN_RUNTIME_FILE = HostPaths.SYSTEM_DIR / "warden-runtime.json"
+
 # Ports we won't bind as TCP host_services listeners — they collide with
 # warden's own HTTP forward proxy or ingress reverse proxy, or with
 # privileged-only ranges that the mitmproxy user can't bind. Cells that
@@ -374,8 +381,36 @@ def start() -> bool:
         # Lifecycle logging is best-effort — don't fail warden start
         # because the audit-log directory perm got weird.
         pass
+    # Record what we bound, so the cell-lifecycle apply path can detect
+    # a new TCP host_service that needs a restart to bind. Atomic write
+    # (parent already exists from the SYSTEM_DIR mkdir at start of
+    # this function).
+    try:
+        from brig.ops.atomic import atomic_write_json
+        atomic_write_json(WARDEN_RUNTIME_FILE, {
+            "tcp_host_service_ports": _collect_tcp_host_service_ports(),
+        })
+    except Exception as e:
+        debug(f"Failed to write warden runtime state: {e}")
     info("Proxy started")
     return True
+
+
+def get_bound_tcp_ports() -> list[int]:
+    """Return the TCP host_service ports warden is currently bound to.
+
+    Reads from WARDEN_RUNTIME_FILE, populated by start(). Used by the
+    cell-lifecycle apply path to detect a port-set diff and prompt
+    for warden restart. Returns [] if warden hasn't started yet or
+    the runtime file is unreadable (fail-safe: act as if no ports
+    are bound, so the lifecycle path will prompt to restart).
+    """
+    try:
+        data = json.loads(WARDEN_RUNTIME_FILE.read_text())
+        ports = data.get("tcp_host_service_ports") or []
+        return sorted(int(p) for p in ports if isinstance(p, int))
+    except (FileNotFoundError, OSError, json.JSONDecodeError, ValueError):
+        return []
 
 
 def _collect_tcp_host_service_ports() -> list[int]:

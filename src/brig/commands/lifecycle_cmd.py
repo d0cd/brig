@@ -254,6 +254,12 @@ def cmd_run(args: Any) -> int:
 
     spec = CellSpec(**spec_kwargs)
     _sync_cell_policy(spec)
+    # If this cell declares TCP host_services on ports warden hasn't
+    # bound yet, warden needs to restart (mitmproxy can't hot-add
+    # listeners). Prompts the operator unless --yes is set; refuses to
+    # continue silently because warden restart drops every other
+    # cell's open egress for ~5s.
+    _maybe_restart_warden_for_tcp(spec, yes=getattr(args, "yes", False))
 
     from brig.ops.logging import Spinner
     with Spinner(f"Starting cell '{spec.name}'...") as spinner:
@@ -273,6 +279,63 @@ def cmd_run(args: Any) -> int:
     if result.success and spec.detach:
         _check_immediate_exit(spec.name)
     return 0
+
+
+def _maybe_restart_warden_for_tcp(spec: CellSpec, yes: bool = False) -> None:
+    """Restart warden if this cell needs a TCP listener that isn't bound.
+
+    mitmproxy can't hot-add `--mode reverse:tcp` listeners, so a new TCP
+    host_service in a cell yaml requires warden restart for the listener
+    to come up. Restart kills every live cell's open egress for ~5s,
+    so we prompt the operator unless `--yes`. Operators who would
+    rather defer the restart get a clean abort + suggestion.
+
+    No-op for cells without TCP host_services, or when warden already
+    has all the cell's ports bound.
+    """
+    spec_tcp_ports = sorted({
+        e["port"] for e in (spec.host_services or [])
+        if isinstance(e, dict) and e.get("protocol") == "tcp"
+        and isinstance(e.get("port"), int)
+    })
+    if not spec_tcp_ports:
+        return
+    from warden.proxy import get_bound_tcp_ports
+    bound = set(get_bound_tcp_ports())
+    missing = [p for p in spec_tcp_ports if p not in bound]
+    if not missing:
+        return
+    info(
+        f"Cell '{spec.name}' declares TCP host_services on port(s) "
+        f"{missing} that warden hasn't bound yet."
+    )
+    if not yes:
+        output(
+            "Restarting warden will drop every running cell's open "
+            "egress connections for ~5s while the new listener binds."
+        )
+        try:
+            answer = input("Proceed with warden restart? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer not in ("y", "yes"):
+            raise BrigError(
+                "Aborted: warden restart declined",
+                suggestion=(
+                    "Re-run with --yes to auto-confirm, OR\n"
+                    "  brig system restart  # bind the new listener "
+                    "manually, then re-run this cell"
+                ),
+            )
+    from warden.proxy import start as warden_start, stop as warden_stop
+    info("Restarting warden to bind new TCP listener(s)...")
+    warden_stop()
+    if not warden_start():
+        raise BrigError(
+            "Warden restart failed",
+            suggestion="brig system doctor",
+        )
+    info(f"Warden restarted; TCP listener(s) on {missing} now bound")
 
 
 def _check_immediate_exit(cell_name: str) -> None:
