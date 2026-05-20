@@ -50,7 +50,8 @@ def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
         n = c.get("Names", "")
         return n[0] if isinstance(n, list) else n
 
-    cell_names = [_name(c) for c in containers if _name(c) != PROXY_NAME]
+    from brig.config import INFRA_CONTAINER_NAMES
+    cell_names = [_name(c) for c in containers if _name(c) not in INFRA_CONTAINER_NAMES]
     if not cell_names:
         return [], []
 

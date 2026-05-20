@@ -52,6 +52,14 @@ COLLECTOR_OTLP_GRPC_PORT = 4317
 COLLECTOR_OTLP_HTTP_PORT = 4318
 COLLECTOR_PROMETHEUS_PORT = 9464
 
+# Brig-managed containers that are NOT cells. Cell-listing surfaces
+# (brig cell list, sdk.list_cells, security.verify, system_cmd.prune)
+# must skip these — otherwise the OTel collector shows up as a cell
+# because its name (`brig-otel`) matches the `name=^brig-` ps filter.
+# Single source of truth so adding a new infra sidecar means updating
+# one tuple, not seven list sites.
+INFRA_CONTAINER_NAMES = (PROXY_NAME, COLLECTOR_NAME)
+
 # External network for proxy egress.
 PROXY_EXTERNAL_NETWORK = "proxy-external"
 

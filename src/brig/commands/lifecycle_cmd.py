@@ -544,12 +544,13 @@ def cmd_list(args: Any) -> int:
         output(json.dumps(containers, indent=2))
         return 0
 
+    from brig.config import INFRA_CONTAINER_NAMES
     cells = []
     for c in containers:
         names = c.get("Names", "")
         # Podman 4.x returns Names as a string; 5.x as a list.
         name = names[0] if isinstance(names, list) else names
-        if name == PROXY_NAME:
+        if name in INFRA_CONTAINER_NAMES:
             continue
         cells.append((name, c))
 

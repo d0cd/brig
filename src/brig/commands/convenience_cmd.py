@@ -83,10 +83,11 @@ def cmd_down(args: Any) -> int:
     from brig.vm.shell import vm_run
 
     # Stop all cells.
+    from brig.config import INFRA_CONTAINER_NAMES
     result = vm_run(["podman", "ps", "--format", "{{.Names}}", "--filter", f"name=^{CONTAINER_PREFIX}"])
     if result.returncode == 0 and result.stdout.strip():
         for name in result.stdout.strip().split("\n"):
-            if name and name != PROXY_NAME:
+            if name and name not in INFRA_CONTAINER_NAMES:
                 output(f"Stopping {name}...")
                 vm_run(["podman", "stop", "-t", "5", name])
 
