@@ -18,24 +18,15 @@ Threats the validators defend against (one test class per family):
 
 from __future__ import annotations
 
-import os
-import socket
 import tempfile
 import unittest
 from pathlib import Path
 
+from conftest import make_unix_socket as _sock
+
 
 def _base() -> dict:
     return {"name": "test-cell", "image": "alpine"}
-
-
-def _sock(td: Path, name: str = "svc.sock") -> Path:
-    """Create a real unix socket at td/name and return the path."""
-    p = td / name
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.bind(str(p))
-    s.close()
-    return p
 
 
 class TestHostSocketAccepted(unittest.TestCase):

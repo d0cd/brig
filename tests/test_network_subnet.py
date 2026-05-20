@@ -128,6 +128,26 @@ class TestSubnetMap(unittest.TestCase):
         free("cell-a", self.state_file, self.lock_file)
         self.assertEqual(get_subnet_map(self.state_file, self.lock_file), {})
 
+    def test_allocate_writes_map_alongside_state(self):
+        """Regression: allocate() with a custom state_file must write
+        subnet-map.json next to it, not to the global SUBNET_MAP_FILE.
+        Before the fix, pytest clobbered the user's real subnet-map.json
+        because _write_subnet_map silently defaulted to it."""
+        allocate("cell-a", self.state_file, self.lock_file)
+        local_map = self.state_file.parent / "subnet-map.json"
+        self.assertTrue(local_map.exists(), "subnet-map.json not written to tmpdir")
+        self.assertEqual(
+            json.loads(local_map.read_text()),
+            {"10.60.1.0/24": "cell-a"},
+        )
+
+    def test_free_updates_map_alongside_state(self):
+        """Regression: free() must update subnet-map.json next to state_file."""
+        allocate("cell-a", self.state_file, self.lock_file)
+        free("cell-a", self.state_file, self.lock_file)
+        local_map = self.state_file.parent / "subnet-map.json"
+        self.assertEqual(json.loads(local_map.read_text()), {})
+
 
 class TestMaxCapacity(unittest.TestCase):
     """Test allocation at capacity limits."""

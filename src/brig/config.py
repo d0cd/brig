@@ -10,6 +10,7 @@ are routed through `limactl shell brig --` by brig.vm.shell.
 """
 
 import re
+import os
 from pathlib import Path
 
 # Version.
@@ -131,7 +132,12 @@ class HostPaths:
     and warden mounts /state/system at /var/run/cells inside its container,
     so host writes flow to warden via virtiofs without any sync step.
     """
-    BRIG_HOME = Path.home() / ".brig"
+    # BRIG_HOME defaults to ~/.brig but can be overridden via the
+    # $BRIG_HOME environment variable. Tests use this to point at a
+    # tmpdir (see tests/conftest.py); operators can use it for
+    # multi-profile setups. Resolved at class-definition time, so set
+    # the env var before any `import brig` happens.
+    BRIG_HOME = Path(os.environ.get("BRIG_HOME") or Path.home() / ".brig")
     CELLS_DIR = BRIG_HOME / "cells"
     ADDONS_DIR = CELLS_DIR / "addons"
     SECRETS_DIR = BRIG_HOME / "secrets"

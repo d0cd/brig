@@ -5,12 +5,13 @@ checklist if any requirement is missing.
 
 from __future__ import annotations
 
-import socket
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+from conftest import make_unix_socket as _real_socket
 
 
 def _args(file):
@@ -21,14 +22,6 @@ def _write_yaml(p: Path, body: str) -> Path:
     yaml_path = p / "cell.yaml"
     yaml_path.write_text(body)
     return yaml_path
-
-
-def _real_socket(td: Path, name: str) -> Path:
-    p = td / name
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.bind(str(p))
-    s.close()
-    return p
 
 
 class TestPreflight(unittest.TestCase):

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from brig.config import ALLOCATOR_LOCK_FILE, CELL_NAME_PATTERN, SUBNET_MAP_FILE, SUBNET_STATE_FILE
+from brig.config import ALLOCATOR_LOCK_FILE, CELL_NAME_PATTERN, SUBNET_STATE_FILE
 from brig.ops.atomic import atomic_write_json
 
 SUBNET_PREFIX = "10.60"
@@ -103,10 +103,12 @@ def _build_subnet_map(state: dict) -> dict[str, str]:
     return mapping
 
 
-def _write_subnet_map(state: dict, map_file: Path = SUBNET_MAP_FILE) -> None:
+def _write_subnet_map(state: dict, *, map_file: Path) -> None:
     """Write subnet-map.json atomically for enforce.py consumption.
 
-    Must be called under the allocator lock.
+    Must be called under the allocator lock. `map_file` is keyword-only with
+    no default — a silent default here once let pytest clobber the user's
+    real subnet-map.json when tests overrode only state_file.
     """
     atomic_write_json(map_file, _build_subnet_map(state))
 
@@ -150,7 +152,7 @@ def allocate(
             }
 
             _save_state(state, state_file)
-            _write_subnet_map(state)
+            _write_subnet_map(state, map_file=state_file.parent / "subnet-map.json")
 
             return SubnetInfo(
                 cell_name=cell_name,
@@ -188,7 +190,7 @@ def free(
                 state["freed"].sort()
 
             _save_state(state, state_file)
-            _write_subnet_map(state)
+            _write_subnet_map(state, map_file=state_file.parent / "subnet-map.json")
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 

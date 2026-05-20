@@ -348,49 +348,36 @@ class TestSubnetMapWriting(unittest.TestCase):
         self.lock_file = Path(self.tmpdir) / "allocator.lock"
         self.map_file = Path(self.tmpdir) / "subnet-map.json"
 
-    def _patch_write_subnet_map(self):
-        """Return a patch that redirects _write_subnet_map to use self.map_file."""
-        from brig.network.subnet import _write_subnet_map as orig_fn
-        map_file = self.map_file
-
-        def patched_write(state, mf=None):
-            return orig_fn(state, map_file=map_file)
-
-        return patch("brig.network.subnet._write_subnet_map", side_effect=patched_write)
-
     def test_allocate_creates_map_file(self):
         """After allocate(), subnet-map.json exists with correct mapping."""
-        with self._patch_write_subnet_map():
-            allocate("test-cell", self.state_file, self.lock_file)
+        allocate("test-cell", self.state_file, self.lock_file)
 
-            self.assertTrue(self.map_file.exists(), "subnet-map.json must exist after allocate")
-            mapping = json.loads(self.map_file.read_text())
-            self.assertEqual(mapping["10.60.1.0/24"], "test-cell")
+        self.assertTrue(self.map_file.exists(), "subnet-map.json must exist after allocate")
+        mapping = json.loads(self.map_file.read_text())
+        self.assertEqual(mapping["10.60.1.0/24"], "test-cell")
 
     def test_free_updates_map_file(self):
         """After free(), the freed cell is removed from subnet-map.json."""
-        with self._patch_write_subnet_map():
-            allocate("cell-a", self.state_file, self.lock_file)
-            allocate("cell-b", self.state_file, self.lock_file)
-            free("cell-a", self.state_file, self.lock_file)
+        allocate("cell-a", self.state_file, self.lock_file)
+        allocate("cell-b", self.state_file, self.lock_file)
+        free("cell-a", self.state_file, self.lock_file)
 
-            mapping = json.loads(self.map_file.read_text())
-            self.assertNotIn("10.60.1.0/24", mapping, "Freed cell must not appear in map")
-            self.assertEqual(mapping["10.60.2.0/24"], "cell-b")
+        mapping = json.loads(self.map_file.read_text())
+        self.assertNotIn("10.60.1.0/24", mapping, "Freed cell must not appear in map")
+        self.assertEqual(mapping["10.60.2.0/24"], "cell-b")
 
     def test_map_file_written_atomically(self):
         """Map file is written via temp+rename (no partial writes visible)."""
-        with self._patch_write_subnet_map():
-            allocate("cell-a", self.state_file, self.lock_file)
+        allocate("cell-a", self.state_file, self.lock_file)
 
-            # Verify the file is valid JSON (not a partial write).
-            content = self.map_file.read_text()
-            mapping = json.loads(content)  # Would raise on partial write.
-            self.assertIsInstance(mapping, dict)
+        # Verify the file is valid JSON (not a partial write).
+        content = self.map_file.read_text()
+        mapping = json.loads(content)  # Would raise on partial write.
+        self.assertIsInstance(mapping, dict)
 
-            # Verify it is a regular file (rename target), not a temp file.
-            stat = self.map_file.stat()
-            self.assertTrue(stat.st_size > 0)
+        # Verify it is a regular file (rename target), not a temp file.
+        stat = self.map_file.stat()
+        self.assertTrue(stat.st_size > 0)
 
 
 # ---------------------------------------------------------------------------

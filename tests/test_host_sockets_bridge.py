@@ -14,11 +14,12 @@ launchd lives in tests/test_host_sockets_e2e.sh (gated on macOS).
 
 from __future__ import annotations
 
-import socket
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+from conftest import make_unix_socket as _real_socket
 
 
 def _socket_entry(name="pg", host_path="/tmp/postgres.sock"):
@@ -28,14 +29,6 @@ def _socket_entry(name="pg", host_path="/tmp/postgres.sock"):
         "mount_point": f"/run/host/{name}.sock",
         "mode": "rw",
     }
-
-
-def _real_socket(td: Path, name: str) -> Path:
-    p = td / name
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.bind(str(p))
-    s.close()
-    return p
 
 
 class TestPlistGeneration(unittest.TestCase):

@@ -10,19 +10,12 @@ M3 — mount_point normalized before duplicate check
 from __future__ import annotations
 
 import os
-import socket
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
-def _real_socket(td: Path, name: str) -> Path:
-    p = td / name
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.bind(str(p))
-    s.close()
-    return p
+from conftest import make_unix_socket as _real_socket
 
 
 # ----- C1: SDK validation -----
@@ -162,10 +155,7 @@ class TestEngineDenylistAfterRealpath(unittest.TestCase):
             # Use a fake "docker.sock" target so we don't depend on
             # /var/run/docker.sock existing. Realpath only cares about
             # the resolved basename matching the denylist.
-            fake_docker = Path(td) / "docker.sock"
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.bind(str(fake_docker))
-            s.close()
+            fake_docker = _real_socket(Path(td), "docker.sock")
             link = Path(td) / "pg.sock"
             os.symlink(fake_docker, link)
             with self.assertRaises(BrigError) as ctx:

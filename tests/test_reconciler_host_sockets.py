@@ -13,19 +13,12 @@ These tests exercise build_run_command directly — no podman, no VM.
 from __future__ import annotations
 
 import os
-import socket
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-
-def _sock(td: Path, name: str = "svc.sock") -> Path:
-    p = td / name
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.bind(str(p))
-    s.close()
-    return p
+from conftest import make_unix_socket as _sock
 
 
 def _spec(host_sockets=None, **kw):
