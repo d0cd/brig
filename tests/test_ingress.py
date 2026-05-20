@@ -565,3 +565,26 @@ class TestIngressSseStreaming(unittest.TestCase):
         flow.metadata = {"ingress_route": "api"}
         flow.response = None
         router.responseheaders(flow)  # must not raise
+
+    def test_lowercase_header_name_still_detected(self):
+        """Some servers (RFC-compliant) emit `content-type: ...` in all
+        lowercase. The detection must be case-insensitive on the header
+        NAME, not just the value. Audit found the original code relied
+        on mitmproxy's Headers normalization, which was fine in
+        production but brittle to test against."""
+        router = self._router()
+        flow = self._flow("text/event-stream")
+        # Override headers to use the lowercase key.
+        flow.response.headers = {"content-type": "text/event-stream"}
+        router.responseheaders(flow)
+        self.assertTrue(flow.response.stream)
+
+    def test_mixed_case_header_value_detected(self):
+        """Servers occasionally send `Content-Type: Text/Event-Stream`
+        (rare but valid). Production code lowercases the value before
+        comparing; this pins that behavior."""
+        router = self._router()
+        flow = self._flow("text/event-stream")
+        flow.response.headers = {"Content-Type": "Text/Event-Stream"}
+        router.responseheaders(flow)
+        self.assertTrue(flow.response.stream)

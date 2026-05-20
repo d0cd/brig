@@ -416,7 +416,20 @@ class IngressRouter:
             return
         if flow.response is None:
             return
-        content_type = flow.response.headers.get("Content-Type", "").lower()
+        # Case-insensitive header lookup. mitmproxy's Headers class
+        # normalizes for us, but `flow.response.headers.get(...)` is
+        # case-sensitive on plain dicts (tests) and on some mitmproxy
+        # versions in edge cases. Iterating keys with `.lower()`
+        # comparison keeps the code correct against any header
+        # container that supports `.items()`.
+        content_type = ""
+        try:
+            for k, v in flow.response.headers.items():
+                if isinstance(k, str) and k.lower() == "content-type":
+                    content_type = str(v).lower()
+                    break
+        except AttributeError:
+            return
         # Strip any `; charset=...` suffix before comparing.
         media_type = content_type.split(";", 1)[0].strip()
         if media_type == "text/event-stream":

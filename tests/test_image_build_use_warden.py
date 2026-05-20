@@ -111,6 +111,61 @@ class TestUseWardenRequiresWardenRunning(unittest.TestCase):
         self.assertIn("Warden", msg)
         self.assertIn("brig up", ctx.exception.suggestion or "")
 
+    def test_raises_brigerror_when_warden_ca_missing(self):
+        """Audit follow-up: pre-check that the CA file we're about to
+        mount actually exists, so an empty mitmproxy-state dir doesn't
+        produce a cryptic 'no such file' from podman build."""
+        from brig.commands import image_cmd
+        from brig.errors import BrigError
+
+        # vm_run("test -f ...") returns non-zero = file missing.
+        ca_missing = subprocess.CompletedProcess([], 1, "", "")
+        with patch.object(image_cmd.Path, "resolve",
+                          lambda self: self), \
+             patch.object(image_cmd.Path, "is_dir", lambda self: True), \
+             patch.object(image_cmd.Path, "is_file",
+                          lambda self: self.name == "Containerfile"), \
+             patch("brig.network.proxy.proxy_running", return_value=True), \
+             patch.object(image_cmd, "vm_run", return_value=ca_missing):
+            with self.assertRaises(BrigError) as ctx:
+                image_cmd.cmd_build(_args(use_warden=True))
+        self.assertIn("Warden CA cert is missing", str(ctx.exception))
+
+
+class TestResolveWardenIp(unittest.TestCase):
+    """Audit follow-up: _resolve_warden_ip must prefer the
+    proxy-external bridge, not just the first network in
+    `podman inspect`'s JSON dict order. A cell-network IP would be
+    unreachable from the build container's host-networking namespace."""
+
+    def _run(self, networks):
+        """Invoke _resolve_warden_ip with a fake `podman inspect`."""
+        import json as _json
+        from brig.commands import image_cmd
+        payload = [{"NetworkSettings": {"Networks": networks}}]
+        fake = subprocess.CompletedProcess(
+            [], 0, _json.dumps(payload), "",
+        )
+        with patch.object(image_cmd, "vm_run", return_value=fake):
+            return image_cmd._resolve_warden_ip()
+
+    def test_prefers_proxy_external_over_cell_networks(self):
+        from brig.config import PROXY_EXTERNAL_NETWORK
+        # cell-net comes first in dict order; must still pick ext.
+        ip = self._run({
+            "brig-alice": {"IPAddress": "10.60.1.2"},
+            PROXY_EXTERNAL_NETWORK: {"IPAddress": "192.168.42.5"},
+            "brig-bob": {"IPAddress": "10.60.2.2"},
+        })
+        self.assertEqual(ip, "192.168.42.5")
+
+    def test_raises_when_proxy_external_absent(self):
+        from brig.errors import BrigError
+        # Warden inexplicably not on the proxy-external network.
+        with self.assertRaises(BrigError) as ctx:
+            self._run({"brig-alice": {"IPAddress": "10.60.1.2"}})
+        self.assertIn("not attached", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

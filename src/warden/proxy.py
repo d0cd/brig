@@ -97,7 +97,8 @@ VM_ADDONS_DIR = VMPaths.ADDONS_DIR
 #     unprivileged, which aitelier hit hard on fresh installs)
 VM_WARDEN_STATE_DIR = Path("/var/lib/warden/mitmproxy-state")
 # Path inside the VM to warden's CA cert. brig.cell.ca_bundle reads from
-# here. Stays in lockstep with WARDEN_CA_PATH_IN_CONTAINER if you bump.
+# here directly via `cat` (no `podman exec`) — see VM_WARDEN_STATE_DIR
+# block above for the rationale.
 VM_WARDEN_CA_FILE = VM_WARDEN_STATE_DIR / "mitmproxy-ca-cert.pem"
 # Warden bind-mounts /state/system → /var/run/cells so it sees the same
 # subnet-map / per-cell policies / ingress routes the host CLI writes.

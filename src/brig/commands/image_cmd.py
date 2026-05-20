@@ -22,13 +22,16 @@ def _resolve_warden_ip() -> str:
     """Return warden's IP on the proxy-external network for use as the
     build-time HTTPS_PROXY target.
 
-    The build container runs in the VM with host networking (no per-cell
-    isolation), so warden is reachable at the proxy-external bridge's
-    gateway IP. We inspect rather than assume because podman networks
-    pick a random /24 unless configured.
+    Warden is attached to multiple networks: the proxy-external bridge
+    plus every cell network it reconnects to at start. The build
+    container runs with host networking in the VM and reaches warden
+    via the proxy-external bridge — so we must prefer that network
+    explicitly, NOT just take the first IP from `podman inspect`.
+    Returning a cell-network IP could route the build over a per-cell
+    isolated bridge the build container isn't a member of.
     """
     import json as _json
-    from brig.config import PROXY_NAME
+    from brig.config import PROXY_EXTERNAL_NETWORK, PROXY_NAME
     result = vm_run(
         ["podman", "inspect", PROXY_NAME, "--format", "json"], timeout=5,
     )
@@ -40,15 +43,20 @@ def _resolve_warden_ip() -> str:
     try:
         info_list = _json.loads(result.stdout)
         nets = info_list[0]["NetworkSettings"]["Networks"]
-        for _net_name, net in nets.items():
-            ip = net.get("IPAddress", "")
-            if ip:
-                return ip
     except (KeyError, IndexError, _json.JSONDecodeError):
-        pass
+        raise BrigError(
+            "Could not parse warden network settings",
+            suggestion="brig system doctor",
+        )
+    # Prefer the proxy-external bridge; that's the one the build
+    # container's host-networking namespace can reach.
+    ext = nets.get(PROXY_EXTERNAL_NETWORK) or {}
+    ip = ext.get("IPAddress", "")
+    if ip:
+        return ip
     raise BrigError(
-        "Could not determine warden's IP from podman inspect",
-        suggestion="brig system doctor",
+        f"Warden is not attached to network '{PROXY_EXTERNAL_NETWORK}'",
+        suggestion="brig system restart  (force warden to rejoin)",
     )
 
 
@@ -279,11 +287,26 @@ def cmd_build(args: Any) -> int:
     # overhead.
     extra_mounts: list[str] = []
     if getattr(args, "use_warden", False):
+        from brig.cell.ca_bundle import VM_WARDEN_CA_FILE
         from brig.network.proxy import proxy_running
         if not proxy_running():
             raise BrigError(
                 "Warden proxy is not running",
                 suggestion="Start with: brig up  (or omit --use-warden)",
+            )
+        # Pre-check the warden CA file exists. We mount it into the
+        # build container below; if it's missing podman build fails
+        # with a confusing "no such file" deep in the run. Surfacing
+        # the same friendly BrigError we use elsewhere (ca_bundle.py
+        # stage_bundle) means operators get one consistent diagnosis.
+        if vm_run(["test", "-f", str(VM_WARDEN_CA_FILE)], timeout=5).returncode != 0:
+            raise BrigError(
+                f"Warden CA cert is missing at {VM_WARDEN_CA_FILE}",
+                suggestion=(
+                    "Bring warden up first: brig up\n"
+                    "  (warden generates its CA at startup; the build "
+                    "would have no cert to mount otherwise)"
+                ),
             )
         # Use the VM-side warden bridge IP. Build container runs with
         # host networking inside the VM, so warden is reachable at the
@@ -305,7 +328,6 @@ def cmd_build(args: Any) -> int:
         # accepts the MITM cert. Build steps that COPY the CA into the
         # final image are an anti-pattern (it bakes a soon-to-rotate
         # cert) — see docs/design/cell-definition.md.
-        from brig.cell.ca_bundle import VM_WARDEN_CA_FILE
         extra_mounts += [
             "-v", f"{VM_WARDEN_CA_FILE}:/etc/ssl/certs/warden-ca.crt:ro",
         ]
