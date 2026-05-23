@@ -8,6 +8,7 @@ All podman commands route through vm_run() to execute inside the Lima VM.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 from brig.cell.lifecycle import kill_cell, rm_cell, run_cell, stop_cell
@@ -692,14 +693,45 @@ def cmd_read(args: Any) -> int:
 
 
 def cmd_logs(args: Any) -> int:
+    """Tail a cell's container stdout/stderr (wraps `podman logs`).
+
+    Empty output usually means the cell's app writes to a file inside
+    the container instead of stdout — common for daemons and agent
+    runtimes (SA, claude-acp, etc.). In that case, use
+    `brig cell exec <name> -- cat /var/log/<app>.log` or
+    `brig cell read <name> <path>` to inspect the file directly.
+
+    Hermes-feedback-driven: detect the empty case for the non-follow
+    path and surface the hint inline so operators don't waste time
+    wondering why `brig cell logs` is silent.
+    """
     cn = container_name(args.name)
     cmd = ["podman", "logs"]
-    if getattr(args, "follow", False):
+    follow = getattr(args, "follow", False)
+    if follow:
         cmd.append("-f")
     if getattr(args, "tail", None):
         cmd.extend(["--tail", str(args.tail)])
     cmd.append(cn)
-    return vm_run_interactive(cmd)
+    # Follow mode wants TTY passthrough; can't capture.
+    if follow:
+        return vm_run_interactive(cmd)
+    # Snapshot mode: capture so we can detect empty output and hint.
+    result = vm_run(cmd, capture=True, timeout=30)
+    if result.returncode == 0:
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        # Empty stdout + stderr likely means file-based logging.
+        if not (result.stdout.strip() or result.stderr.strip()):
+            from brig.ops.logging import info
+            info(
+                f"(no stdout/stderr from '{args.name}' — if the app logs "
+                f"to a file, try: brig cell exec {args.name} -- "
+                f"cat /var/log/<app>.log)"
+            )
+        return 0
+    sys.stderr.write(result.stderr)
+    return result.returncode
 
 
 def _parse_cp_target(spec: str) -> tuple[str, str] | None:
