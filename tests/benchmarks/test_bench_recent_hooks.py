@@ -81,6 +81,7 @@ def _non_sse_flow():
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_ingress_sse_detection_match(benchmark, ingress_router):
     """The hot path: every ingress response gets responseheaders'd.
     SSE-positive case (sets stream=True)."""
@@ -88,6 +89,7 @@ def test_bench_ingress_sse_detection_match(benchmark, ingress_router):
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_ingress_sse_detection_negative(benchmark, ingress_router):
     """SSE-negative case (most ingress flows). Must not be slower
     than the positive path."""
@@ -107,6 +109,7 @@ def _tls_clienthello_data(sni):
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_tls_clienthello_passthrough_match(benchmark, policy_enforcer):
     """Cell has chatgpt.com in both allow + tls_passthrough. Hook
     flips client_conn.tls_passthrough. Fires on every TLS egress."""
@@ -114,6 +117,7 @@ def test_bench_tls_clienthello_passthrough_match(benchmark, policy_enforcer):
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_tls_clienthello_no_passthrough(benchmark, policy_enforcer):
     """SNI not in passthrough list — common path for MITM flows."""
     benchmark(policy_enforcer.tls_clienthello, _tls_clienthello_data("api.anthropic.com"))
@@ -129,6 +133,7 @@ def _tcp_flow(port):
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_tcp_start_allow(benchmark, policy_enforcer):
     """TCP host_service permitted-port path. Per-connection cost for
     every cell that uses TCP host_services."""
@@ -136,6 +141,7 @@ def test_bench_tcp_start_allow(benchmark, policy_enforcer):
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_tcp_start_deny(benchmark, policy_enforcer):
     """TCP host_service blocked-port path. Fail-closed must still be
     fast — DoS resilience."""
@@ -147,6 +153,7 @@ def test_bench_tcp_start_deny(benchmark, policy_enforcer):
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_policy_is_passthrough_match(benchmark):
     """Invariant 11 defense-in-depth check. Runs at every
     tls_clienthello and gates the passthrough flip — must be µs."""
@@ -163,6 +170,7 @@ def test_bench_policy_is_passthrough_match(benchmark):
 
 
 @pytest.mark.bench
+@pytest.mark.benchmark(group="recent_hooks", max_time=0.5, min_rounds=5)
 def test_bench_policy_is_passthrough_no_match(benchmark):
     """Negative path — host not in passthrough list. Hot for every
     TLS connection that ISN'T passthrough (the majority)."""

@@ -104,10 +104,14 @@ class TestStageBundleErrorPath(unittest.TestCase):
         self.assertIn("Warden CA cert is missing", msg)
         self.assertIn("brig up", ctx.exception.suggestion or "")
 
-    def test_raises_runtime_error_when_concat_fails(self):
+    def test_raises_brigerror_when_concat_fails(self):
         """If the CA file IS there but the concat step itself fails
-        (disk full, perms), surface the raw stderr so operators can grep."""
+        (disk full, perms), surface a BrigError with the raw stderr +
+        a suggestion line — consistent with the pre-check path so the
+        operator gets the same shape regardless of which failure
+        mode hit. Audit H1."""
         from brig.cell import ca_bundle
+        from brig.errors import BrigError
         # First call (test -f) succeeds; second call (sudo sh -c concat) fails.
         calls = [
             MagicMock(returncode=0, stderr="", stdout=""),
@@ -118,11 +122,12 @@ class TestStageBundleErrorPath(unittest.TestCase):
             ),
         ]
         with patch.object(ca_bundle, "vm_run", side_effect=calls):
-            with self.assertRaises(RuntimeError) as ctx:
+            with self.assertRaises(BrigError) as ctx:
                 ca_bundle.stage_bundle("alice")
         self.assertIn("Failed to stage CA bundle", str(ctx.exception))
         self.assertIn("alice", str(ctx.exception))
         self.assertIn("Read-only file system", str(ctx.exception))
+        self.assertIn("brig system doctor", ctx.exception.suggestion or "")
 
 
 if __name__ == "__main__":

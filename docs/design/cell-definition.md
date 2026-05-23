@@ -275,7 +275,7 @@ Limitations:
   to raw TCP or binary protocols.
 - No automatic detection: every socket is declared in the cell yaml.
 - Cannot expose services that lack a unix-socket transport. See
-  [Not supported: raw TCP host services](#not-supported-raw-tcp-host-services)
+  [Raw TCP host services (via `protocol: tcp`)](#raw-tcp-host-services-via-protocol-tcp)
   below for affected protocols and workarounds.
 
 ## Host Services
@@ -336,45 +336,55 @@ languages. Combined with HTTP via `host_services` (egress) and
 `ingress` (inbound), the unix-socket path via `host_sockets` covers
 the common cell-to-host access patterns.
 
-### Not supported: raw TCP host services
+### Raw TCP host services (via `protocol: tcp`)
 
-Brig does not currently expose raw TCP forwarding as a first-class
-cell-yaml feature. The following patterns therefore have no
-declarative form in brig today:
+Cells reach TCP services on the host with the same `host_services`
+block, using `protocol: tcp`. Warden binds a listener per declared
+port (mitmproxy `--mode reverse:tcp`) and forwards raw bytes to
+`host.lima.internal:<port>` — single trust boundary, connection-level
+audit (no per-message body inspection, which is opaque for binary DB
+wire protocols anyway).
 
-- **SSH from a cell to a host.** The SSH protocol requires a network
-  endpoint and has no unix-socket transport.
-- **Distributed or replica-set service discovery.** Mongo replica
-  sets, etcd, Consul Connect, and similar protocols probe additional
-  servers by DNS during connection setup. Single-instance access via
-  unix socket works; replica-set discovery does not.
-- **TLS services requiring strict SNI hostname verification.** When
-  the client does not expose an option to override the expected
-  hostname, the unix-socket transport cannot satisfy verification.
-  This affects some enterprise JDBC drivers and some HTTPS libraries.
-- **Legacy TCP-only drivers.** Database drivers that have not added
-  unix-socket support (for example, older Oracle JDBC and some MSSQL
-  TDS clients).
+```yaml
+host_services:
+  - {name: db, port: 5432, protocol: tcp}     # Postgres
+  - {name: redis, port: 6379, protocol: tcp}
+  - {name: mongo, port: 27017, protocol: tcp}
+```
 
-Adding first-class raw TCP host services is deferred pending a
-concrete consumer. The open design decisions — per-cell port
-allocation versus SNI demultiplexing, TLS termination versus
-passthrough, per-cell connection budgets, and the audit-log shape —
-are best resolved against the requirements of a specific protocol
-rather than in the abstract.
+In the cell, the upstream is reachable on the same port with a normal
+TCP client:
 
-Workarounds available today:
+    psql -h db.host.brig -p 5432 ...
+    redis-cli -h redis.host.brig -p 6379 ...
 
-- Run a host-side tunnel that exposes the remote TCP endpoint as a
-  unix socket, then declare that socket via `host_sockets`:
+Operational notes:
 
-      socat UNIX-LISTEN:/tmp/db.sock,fork TCP-CONNECT:remote:5432
+- **First add of a TCP service triggers a warden restart** so the new
+  `--mode reverse:tcp` listener binds. `brig run` prompts before
+  restart (warden restart drops every running cell's open egress for
+  ~5s). Re-run with `--yes` to auto-confirm.
+- **Reserved ports**: 8080 (warden HTTP proxy) and 8443 (ingress) are
+  rejected at parse time.
+- **Untrusted profile** rejects `protocol: tcp` — adversarial cells
+  stay HTTP-only and inspectable.
+- **TCP host_services bypass mitmproxy MITM** — no URL audit, no body
+  inspection. Audit shape is connection-level (cell, service, bytes,
+  duration) via `tcp_start`.
 
-- Use SSH `LocalForward` to terminate at a unix socket on the host,
-  declared via `host_sockets` as above.
+Patterns where TCP host_services or `host_sockets` (unix-socket
+variant) is the right answer:
 
-- Run the dependent service inside the cell itself when isolation
-  from the host is acceptable.
+- Database protocols (Postgres, MySQL, MongoDB, Redis, Cassandra)
+- SSH from cell to a host bastion
+- gRPC-over-h2c
+- Replica-set / service discovery that probes by DNS
+- Legacy TCP-only drivers (Oracle JDBC, MSSQL TDS)
+
+`host_sockets` is still preferred when the upstream already speaks
+unix sockets — bypass-of-warden is total there (see invariant 10).
+TCP host_services preserve warden in the path for audit + connection
+limits.
 
 ## Examples
 

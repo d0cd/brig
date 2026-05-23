@@ -265,6 +265,26 @@ verify_cell_single_homed() {
 
 ---
 
+### Invariant 10: `host_sockets` Bypass Warden by Design
+
+**Rule:** A cell that declares `host_sockets: [...]` in its yaml bind-mounts a macOS-side unix socket into the cell at a path under `/run/host/`. Bytes flow kernel-direct between the cell and the host service — no proxy interposition possible.
+
+**Why this matters:** Some upstream services (Postgres / Redis / ssh-agent) don't speak HTTP and can't meaningfully traverse a CONNECT-style proxy. The `host_sockets` primitive trades audit visibility for protocol generality.
+
+**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 10):
+
+1. **Opt-in per cell yaml.** No default access; the operator's act of writing the entry IS the security review.
+2. **Untrusted profile cannot declare `host_sockets`** at parse time. Adversarial cells don't get side channels.
+3. **Engine sockets (`docker.sock`, `podman.sock`, …) are denylisted** at parse time AND at bridge-start (defense in depth).
+4. **Bridge sockets are real unix sockets, never symlinks** (lstat check defends against TOCTOU swap of the bridge path).
+5. **Per-cell namespacing** — cell A's bridge can't be reused by cell B.
+6. **Every attach is audited** via `log_lifecycle("host_socket_attach", …)`.
+7. **The cell startup banner** explicitly says Warden does not see the traffic, so operators internalize the trade-off.
+
+For host services that DO speak TCP but aren't worth bypassing Warden entirely, `host_services` with `protocol: tcp` keeps Warden in the path (connection-level audit only — see cell-definition.md).
+
+---
+
 ### Invariant 11: TLS Passthrough Is an Explicit, Opt-In TLS-Handling Override
 
 **Rule:** A cell that declares `policy.tls_passthrough: [<host>]` in its yaml — *with* the same host listed in `policy.allow` — tells Warden to tunnel that host's TLS traffic raw, without decrypting. Warden routes by SNI; no MITM, no body inspection, no per-URL log entry.
@@ -308,6 +328,24 @@ policy:
 ```
 
 Two lists, not one with attributes, so `grep -l tls_passthrough cells/*.yaml` answers "which cells have un-inspected egress?" in a single command.
+
+---
+
+### Invariant 12: Warden CA Auto-Mount Is Per-Cell, Re-Extracted From Container, Opt-Out-Able
+
+**Rule:** Cells with `trust_warden_ca: true` (the default) get a combined system+Warden CA bundle bind-mounted at `/run/brig/ca-bundle.crt`, with `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` auto-exported. Bundle is staged from the live Warden container at every cell start — not cached on macOS.
+
+**Why this matters:** Without auto-mount, every brig-cell consumer rediscovers a manual workaround (extract CA → concat onto system roots → export the four env vars). Auto-mount also lets brig handle CA rotation transparently: every cell start re-extracts the current Warden CA, so a `brig system restart` (which can rotate the CA) doesn't leave cells with stale trust.
+
+**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 12):
+
+1. **Bundle source-of-truth is `/var/lib/warden/mitmproxy-state/`** on the VM — a persistent dir owned by uid 1000 (mitmproxy user). Bind-mounted into Warden so mitmproxy can write the CA. Brig reads via plain `cat` — no `podman exec` (audit eliminated that surface; see commits 51082fd, 6b51eed).
+2. **CA generated eagerly at `warden start`.** Polls for the cert file up to 30s after container is healthy; refuses to declare Warden ready until it exists. Cells racing a fresh `brig system up` can no longer get an empty bundle.
+3. **Bundle staged inside the VM, not on macOS.** Lives at `/state/<cell>/ca-bundle.crt`; the VM is the trust boundary (invariant 4 keeps macOS state untrusted).
+4. **Cell-side mount is read-only.** Compromised cell can't tamper with its own trust store.
+5. **Cell-set env wins.** Operators / image authors who explicitly set `SSL_CERT_FILE` keep their value (brig only fills vars the cell didn't declare). **Foot-gun:** if the image sets `SSL_CERT_FILE` differently from `/run/brig/ca-bundle.crt`, a Warden CA rotation can produce silent TLS hangs. `brig system doctor` now inspects each running cell's effective `Config.Env` and warns on mismatch.
+6. **Airgapped cells (`network: none`) skip the mount.** No egress = no CA to validate.
+7. **Opt-out via `trust_warden_ca: false`.** For cells with strict pinning or that manage their own trust store.
 
 ---
 

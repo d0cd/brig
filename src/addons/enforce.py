@@ -71,6 +71,13 @@ ALLOWED_PORTS = {80, 443}
 # Maximum number of cell policies to cache (LRU eviction beyond this).
 MAX_CACHED_CELL_POLICIES = 1000
 
+# Per-cell policy JSON files are mounted from the brig CLI side. brig
+# writes them via atomic_write_json; the writer has no explicit size cap.
+# Cap reads here so a malformed / tampered file can't OOM warden by
+# loading a multi-gigabyte JSON. 1 MiB is well above any realistic
+# policy (1000 rules ≈ ~100 KiB at the verbose end). Audit H3.
+MAX_POLICY_FILE_BYTES = 1024 * 1024
+
 
 class PolicyEnforcer:
     """mitmproxy addon for policy enforcement."""
@@ -237,7 +244,22 @@ class PolicyEnforcer:
 
             for policy_file in CELL_POLICY_DIR.glob("*.json"):
                 cell_name = policy_file.stem
-                mtime = policy_file.stat().st_mtime
+                stat = policy_file.stat()
+                mtime = stat.st_mtime
+
+                # Size cap (audit H3) — refuse to load files larger than
+                # MAX_POLICY_FILE_BYTES. Fail-closed: a too-large file
+                # leaves the previous policy (if any) in place; cells
+                # without a prior policy hit the existing "no per-cell
+                # policy" block at request time. Logged so operators
+                # see the rejection.
+                if stat.st_size > MAX_POLICY_FILE_BYTES:
+                    ctx.log.error(
+                        f"PolicyEnforcer: skipping policy '{cell_name}' "
+                        f"({stat.st_size} bytes > "
+                        f"{MAX_POLICY_FILE_BYTES} byte cap)"
+                    )
+                    continue
 
                 with self._cell_policy_lock:
                     if self.cell_policy_mtimes.get(cell_name) == mtime:

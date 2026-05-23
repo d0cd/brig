@@ -102,9 +102,19 @@ def stage_bundle(cell_name: str) -> None:
     )
     result = vm_run(["sudo", "sh", "-c", script], timeout=15)
     if result.returncode != 0:
-        raise RuntimeError(
+        # BrigError (not RuntimeError) so the operator gets the
+        # standard suggestion-line affordance brig uses everywhere
+        # else. The pre-check above already raises BrigError; the
+        # split between BrigError + RuntimeError here was an
+        # inconsistency caught by audit H1.
+        raise BrigError(
             f"Failed to stage CA bundle for {cell_name}: "
-            f"{result.stderr.strip()}"
+            f"{result.stderr.strip()}",
+            suggestion=(
+                "Check VM filesystem state: brig system doctor\n"
+                "  If /state/<cell>/ is read-only or full, free space "
+                "and retry."
+            ),
         )
 
 

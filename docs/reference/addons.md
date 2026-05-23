@@ -47,7 +47,33 @@ None there anyway — see `docs/INVARIANTS.md` invariant 2.)
 A `tls_clienthello` hook implements invariant 11 (TLS passthrough): for
 hosts that match both `policy.allow` and `policy.tls_passthrough` AND
 whose SNI equals the CONNECT host, warden tunnels TCP raw instead of
-MITM-ing.
+MITM-ing. Fails closed: if the CONNECT host can't be read (mitmproxy
+API quirk) or SNI doesn't match, passthrough is NOT flipped — the
+flow falls through to MITM and the cell sees a cert error.
+
+A `tcp_start` hook gates per-cell access for raw TCP `host_services`
+(invariant 11/MVP+):
+  - Resolves cell from peer IP via the subnet-map.
+  - Loads the cell's per-cell policy.
+  - Allows only if the listening port appears in `cell.tcp_host_services_map`.
+  - Tags `flow.metadata["host_service_protocol"] = "tcp"` so otel_export
+    emits per-service counters; logger writes a `TCP HOST_SERVICE`
+    audit line.
+  - Skips TLS-passthrough flows (different mechanism).
+  - Fail-closed on any unexpected mitmproxy API shape.
+
+OTel passthrough metrics emitted via `otel_export.py` `tcp_start` /
+`tcp_message` / `tcp_end` hooks:
+
+| Metric | Cardinality |
+|---|---|
+| `warden_passthrough_connections_total{cell,host}` | one counter per (cell, SNI) |
+| `warden_passthrough_bytes_total{cell,host,direction}` | direction ∈ {in, out} |
+| `warden_passthrough_duration_ms{cell,host}` | histogram |
+
+These surface in `brig system stats` as `PT/CONN` / `PT/IN` / `PT/OUT`
+columns (the `PT/*` callout appears when any cell had passthrough
+connections).
 
 Configured via `~/.brig/cells/network-policy.json`:
 

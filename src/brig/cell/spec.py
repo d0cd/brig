@@ -624,22 +624,25 @@ def _v_host_service_entry(
             f"'host_services[{i}].protocol' must be 'http' or 'tcp'{context}"
         )
 
-    # Reject TCP services on warden's reserved ports — those collide
-    # with warden's own HTTP forward proxy (8080) and ingress reverse
-    # proxy (8443). Hardcoded as the schema validator (which can't
-    # easily import warden constants) — kept in lockstep with
-    # src/warden/proxy.py:WARDEN_RESERVED_PORTS, and a constant-mirror
-    # test pins the two.
-    if (
-        protocol == "tcp"
-        and isinstance(port, int)
-        and port in (8080, 8443)
-    ):
-        errors.append(
-            f"'host_services[{i}].port' {port} is reserved by warden "
-            f"(HTTP proxy / ingress); pick a different upstream port"
-            f"{context}"
-        )
+    # Reject TCP services on warden's reserved ports (HTTP forward
+    # proxy + ingress reverse proxy). Import the actual constant from
+    # warden so spec and warden stay in lockstep — was previously
+    # hardcoded (8080, 8443) with a constant-mirror test; audit M6
+    # removed the DRY violation.
+    if protocol == "tcp" and isinstance(port, int):
+        try:
+            from warden.proxy import WARDEN_RESERVED_PORTS
+            reserved = WARDEN_RESERVED_PORTS
+        except ImportError:
+            # warden module not importable in some test contexts —
+            # fall back to the known set rather than crash validation.
+            reserved = frozenset({8080, 8443})
+        if port in reserved:
+            errors.append(
+                f"'host_services[{i}].port' {port} is reserved by "
+                f"warden (HTTP proxy / ingress); pick a different "
+                f"upstream port{context}"
+            )
 
     return errors
 
