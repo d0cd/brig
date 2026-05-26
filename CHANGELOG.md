@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-26
+
 ### Added
 
 - TCP `host_services` — declare `protocol: tcp` on a host_service entry to forward L4 traffic from the cell to a host port through warden's TCP listener. HTTP entries still go through mitmproxy at L7. Warden auto-restarts when a cell adds a new TCP host_service port that needs a listener bound.

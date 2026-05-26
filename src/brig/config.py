@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 
 # Version.
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # Lima VM name.
 VM_NAME = "brig"
