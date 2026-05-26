@@ -4,10 +4,7 @@ Covers:
   - Webhook URL SSRF prevention (notifier.py)
 """
 
-import json
-import os
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -24,7 +21,7 @@ _addons_dir = str(Path(__file__).parent.parent / "src" / "addons")
 if _addons_dir not in sys.path:
     sys.path.insert(0, _addons_dir)
 
-from notifier import _resolve_webhook_url, Notifier, BLOCKED_NETWORKS  # noqa: E402
+from notifier import _resolve_webhook_url, Notifier  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

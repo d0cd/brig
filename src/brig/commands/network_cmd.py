@@ -5,10 +5,9 @@ CLI handlers for network and event commands.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
-from brig.config import CONTAINER_PREFIX, STATE_DIR, VMPaths
+from brig.config import STATE_DIR, VMPaths
 from brig.errors import BrigError
 from brig.ops.logging import output
 from brig.vm.shell import vm_run

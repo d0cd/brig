@@ -7,15 +7,13 @@ podman command routed through limactl shell.
 This is the closest we can get to an end-to-end test without a Mac + Lima.
 """
 
-import json
 import subprocess
 import unittest
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import patch
 
 from brig.cell.reconciler import (
     ActionType,
     CellState,
-    ReconcileResult,
     build_run_command,
     plan_run,
 )
@@ -225,6 +223,7 @@ class TestProxyEnvRejection(unittest.TestCase):
 
     def test_all_15_forms_rejected(self):
         """5 proxy vars × 3 case forms = 15 rejection tests."""
+        from brig.errors import BrigError
         rejected = 0
         for var in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "ftp_proxy"]:
             for form in [var, var.upper(), var.capitalize()]:
@@ -232,6 +231,6 @@ class TestProxyEnvRejection(unittest.TestCase):
                 try:
                     build_run_command(spec, "10.60.1.1")
                     self.fail(f"{form} was not rejected")
-                except ValueError:
+                except BrigError:
                     rejected += 1
         self.assertEqual(rejected, 15)

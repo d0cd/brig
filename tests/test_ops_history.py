@@ -142,6 +142,41 @@ class TestRedaction(unittest.TestCase):
         self.assertIsNone(_extract_cell_name(args))
 
 
+class TestErrorRedaction(unittest.TestCase):
+    """Error strings logged to operations.jsonl must redact host paths
+    AND secret-shaped tokens. A naive regex that stops at the first ':'
+    leaves traceback fragments intact.
+    """
+
+    def test_user_home_path_redacted(self):
+        from brig.ops.history import _redact_error
+        err = 'File "/Users/d0c/projects/brig/foo.py", line 12'
+        result = _redact_error(err)
+        self.assertNotIn("/Users/d0c", result)
+        self.assertIn("<path>", result)
+
+    def test_tmp_path_redacted(self):
+        from brig.ops.history import _redact_error
+        err = 'tempfile at /tmp/brig-abc/secret.json failed'
+        result = _redact_error(err)
+        self.assertNotIn("/tmp/brig-abc/secret.json", result)
+        self.assertIn("<path>", result)
+
+    def test_long_hex_token_redacted(self):
+        from brig.ops.history import _redact_error
+        err = "auth header carried " + ("a" * 40) + " value"
+        result = _redact_error(err)
+        self.assertNotIn("a" * 40, result)
+        self.assertIn("<redacted>", result)
+
+    def test_base64ish_long_token_redacted(self):
+        from brig.ops.history import _redact_error
+        token = "x" * 32 + "Y" * 8
+        err = f"failure due to token {token}"
+        result = _redact_error(err)
+        self.assertNotIn(token, result)
+
+
 class TestOperationStartEnd(unittest.TestCase):
     """Test log_operation_start/end with config."""
 

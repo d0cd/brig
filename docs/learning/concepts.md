@@ -157,8 +157,6 @@ Even if a cell ignores `HTTP_PROXY` environment variables, it still can't reach 
 
 ```yaml
 # network-policy.json
-default: deny
-
 allow:
   - pypi.org
   - "*.pythonhosted.org"
@@ -213,10 +211,11 @@ Files are more secure:
      - anthropic-key
    ```
 
-2. **Create secret files** on macOS:
+2. **Create secret files** on macOS — the file name is exactly the
+   secret name (no extension):
    ```
-   ~/.brig/secrets/openai-key.txt    # Contains: sk-...
-   ~/.brig/secrets/anthropic-key.txt # Contains: sk-ant-...
+   ~/.brig/secrets/openai-key       # Contains: sk-...
+   ~/.brig/secrets/anthropic-key    # Contains: sk-ant-...
    ```
 
 3. **Cell sees**:
@@ -305,7 +304,7 @@ The `~/.brig/state/` directory contains untrusted output from cells.
 
 1. Review files inside the VM first:
    ```bash
-   brig cat my-cell /work/output.txt
+   brig cell read my-cell /work/output.txt
    brig cell files my-cell
    ```
 

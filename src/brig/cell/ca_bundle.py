@@ -31,6 +31,7 @@ set, leaving the cell's image defaults in place.
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 from brig.config import VMPaths
@@ -93,20 +94,23 @@ def stage_bundle(cell_name: str) -> None:
     # sudo whitelist when invoked separately, but here we mkdir inside
     # the same sh -c — so we route through sudo explicitly for the
     # rare case the state dir doesn't yet exist with the right perms).
+    #
+    # shlex.quote interpolated paths as defense in depth; cell_name is
+    # the only user input and CELL_NAME_PATTERN rejects shell metacharacters,
+    # but a future loosening of that regex must not turn this into an injection.
     script = (
         f"set -e; "
-        f"mkdir -p {bundle.parent}; "
-        f"cat {SYSTEM_CA_BUNDLE_IN_VM} {VM_WARDEN_CA_FILE} > {tmp}; "
-        f"chmod 0644 {tmp}; "
-        f"mv {tmp} {bundle}"
+        f"mkdir -p {shlex.quote(str(bundle.parent))}; "
+        f"cat {shlex.quote(SYSTEM_CA_BUNDLE_IN_VM)} "
+        f"{shlex.quote(VM_WARDEN_CA_FILE)} > {shlex.quote(str(tmp))}; "
+        f"chmod 0644 {shlex.quote(str(tmp))}; "
+        f"mv {shlex.quote(str(tmp))} {shlex.quote(str(bundle))}"
     )
     result = vm_run(["sudo", "sh", "-c", script], timeout=15)
     if result.returncode != 0:
         # BrigError (not RuntimeError) so the operator gets the
         # standard suggestion-line affordance brig uses everywhere
-        # else. The pre-check above already raises BrigError; the
-        # split between BrigError + RuntimeError here was an
-        # inconsistency caught by audit H1.
+        # else, matching the pre-check above which already raises BrigError.
         raise BrigError(
             f"Failed to stage CA bundle for {cell_name}: "
             f"{result.stderr.strip()}",

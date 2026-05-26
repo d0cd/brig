@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 import sys
 import tempfile
@@ -74,12 +73,11 @@ class TestPolicyIsPassthrough(unittest.TestCase):
 
 
 class TestPassthroughAllowWildcardCoverage(unittest.TestCase):
-    """Audit H1: validator must accept passthrough hosts covered by an
-    allow wildcard, not just exact-string allow entries. Runtime
-    is_passthrough() uses wildcard-aware lookup; exact-string-only
-    parse-time validation diverged from runtime and rejected legitimate
-    configs (e.g. allow: ['*.openai.com'] + tls_passthrough:
-    ['auth.openai.com'])."""
+    """Validator must accept passthrough hosts covered by an allow
+    wildcard, not just exact-string allow entries. Runtime
+    is_passthrough() uses wildcard-aware lookup; parse-time validation
+    must agree so configs like allow: ['*.openai.com'] +
+    tls_passthrough: ['auth.openai.com'] aren't rejected."""
 
     def test_passthrough_subdomain_covered_by_wildcard_accepted(self):
         from brig.cell.spec import validate_cell_definition
@@ -202,11 +200,10 @@ class TestPrintNetworkLineRendersPassthrough(unittest.TestCase):
 
 
 class TestTlsClientHelloFailsClosed(unittest.TestCase):
-    """Audit C1: tls_clienthello MUST NOT flip passthrough when the
-    CONNECT host can't be read (e.g. mitmproxy didn't populate
-    context.server.address). Otherwise a malicious cell could ship
-    arbitrary SNI through warden as a tunnel after CONNECTing to an
-    allowed host."""
+    """tls_clienthello MUST NOT flip passthrough when the CONNECT host
+    can't be read (e.g. mitmproxy didn't populate context.server.address).
+    Otherwise a malicious cell could ship arbitrary SNI through warden
+    as a tunnel after CONNECTing to an allowed host."""
 
     def _enforcer(self):
         import sys

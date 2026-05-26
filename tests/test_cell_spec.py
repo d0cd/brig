@@ -6,7 +6,6 @@ Covers invariants 1, 6, 8 (network validation).
 import json
 import tempfile
 import unittest
-from pathlib import Path
 
 from brig.cell.spec import (
     CellSpec,
@@ -72,6 +71,29 @@ class TestValidateCellDefinition(unittest.TestCase):
     def test_secrets_traversal(self):
         errors = validate_cell_definition({"secrets": ["../etc/passwd"]})
         self.assertTrue(any("path traversal" in e for e in errors))
+
+    def test_secrets_empty_rejected(self):
+        """Empty secret name must be rejected; it would collapse
+        Path('/secrets') / '' to '/secrets', mounting the whole secrets
+        directory into the cell."""
+        errors = validate_cell_definition({"secrets": [""]})
+        self.assertTrue(any("non-empty" in e or "must match" in e for e in errors))
+
+    def test_secrets_null_byte_rejected(self):
+        """Null bytes are rejected at validation time."""
+        errors = validate_cell_definition({"secrets": ["api\x00key"]})
+        self.assertTrue(any("null byte" in e or "must match" in e for e in errors))
+
+    def test_secrets_leading_dash_rejected(self):
+        """Leading dash could be parsed as a flag by downstream tooling.
+        Secret-name regex requires alphanumeric start."""
+        errors = validate_cell_definition({"secrets": ["-rm"]})
+        self.assertTrue(any("must match" in e for e in errors))
+
+    def test_secrets_valid(self):
+        """Common shapes pass: lowercase, dots, underscores, hyphens."""
+        errors = validate_cell_definition({"secrets": ["api-key", "openai.token", "x_y"]})
+        self.assertEqual(errors, [])
 
     def test_invalid_memory(self):
         errors = validate_cell_definition({"memory": "abc"})
@@ -172,7 +194,11 @@ class TestValidateCellDefinition(unittest.TestCase):
     def test_workspace_mount_shadowing_run_secrets_rejected(self):
         # The crown jewel: a cell that sets workspace_mount: /run/secrets
         # would hide its own secrets dir behind the workspace mount. Reject.
+        # /run/host and /run/brig also covered: host_sockets + downward
+        # API + CA bundle mount roots, shadowed = silent breakage.
         for shadow in ("/run/secrets", "/run/secrets/foo",
+                       "/run/host", "/run/host/foo.sock",
+                       "/run/brig", "/run/brig/cell.json",
                        "/proc", "/sys", "/dev", "/etc/passwd"):
             errors = validate_cell_definition({"workspace_mount": shadow})
             self.assertTrue(
@@ -220,7 +246,7 @@ class TestValidateCellDefinition(unittest.TestCase):
         self.assertEqual(spec.memory, "4")
 
     def test_workspace_mount_ancestor_of_forbidden_rejected(self):
-        """Audit M3: workspace_mount: /run would shadow /run/secrets via
+        """workspace_mount: /run would shadow /run/secrets via
         mount-over-mount, even though /run itself isn't in the forbidden
         set. The cell starts fine; secrets silently disappear."""
         errors = validate_cell_definition({"workspace_mount": "/run"})

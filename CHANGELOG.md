@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- TCP `host_services` — declare `protocol: tcp` on a host_service entry to forward L4 traffic from the cell to a host port through warden's TCP listener. HTTP entries still go through mitmproxy at L7. Warden auto-restarts when a cell adds a new TCP host_service port that needs a listener bound.
+- TLS passthrough (invariant 11): `policy.tls_passthrough` opts a cell out of MITM for specific hosts that refuse mitmproxy's relayed handshake. Each entry must also appear in `policy.allow`; the untrusted profile cannot declare passthrough.
+- Auto-mount Warden CA bundle (invariant 12): cells get `/run/brig/ca-bundle.crt` (system roots + Warden CA) plus `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` pointed at it, unless the cell sets those env vars itself or opts out via `trust_warden_ca: false`.
+- OpenTelemetry collector subsystem (phases 1-3): sidecar collector container (pinned image digest), warden SDK instrumentation, `brig system stats` (per-cell summary scraped from the collector), `brig cell trace <trace_id>` (request trace by id), `brig cell network --otel` (read warden flows from the collector instead of per-cell JSONL), benchmark forwarding.
+- `brig image build <dir>` — wrap `podman build` inside the VM. `--use-warden` injects HTTPS_PROXY / HTTP_PROXY / NO_PROXY and mounts the Warden CA so the build's HTTP traffic flows through the same policy as runtime.
+- `brig cell trace <trace_id>` — render a request trace from the collector.
+- `brig system stats` — per-cell summary (requests, bytes, blocks) from the collector.
+- `brig system prune` detects orphan workspace directories under `~/.brig/state/` whose cell no longer exists.
+
+### Security
+
+- `image_digest` is now enforced at runtime, not just at parse time. The reconciler rewrites `image` to `image@digest` form before `podman run`, so podman refuses any mismatch at pull time.
+- Secret-name validator rejects empty strings, null bytes, and leading dashes (in addition to traversal). An empty name would previously collapse `Path("/secrets") / ""` and bind-mount the whole secrets directory into the cell.
+- Reconciler calls `validate_secret_path` before bind-mounting each secret into a cell. Defends against a symlink under `~/.brig/secrets/` escaping the directory at run time.
+- `O_NOFOLLOW` when writing secrets via `brig secrets add` so a pre-planted symlink at the target name can't redirect the write.
+- `host_socket` bridge plist freezes the connect target via `realpath` before launchd sees it; a swap of the host path after the plist is written can no longer redirect the bridge.
+- `save_cell_policy` writes are serialized under `fcntl` so concurrent `brig policy set` invocations don't interleave.
+- Ops addon's health endpoint binds to loopback inside the warden container so it isn't reachable from cells.
+- `ca_bundle` staging shell-quotes interpolated paths.
+- `BLOCKED_NETWORKS` now includes `64:ff9b::/96` (NAT64), `100::/64` (discard), and `2002::/16` (6to4) — covers IPv6 SSRF vectors the original list missed.
+- `/run/host` and `/run/brig` added to `workspace_mount` forbidden_prefixes. Shadowing either silently breaks host_sockets or the downward-API metadata.
+- Policy reload uses nanosecond mtime comparison so a sub-second rewrite triggers a reload.
+- Operations-log error redactor tightened so paths and secret values don't leak through error messages.
+- Host-side `domain_matches_rule` matches the addon's IDN encoding so YAML wildcard rules and runtime evaluation agree on punycode hosts.
+- Webhook notifier resolves the configured URL's host at config load and refuses connections that resolve to a different IP later (pins DNS).
+
 ## [0.3.0] - 2026-05-18
 
 ### Added

@@ -1,7 +1,6 @@
-"""Smoke coverage for command handler modules that previously had no
-dedicated tests (audit C5). Each test exercises the happy path and at
-least one error case so a future refactor that breaks the handler
-signature or imports is caught.
+"""Smoke coverage for command handler modules. Each test exercises the
+happy path and at least one error case so a future refactor that breaks
+the handler signature or imports is caught.
 
 Not meant to replace integration tests — these are guard rails against
 silent breakage. Deeper behavior tests live alongside the features
@@ -10,12 +9,11 @@ themselves (e.g. test_warden_ca_mount.py, test_image_build_use_warden.py)."""
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 def _args(**kw):

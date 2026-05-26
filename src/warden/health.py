@@ -10,7 +10,6 @@ from pathlib import Path
 
 from brig.vm.shell import vm_run
 
-from brig.ops.logging import debug
 
 
 @dataclass

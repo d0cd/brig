@@ -12,7 +12,6 @@ subprocess.run() directly.
 from __future__ import annotations
 
 import subprocess
-from typing import Any
 
 from brig.config import VM_NAME
 from brig.ops.logging import debug
@@ -34,7 +33,7 @@ def _redact_cmd(cmd: list[str]) -> str:
     Also redacts the value of env-var assignments whose KEY contains a
     known-credential substring (PASSWORD, TOKEN, SECRET, etc.) — common
     for `podman run -e KEY=VALUE` patterns where a leak through debug
-    logs is the most likely accidental disclosure path (audit M12).
+    logs is the most likely accidental disclosure path.
     """
     redacted: list[str] = []
     skip_next = False

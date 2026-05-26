@@ -1,7 +1,6 @@
 """Tests for brig.cell.reconciler — declarative reconciliation engine."""
 
 import unittest
-from unittest.mock import patch
 
 from brig.cell.reconciler import (
     ActionType,
@@ -151,17 +150,19 @@ class TestBuildRunCommand(unittest.TestCase):
 
     def test_proxy_env_override_rejected(self):
         """User cannot override proxy env vars."""
+        from brig.errors import BrigError
         spec = CellSpec(name="test", image="alpine", env=["http_proxy=evil"])
-        with self.assertRaises(ValueError, msg="Cannot override proxy"):
+        with self.assertRaises(BrigError, msg="Cannot override proxy"):
             build_run_command(spec, "10.60.1.1")
 
     def test_all_proxy_env_names_rejected(self):
         """All 5 proxy env var names are rejected."""
+        from brig.errors import BrigError
         proxy_vars = ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "ftp_proxy"]
         for var in proxy_vars:
             for form in [var, var.upper(), var.capitalize()]:
                 spec = CellSpec(name="test", image="alpine", env=[f"{form}=evil"])
-                with self.assertRaises(ValueError, msg=f"{form} should be rejected"):
+                with self.assertRaises(BrigError, msg=f"{form} should be rejected"):
                     build_run_command(spec, "10.60.1.1")
 
     def test_security_hardening(self):

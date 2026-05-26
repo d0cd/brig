@@ -10,10 +10,10 @@ from brig.vm.shell import vm_run
 from pathlib import Path
 from typing import Any
 
-from brig.config import BRIG_HOME, CONTAINER_PREFIX, PROXY_NAME, STATE_DIR, container_name
+from brig.config import BRIG_HOME, CONTAINER_PREFIX, STATE_DIR, container_name
 from brig.errors import BrigError
 from brig.ops.atomic import atomic_write_json
-from brig.ops.logging import debug, info, output
+from brig.ops.logging import debug, output
 from brig.security.verify import verify_all
 
 
@@ -457,22 +457,11 @@ def cmd_metrics(args: Any) -> int:
     output("# TYPE brig_cells_total gauge")
     output(f"brig_cells_total {len(subnets)}")
 
-    result = vm_run(
-        ["podman", "ps", "--format", "json", "--filter", f"name=^{CONTAINER_PREFIX}"],
+    from brig.cell.lifecycle import list_cell_containers
+    running = sum(
+        1 for _name, c in list_cell_containers(include_stopped=False)
+        if c.get("State") == "running"
     )
-    running = 0
-    if result.returncode == 0 and result.stdout.strip():
-        try:
-            containers = json.loads(result.stdout)
-            def _name(c):
-                n = c.get("Names", "")
-                return n[0] if isinstance(n, list) else n
-            from brig.config import INFRA_CONTAINER_NAMES
-            running = sum(1 for c in containers
-                         if c.get("State") == "running"
-                         and _name(c) not in INFRA_CONTAINER_NAMES)
-        except json.JSONDecodeError:
-            pass
 
     output("# HELP brig_cells_running Number of running cells")
     output("# TYPE brig_cells_running gauge")
@@ -506,31 +495,21 @@ def cmd_prune(args: Any) -> int:
     # container, left by `brig rm` versions before the workspace
     # cleanup landed, or by externally-killed containers).
     if do_cells:
-        result = vm_run(
-            ["podman", "ps", "-a", "--format", "json",
-             "--filter", f"name=^{CONTAINER_PREFIX}"],
-        )
+        from brig.cell.lifecycle import list_cell_containers
         live_cells: set[str] = set()
-        if result.returncode == 0 and result.stdout.strip():
-            try:
-                containers = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                containers = []
-            from brig.config import INFRA_CONTAINER_NAMES
-            for c in containers:
-                names = c.get("Names", "")
-                name = names[0] if isinstance(names, list) else names
-                if name in INFRA_CONTAINER_NAMES:
-                    continue
-                cell_name = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
-                live_cells.add(cell_name)
-                state = (c.get("State") or "").lower()
-                if state in ("exited", "stopped", "created", "configured"):
-                    output(f"  {'would remove' if dry_run else 'removing'} cell: {name}")
-                    if not dry_run:
-                        vm_run(["podman", "rm", "-f", name])
-                        vm_run(["podman", "network", "rm", name])
-                    removed_cells += 1
+        for cell_name, c in list_cell_containers(include_stopped=True):
+            live_cells.add(cell_name)
+            container_name_full = f"{CONTAINER_PREFIX}{cell_name}"
+            state = (c.get("State") or "").lower()
+            if state in ("exited", "stopped", "created", "configured"):
+                output(
+                    f"  {'would remove' if dry_run else 'removing'} cell: "
+                    f"{container_name_full}"
+                )
+                if not dry_run:
+                    vm_run(["podman", "rm", "-f", container_name_full])
+                    vm_run(["podman", "network", "rm", container_name_full])
+                removed_cells += 1
 
         # Orphan workspaces — directories under ~/.brig/state/ whose
         # name doesn't correspond to any podman container. system/ is

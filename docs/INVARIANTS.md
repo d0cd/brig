@@ -1,6 +1,6 @@
 # Brig Security Invariants — Living Ledger
 
-The 9 invariants from [docs/design/security.md](design/security.md) are the
+The 12 invariants from [docs/design/security.md](design/security.md) are the
 thing this project exists to uphold. This document is the single source of
 truth for **which tests prove them** and **which CI lane runs those tests**.
 
@@ -93,8 +93,8 @@ proxy logs, not prevention.
 | Verify check | `src/brig/security/verify.py:verify_cell_network_members` — flags any member of a `brig-<cell>` network that isn't warden or the cell itself |
 | Unit test | `tests/test_security_verify.py::TestVerifyCellNetworkMembers::test_foreign_container` |
 | Unit test | `tests/test_security_verify.py::TestVerifyCellNetworkMembers::test_only_warden_and_cell` |
-| Gap | No E2E test that actually attaches a foreign container and asserts detection. Tracked for a future E2E test pass. |
-| CI | Unit |
+| E2E test | `tests/test_invariants_7_8.sh` — attaches a foreign container to a cell's network and asserts `brig system verify` detects it |
+| CI | Unit + E2E |
 
 ### 8. Cells Must Be Single-Homed
 
@@ -290,7 +290,7 @@ The invariants we DO uphold:
 | DNS rebinding to host-service tuple | `test_security_audit.py::TestResponseHeadersDnsRebinding::test_does_not_skip_without_metadata` — naked (ip,port) match must not bypass |
 | Webhook redirect to internal host | `notifier.py` urllib fallback uses a redirect-disabling opener; urllib3 path uses `assert_hostname` and `cert_reqs=CERT_REQUIRED` |
 | Cell with deny-all reaching host service | `test_security_audit.py::TestHandleHostService::test_no_cell_policy_blocked` |
-| Ingress route pointing at warden gateway IP | `src/addons/ingress.py` `_reload_routes` rejects host octets `< 2` (audit M4) |
+| Ingress route pointing at warden gateway IP | `src/addons/ingress.py` `_reload_routes` rejects host octets `< 2` |
 
 ## CI wiring
 

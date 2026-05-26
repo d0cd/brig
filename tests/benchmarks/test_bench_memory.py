@@ -66,7 +66,7 @@ def test_memory_metrics_100_cells(cell_metrics_class):
 
 def test_memory_lru_bounded(metrics_collector_class):
     """Fill MetricsCollector to MAX+100, verify eviction bounds count."""
-    from metrics import MAX_TRACKED_CELLS, CellMetrics
+    from metrics import MAX_TRACKED_CELLS
 
     collector = metrics_collector_class()
     total = MAX_TRACKED_CELLS + 100

@@ -35,6 +35,15 @@ dev = [
     "pytest-cov>=4.0",
     "ruff>=0.1.0",
     "mypy>=1.0",
+    # types-PyYAML so `mypy src/brig/` is clean locally without CI
+    # having to install it inline.
+    "types-PyYAML",
+    # Real mitmproxy in dev so the addon tests can import the actual
+    # symbols instead of MagicMock-ing them. The proxy-side addons
+    # (enforce, ingress, logger, notifier, ops) are the most security-
+    # critical code in the tree; mocking mitmproxy's API surface means
+    # an upstream signature change only surfaces in E2E.
+    "mitmproxy>=10.0",
 ]
 
 [project.scripts]
@@ -66,7 +75,19 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W"]
-ignore = ["E402", "E501", "F401", "F405"]
+# F401 is intentionally NOT in this global ignore — orphan imports
+# should be flagged. Re-exports opt in per-file via `# noqa: F401`
+# (see e.g. src/addons/enforce.py's re-exports for tests and external
+# callers).
+ignore = ["E402", "E501", "F405"]
+
+[tool.ruff.format]
+# Quoting consistency only — keep the formatter conservative so it
+# doesn't churn unrelated lines when a security fix lands. Audit
+# Quality:8.1 wanted some formatter wired in; this is the minimum useful
+# step without imposing a sweeping reformat.
+quote-style = "preserve"
+indent-style = "space"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

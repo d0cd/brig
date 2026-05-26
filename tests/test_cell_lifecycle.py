@@ -74,6 +74,51 @@ class TestRunCell(unittest.TestCase):
             self.assertEqual(call_args[0][1], "create")
 
 
+class TestApplyImageDigestPin(unittest.TestCase):
+    """image_digest must be enforced, not silently accepted."""
+
+    def test_invalid_digest_rejected(self):
+        from brig.cell.lifecycle import _apply_image_digest_pin
+        spec = CellSpec(name="t", image="alpine", image_digest="not-a-digest")
+        with self.assertRaises(BrigError):
+            _apply_image_digest_pin(spec)
+
+    def test_short_digest_rejected(self):
+        from brig.cell.lifecycle import _apply_image_digest_pin
+        # 32 hex chars instead of 64 — must be rejected.
+        spec = CellSpec(name="t", image="alpine", image_digest="sha256:" + "a" * 32)
+        with self.assertRaises(BrigError):
+            _apply_image_digest_pin(spec)
+
+    def test_digest_appended_to_image(self):
+        from brig.cell.lifecycle import _apply_image_digest_pin
+        digest = "sha256:" + "f" * 64
+        spec = CellSpec(name="t", image="alpine:3.19", image_digest=digest)
+        _apply_image_digest_pin(spec)
+        self.assertEqual(spec.image, f"alpine:3.19@{digest}")
+
+    def test_conflicting_inline_digest_rejected(self):
+        from brig.cell.lifecycle import _apply_image_digest_pin
+        d1 = "sha256:" + "a" * 64
+        d2 = "sha256:" + "b" * 64
+        spec = CellSpec(name="t", image=f"alpine@{d1}", image_digest=d2)
+        with self.assertRaises(BrigError):
+            _apply_image_digest_pin(spec)
+
+    def test_matching_inline_digest_accepted_no_change(self):
+        from brig.cell.lifecycle import _apply_image_digest_pin
+        d = "sha256:" + "a" * 64
+        spec = CellSpec(name="t", image=f"alpine@{d}", image_digest=d)
+        _apply_image_digest_pin(spec)
+        self.assertEqual(spec.image, f"alpine@{d}")
+
+    def test_no_digest_no_change(self):
+        from brig.cell.lifecycle import _apply_image_digest_pin
+        spec = CellSpec(name="t", image="alpine:3.19")
+        _apply_image_digest_pin(spec)
+        self.assertEqual(spec.image, "alpine:3.19")
+
+
 class TestStopCell(unittest.TestCase):
     @patch("brig.cell.lifecycle.observe")
     def test_not_exists(self, mock_observe):

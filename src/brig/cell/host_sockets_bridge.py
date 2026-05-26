@@ -235,9 +235,16 @@ def start_cell_bridges(
             if bridge.exists():
                 bridge.unlink()
 
+            # Freeze the connect target by writing the realpath into the
+            # plist instead of the literal path. _validate_target() above
+            # already rejected leaf symlinks and ancestor-chain redirects,
+            # but socat would otherwise follow any post-validation symlink
+            # swap. Baking the canonical path into the launchd config closes
+            # that window — socat connects to a fixed inode chain.
+            target_real = os.path.realpath(target)
             xml = generate_plist(
                 label=label, socat_bin=socat,
-                bridge_path=str(bridge), target_path=target,
+                bridge_path=str(bridge), target_path=target_real,
             )
             plist.write_text(xml)
             plist.chmod(0o644)

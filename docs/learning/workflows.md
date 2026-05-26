@@ -74,7 +74,7 @@ brig policy rm mycell                           # clear (cell will block all egr
 
 ```bash
 brig system doctor --quick          # check VM + proxy status
-brig system verify          # check all 9 security invariants
+brig system verify          # check all 12 security invariants
 brig cell diagnose mycell # inspect a specific cell
 brig cell inspect mycell  # raw container details
 ```

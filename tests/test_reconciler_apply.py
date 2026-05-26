@@ -6,9 +6,7 @@ and rollback cleans up on failure.
 
 import json
 import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from brig.cell.reconciler import (
@@ -17,7 +15,6 @@ from brig.cell.reconciler import (
     ReconcileResult,
     _execute_action,
     apply,
-    build_run_command,
     plan_run,
 )
 from brig.cell.spec import CellSpec

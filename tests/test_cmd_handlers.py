@@ -9,10 +9,9 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from brig.cell.reconciler import CellState, ReconcileResult
-from brig.cell.spec import CellSpec
+from brig.cell.reconciler import ReconcileResult
 from brig.errors import BrigError
 
 

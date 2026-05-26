@@ -112,3 +112,7 @@ cells/
 .ralphx/**/progress.md
 .ralphx/**/prd.json
 .ralphx/**/findings/
+
+# Hermes cell — local-checkout build mode populates this dir on demand.
+cells/hermes/hermes-src/*
+!cells/hermes/hermes-src/.gitkeep

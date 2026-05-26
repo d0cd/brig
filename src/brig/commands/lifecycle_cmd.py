@@ -14,7 +14,7 @@ from typing import Any
 from brig.cell.lifecycle import kill_cell, rm_cell, run_cell, stop_cell
 from brig.cell.profiles import apply_profile, load_profile
 from brig.cell.spec import CellSpec, load_cell_definition, validate_cell_definition
-from brig.config import CONTAINER_PREFIX, PROXY_NAME, container_name
+from brig.config import CONTAINER_PREFIX, container_name
 from brig.errors import BrigError
 from brig.ops.logging import info, output
 from brig.vm.shell import vm_run, vm_run_interactive
@@ -147,9 +147,9 @@ def cmd_run(args: Any) -> int:
         "workdir": getattr(args, "workdir", None),
     }
 
-    # Precedence (audit L4): CLI flag > yaml > profile > defaults.
-    # Build up from least-specific to most-specific: apply profile first,
-    # then merge yaml on top, then CLI flag overrides below.
+    # Precedence: CLI flag > yaml > profile > defaults. Build up from
+    # least-specific to most-specific: apply profile first, then merge
+    # yaml on top, then CLI flag overrides below.
 
     if args.profile:
         profile = load_profile(args.profile)
@@ -592,31 +592,13 @@ def cmd_rm(args: Any) -> int:
 
 
 def cmd_list(args: Any) -> int:
-    result = vm_run(
-        ["podman", "ps", "-a", "--format", "json", "--filter", f"name=^{CONTAINER_PREFIX}"],
-    )
-    if result.returncode != 0:
-        return 1
-
-    try:
-        containers = json.loads(result.stdout) if result.stdout.strip() else []
-    except json.JSONDecodeError:
-        return 1
-
+    from brig.cell.lifecycle import list_cell_containers
     fmt = getattr(args, "format", "table")
-    if fmt == "json":
-        output(json.dumps(containers, indent=2))
-        return 0
+    cells = list_cell_containers(include_stopped=True)
 
-    from brig.config import INFRA_CONTAINER_NAMES
-    cells = []
-    for c in containers:
-        names = c.get("Names", "")
-        # Podman 4.x returns Names as a string; 5.x as a list.
-        name = names[0] if isinstance(names, list) else names
-        if name in INFRA_CONTAINER_NAMES:
-            continue
-        cells.append((name, c))
+    if fmt == "json":
+        output(json.dumps([entry for _, entry in cells], indent=2))
+        return 0
 
     if not cells:
         output("No cells found")
@@ -624,16 +606,14 @@ def cmd_list(args: Any) -> int:
 
     if fmt == "wide":
         output(f"{'NAME':<25} {'STATUS':<12} {'CREATED':<22} {'NETWORK':<25} {'IMAGE'}")
-        for name, c in cells:
-            cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+        for cell, c in cells:
             networks = c.get("Networks") or []
             network = ",".join(networks)[:25] if networks else "-"
             created = c.get("CreatedAt", "")[:22]
             output(f"{cell:<25} {c.get('State', ''):<12} {created:<22} {network:<25} {c.get('Image', '')}")
     else:
         output(f"{'NAME':<25} {'STATUS':<12} {'IMAGE':<30}")
-        for name, c in cells:
-            cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+        for cell, c in cells:
             output(f"{cell:<25} {c.get('State', ''):<12} {c.get('Image', ''):<30}")
     return 0
 

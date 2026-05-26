@@ -4,7 +4,6 @@ Provides pre-configured addon classes and test data generators.
 Uses mitmproxy mocking pattern from test_addons_unit.py.
 """
 
-import importlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock

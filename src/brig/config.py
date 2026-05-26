@@ -123,6 +123,12 @@ HOST_SOCKET_ENGINE_DENYLIST = (
     "crio.sock", "firecracker.sock", "limactl.sock",
 )
 
+# Secret name pattern — restricts allowable filenames in ~/.brig/secrets/
+# to a safe character set. Empty names, null bytes, leading dashes, and
+# shell metacharacters are excluded; an empty name would otherwise collapse
+# the per-secret bind mount to the whole secrets directory.
+SECRET_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9._-]{0,62}$')
+
 # Unsafe file extensions for --sanitize mode.
 UNSAFE_EXTENSIONS = {
     ".app", ".command", ".scpt", ".dmg", ".pkg", ".webloc",

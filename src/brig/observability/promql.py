@@ -11,7 +11,6 @@ input shape is bounded by what warden's OTel SDK produces.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterator
 
 
 @dataclass

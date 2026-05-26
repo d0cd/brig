@@ -3,21 +3,20 @@
 Tests composition of modules, not individual functions.
 """
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from brig.cell.lifecycle import run_cell, rm_cell
+from brig.cell.lifecycle import run_cell
 from brig.cell.reconciler import (
     ActionType, CellState, ReconcileResult,
     build_run_command, plan_destroy, plan_run,
 )
 from brig.cell.spec import CellSpec
-from brig.config import CONTAINER_PREFIX, RUNTIME
+from brig.config import RUNTIME
 from brig.errors import BrigError
-from brig.network.subnet import allocate, free, get, list_all
+from brig.network.subnet import allocate, free, get
 
 
 class TestRunThroughReconciler(unittest.TestCase):
@@ -73,7 +72,7 @@ class TestRunThroughReconciler(unittest.TestCase):
         for var in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "ftp_proxy"]:
             for form in [var, var.upper(), var.capitalize()]:
                 spec = CellSpec(name="t", image="a", env=[f"{form}=evil"])
-                with self.assertRaises(ValueError):
+                with self.assertRaises(BrigError):
                     build_run_command(spec, "10.60.1.1")
 
 

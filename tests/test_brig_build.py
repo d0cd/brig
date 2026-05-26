@@ -13,7 +13,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 def _args(**kw) -> types.SimpleNamespace:
@@ -243,9 +243,9 @@ class TestContainerIgnore(unittest.TestCase):
             self.assertEqual(_load_ignore_patterns(Path(td)), [])
 
     def test_anchored_pattern_matches_only_at_root(self):
-        """Audit M1 bug #1: leading-slash patterns (`/.git`, `/build`)
-        previously matched nothing because paths from relative_to() never
-        start with /. Now they should anchor to the context root."""
+        """Leading-slash patterns (`/.git`, `/build`) must anchor to the
+        context root. A naive implementation matches nothing because
+        paths from relative_to() never start with /."""
         from brig.commands.image_cmd import _path_excluded
         patterns = ["/build"]
         self.assertTrue(_path_excluded("build", patterns))
@@ -262,7 +262,7 @@ class TestContainerIgnore(unittest.TestCase):
         self.assertTrue(_path_excluded("a/b/c/node_modules/foo", patterns))
 
     def test_double_star_matches_zero_components(self):
-        """Audit M1 bug #2: `a/**/b` should match `a/b` (zero intermediate),
+        """`a/**/b` should match `a/b` (zero intermediate components),
         not only `a/x/b` or deeper."""
         from brig.commands.image_cmd import _path_excluded
         patterns = ["a/**/b"]
@@ -272,8 +272,8 @@ class TestContainerIgnore(unittest.TestCase):
         self.assertFalse(_path_excluded("a/c", patterns))
 
     def test_negation_reincludes(self):
-        """Audit M1 bug #3: negation (!pattern) re-includes a previously-
-        excluded path. Last matching rule wins."""
+        """Negation (!pattern) re-includes a previously-excluded path;
+        last matching rule wins."""
         from brig.commands.image_cmd import _path_excluded
         patterns = ["*.log", "!important.log"]
         self.assertTrue(_path_excluded("debug.log", patterns))
@@ -288,9 +288,9 @@ class TestContainerIgnore(unittest.TestCase):
             "later *.log should still exclude")
 
     def test_bounded_regex_no_redos(self):
-        """Audit M1 ReDoS: matching a non-matching path against many `**`
-        segments completes promptly (sub-second). Previous `.*`-based
-        translation took ~10s per path under similar inputs."""
+        """Matching a non-matching path against many `**` segments must
+        complete promptly (sub-second) — a `.*`-based glob translation
+        would take ~10s per path under similar inputs."""
         import time
         from brig.commands.image_cmd import _path_excluded
         # Many `**` segments, no match.
@@ -332,10 +332,10 @@ class TestContainerIgnore(unittest.TestCase):
 
 
 class TestBuildContextSymlinkSafety(unittest.TestCase):
-    """Audit H1: a symlink in the build context pointing outside the
-    context can exfiltrate host secrets (the resolved file contents
-    end up in the tar / become readable inside the build container).
-    The tar filter must reject these."""
+    """A symlink in the build context pointing outside the context can
+    exfiltrate host secrets (the resolved file contents end up in the
+    tar / become readable inside the build container). The tar filter
+    must reject these."""
 
     def test_symlink_escaping_context_is_dropped(self):
         from brig.commands.image_cmd import _stream_tar_context
@@ -389,8 +389,8 @@ class TestBuildContextSymlinkSafety(unittest.TestCase):
 
 
 class TestBuildContextSizeCap(unittest.TestCase):
-    """Audit M2: a runaway build context should fail with a clear error
-    rather than OOM the host."""
+    """A runaway build context should fail with a clear error rather
+    than OOM the host."""
 
     def test_oversized_context_refused(self):
         from brig.commands import image_cmd

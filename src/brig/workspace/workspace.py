@@ -15,9 +15,9 @@ import os
 import subprocess
 from pathlib import Path
 
-from brig.config import UNSAFE_EXTENSIONS, HostPaths, VMPaths, container_name
+from brig.config import UNSAFE_EXTENSIONS, VMPaths, container_name
 from brig.errors import BrigError
-from brig.ops.logging import debug, warn
+from brig.ops.logging import warn
 from brig.vm.shell import vm_run
 
 

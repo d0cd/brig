@@ -4,7 +4,6 @@ These run host-side with no VM dependency. They cover the parts of
 brig.workspace.workspace that weren't exercised by test_workspace.py.
 """
 
-import os
 import tempfile
 import unittest
 from pathlib import Path

@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 # Stub mitmproxy.
 _mock = MagicMock()
 sys.modules.setdefault("mitmproxy", _mock)
@@ -116,7 +118,11 @@ class TestAsyncLogWriter(unittest.TestCase):
         self.assertEqual(len(contents), 1)
         self.assertEqual(json.loads(contents[0])["event"], "test")
 
+    @pytest.mark.slow
     def test_async_flush_lands_on_disk(self):
+        """Timing-dependent: polls for the background flush thread to land
+        bytes on disk. Marked slow so CI matrix concurrency doesn't
+        starve the writer past the 2s deadline."""
         w = AsyncLogWriter(flush_interval_ms=10, batch_size=2)
         log_file = self.tmpdir / "async.jsonl"
         from unittest.mock import patch

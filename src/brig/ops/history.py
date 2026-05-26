@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import fcntl
 import json
-import os
 import re
 import time
 from pathlib import Path
@@ -27,6 +26,30 @@ from brig.ops.logging import debug
 
 
 MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB per log file.
+
+
+# Error redaction strategy: redact every absolute path-looking substring
+# AND known credential-shaped tokens (long hex / base64 / env-var values
+# that look secret-y). A naive `re.sub(r'(/[^\s:]+)', '<path>', error)`
+# stops at the first ':' or whitespace, leaving traceback fragments like
+# `File "/Users/d0c/.../foo.py", line N` with `/foo.py` and the line
+# number intact, and misses path-typed secrets embedded in an exception's
+# `__str__`. We deliberately throw away precision to keep the operations
+# log safe to share for debugging.
+_HOME_OR_USER_PATH = re.compile(
+    r'(?:/Users/[^/\s"\'`<>]+|/home/[^/\s"\'`<>]+|/private/var/folders/[^\s"\'`<>]+|/tmp/[^\s"\'`<>]+|/var/folders/[^\s"\'`<>]+)'
+    r'(?:/[^\s"\'`<>:,;]+)*'
+)
+_GENERIC_PATH = re.compile(r'(?<!\w)/(?:[A-Za-z0-9_.+-]+/)*[A-Za-z0-9_.+-]+')
+_SECRET_TOKEN = re.compile(r'\b(?:[A-Fa-f0-9]{32,}|[A-Za-z0-9+/_=-]{32,})\b')
+
+
+def _redact_error(error: str) -> str:
+    """Redact paths and secret-shaped tokens from an error string."""
+    redacted = _HOME_OR_USER_PATH.sub("<path>", error)
+    redacted = _GENERIC_PATH.sub("<path>", redacted)
+    redacted = _SECRET_TOKEN.sub("<redacted>", redacted)
+    return redacted
 
 
 def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
@@ -294,7 +317,7 @@ def log_operation_end(
             entry["args"] = _redact_args(args, config)
 
         if error:
-            entry["error"] = re.sub(r'(/[^\s:]+)', '<path>', error)
+            entry["error"] = _redact_error(error)
 
         _append_jsonl(operations_file, entry)
 

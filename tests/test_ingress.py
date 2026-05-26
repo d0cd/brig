@@ -299,7 +299,6 @@ class TestIngressAddonRouteMatching(unittest.TestCase):
     """Test the ingress addon route matching logic."""
 
     def _make_route(self, **kwargs):
-        from importlib import import_module
         # Import from addons path — need to handle the path.
         import sys
         sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))

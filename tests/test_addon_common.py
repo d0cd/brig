@@ -12,7 +12,6 @@ if _addons_dir not in sys.path:
     sys.path.insert(0, _addons_dir)
 
 from _common import (  # noqa: E402
-    BLOCKED_NETWORKS,
     SubnetResolver,
     atomic_write_json,
     is_blocked_ip,

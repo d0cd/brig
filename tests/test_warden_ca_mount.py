@@ -109,7 +109,7 @@ class TestStageBundleErrorPath(unittest.TestCase):
         (disk full, perms), surface a BrigError with the raw stderr +
         a suggestion line — consistent with the pre-check path so the
         operator gets the same shape regardless of which failure
-        mode hit. Audit H1."""
+        mode hit."""
         from brig.cell import ca_bundle
         from brig.errors import BrigError
         # First call (test -f) succeeds; second call (sudo sh -c concat) fails.

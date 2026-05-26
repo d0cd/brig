@@ -22,7 +22,7 @@ from typing import Any
 
 from brig.config import HostPaths
 from brig.errors import BrigError
-from brig.ops.logging import info, output, warn
+from brig.ops.logging import info, output
 
 
 def register_parser(sub) -> None:
@@ -86,18 +86,55 @@ def cmd_secrets_add(args: Any) -> int:
     secrets_dir.chmod(0o700)
 
     name = args.name
-    # Validate name.
+    # Validate name. Mirrors the cell-yaml `secrets:` rules: the same
+    # regex governs every place a secret name shows up, so a name
+    # accepted by `brig secrets add` is also acceptable as a cell
+    # `secrets:` entry.
+    from brig.config import SECRET_NAME_PATTERN
+    if not name:
+        raise BrigError("Secret name must not be empty")
+    if "\x00" in name:
+        raise BrigError("Secret name must not contain null bytes")
     if "/" in name or ".." in name:
         raise BrigError("Secret name must not contain / or ..")
+    if not SECRET_NAME_PATTERN.match(name):
+        raise BrigError(
+            f"Invalid secret name '{name}'",
+            suggestion=(
+                "Use lowercase letters, digits, and -._  "
+                "(e.g. 'github-token', 'openai.api_key')"
+            ),
+        )
 
     path = secrets_dir / name
-    if path.exists() and not getattr(args, "force", False):
+    # lstat (not exists) so an existing symlink at this path is detected
+    # whether or not its target exists. Pre-planted symlinks are an
+    # attack surface — see the O_NOFOLLOW handling below.
+    import stat as _stat
+    try:
+        st = os.lstat(str(path))
+        exists = True
+        is_symlink = _stat.S_ISLNK(st.st_mode)
+    except FileNotFoundError:
+        exists = False
+        is_symlink = False
+    if exists and is_symlink:
+        # Refuse to follow a pre-planted symlink. If the user genuinely
+        # wants to replace the secret, they should remove the symlink
+        # themselves and re-run with --force.
+        raise BrigError(
+            f"Refusing to write secret '{name}': path is a symlink",
+            suggestion=(
+                f"Remove the symlink at {path} and try again. "
+                f"Brig never follows symlinks when writing secrets."
+            ),
+        )
+    if exists and not getattr(args, "force", False):
         raise BrigError(
             f"Secret '{name}' already exists",
             suggestion="Use --force to overwrite",
         )
 
-    # Get value.
     value_source = getattr(args, "value", None)
     file_source = getattr(args, "from_file", None)
 
@@ -110,15 +147,28 @@ def cmd_secrets_add(args: Any) -> int:
             raise BrigError(f"File not found: {file_source}")
         value = src.read_text()
     elif not sys.stdin.isatty():
-        # Piped input.
         value = sys.stdin.read()
     else:
-        # Interactive prompt.
         import getpass
         value = getpass.getpass(f"Enter value for '{name}': ")
 
-    # Write with restrictive permissions.
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Write with restrictive permissions. O_NOFOLLOW refuses to open a
+    # symlink at the target path — defends against a pre-planted symlink
+    # in ~/.brig/secrets/ being used to overwrite arbitrary files the
+    # user can write (e.g. `legit-name -> ~/.ssh/authorized_keys`).
+    open_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+    try:
+        fd = os.open(str(path), open_flags, 0o600)
+    except OSError as e:
+        # ELOOP under O_NOFOLLOW means the leaf is a symlink. We already
+        # caught that case above via lstat, but a TOCTOU window between
+        # the lstat check and this open is closed here.
+        raise BrigError(
+            f"Cannot write secret '{name}': {e.strerror or e}",
+            suggestion=(
+                f"If {path} is a symlink, remove it manually before retry."
+            ),
+        )
     with os.fdopen(fd, "w") as f:
         f.write(value)
 

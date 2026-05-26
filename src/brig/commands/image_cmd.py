@@ -4,7 +4,6 @@ CLI handlers for image operations.
 
 from __future__ import annotations
 
-import fnmatch
 import io
 import re
 import subprocess
@@ -83,7 +82,7 @@ def _glob_segment_to_regex(seg: str) -> str:
     """Translate one path-segment glob (no `/` inside) to a bounded regex.
 
     `*` → `[^/]*`, `?` → `[^/]`, everything else escaped. Bounded means
-    no `.*` — protects against ReDoS via crafted long patterns (audit M1).
+    no `.*` — protects against ReDoS via crafted long patterns.
     """
     out = []
     for ch in seg:
@@ -147,8 +146,8 @@ def _path_excluded(relpath: str, patterns: list[str]) -> bool:
       - last matching pattern wins (so `*.log\\n!important.log` keeps
         important.log)
 
-    Bounded regex translation (no `.*` segments) — see audit finding M1
-    on ReDoS via crafted `**` patterns.
+    Bounded regex translation (no `.*` segments) — protects against
+    ReDoS via crafted `**` patterns.
     """
     rel = relpath.replace("\\", "/")
     excluded = False
@@ -159,8 +158,8 @@ def _path_excluded(relpath: str, patterns: list[str]) -> bool:
     return excluded
 
 
-# Soft + hard size caps for the in-memory tar (audit finding M2: a 50 GB
-# `brig image build ~` would OOM the host before podman saw a byte).
+# Soft + hard size caps for the in-memory tar — a 50 GB
+# `brig image build ~` would otherwise OOM the host before podman saw a byte.
 _TAR_WARN_BYTES = 500 * 1024 * 1024     # 500 MB — warn but proceed.
 _TAR_ABORT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB — refuse with clear error.
 
@@ -172,8 +171,8 @@ def _stream_tar_context(ctx: Path, patterns: list[str]) -> bytes:
     fitting in memory is acceptable. If/when someone needs to build a
     >2 GB context, switch to a streaming Popen-tar pipeline.
 
-    Security (audit finding H1): symlinks in the build context that point
-    outside `ctx` are REJECTED. Otherwise a project containing
+    Security: symlinks in the build context that point outside `ctx`
+    are REJECTED. Otherwise a project containing
     `ln -s ~/.ssh/id_rsa secret.txt` would bundle the host key into the
     build context, and a Containerfile `COPY secret.txt /` could exfiltrate
     via any allowlisted egress. Symlinks pointing *inside* the context are
@@ -387,7 +386,7 @@ def cmd_pull(args: Any) -> int:
 
 def cmd_warmup(args: Any) -> int:
     """Handle `brig warmup` — pre-pull images for a profile."""
-    from brig.cell.profiles import BUILTIN_PROFILES, load_profile
+    from brig.cell.profiles import load_profile
 
     profile_name = getattr(args, "profile", None)
     if profile_name:

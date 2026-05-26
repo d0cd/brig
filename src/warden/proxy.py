@@ -19,7 +19,7 @@ from brig.config import (
     VMPaths,
 )
 from brig.ops.logging import debug, info
-from brig.vm.shell import vm_run, vm_run_interactive
+from brig.vm.shell import vm_run
 
 # Warden runs a thin custom image: mitmproxy + OpenTelemetry SDK.
 # Build with `./scripts/build-warden-image.sh` (runs inside the VM

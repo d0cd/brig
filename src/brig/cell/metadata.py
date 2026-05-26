@@ -165,9 +165,8 @@ def write_metadata(
 
     Mode 0o644: world-readable inside the cell so any uid the container
     runs as can read it. The mode is set on the open fd before the
-    atomic rename (audit L3) — previously chmod-after-rename inside a
-    `try: ... except OSError: pass` could silently leave the file at
-    mkstemp's default 0600 and the cell couldn't read its own metadata.
+    atomic rename so a chmod failure can't silently leave the file at
+    mkstemp's default 0600 (which would make it unreadable to the cell).
     """
     payload = build_metadata(cell_name, workspace_mount, host_sockets=host_sockets)
     target = _host_metadata_path(cell_name)

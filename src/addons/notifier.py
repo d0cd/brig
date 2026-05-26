@@ -60,7 +60,6 @@ from _notifier_state import (
     CircuitBreakerConfig,
     CircuitBreakerState,
     NotificationConfig,
-    _is_safe_webhook_url,
     _redact_notification_path,
     _redact_url_for_logging,
     _resolve_webhook_url,
@@ -76,10 +75,7 @@ except ImportError:
     URLLIB3_AVAILABLE = False
 
 
-# Policy file path.
 POLICY_FILE = Path("/policy.json")
-
-# Dead letter queue file path.
 DEAD_LETTER_FILE = Path("/var/run/cells/dead-letters.json")
 
 
@@ -164,9 +160,21 @@ class Notifier:
 
             notifications = data.get("notifications", {})
             webhook_url = notifications.get("webhook_url", "")
-            if webhook_url and not _is_safe_webhook_url(webhook_url):
-                ctx.log.error("Notifier: webhook URL targets internal network, disabling")
-                webhook_url = ""
+            resolved_ip = ""
+            resolved_hostname = ""
+            resolved_port = 0
+            if webhook_url:
+                safe, resolved_ip, resolved_hostname, resolved_port = (
+                    _resolve_webhook_url(webhook_url)
+                )
+                if not safe:
+                    ctx.log.error(
+                        "Notifier: webhook URL targets internal network, disabling"
+                    )
+                    webhook_url = ""
+                    resolved_ip = ""
+                    resolved_hostname = ""
+                    resolved_port = 0
             filters = notifications.get("filters", {})
             cb_config = notifications.get("circuit_breaker", {})
 
@@ -183,6 +191,9 @@ class Notifier:
                     base_backoff=cb_config.get("base_backoff", DEFAULT_BASE_BACKOFF),
                     max_backoff=cb_config.get("max_backoff", DEFAULT_MAX_BACKOFF),
                 ),
+                resolved_ip=resolved_ip,
+                resolved_hostname=resolved_hostname,
+                resolved_port=resolved_port,
             )
             self.policy_mtime = mtime
 
@@ -352,13 +363,26 @@ class Notifier:
                 return False, str(e)
 
     def _send_notification(self, notification: dict) -> None:
-        """Send notification to webhook with circuit breaker and retry logic."""
+        """Send notification to webhook with circuit breaker and retry logic.
+
+        Uses the resolved IP/hostname pinned at config-load time rather
+        than re-resolving DNS every call — re-resolving would let an
+        attacker who controls the webhook DNS return a public IP first
+        (passing BLOCKED_NETWORKS) and an internal IP later. Pinning
+        means the only way to change the connect target is to reload
+        the config, which re-runs the SSRF gate.
+        """
         if not self.config.webhook_url:
             return
 
-        safe, resolved_ip, hostname, port = _resolve_webhook_url(self.config.webhook_url)
-        if not safe:
-            ctx.log.warn("Notifier: webhook URL targets internal network, skipping")
+        resolved_ip = self.config.resolved_ip
+        hostname = self.config.resolved_hostname
+        port = self.config.resolved_port
+        if not resolved_ip or not hostname or not port:
+            ctx.log.warn(
+                "Notifier: webhook URL has no pinned resolution, skipping "
+                "(config reload required)"
+            )
             return
 
         if not self._check_circuit_breaker():

@@ -1,4 +1,4 @@
-"""Tests for the new UX commands and behaviors added in the audit pass.
+"""Tests for UX commands and behaviors.
 
 Covers:
   - brig secrets rm confirmation (require --yes)
@@ -9,7 +9,6 @@ Covers:
   - brig network --blocked filter
 """
 
-import io
 import json
 import tempfile
 import unittest
@@ -352,6 +351,7 @@ class TestPruneCommand(unittest.TestCase):
                     )
                 return SimpleNamespace(returncode=0, stdout="")
             with patch("brig.commands.system_cmd.vm_run", side_effect=fake_vm), \
+                 patch("brig.cell.lifecycle.vm_run", side_effect=fake_vm), \
                  patch("brig.network.subnet.list_all", return_value=[]), \
                  patch("brig.config.HostPaths.STATE_DIR", state):
                 cmd_prune(SimpleNamespace(

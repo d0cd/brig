@@ -10,7 +10,6 @@ Covers:
 """
 
 import json
-import os
 import sys
 import tempfile
 import unittest
@@ -34,6 +33,7 @@ from logger import RequestLogger  # noqa: E402
 
 from brig.cell.reconciler import build_run_command  # noqa: E402
 from brig.cell.spec import CellSpec  # noqa: E402
+from brig.errors import BrigError  # noqa: E402
 from brig.network.subnet import allocate, free  # noqa: E402
 
 
@@ -288,21 +288,21 @@ class TestSeccompProfileValidation(unittest.TestCase):
     def test_unconfined_rejected(self, mock_vm_run):
         """seccomp_profile='unconfined' must be rejected."""
         spec = self._make_spec("unconfined")
-        with self.assertRaises(ValueError, msg="unconfined"):
+        with self.assertRaises(BrigError, msg="unconfined"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
     def test_unconfined_case_insensitive(self, mock_vm_run):
         """seccomp_profile='Unconfined' must also be rejected (case-insensitive)."""
         spec = self._make_spec("Unconfined")
-        with self.assertRaises(ValueError, msg="unconfined"):
+        with self.assertRaises(BrigError, msg="unconfined"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
     def test_path_with_slash_rejected(self, mock_vm_run):
         """seccomp_profile with '/' is rejected (must be filename only)."""
         spec = self._make_spec("/etc/seccomp.json")
-        with self.assertRaises(ValueError, msg="path"):
+        with self.assertRaises(BrigError, msg="path"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
@@ -310,7 +310,7 @@ class TestSeccompProfileValidation(unittest.TestCase):
         """seccomp_profile with '..' is rejected."""
         # URL-encoded ".." won't trigger the check, but literal ".." will.
         spec_literal = self._make_spec("../../../etc/seccomp.json")
-        with self.assertRaises(ValueError, msg="path"):
+        with self.assertRaises(BrigError, msg="path"):
             build_run_command(spec_literal, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")

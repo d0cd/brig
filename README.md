@@ -90,11 +90,14 @@ brig run --network none alpine sh           # fully airgapped
 ### Policy
 
 ```bash
-brig policy show                            # show global policy
-brig policy set global --allow '*.example.com'  # add to global allowlist
-brig policy set mycell --deny evil.com      # per-cell deny
-brig policy show mycell --effective         # merged global + per-cell
+brig policy show mycell                              # show a cell's policy
+brig policy set mycell --allow '*.example.com'       # extend cell allowlist
+brig policy set mycell --deny evil.com               # extend cell denylist
+brig policy test mycell api.example.com              # dry-run a host against the policy
+brig policy rm mycell                                # drop the per-cell policy file
 ```
+
+Policy commands always operate against a named cell; the cell yaml is the source of truth for what each cell can reach.
 
 ### System
 
@@ -102,7 +105,7 @@ brig policy show mycell --effective         # merged global + per-cell
 brig system up                       # start everything (VM + warden)
 brig system down                     # stop everything
 brig system down --vm                # also stop the VM
-brig system verify                   # check all 9 security invariants
+brig system verify                   # check all 12 security invariants
 brig system doctor --quick                   # system health check
 brig cell diagnose mycell          # debug a specific cell
 ```
@@ -131,7 +134,7 @@ Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
 | Per-cell networks | No lateral movement between cells |
 | Warden proxy | Egress filtering, logging, rate limiting |
 
-9 security invariants, all tested. Run `brig system verify` to check.
+12 security invariants, all tested. Run `brig system verify` to check.
 
 ## Development
 

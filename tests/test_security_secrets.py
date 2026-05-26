@@ -3,7 +3,6 @@
 Tests invariant 4: macOS state directory is untrusted.
 """
 
-import os
 import tempfile
 import unittest
 from pathlib import Path

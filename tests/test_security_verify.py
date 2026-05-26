@@ -9,7 +9,6 @@ import unittest
 from unittest.mock import patch
 
 from brig.security.verify import (
-    CheckResult,
     verify_cell_network_members,
     verify_gvisor_runtime,
     verify_network_isolation,

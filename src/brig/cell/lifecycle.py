@@ -8,6 +8,7 @@ making it testable without mocking subprocess.
 
 from __future__ import annotations
 
+import re
 from typing import Callable
 
 from brig.cell.reconciler import (
@@ -25,6 +26,7 @@ from brig.errors import BrigError
 from brig.ops.history import log_lifecycle, log_operation, log_policy_change
 from brig.ops.logging import debug, info
 from brig.ops.ratelimit import check_rate_limit
+from brig.vm.shell import vm_run
 
 
 def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
@@ -106,6 +108,94 @@ def _default_proxy_check() -> bool:
     return proxy_running()
 
 
+def _container_name_from_entry(entry: dict) -> str:
+    """Extract the container name from a `podman ps` JSON entry.
+
+    Podman 4.x returns Names as a string; 5.x as a list. This handles
+    both shapes so callers don't have to remember which one this version
+    of podman emits.
+    """
+    names = entry.get("Names", "")
+    if isinstance(names, list):
+        return names[0] if names else ""
+    return names
+
+
+def list_cell_containers(*, include_stopped: bool = True) -> list[tuple[str, dict]]:
+    """Return `(cell_name, container_entry)` pairs for every brig-managed cell.
+
+    Filters by `name=^brig-` (the CONTAINER_PREFIX), then drops infra
+    sidecars (warden, OTel collector — see config.INFRA_CONTAINER_NAMES)
+    so they don't masquerade as cells in `brig cell list`, security
+    invariant checks, or the prune surface.
+
+    Returns the unprefixed cell name (`brig-foo` → `foo`) alongside the
+    raw podman entry so callers needing extra fields (Image, State,
+    Networks) don't re-fetch.
+    """
+    import json
+
+    from brig.config import CONTAINER_PREFIX, INFRA_CONTAINER_NAMES
+
+    cmd = ["podman", "ps", "--format", "json",
+           "--filter", f"name=^{CONTAINER_PREFIX}"]
+    if include_stopped:
+        cmd.insert(2, "-a")
+    result = vm_run(cmd)
+    if result.returncode != 0:
+        return []
+    try:
+        entries = json.loads(result.stdout) if result.stdout.strip() else []
+    except json.JSONDecodeError:
+        return []
+
+    out: list[tuple[str, dict]] = []
+    for entry in entries:
+        name = _container_name_from_entry(entry)
+        if not name or name in INFRA_CONTAINER_NAMES:
+            continue
+        cell_name = (
+            name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+        )
+        out.append((cell_name, entry))
+    return out
+
+
+_DIGEST_PATTERN = re.compile(r"^sha(?:256|384|512):[0-9a-fA-F]{64,}$")
+
+
+def _apply_image_digest_pin(spec: CellSpec) -> None:
+    """Rewrite spec.image to `image@digest` form when image_digest is set.
+
+    Podman natively enforces digest pinning when the image reference
+    contains `@sha256:...`, so converting the soft-pin into a hard
+    reference before invoking podman lets podman refuse any mismatch
+    at pull time.
+
+    Raises BrigError if:
+      - image_digest is set but malformed (must be sha{256,384,512}:HEX)
+      - image already contains a digest that disagrees with image_digest
+    """
+    if not spec.image_digest:
+        return
+    digest = spec.image_digest.strip()
+    if not _DIGEST_PATTERN.match(digest):
+        raise BrigError(
+            f"Invalid image_digest '{digest}'",
+            suggestion="Format must be sha256:<64-hex> (or sha384/sha512)",
+        )
+    if "@" in spec.image:
+        repo, _, existing = spec.image.partition("@")
+        if existing != digest:
+            raise BrigError(
+                f"image_digest '{digest}' disagrees with the digest already "
+                f"present on image reference '{spec.image}'",
+                suggestion="Remove one of the two so the source of truth is unambiguous",
+            )
+        return  # Already in image@digest form and matches.
+    spec.image = f"{spec.image}@{digest}"
+
+
 def run_cell(
     spec: CellSpec,
     proxy_check: Callable[[], bool] = _default_proxy_check,
@@ -120,7 +210,11 @@ def run_cell(
     Enforces:
       - Invariant 9: proxy must be running (unless airgapped)
       - Rate limiting
+      - image_digest pinning (when set, image is rewritten to image@digest
+        so podman refuses any mismatch at pull time)
     """
+    _apply_image_digest_pin(spec)
+
     if not spec.is_airgapped and not proxy_check():
         raise BrigError(
             "Warden proxy is not running",
@@ -189,7 +283,7 @@ def run_cell(
     try:
         log_operation("run", cell_name=spec.name, details={"image": spec.image})
         log_lifecycle("start", spec.name, details={"image": spec.image})
-        # Log per-cell policy if specified (audit trail gap fix).
+        # Log per-cell policy to the audit trail when specified.
         if spec.policy_allow or spec.policy_deny:
             log_policy_change(
                 spec.name, "create",

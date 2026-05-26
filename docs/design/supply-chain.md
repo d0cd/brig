@@ -81,5 +81,5 @@ curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/${RELEASE}/${
 **Brig's own code:**
 
 1. Security issues should be reported via GitHub security advisories (private disclosure). See `SECURITY.md` at the repo root.
-2. All 9 invariants have tests — run `brig system verify` after any security fix.
+2. All 12 invariants have tests — run `brig system verify` after any security fix.
 3. The audit trail is in `docs/INVARIANTS.md`.

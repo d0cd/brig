@@ -32,7 +32,9 @@ def _run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
 def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
     """Shared query: list cell containers and their inspect data.
 
-    Returns (cell_names, container_infos) or None on failure.
+    Returns (cell_names, container_infos) or None on failure. Uses the
+    module-local `_run` alias for both calls so tests can mock the
+    verify-side subprocess seam independently of list_cell_containers.
     """
     result = _run([
         "podman", "ps", "-a", "--format", "json",

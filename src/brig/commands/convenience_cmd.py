@@ -9,8 +9,8 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-from brig.config import CONTAINER_PREFIX, PROXY_NAME, VM_NAME, HostPaths
-from brig.ops.logging import info, output, warn
+from brig.config import VM_NAME, HostPaths
+from brig.ops.logging import output
 
 
 def cmd_up(args: Any) -> int:
@@ -82,14 +82,15 @@ def cmd_down(args: Any) -> int:
     """
     from brig.vm.shell import vm_run
 
-    # Stop all cells.
-    from brig.config import INFRA_CONTAINER_NAMES
-    result = vm_run(["podman", "ps", "--format", "{{.Names}}", "--filter", f"name=^{CONTAINER_PREFIX}"])
-    if result.returncode == 0 and result.stdout.strip():
-        for name in result.stdout.strip().split("\n"):
-            if name and name not in INFRA_CONTAINER_NAMES:
-                output(f"Stopping {name}...")
-                vm_run(["podman", "stop", "-t", "5", name])
+    # Stop all cells. list_cell_containers already strips infra sidecars.
+    from brig.cell.lifecycle import list_cell_containers
+    for _cell, entry in list_cell_containers(include_stopped=False):
+        name = entry.get("Names")
+        if isinstance(name, list):
+            name = name[0] if name else ""
+        if name:
+            output(f"Stopping {name}...")
+            vm_run(["podman", "stop", "-t", "5", name])
 
     # Tear down ALL host_socket bridges — not just the cells we know
     # about, but every loaded launchd plist with our prefix. Otherwise

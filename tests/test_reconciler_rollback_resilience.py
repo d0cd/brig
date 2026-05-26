@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 from brig.cell.reconciler import (
     Action,
     ActionType,
-    _execute_action,
     _rollback,
     apply,
 )

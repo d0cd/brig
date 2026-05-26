@@ -406,7 +406,9 @@ def main() -> None:
     )
 
     # Two-level dispatch: keyed by (group, verb) for grouped commands,
-    # plain str for top-level commands.
+    # plain str for top-level commands. Kept as a table (rather than
+    # argparse `set_defaults(func=...)`) so command-module imports stay
+    # lazy — `brig --version` / `brig --help` don't pay the import cost.
     dispatch: dict = {
         "run": lifecycle_cmd.cmd_run,
 

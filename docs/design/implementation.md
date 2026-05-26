@@ -46,7 +46,7 @@ src/
 
     commands/
       lifecycle_cmd.py       # run/stop/kill/rm/list/exec/shell/etc.
-      system_cmd.py          # init/verify/health/diagnose/preflight/metrics
+      system_cmd.py          # init/verify/doctor/preflight/metrics/prune/history/stats
       policy_cmd.py          # policy show/set
       secrets_cmd.py         # secrets list/add/rm
       config_cmd.py          # config show/set/reset

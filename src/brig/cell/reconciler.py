@@ -25,8 +25,10 @@ from brig.cell.ca_bundle import (
 )
 from brig.cell.metadata import IN_CELL_PATH, vm_source_path, write_metadata
 from brig.cell.spec import CellSpec
-from brig.config import PROXY_NAME, RUNTIME, VMPaths, container_name
+from brig.config import HostPaths, PROXY_NAME, RUNTIME, VMPaths, container_name
+from brig.errors import BrigError
 from brig.ops.logging import debug
+from brig.security.secrets import validate_secret_path
 from brig.vm.shell import vm_run
 
 
@@ -176,6 +178,35 @@ def plan_stop(cell_name: str, actual: CellState) -> list[Action]:
 _PROXY_ENV_NAMES = {"http_proxy", "https_proxy", "no_proxy", "all_proxy", "ftp_proxy"}
 
 
+def _verify_secrets_for_run(spec: CellSpec) -> None:
+    """Validate every requested secret against the host secrets dir.
+
+    Ensures each entry in spec.secrets resolves to a real file inside
+    HostPaths.SECRETS_DIR — no missing files, no symlinks that escape
+    the directory. Called from _execute_action just before the podman
+    bind-mount is emitted.
+    """
+    if not spec.secrets:
+        return
+    host_secrets_dir = HostPaths.SECRETS_DIR
+    for secret_name in spec.secrets:
+        try:
+            validate_secret_path(secret_name, host_secrets_dir)
+        except FileNotFoundError:
+            raise BrigError(
+                f"Secret '{secret_name}' not found in {host_secrets_dir}",
+                suggestion=f"Create it with: brig secrets add {secret_name}",
+            )
+        except ValueError as e:
+            raise BrigError(
+                f"Refusing to mount secret '{secret_name}': {e}",
+                suggestion=(
+                    "Check ~/.brig/secrets/ for symlinks that escape "
+                    "the secrets directory and remove them."
+                ),
+            )
+
+
 def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     """Build the podman run command for a cell.
 
@@ -193,7 +224,13 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         cmd.extend(["--network", "none"])
     else:
         if not proxy_ip:
-            raise RuntimeError("proxy_ip is required for non-airgapped cells")
+            raise BrigError(
+                "proxy_ip is required for non-airgapped cells",
+                suggestion=(
+                    "Warden's per-cell IP could not be determined. "
+                    "Try: brig system doctor"
+                ),
+            )
         cmd.extend([
             "--network", name,
             "-e", f"http_proxy=http://{proxy_ip}:8080",
@@ -236,10 +273,9 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
 
     if spec.seccomp_profile:
         if spec.seccomp_profile.lower() == "unconfined":
-            raise ValueError("seccomp_profile='unconfined' is not allowed")
+            raise BrigError("seccomp_profile='unconfined' is not allowed")
         if "/" in spec.seccomp_profile or ".." in spec.seccomp_profile:
-            raise ValueError("seccomp_profile must be a filename, not a path")
-        # Resolve against a known profiles directory.
+            raise BrigError("seccomp_profile must be a filename, not a path")
         profile_path = VMPaths.CELLS_DIR / "seccomp" / spec.seccomp_profile
         cmd.extend(["--security-opt", f"seccomp={profile_path}"])
 
@@ -251,7 +287,7 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     for env in spec.env:
         env_key = env.split("=", 1)[0].lower() if "=" in env else env.lower()
         if env_key in _PROXY_ENV_NAMES:
-            raise ValueError(
+            raise BrigError(
                 f"Cannot override proxy environment variable: {env.split('=', 1)[0]}"
             )
         cmd.extend(["-e", env])
@@ -280,7 +316,12 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
             cmd.extend(["-e", env])
 
     if spec.secrets:
-        secrets_dir = Path("/secrets")
+        # Note: the host-side symlink / existence check for each secret
+        # happens in _execute_action(PODMAN_RUN) via _verify_secrets_for_run
+        # so build_run_command stays pure and unit-testable. Without that
+        # check, a symlink in ~/.brig/secrets/<name> could redirect the
+        # bind-mount to an arbitrary host path.
+        secrets_dir = Path("/secrets")  # in-VM virtiofs view
         for secret_name in spec.secrets:
             resolved = secrets_dir / secret_name
             cmd.extend(["-v", f"{resolved}:/run/secrets/{secret_name}:ro"])
@@ -335,18 +376,17 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
         try:
             st = source.lstat()
         except FileNotFoundError:
-            raise RuntimeError(
-                f"host_socket '{name}': bridge socket not found at "
-                f"{source}. Is the launchd bridge running? "
-                f"Try: brig system up"
+            raise BrigError(
+                f"host_socket '{name}': bridge socket not found at {source}",
+                suggestion="Is the launchd bridge running? Try: brig up",
             )
         if _stat.S_ISLNK(st.st_mode):
-            raise RuntimeError(
+            raise BrigError(
                 f"host_socket '{name}': bridge path {source} is a symlink. "
                 f"Refusing to mount — bridge sockets must be real files."
             )
         if not _stat.S_ISSOCK(st.st_mode):
-            raise RuntimeError(
+            raise BrigError(
                 f"host_socket '{name}': bridge path {source} is not a "
                 f"unix socket (mode={oct(st.st_mode)})."
             )
@@ -360,7 +400,7 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
         real_source = _os.path.realpath(str(source))
         real_root = _os.path.realpath(str(bridge_dir))
         if not real_source.startswith(real_root + "/"):
-            raise RuntimeError(
+            raise BrigError(
                 f"host_socket '{name}': bridge socket realpath {real_source} "
                 f"escapes bridge dir {real_root}"
             )
@@ -418,12 +458,15 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         from brig.network.subnet import get
         info = get(action.cell_name)
         if info is None:
-            raise RuntimeError(f"No subnet allocated for {action.cell_name}")
+            raise BrigError(f"No subnet allocated for {action.cell_name}")
         r = _run_cmd([
             "podman", "network", "create", "--internal", "--subnet", info.subnet, name,
         ])
         if r.returncode != 0:
-            raise RuntimeError(f"Failed to create network: {r.stderr}")
+            raise BrigError(
+                f"Failed to create network for {action.cell_name}: {r.stderr.strip()}",
+                suggestion="Check VM state with: brig system doctor",
+            )
 
     elif action.type == ActionType.CONNECT_PROXY:
         r = _run_cmd(["podman", "network", "connect", name, PROXY_NAME])
@@ -432,6 +475,12 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
 
     elif action.type == ActionType.PODMAN_RUN:
         spec = action.params["spec"]
+        # Host-side secret-path validation: refuse to start the cell if
+        # any requested secret is missing or its path escapes the secrets
+        # directory via symlink. Runs here — not in build_run_command —
+        # so unit tests can drive build_run_command without needing real
+        # files on disk.
+        _verify_secrets_for_run(spec)
         # Ensure workspace directory exists inside the VM before podman mounts it.
         workspace = VMPaths.STATE_DIR / spec.name / "workspace"
         _run_cmd(["mkdir", "-p", str(workspace)])
@@ -459,12 +508,24 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
                     break
                 time.sleep(1)
             if not proxy_ip:
-                raise RuntimeError(f"Could not determine proxy IP on {name}")
+                raise BrigError(
+                    f"Could not determine proxy IP on network {name}",
+                    suggestion=(
+                        "Warden may not be connected to the cell network. "
+                        "Try: brig up"
+                    ),
+                )
 
         cmd = build_run_command(spec, proxy_ip)
         r = _run_cmd(cmd, timeout=120)
         if r.returncode != 0:
-            raise RuntimeError(f"podman run failed: {r.stderr}")
+            raise BrigError(
+                f"podman run failed: {r.stderr.strip()}",
+                suggestion=(
+                    f"Check the cell's logs: brig cell logs {spec.name}\n"
+                    "Or run diagnostics:    brig system doctor"
+                ),
+            )
         result.container_id = r.stdout.strip()
 
     elif action.type == ActionType.PODMAN_STOP:

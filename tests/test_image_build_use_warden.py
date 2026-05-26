@@ -112,9 +112,9 @@ class TestUseWardenRequiresWardenRunning(unittest.TestCase):
         self.assertIn("brig up", ctx.exception.suggestion or "")
 
     def test_raises_brigerror_when_warden_ca_missing(self):
-        """Audit follow-up: pre-check that the CA file we're about to
-        mount actually exists, so an empty mitmproxy-state dir doesn't
-        produce a cryptic 'no such file' from podman build."""
+        """Pre-check that the CA file we're about to mount actually
+        exists, so an empty mitmproxy-state dir doesn't produce a
+        cryptic 'no such file' from podman build."""
         from brig.commands import image_cmd
         from brig.errors import BrigError
 
@@ -133,10 +133,10 @@ class TestUseWardenRequiresWardenRunning(unittest.TestCase):
 
 
 class TestResolveWardenIp(unittest.TestCase):
-    """Audit follow-up: _resolve_warden_ip must prefer the
-    proxy-external bridge, not just the first network in
-    `podman inspect`'s JSON dict order. A cell-network IP would be
-    unreachable from the build container's host-networking namespace."""
+    """_resolve_warden_ip must prefer the proxy-external bridge, not
+    just the first network in `podman inspect`'s JSON dict order. A
+    cell-network IP would be unreachable from the build container's
+    host-networking namespace."""
 
     def _run(self, networks):
         """Invoke _resolve_warden_ip with a fake `podman inspect`."""

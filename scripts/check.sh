@@ -37,7 +37,9 @@ run_check "ruff" ruff check src/ tests/
 run_check "mypy" mypy src/brig/ --ignore-missing-imports --follow-imports=silent
 run_check "shellcheck" shellcheck tests/*.sh
 run_check "bandit" bandit -r src/ -ll --skip B101,B104,B108 -q
-run_check "pytest" pytest --cov=src --cov-fail-under=70 -q --ignore=tests/benchmarks -m "not slow"
+# Coverage threshold mirrors the Makefile / CI gate so a local pass
+# doesn't disagree with CI.
+run_check "pytest" pytest --cov=src --cov-fail-under=65 -q --ignore=tests/benchmarks -m "not slow"
 
 echo ""
 if [ "$FAILED" -eq 0 ]; then

@@ -130,10 +130,23 @@ class CircuitBreakerState:
 
 @dataclass
 class NotificationConfig:
-    """Notification configuration."""
+    """Notification configuration.
+
+    `resolved_ip` / `resolved_hostname` / `resolved_port` are pinned at
+    config-load time. Without pinning, every notification re-resolves
+    the webhook hostname and accepts the first IP returned. An attacker
+    who controls the webhook hostname's DNS could return a public IP on
+    the first call (passes the BLOCKED_NETWORKS check) and flip to an
+    internal IP later. Pinning closes that mid-flight rebinding window —
+    only a config reload (which re-runs the SSRF check) can change the
+    connect target.
+    """
     webhook_url: str = ""
     block_reasons: Optional[list] = None  # None = all reasons.
     cells: Optional[list] = None  # None = all cells.
     min_interval_seconds: int = DEFAULT_MIN_INTERVAL
     enabled: bool = False
     circuit_breaker: CircuitBreakerConfig = field(default_factory=CircuitBreakerConfig)
+    resolved_ip: str = ""
+    resolved_hostname: str = ""
+    resolved_port: int = 0

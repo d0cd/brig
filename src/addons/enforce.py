@@ -41,7 +41,7 @@ from typing import Optional
 
 from mitmproxy import ctx, http
 
-from _common import BLOCKED_NETWORKS, SubnetResolver
+from _common import BLOCKED_NETWORKS, SubnetResolver, is_blocked_ip  # noqa: F401 (BLOCKED_NETWORKS re-exported for the constant-mirror test)
 # Re-exported for tests and any external addons that import policy types
 # from `enforce` for historical reasons. Implementation lives in _policy.
 from _policy import (  # noqa: F401
@@ -75,8 +75,18 @@ MAX_CACHED_CELL_POLICIES = 1000
 # writes them via atomic_write_json; the writer has no explicit size cap.
 # Cap reads here so a malformed / tampered file can't OOM warden by
 # loading a multi-gigabyte JSON. 1 MiB is well above any realistic
-# policy (1000 rules ≈ ~100 KiB at the verbose end). Audit H3.
+# policy (1000 rules ≈ ~100 KiB at the verbose end).
 MAX_POLICY_FILE_BYTES = 1024 * 1024
+
+
+def _stat_signature(path: Path) -> tuple[int, int]:
+    """Return (st_mtime_ns, st_size) — a fingerprint resilient to coarse
+    filesystem mtime resolution. Same-second policy rewrites can collide
+    on float-precision mtime but rarely on size, so the tuple catches
+    edits that a `!=` on `st_mtime` would silently drop.
+    """
+    st = path.stat()
+    return (st.st_mtime_ns, st.st_size)
 
 
 class PolicyEnforcer:
@@ -85,8 +95,13 @@ class PolicyEnforcer:
     def __init__(self):
         self.cell_policies: collections.OrderedDict[str, Policy] = collections.OrderedDict()
         self.subnets = SubnetResolver(SUBNET_MAP_FILE)
-        self.policy_mtime = 0.0
-        self.cell_policy_mtimes: dict[str, float] = {}
+        # mtime is tracked as (st_mtime_ns, st_size) so coarse-grained
+        # filesystem mtimes (HFS+ has 1-second resolution; some tmpfs
+        # variants in CI are similar) can't hide a same-second policy
+        # rewrite — a float-equality comparison on st_mtime alone would
+        # silently skip reload for edits within the same wall-clock second.
+        self.policy_mtime: tuple[int, int] = (0, 0)
+        self.cell_policy_mtimes: dict[str, tuple[int, int]] = {}
         self.trace_config = PolicyTraceConfig()
         self._cell_policy_lock = threading.Lock()
         self._reload_lock = threading.RLock()
@@ -167,7 +182,7 @@ class PolicyEnforcer:
         try:
             policy_changed = (
                 POLICY_FILE.exists() and
-                POLICY_FILE.stat().st_mtime != self.policy_mtime
+                _stat_signature(POLICY_FILE) != self.policy_mtime
             )
             subnet_changed = (
                 SUBNET_MAP_FILE.exists() and
@@ -176,12 +191,12 @@ class PolicyEnforcer:
             policy_dir_changed = False
             if CELL_POLICY_DIR.exists():
                 # Detect adds / removes / edits to per-cell policies via dir mtime.
-                dir_mtime = CELL_POLICY_DIR.stat().st_mtime
+                dir_mtime_ns = CELL_POLICY_DIR.stat().st_mtime_ns
                 if not hasattr(self, "_cell_policy_dir_mtime"):
-                    self._cell_policy_dir_mtime = 0.0
-                policy_dir_changed = dir_mtime != self._cell_policy_dir_mtime
+                    self._cell_policy_dir_mtime = 0
+                policy_dir_changed = dir_mtime_ns != self._cell_policy_dir_mtime
                 if policy_dir_changed:
-                    self._cell_policy_dir_mtime = dir_mtime
+                    self._cell_policy_dir_mtime = dir_mtime_ns
         except OSError:
             return
 
@@ -213,15 +228,15 @@ class PolicyEnforcer:
                 ctx.log.warn(f"PolicyEnforcer: Policy file not found: {POLICY_FILE}")
                 return
 
-            mtime = POLICY_FILE.stat().st_mtime
-            if mtime == self.policy_mtime:
+            sig = _stat_signature(POLICY_FILE)
+            if sig == self.policy_mtime:
                 return
 
             with open(POLICY_FILE, "r") as f:
                 data = json.load(f)
 
             self.trace_config = PolicyTraceConfig(data.get("policy_trace", {}))
-            self.policy_mtime = mtime
+            self.policy_mtime = sig
 
             if self.trace_config.enabled:
                 ctx.log.info("PolicyEnforcer: Policy tracing enabled")
@@ -245,9 +260,9 @@ class PolicyEnforcer:
             for policy_file in CELL_POLICY_DIR.glob("*.json"):
                 cell_name = policy_file.stem
                 stat = policy_file.stat()
-                mtime = stat.st_mtime
+                sig = (stat.st_mtime_ns, stat.st_size)
 
-                # Size cap (audit H3) — refuse to load files larger than
+                # Size cap — refuse to load files larger than
                 # MAX_POLICY_FILE_BYTES. Fail-closed: a too-large file
                 # leaves the previous policy (if any) in place; cells
                 # without a prior policy hit the existing "no per-cell
@@ -262,7 +277,7 @@ class PolicyEnforcer:
                     continue
 
                 with self._cell_policy_lock:
-                    if self.cell_policy_mtimes.get(cell_name) == mtime:
+                    if self.cell_policy_mtimes.get(cell_name) == sig:
                         continue  # No change.
 
                     # Evict least recently used policy if at capacity.
@@ -282,7 +297,7 @@ class PolicyEnforcer:
                             host_services=data.get("host_services"),
                             tls_passthrough=data.get("tls_passthrough", []),
                         )
-                        self.cell_policy_mtimes[cell_name] = mtime
+                        self.cell_policy_mtimes[cell_name] = sig
                         ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
                     except (json.JSONDecodeError, IOError) as e:
                         ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
@@ -291,17 +306,13 @@ class PolicyEnforcer:
             ctx.log.error(f"PolicyEnforcer: Failed to scan cell policies: {e}")
 
     def _is_internal_ip(self, host: str) -> bool:
-        """Check if host is an internal/reserved IP address."""
-        try:
-            addr = host[1:-1] if host.startswith("[") and host.endswith("]") else host
-            ip = ipaddress.ip_address(addr)
-            for network in BLOCKED_NETWORKS:
-                if ip in network:
-                    return True
-        except ValueError:
-            # Not an IP address (domain name).
-            pass
-        return False
+        """Check if host is an internal/reserved IP address.
+
+        Delegates to _common.is_blocked_ip so the membership check and the
+        bracketed-IPv6 unwrap stay in one place. Returns False for
+        non-IP hosts (domain names), matching the prior behavior.
+        """
+        return is_blocked_ip(host)
 
     def _is_literal_ip(self, host: str) -> bool:
         """Check if host is a literal IP address (not a domain)."""
@@ -837,14 +848,20 @@ class PolicyEnforcer:
             return
         try:
             ip_str = flow.server_conn.peername[0]
-            ip = ipaddress.ip_address(ip_str)
-            for net in BLOCKED_NETWORKS:
-                if ip in net:
-                    reason = f"DNS rebinding: resolved to {ip_str}"
-                    self._block(flow, reason)
-                    return
-        except (ValueError, IndexError):
-            # Fail closed: block on any parse/validation error.
+        except (IndexError, AttributeError):
+            self._block(flow, "IP validation failed in responseheaders")
+            return
+        if is_blocked_ip(ip_str):
+            self._block(flow, f"DNS rebinding: resolved to {ip_str}")
+            return
+        # is_blocked_ip returns False for unparseable input; treat
+        # unparseable peer IPs as fail-closed since we cannot prove the
+        # server isn't internal.
+        try:
+            ipaddress.ip_address(
+                ip_str[1:-1] if ip_str.startswith("[") and ip_str.endswith("]") else ip_str
+            )
+        except ValueError:
             self._block(flow, "IP validation failed in responseheaders")
 
 

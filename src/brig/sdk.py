@@ -15,17 +15,15 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from brig.cell.lifecycle import kill_cell, rm_cell, run_cell, stop_cell
 from brig.vm.shell import vm_run
 from brig.cell.profiles import apply_profile, load_profile
-from brig.cell.reconciler import CellState, ReconcileResult, observe
+from brig.cell.reconciler import observe
 from brig.cell.spec import CellSpec
-from brig.config import CELL_NAME_PATTERN, CONTAINER_PREFIX, PROXY_NAME, container_name
+from brig.config import CELL_NAME_PATTERN, container_name
 from brig.errors import BrigError
 
 
@@ -358,32 +356,11 @@ class Brig:
 
     def list_sync(self) -> list[CellInfo]:
         """Synchronous version of list()."""
-        result = vm_run(
-            ["podman", "ps", "-a", "--format", "json",
-             "--filter", f"name=^{CONTAINER_PREFIX}"],
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-
-        try:
-            containers = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return []
-
-        from brig.config import INFRA_CONTAINER_NAMES
-        cells = []
-        for c in containers:
-            names = c.get("Names", "")
-            name = names[0] if isinstance(names, list) else names
-            if name in INFRA_CONTAINER_NAMES:
-                continue
-            cell_name = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
-            cells.append(CellInfo(
-                name=cell_name,
-                status=c.get("State", ""),
-                image=c.get("Image", ""),
-            ))
-        return cells
+        from brig.cell.lifecycle import list_cell_containers
+        return [
+            CellInfo(name=cell, status=c.get("State", ""), image=c.get("Image", ""))
+            for cell, c in list_cell_containers(include_stopped=True)
+        ]
 
     def cell(self, name: str) -> Cell:
         """Get a handle to an existing cell."""
