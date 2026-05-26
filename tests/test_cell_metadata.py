@@ -164,6 +164,56 @@ class TestRefreshMetadataIfPresent(unittest.TestCase):
                 self.assertIsNone(result)
 
 
+class TestIngressInMetadata(unittest.TestCase):
+    """Ingress entries persist in cell metadata so `brig cell start` can
+    replay registration with a fresh cell IP. Without this, restoring a
+    cell after `brig system down/up` leaves ingress pointing at a stale
+    IP from the previous start.
+    """
+
+    def _ingress(self) -> list[dict]:
+        return [
+            {"name": "api", "port": 8000, "path_prefix": "/api", "auth": "token"},
+        ]
+
+    def test_write_includes_ingress(self):
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths, \
+                 patch("brig.cell.metadata.load_cell_policy", return_value=None):
+                host_paths.STATE_DIR = Path(td)
+                target = metadata.write_metadata(
+                    "c1", "/work", ingress=self._ingress(),
+                )
+                payload = json.loads(target.read_text())
+        self.assertEqual(payload["ingress"], self._ingress())
+
+    def test_write_without_ingress_omits_field(self):
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths, \
+                 patch("brig.cell.metadata.load_cell_policy", return_value=None):
+                host_paths.STATE_DIR = Path(td)
+                target = metadata.write_metadata("c1", "/work")
+                payload = json.loads(target.read_text())
+        # Either absent or an empty list; both are acceptable.
+        self.assertFalse(payload.get("ingress"))
+
+    def test_refresh_preserves_ingress(self):
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths, \
+                 patch("brig.cell.metadata.load_cell_policy", return_value=None):
+                host_paths.STATE_DIR = Path(td)
+                metadata.write_metadata(
+                    "c1", "/work", ingress=self._ingress(),
+                )
+                refreshed = metadata.refresh_metadata_if_present("c1")
+                self.assertIsNotNone(refreshed)
+                payload = json.loads(refreshed.read_text())
+        self.assertEqual(payload["ingress"], self._ingress())
+
+
 class TestReconcilerBindMountsMetadata(unittest.TestCase):
     """build_run_command must include the `-v <metadata>:/run/brig/cell.json:ro`
     bind so the cell can read the file."""

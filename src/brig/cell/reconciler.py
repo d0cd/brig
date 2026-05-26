@@ -487,7 +487,8 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # Write the cell metadata file (downward API) so it's in place when
         # podman creates the read-only bind mount at /run/brig/cell.json.
         write_metadata(spec.name, spec.workspace_mount,
-                       host_sockets=spec.host_sockets)
+                       host_sockets=spec.host_sockets,
+                       ingress=spec.ingress)
         # Stage the combined CA bundle inside the VM so HTTPS clients in
         # the cell trust Warden's MITM cert. Re-extracted from Warden
         # every start so a CA rotation doesn't leave cells with stale

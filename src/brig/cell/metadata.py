@@ -71,6 +71,7 @@ def build_metadata(
     workspace_mount: str,
     started_at: datetime | None = None,
     host_sockets: list[dict[str, Any]] | None = None,
+    ingress: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Compose the cell metadata payload. Pure function for testability.
 
@@ -84,12 +85,28 @@ def build_metadata(
     host_path/mode set) or pre-projected ones — both work. Don't add
     fabricated values (the old `host_path: ""` placeholder was a lie
     waiting to break if the projection ever extended).
+
+    ingress entries are stored in full ({name, port, path_prefix, auth})
+    so `brig cell start` can replay registration without the original
+    yaml. No secrets land here — the bearer token lives in the secrets
+    dir and is re-read at registration time.
     """
     ts = started_at or datetime.now(timezone.utc)
     sockets_published = [
         {"name": entry["name"], "mount_point": entry["mount_point"]}
         for entry in (host_sockets or [])
         if isinstance(entry, dict) and "name" in entry and "mount_point" in entry
+    ]
+    ingress_published = [
+        {
+            "name": entry["name"],
+            "port": entry["port"],
+            "path_prefix": entry["path_prefix"],
+            "auth": entry["auth"],
+        }
+        for entry in (ingress or [])
+        if isinstance(entry, dict)
+        and {"name", "port", "path_prefix", "auth"} <= entry.keys()
     ]
     payload: dict[str, Any] = {
         "version": SCHEMA_VERSION,
@@ -99,6 +116,7 @@ def build_metadata(
             "mount_point": workspace_mount,
         },
         "host_sockets": sockets_published,
+        "ingress": ingress_published,
         "policy": {
             "host_services": _per_cell_host_services(cell_name),
         },
@@ -142,21 +160,46 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
     workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
-    # Preserve host_sockets across refresh — bind mounts are fixed at
-    # podman-create time, so this list can't change without a restart.
-    # The already-projected list goes straight through; build_metadata
-    # only reads name + mount_point.
+    # Preserve host_sockets and ingress across refresh — bind mounts and
+    # ingress configuration are fixed at cell-create time, so these lists
+    # can't change without a `brig run`. build_metadata projects each
+    # entry to its public-facing fields.
     prior_sockets = [
         s for s in prior.get("host_sockets", [])
         if isinstance(s, dict) and "name" in s and "mount_point" in s
     ]
-    return write_metadata(cell_name, workspace_mount, host_sockets=prior_sockets)
+    prior_ingress = read_ingress(cell_name)
+    return write_metadata(
+        cell_name, workspace_mount,
+        host_sockets=prior_sockets, ingress=prior_ingress,
+    )
+
+
+def read_ingress(cell_name: str) -> list[dict[str, Any]]:
+    """Return the cell's stored ingress entries from cell-metadata.json.
+
+    Empty list when the cell has no metadata file, the file is corrupt,
+    or the cell predates the `ingress` field. Each entry has the public
+    shape (name, port, path_prefix, auth) — no secrets.
+    """
+    import json as _json
+    try:
+        payload = _json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return []
+    entries = payload.get("ingress", []) or []
+    return [
+        e for e in entries
+        if isinstance(e, dict)
+        and {"name", "port", "path_prefix", "auth"} <= e.keys()
+    ]
 
 
 def write_metadata(
     cell_name: str,
     workspace_mount: str,
     host_sockets: list[dict[str, Any]] | None = None,
+    ingress: list[dict[str, Any]] | None = None,
 ) -> Path:
     """Write the cell's metadata JSON to the host path. Returns the path.
 
@@ -168,7 +211,10 @@ def write_metadata(
     atomic rename so a chmod failure can't silently leave the file at
     mkstemp's default 0600 (which would make it unreadable to the cell).
     """
-    payload = build_metadata(cell_name, workspace_mount, host_sockets=host_sockets)
+    payload = build_metadata(
+        cell_name, workspace_mount,
+        host_sockets=host_sockets, ingress=ingress,
+    )
     target = _host_metadata_path(cell_name)
     atomic_write_json(target, payload, mode=0o644)
     return target

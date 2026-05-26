@@ -15,6 +15,46 @@ from brig.cell.reconciler import ReconcileResult
 from brig.errors import BrigError
 
 
+class TestCmdStartReplayIngress(unittest.TestCase):
+    """`brig cell start` must replay ingress registration with the
+    freshly-inspected cell IP. Without this, a `brig system down/up`
+    cycle leaves the cell running but ingress requests through warden's
+    :8443 reverse proxy return 502.
+    """
+
+    def test_start_with_ingress_in_metadata_replays_registration(self):
+        from brig.commands.lifecycle_cmd import cmd_start
+        ingress_entries = [
+            {"name": "api", "port": 8000,
+             "path_prefix": "/api", "auth": "token"},
+        ]
+        with patch("brig.network.proxy.proxy_running", return_value=True), \
+             patch("brig.commands.lifecycle_cmd._refresh_metadata_for_start"), \
+             patch("brig.commands.lifecycle_cmd.vm_run") as mock_vm, \
+             patch("brig.cell.metadata.read_ingress",
+                   return_value=ingress_entries) as mock_read, \
+             patch("brig.cell.lifecycle.register_ingress_for") as mock_reg:
+            import subprocess
+            mock_vm.return_value = subprocess.CompletedProcess([], 0, "", "")
+            rc = cmd_start(types.SimpleNamespace(name="cell-with-ingress"))
+        self.assertEqual(rc, 0)
+        mock_read.assert_called_once_with("cell-with-ingress")
+        mock_reg.assert_called_once_with("cell-with-ingress", ingress_entries)
+
+    def test_start_without_ingress_in_metadata_skips_registration(self):
+        from brig.commands.lifecycle_cmd import cmd_start
+        with patch("brig.network.proxy.proxy_running", return_value=True), \
+             patch("brig.commands.lifecycle_cmd._refresh_metadata_for_start"), \
+             patch("brig.commands.lifecycle_cmd.vm_run") as mock_vm, \
+             patch("brig.cell.metadata.read_ingress", return_value=[]), \
+             patch("brig.cell.lifecycle.register_ingress_for") as mock_reg:
+            import subprocess
+            mock_vm.return_value = subprocess.CompletedProcess([], 0, "", "")
+            rc = cmd_start(types.SimpleNamespace(name="cell-without"))
+        self.assertEqual(rc, 0)
+        mock_reg.assert_not_called()
+
+
 class TestCmdRunProfileMerge(unittest.TestCase):
     """Test that cmd_run correctly applies profiles to CellSpec."""
 

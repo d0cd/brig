@@ -35,41 +35,42 @@ def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
     Reads the cell's IP from podman inspect, reads the auth token from
     the mounted ingress-token secret, and registers routes.
     """
-    from brig.network.ingress import register_ingress
+    register_ingress_for(spec.name, spec.ingress)
 
-    # Get the cell's IP on its dedicated network.
-    container_name = f"brig-{spec.name}"
-    network_name = container_name
-    from brig.cell.reconciler import _podman_inspect_json
-    container_info = _podman_inspect_json(container_name)
-    if not container_info:
-        debug(f"Could not inspect {container_name} for ingress registration")
+
+def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
+    """Inspect `cell_name`, look up the ingress token, and register routes.
+
+    Shared by the create-time path (run_cell) and the start-time path
+    (cmd_start replaying registration after `brig system down/up`).
+    Raises BrigError if ingress is declared but the auth token is missing
+    or empty — registering would-be-rejected routes is worse than failing
+    loudly.
+    """
+    if not ingress_spec:
         return
 
+    from brig.config import HostPaths
+    from brig.network.ingress import register_ingress
+    from brig.security.secrets import validate_secret_path
+
+    cn = f"brig-{cell_name}"
+    from brig.cell.reconciler import _podman_inspect_json
+    container_info = _podman_inspect_json(cn)
+    if not container_info:
+        debug(f"Could not inspect {cn} for ingress registration")
+        return
     cell_ip = (
         container_info.get("NetworkSettings", {})
         .get("Networks", {})
-        .get(network_name, {})
+        .get(cn, {})
         .get("IPAddress", "")
     )
     if not cell_ip:
         debug("Could not determine cell IP for ingress registration")
         return
 
-    # Read ingress auth token from secrets. Validate the path resolves inside
-    # the secrets dir to prevent symlink escape (an attacker who plants a
-    # symlink in ~/.brig/secrets pointing at /etc/passwd would otherwise
-    # have its contents adopted as the ingress token).
-    from brig.config import HostPaths
-    from brig.security.secrets import validate_secret_path
-
-    # Every ingress entry today uses auth: token (the only supported
-    # method). A missing token means routes get registered but every
-    # request 401s — silent failure that aitelier flagged. Promote to
-    # a hard error: the cell starts (containers are already up), but
-    # ingress registration refuses, and the operator gets a clear
-    # message instead of a buried WARN line.
-    token_name = f"{spec.name}-ingress-token"
+    token_name = f"{cell_name}-ingress-token"
     try:
         token_path = validate_secret_path(token_name, HostPaths.SECRETS_DIR)
     except (ValueError, FileNotFoundError):
@@ -77,29 +78,29 @@ def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
             token_path = validate_secret_path("ingress-token", HostPaths.SECRETS_DIR)
         except (ValueError, FileNotFoundError):
             raise BrigError(
-                f"Cell '{spec.name}' declares ingress with auth: token "
+                f"Cell '{cell_name}' declares ingress with auth: token "
                 f"but no token secret exists. Ingress would register "
                 f"routes that reject every request.",
                 suggestion=(
                     f"Create the token (32+ random chars), then re-run:\n"
                     f"  openssl rand -hex 32 | brig secrets add {token_name} -\n"
-                    f"  brig cell rm {spec.name} && brig run --file <yaml>"
+                    f"  brig cell rm {cell_name} && brig run --file <yaml>"
                 ),
             )
 
     auth_token = token_path.read_text().strip()
     if not auth_token:
         raise BrigError(
-            f"Ingress token for '{spec.name}' is empty",
+            f"Ingress token for '{cell_name}' is empty",
             suggestion=f"openssl rand -hex 32 | brig secrets add {token_name} -",
         )
     if len(auth_token) < 32:
         info(
-            f"WARNING: Ingress token for '{spec.name}' is short. "
+            f"WARNING: Ingress token for '{cell_name}' is short. "
             f"Use at least 32 characters."
         )
 
-    register_ingress(spec.name, cell_ip, spec.ingress, auth_token)
+    register_ingress(cell_name, cell_ip, ingress_spec, auth_token)
 
 
 def _default_proxy_check() -> bool:

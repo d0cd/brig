@@ -801,6 +801,16 @@ def cmd_start(args: Any) -> int:
             f"Failed to start cell '{args.name}': {result.stderr.strip()}",
             suggestion="Check if cell exists with: brig cell list",
         )
+    # Replay ingress registration with the freshly-inspected cell IP.
+    # podman may assign a different IP after stop/start, leaving the
+    # routes file pointing at a stale address; without this, external
+    # requests through warden's :8443 reverse proxy return 502 until
+    # the operator does `brig cell rm + brig run --file` to rebuild.
+    from brig.cell.lifecycle import register_ingress_for
+    from brig.cell.metadata import read_ingress
+    ingress_entries = read_ingress(args.name)
+    if ingress_entries:
+        register_ingress_for(args.name, ingress_entries)
     info(f"Cell '{args.name}' started")
     return 0
 
@@ -808,25 +818,15 @@ def cmd_start(args: Any) -> int:
 def _refresh_metadata_for_start(cell_name: str) -> None:
     """Rewrite /run/brig/cell.json on restart with a fresh `started_at`.
 
-    Preserves the original workspace_mount (the bind mount is fixed at
-    container-create time and re-setting it on `podman start` doesn't
-    take effect). If the existing metadata is missing or unreadable
-    (e.g. the cell was created before cell.json existed), write a
-    default-mount metadata file as a best-effort fallback.
+    Preserves the original workspace_mount, host_sockets, and ingress —
+    bind mounts and ingress configuration are fixed at create time, so
+    these come from the prior metadata write rather than being re-derived.
+    If the file is missing or unreadable (cell predates cell.json), write
+    a default-mount fallback.
     """
-    import json as _json
-    from brig.cell.metadata import (
-        _host_metadata_path,
-        write_metadata,
-    )
-    existing = _host_metadata_path(cell_name)
-    workspace_mount = "/work"
-    try:
-        prior = _json.loads(existing.read_text())
-        workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
-    except (FileNotFoundError, _json.JSONDecodeError, OSError):
-        pass
-    write_metadata(cell_name, workspace_mount)
+    from brig.cell.metadata import refresh_metadata_if_present, write_metadata
+    if refresh_metadata_if_present(cell_name) is None:
+        write_metadata(cell_name, "/work")
 
 
 def cmd_restart(args: Any) -> int:
