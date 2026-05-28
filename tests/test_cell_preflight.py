@@ -84,7 +84,12 @@ class TestPreflight(unittest.TestCase):
                 f"host_sockets:\n  - name: pg\n"
                 f"    host_path: {target}\n"
                 f"    mount_point: /run/host/pg.sock\n")
-            with patch("brig.config.HostPaths.SECRETS_DIR", Path(td)):
+            # socat isn't installed on Linux CI runners; pretend it is so
+            # the host_socket dependency check doesn't fail this test on
+            # the missing-binary, not the path-validation logic under test.
+            with patch("brig.config.HostPaths.SECRETS_DIR", Path(td)), \
+                 patch("shutil.which",
+                       lambda name: "/usr/bin/socat" if name == "socat" else None):
                 rc = cmd_preflight(_args(str(yaml)))
         self.assertEqual(rc, 0)
 
