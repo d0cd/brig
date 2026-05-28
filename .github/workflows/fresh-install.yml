@@ -34,7 +34,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # GitHub-hosted macos-15 runners don't expose nested virtualization,
+  # which Lima's VZ driver requires. Probe in a tiny preflight job;
+  # gate the main job on the result. See e2e.yml for the same pattern.
+  check-vz:
+    runs-on: macos-15
+    timeout-minutes: 2
+    outputs:
+      available: ${{ steps.hv.outputs.available }}
+    steps:
+      - id: hv
+        run: |
+          HV=$(sysctl -n kern.hv_support 2>/dev/null || echo 0)
+          echo "kern.hv_support=$HV"
+          if [ "$HV" = "1" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::fresh-install will be skipped — nested virtualization unavailable on this runner. Re-run on a bare-metal macOS host."
+          fi
+
   fresh-install:
+    needs: check-vz
+    if: needs.check-vz.outputs.available == 'true'
     runs-on: macos-15
     timeout-minutes: 30
     steps:

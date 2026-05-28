@@ -43,7 +43,33 @@ jobs:
       - name: Fetch upstream sha512 + compare to pin
         run: ./scripts/check-gvisor-pin.sh --fetch
 
+  # GitHub-hosted macos-15 runners are themselves M-series VMs and
+  # don't expose nested virtualization (`kern.hv_support` == 0). The
+  # E2E suite drives a real Lima VM + podman + gVisor, which Apple's
+  # Virtualization framework refuses to start without VZ
+  # (`VZErrorDomain Code=2 "Virtualization is not available on this
+  # hardware."`). Probe once in a tiny preflight job; gate the
+  # expensive e2e job on the result. Same pattern in fresh-install.yml.
+  check-vz:
+    runs-on: macos-15
+    timeout-minutes: 2
+    outputs:
+      available: ${{ steps.hv.outputs.available }}
+    steps:
+      - id: hv
+        run: |
+          HV=$(sysctl -n kern.hv_support 2>/dev/null || echo 0)
+          echo "kern.hv_support=$HV"
+          if [ "$HV" = "1" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::E2E will be skipped — nested virtualization unavailable on this runner. Re-run on a self-hosted bare-metal macOS host or via workflow_dispatch on a paid runner with nested-virt support."
+          fi
+
   e2e:
+    needs: check-vz
+    if: needs.check-vz.outputs.available == 'true'
     runs-on: macos-15
     timeout-minutes: 90
 
