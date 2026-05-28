@@ -70,8 +70,11 @@ jobs:
         timeout-minutes: 1
         run: mkdir -p ~/.brig/{cells/addons,secrets,state/system}
 
-      - name: Copy CI Lima YAML
-        run: cp .github/e2e/lima-ci.yaml ~/.brig/lima.yaml
+      - name: Copy Lima YAML
+        # Use the same template `brig init` ships. Removes the need for a
+        # separate `.github/e2e/lima-ci.yaml` file and keeps CI in lockstep
+        # with what users actually get.
+        run: cp src/brig/vm/lima.yaml.template ~/.brig/lima.yaml
 
       - name: Install addons
         run: |
@@ -99,7 +102,7 @@ jobs:
         id: vm-cache
         with:
           path: ~/.lima/cell/
-          key: lima-vm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/e2e/lima-ci.yaml') }}
+          key: lima-vm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/brig/vm/lima.yaml.template') }}
 
       - name: Create VM (cache miss)
         if: steps.vm-cache.outputs.cache-hit != 'true'

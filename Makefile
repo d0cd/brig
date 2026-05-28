@@ -8,7 +8,7 @@ help: ## Show this help
 setup: .venv ## Install brig, create VM, start everything
 	uv pip install -e ".[dev]"
 	@$(MAKE) _copy-addons
-	uv run brig init 2>/dev/null || true
+	uv run brig system init
 	@if ! limactl list --format '{{.Name}}' 2>/dev/null | grep -q '^brig$$'; then \
 		echo "Creating VM (this takes a few minutes on first run)..."; \
 		limactl create --name=brig ~/.brig/lima.yaml; \

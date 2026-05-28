@@ -59,9 +59,15 @@ def cmd_init(args: Any) -> int:
     lima_yaml = BRIG_HOME / "lima.yaml"
     if not lima_yaml.exists():
         template = Path(__file__).parent.parent / "vm" / "lima.yaml.template"
-        if template.exists():
-            shutil.copy2(template, lima_yaml)
-            output(f"  Created VM config: {lima_yaml}")
+        if not template.exists():
+            raise BrigError(
+                f"Lima VM template missing at {template}. "
+                f"This is a packaging bug — the wheel should ship "
+                f"src/brig/vm/lima.yaml.template; the editable install "
+                f"should expose the source tree directly."
+            )
+        shutil.copy2(template, lima_yaml)
+        output(f"  Created VM config: {lima_yaml}")
 
     output(f"Initialized brig at {BRIG_HOME}")
     output("")

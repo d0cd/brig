@@ -131,12 +131,14 @@ jobs:
           python-version: "3.12"
 
       - name: Install and audit dependencies
-        # --skip-editable: don't look up brig (the editable install) on
-        # PyPI; only audit transitive deps for CVEs.
+        # Install brig non-editable so pip-audit can resolve it the same
+        # way it resolves transitive deps. With `pip install -e .` plus
+        # `--skip-editable`, recent pip-audit versions still error on
+        # `distribution marked as editable` before they get to the skip.
         run: |
           pip install pip-audit
-          pip install -e .
-          pip-audit --strict --desc --skip-editable
+          pip install .
+          pip-audit --strict --desc
 
   secrets-scan:
     runs-on: ubuntu-latest
