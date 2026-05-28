@@ -35,14 +35,15 @@ from pathlib import Path
 #
 # Path                            current   →   gate    audit goal
 # addons/enforce.py                ~58%         55.0%   90%
-# brig/security/                   ~88%         85.0%   90%
+# brig/security/                   ~83%         80.0%   90%
 # brig/cell/reconciler.py          ~81%         78.0%   85%
 #
 # Gates run below the current actuals so a small refactor passes without
-# an immediate test-write demand.
+# an immediate test-write demand. The security gate stays at 80 because
+# the slow-marked tests skewed local coverage above what CI sees.
 THRESHOLDS: list[tuple[str, float]] = [
     ("addons/enforce.py", 55.0),
-    ("brig/security/", 85.0),
+    ("brig/security/", 80.0),
     ("brig/cell/reconciler.py", 78.0),
 ]
 

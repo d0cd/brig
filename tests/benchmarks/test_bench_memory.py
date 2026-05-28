@@ -6,6 +6,19 @@ These are not time benchmarks — they verify memory bounds.
 
 import tracemalloc
 
+import pytest
+
+# The histogram / metrics-collector tests below target the old
+# `metrics.py` addon module that was removed when warden was rewired
+# through the OTel collector. The fixtures (`histogram_class`,
+# `metrics_collector_class`) were never re-introduced after the
+# rewrite. Skip them until equivalent benchmarks for the collector
+# pipeline are written.
+_METRICS_GONE = pytest.mark.skip(
+    reason="metrics.py was replaced by the OTel collector; "
+           "equivalent benchmarks pending",
+)
+
 
 def test_memory_policy_1000_rules(policy_class):
     """1000-rule Policy should use less than 1MB."""
@@ -27,6 +40,7 @@ def test_memory_policy_1000_rules(policy_class):
     assert delta_bytes < 1_000_000, f"Policy uses {delta_kb:.1f}KB, expected <1000KB"
 
 
+@_METRICS_GONE
 def test_memory_histogram_10k(histogram_class):
     """Histogram after 10k samples should use less than 10KB."""
     tracemalloc.start()
@@ -64,6 +78,7 @@ def test_memory_metrics_100_cells(cell_metrics_class):
     assert per_cell < 200_000, f"Per-cell cost {per_cell:.0f}B is too high"
 
 
+@_METRICS_GONE
 def test_memory_lru_bounded(metrics_collector_class):
     """Fill MetricsCollector to MAX+100, verify eviction bounds count."""
     from metrics import MAX_TRACKED_CELLS
@@ -80,6 +95,7 @@ def test_memory_lru_bounded(metrics_collector_class):
     )
 
 
+@_METRICS_GONE
 def test_memory_steady_state_50k_requests(policy_class, metrics_collector_class,
                                            log_filter_class):
     """Simulate 50k requests in 5 batches, verify memory stabilizes.
