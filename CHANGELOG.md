@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.1] - 2026-05-26
 
+### Fixed
+
+- `brig cell start` now replays ingress registration with a freshly-inspected cell IP. Without this, a `brig system down` / `brig system up` cycle left the cell running but external requests through warden's `:8443` reverse proxy returned 502 indefinitely because the routes file still held the pre-restart cell IP. Ingress entries are now stored in `cell-metadata.json` (no secrets — the bearer token still lives in the secrets directory) so the start path can replay registration without the original yaml.
+
 ### Added
 
 - TCP `host_services` — declare `protocol: tcp` on a host_service entry to forward L4 traffic from the cell to a host port through warden's TCP listener. HTTP entries still go through mitmproxy at L7. Warden auto-restarts when a cell adds a new TCP host_service port that needs a listener bound.

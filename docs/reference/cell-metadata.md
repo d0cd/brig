@@ -20,6 +20,10 @@ it read-only into the cell. The cell can read but cannot modify it.
   "workspace": {
     "mount_point": "/work"
   },
+  "host_sockets": [],
+  "ingress": [
+    {"name": "api", "port": 8000, "path_prefix": "/api", "auth": "token"}
+  ],
   "policy": {
     "host_services": ["model"]
   }
@@ -34,6 +38,7 @@ it read-only into the cell. The cell can read but cannot modify it.
 | `workspace.mount_point` | string | Path inside the cell, default `/work`, overridable via `workspace_mount` in the cell spec. |
 | `policy.host_services` | string[] | Per-cell host-service ACL — the names of host services this cell may reach. Ports live in the per-cell policy file on disk; metadata exposes names only. |
 | `host_sockets[]` | `[{name, mount_point}]` | Unix sockets bind-mounted into the cell from the host (host_path is intentionally omitted). |
+| `ingress[]` | `[{name, port, path_prefix, auth}]` | Ingress endpoints the cell publishes through warden's `:8443` reverse proxy. The bearer token itself is never stored here — it lives in `~/.brig/secrets/<cell>-ingress-token`. `brig cell start` uses this list to replay route registration with a freshly-inspected cell IP after a `brig system down` / `up` cycle. |
 
 ### What changed in v2
 

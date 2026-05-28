@@ -10,7 +10,8 @@ import subprocess
 from typing import Any
 
 from brig.config import VM_NAME, HostPaths
-from brig.ops.logging import output
+from brig.errors import BrigError
+from brig.ops.logging import debug, output
 
 
 def cmd_up(args: Any) -> int:
@@ -76,25 +77,27 @@ def cmd_down(args: Any) -> int:
     """Handle `brig down` — stop everything.
 
     Steps:
-      1. Stop all running cells.
-      2. Stop warden.
-      3. Optionally stop VM (--vm flag).
+      1. Stop all running cells (via stop_cell so ingress / host_socket
+         bridges are torn down consistently per-cell).
+      2. Sweep any orphan host_socket bridges whose cell already exited.
+      3. Stop warden.
+      4. Optionally stop VM (--vm flag).
     """
-    from brig.vm.shell import vm_run
+    from brig.cell.lifecycle import list_cell_containers, stop_cell
 
-    # Stop all cells. list_cell_containers already strips infra sidecars.
-    from brig.cell.lifecycle import list_cell_containers
-    for _cell, entry in list_cell_containers(include_stopped=False):
-        name = entry.get("Names")
-        if isinstance(name, list):
-            name = name[0] if name else ""
-        if name:
-            output(f"Stopping {name}...")
-            vm_run(["podman", "stop", "-t", "5", name])
+    # Stop each running cell through the full lifecycle path. Wrap in
+    # try/except so a single misbehaving cell doesn't strand the others
+    # (e.g., already mid-shutdown, deregistered externally, etc.).
+    for cell_name, _entry in list_cell_containers(include_stopped=False):
+        output(f"Stopping {cell_name}...")
+        try:
+            stop_cell(cell_name)
+        except BrigError as e:
+            debug(f"stop_cell({cell_name}) returned: {e}")
 
-    # Tear down ALL host_socket bridges — not just the cells we know
-    # about, but every loaded launchd plist with our prefix. Otherwise
-    # socat keeps running across `brig down` for cells that are gone.
+    # Sweep orphan host_socket bridges — launchd plists whose cells were
+    # already stopped (or removed) before this `brig down`. Idempotent;
+    # no-op when there's nothing to clean.
     _bootout_all_host_socket_bridges()
 
     # Stop warden.
