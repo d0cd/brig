@@ -4,7 +4,6 @@ Provides pre-configured addon classes and test data generators.
 Uses mitmproxy mocking pattern from test_addons_unit.py.
 """
 
-import importlib
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -25,6 +24,33 @@ if str(ADDONS_DIR) not in sys.path:
 SRC_DIR = Path(__file__).parent.parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
+
+
+def pytest_benchmark_update_machine_info(config, machine_info):
+    """Annotate the pytest-benchmark JSON with the OTel endpoint we
+    forwarded to, so the static JSON record carries the same
+    correlation operators see in Grafana."""
+    import os
+    endpoint = os.environ.get("BRIG_BENCH_OTEL_ENDPOINT", "")
+    if endpoint:
+        machine_info.setdefault("brig", {})["otel_endpoint"] = endpoint
+
+
+@pytest.fixture(autouse=True)
+def _brig_bench_otel_emit(request):
+    """After each benchmark test, forward its stats into the OTel
+    collector. No-op when pytest-benchmark wasn't used in the test
+    or BRIG_BENCH_OTEL_ENDPOINT is unset."""
+    yield
+    bench = request.node.funcargs.get("benchmark")
+    if bench is None:
+        return
+    try:
+        from tests.benchmarks.otel_emit import emit
+        emit(bench)
+    except Exception:
+        # Never fail a benchmark because of telemetry export.
+        pass
 
 
 @pytest.fixture(scope="session")

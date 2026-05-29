@@ -33,13 +33,34 @@ provision:
       apt-get update
       apt-get install -y podman uidmap slirp4netns fuse-overlayfs
 
-      # Install gVisor (runsc) with integrity verification.
+      # Install gVisor (runsc) — pinned release + sha512 verified against
+      # an in-template constant. Fetching `release/latest` plus its sha512
+      # from the same TLS endpoint detects corruption but not authenticity;
+      # an attacker controlling the bucket would get persistent runsc
+      # compromise, and runsc enforces invariant 5. Keep these values in
+      # sync with scripts/provision-vm.sh (CI checks this).
+      GVISOR_RELEASE="20260511.0"
+      declare -A GVISOR_SHA512_BY_ARCH=(
+        [aarch64]="1a1da6060bbfb98fcd98304a7e73afb2c23a897ae4a8bf741e1c6a16cf07e0cd14bcd9d0f0e51aff201feb0cf8d19952f944aeb5eb5d92b091509374b9702a26"
+        [x86_64]="e227a71c95e794119f6648a44083df945392c6cd457f36abbc49c2b6e0b87c7f01b94e6bf4632f4cb22ee34fbec7a2c34ca03d30efa9c689db76a6215a6e44e1"
+      )
       ARCH=$(uname -m)
-      curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc" -o /usr/local/bin/runsc
-      curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/latest/${ARCH}/runsc.sha512" -o /tmp/runsc.sha512
-      cd /usr/local/bin && sha512sum -c /tmp/runsc.sha512
+      EXPECTED_SHA="${GVISOR_SHA512_BY_ARCH[$ARCH]:-}"
+      if [[ -z "$EXPECTED_SHA" || "$EXPECTED_SHA" == REPLACE_WITH_* ]]; then
+        echo "ERROR: no pinned sha512 for arch '$ARCH'." >&2
+        echo "  Run ./scripts/pin-gvisor.sh before provisioning." >&2
+        exit 1
+      fi
+      URL="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/${ARCH}/runsc"
+      curl -fsSL "$URL" -o /usr/local/bin/runsc.new
+      ACTUAL=$(sha512sum /usr/local/bin/runsc.new | awk '{print $1}')
+      if [[ "$ACTUAL" != "$EXPECTED_SHA" ]]; then
+        echo "ERROR: gVisor sha512 MISMATCH (got $ACTUAL, expected $EXPECTED_SHA)" >&2
+        rm -f /usr/local/bin/runsc.new
+        exit 1
+      fi
+      mv /usr/local/bin/runsc.new /usr/local/bin/runsc
       chmod +x /usr/local/bin/runsc
-      rm -f /tmp/runsc.sha512
 
       # Install crun (for Warden — proxy needs raw I/O, not gVisor overhead)
       apt-get install -y crun
@@ -62,11 +83,16 @@ provision:
       # Create proxy-external network
       podman network create proxy-external || true
 
-      # Create required directories
+      # Create log directory (coordination state lives on the host under
+      # ~/.brig/state/system and reaches warden via the /state virtiofs mount).
       mkdir -p /var/log/brig/network
-      mkdir -p /var/run/brig/policies
       chmod 755 /var/log/brig/network
-      chmod 755 /var/run/brig
+
+      # Map the VM hostname to 127.0.0.1 so sudo doesn't pay a 5-second DNS
+      # timeout resolving "lima-brig" for its logging — that delay was making
+      # every "brig" command on the host feel hung.
+      grep -q "$(hostname)" /etc/hosts || \
+        echo "127.0.0.1 $(hostname)" >> /etc/hosts
 
       # Log rotation
       cat > /etc/logrotate.d/brig <<'LOGROTATE'

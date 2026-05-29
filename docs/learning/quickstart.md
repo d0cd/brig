@@ -42,18 +42,18 @@ print(urllib.request.urlopen('https://pypi.org').status)
 Check it:
 
 ```bash
-brig list                     # see all cells
-brig logs my-cell             # view output
-brig files my-cell            # list workspace
-brig exec my-cell -- whoami   # run command inside
-brig stop my-cell             # stop
-brig rm my-cell               # remove
+brig cell list                     # see all cells
+brig cell logs my-cell             # view output
+brig cell files my-cell            # list workspace
+brig cell exec my-cell -- whoami   # run command inside
+brig cell stop my-cell             # stop
+brig cell rm my-cell               # remove
 ```
 
 ## 4. Use Profiles
 
 ```bash
-brig profiles                 # see available profiles
+brig system profiles                 # see available profiles
 
 brig run --profile untrusted alpine sh        # 512m, 1 cpu, restricted
 brig run --profile dev python:3.12 bash       # 4g, 4 cpus, generous
@@ -77,25 +77,30 @@ env vars, process listings, or container inspect output.
 
 ```bash
 # Export from cell (applies quarantine + extension blocking)
-brig cp my-cell:/work/output.json ./output.json
+brig cell cp my-cell:/work/output.json ./output.json
 
 # Import into cell
-brig cp ./input.txt my-cell:/work/input.txt
+brig cell cp ./input.txt my-cell:/work/input.txt
 ```
 
 ## 7. Edit Policy
 
 ```bash
-brig policy show                              # view global policy
-brig policy set global --allow '*.example.com'  # add to allowlist
-brig policy set my-cell --deny evil.com       # per-cell deny
+brig policy show my-cell                       # view a cell's policy
+brig policy set my-cell --allow '*.example.com'  # extend allowlist
+brig policy set my-cell --deny evil.com          # extend denylist
+brig policy test my-cell api.github.com          # simulate a request
 ```
+
+Policy lives per-cell. For shared defaults across many cells, declare
+them in a trust profile and reference it from the cell yaml's
+`profile:` field.
 
 ## 8. Shutdown
 
 ```bash
-brig down                     # stop all cells + warden
-brig down --vm                # also stop the VM
+brig system down                     # stop all cells + warden
+brig system down --vm                # also stop the VM
 ```
 
 ## Troubleshooting
@@ -103,8 +108,8 @@ brig down --vm                # also stop the VM
 | Problem | Fix |
 |---------|-----|
 | "limactl not found" | `brew install lima` |
-| "Brig VM is not running" | `brig up` |
-| "Warden proxy is not running" | `brig up` |
+| "Brig VM is not running" | `brig system up` |
+| "Warden proxy is not running" | `brig system up` |
 | "Rate limit exceeded" | Wait 60 seconds |
 | Cell can't reach the internet | Check `brig policy show` — domain must be in allowlist |
 

@@ -99,13 +99,11 @@ def _cmd_status(proxy_mod: object) -> int:
 
 
 def _domain_matches_rule(domain: str, rule: str) -> bool:
-    """Check if a domain matches a policy rule, supporting wildcard rules."""
-    domain = domain.lower()
-    rule = rule.lower()
-    if rule.startswith("*."):
-        suffix = rule[1:]  # ".example.com"
-        return domain.endswith(suffix) and len(domain) > len(suffix)
-    return domain == rule
+    """Check if a domain matches a policy rule. Thin wrapper around the
+    shared brig.policy.policy.domain_matches_rule so warden and brig CLI
+    share one implementation (C6 dedup from the 0.3 validation plan)."""
+    from brig.policy.policy import domain_matches_rule
+    return domain_matches_rule(rule, domain)
 
 
 def _handle_policy(args: object, policy_mod: object) -> int:

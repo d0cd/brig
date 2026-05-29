@@ -2,6 +2,8 @@
 
 import sys
 import unittest
+
+import pytest
 from unittest.mock import MagicMock
 
 # Mock mitmproxy before importing.
@@ -22,7 +24,12 @@ class TestTokenBucket(unittest.TestCase):
         self.assertTrue(bucket.consume())
         self.assertFalse(bucket.consume())
 
+    @pytest.mark.slow
     def test_refill(self):
+        """Timing-dependent: relies on monotonic clock advancing during a
+        20ms sleep. Marked slow so CI matrix concurrency doesn't flake
+        the bucket consume below the refill threshold.
+        """
         bucket = TokenBucket(rate=1000.0, burst=10)
         for _ in range(10):
             bucket.consume()

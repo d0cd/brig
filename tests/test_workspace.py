@@ -7,7 +7,6 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from brig.config import UNSAFE_EXTENSIONS
 from brig.errors import BrigError

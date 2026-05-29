@@ -1,7 +1,6 @@
 """Tests for brig.cell.reconciler — declarative reconciliation engine."""
 
 import unittest
-from unittest.mock import patch
 
 from brig.cell.reconciler import (
     ActionType,
@@ -151,17 +150,19 @@ class TestBuildRunCommand(unittest.TestCase):
 
     def test_proxy_env_override_rejected(self):
         """User cannot override proxy env vars."""
+        from brig.errors import BrigError
         spec = CellSpec(name="test", image="alpine", env=["http_proxy=evil"])
-        with self.assertRaises(ValueError, msg="Cannot override proxy"):
+        with self.assertRaises(BrigError, msg="Cannot override proxy"):
             build_run_command(spec, "10.60.1.1")
 
     def test_all_proxy_env_names_rejected(self):
         """All 5 proxy env var names are rejected."""
+        from brig.errors import BrigError
         proxy_vars = ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "ftp_proxy"]
         for var in proxy_vars:
             for form in [var, var.upper(), var.capitalize()]:
                 spec = CellSpec(name="test", image="alpine", env=[f"{form}=evil"])
-                with self.assertRaises(ValueError, msg=f"{form} should be rejected"):
+                with self.assertRaises(BrigError, msg=f"{form} should be rejected"):
                     build_run_command(spec, "10.60.1.1")
 
     def test_security_hardening(self):
@@ -195,6 +196,63 @@ class TestBuildRunCommand(unittest.TestCase):
         cmd = build_run_command(spec, "10.60.1.1")
         cmd_str = " ".join(cmd)
         self.assertIn("/work:rw", cmd_str)
+
+    def test_readonly_rootfs_by_default(self):
+        """Safe-by-default: cells get --read-only rootfs with sized tmpfs
+        at /tmp and /run. Closes the DoS-via-writable-layer hole and the
+        hidden-persistence-across-stop/start hole."""
+        spec = CellSpec(name="test", image="alpine")
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertIn("--read-only", cmd)
+        # /tmp tmpfs with size cap.
+        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        self.assertTrue(any(t.startswith("/tmp:") and "size=64m" in t
+                            for t in tmpfs_pairs),
+            f"expected /tmp tmpfs with 64m cap, got --tmpfs values {tmpfs_pairs}")
+        # /run tmpfs.
+        self.assertTrue(any(t.startswith("/run:") for t in tmpfs_pairs),
+            f"expected /run tmpfs, got --tmpfs values {tmpfs_pairs}")
+
+    def test_readonly_tmpfs_has_security_options(self):
+        """Sized tmpfs is necessary but not sufficient — also need
+        noexec/nosuid/nodev so the cell can't drop a SUID binary in /tmp
+        and exec something privileged from there."""
+        spec = CellSpec(name="test", image="alpine")
+        cmd = build_run_command(spec, "10.60.1.1")
+        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        for t in tmpfs_pairs:
+            self.assertIn("noexec", t, f"{t} missing noexec")
+            self.assertIn("nosuid", t, f"{t} missing nosuid")
+            self.assertIn("nodev", t, f"{t} missing nodev")
+
+    def test_writable_rootfs_opt_out_omits_readonly(self):
+        """For cells whose images legitimately need a writable rootfs
+        (legacy daemons, dev images that build at runtime), opt-out via
+        writable_rootfs: true. Should skip --read-only entirely and not
+        introduce the tmpfs mounts (the cell's own filesystem covers /tmp
+        and /run)."""
+        spec = CellSpec(name="test", image="alpine", writable_rootfs=True)
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertNotIn("--read-only", cmd)
+        # /tmp and /run shouldn't appear in any --tmpfs flag.
+        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
+        for t in tmpfs_pairs:
+            self.assertFalse(t.startswith("/tmp:"),
+                f"writable_rootfs cell shouldn't get /tmp tmpfs: {t}")
+            self.assertFalse(t.startswith("/run:"),
+                f"writable_rootfs cell shouldn't get /run tmpfs: {t}")
+
+    def test_workspace_mount_override(self):
+        """The new `workspace_mount` field must flow into the podman -v
+        argument and -w workdir, not just sit unused on CellSpec."""
+        spec = CellSpec(name="test", image="alpine", workspace_mount="/workspace")
+        cmd = build_run_command(spec, "10.60.1.1")
+        cmd_str = " ".join(cmd)
+        self.assertIn(":/workspace:rw", cmd_str)
+        # -w /workspace too, so the cell's cwd matches the mount.
+        self.assertIn("-w /workspace", cmd_str)
+        # Default /work should NOT appear as a mount when overridden.
+        self.assertNotIn(":/work:rw", cmd_str)
 
     def test_user_env_accepted(self):
         """Non-proxy env vars are accepted."""

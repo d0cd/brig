@@ -1,13 +1,11 @@
 """Tests for brig.ops.logging — the canonical logging implementation."""
 
 import io
-import sys
 import unittest
 from unittest.mock import patch
 
 from brig.ops.logging import (
     LOG_LEVEL_DEBUG,
-    LOG_LEVEL_ERROR,
     LOG_LEVEL_INFO,
     LOG_LEVEL_WARN,
     Spinner,

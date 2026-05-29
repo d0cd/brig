@@ -1,0 +1,105 @@
+[
+  {
+    "AutoRemove": false,
+    "Command": [
+      "sleep",
+      "10"
+    ],
+    "CreatedAt": "6 days ago",
+    "CIDFile": "",
+    "Exited": true,
+    "ExitedAt": 1778608605,
+    "ExitCode": 0,
+    "Id": "c79050482cce087b95a9ccb8c35bfcdaf7baee00924f8b54274e5b88203ceb7d",
+    "Image": "docker.io/library/alpine:latest",
+    "ImageID": "2ffb2ff4aab36d06b7f3266bbb10e8232769cd2360613131d37abd19430cf6f1",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [],
+    "Names": [
+      "test-rt"
+    ],
+    "Namespaces": {
+
+    },
+    "Networks": [
+      "podman"
+    ],
+    "Pid": 0,
+    "Pod": "",
+    "PodName": "",
+    "Ports": null,
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1778608595,
+    "State": "exited",
+    "Status": "Exited (0) 6 days ago",
+    "Created": 1778608594
+  },
+  {
+    "AutoRemove": false,
+    "Command": [
+      "--mode",
+      "regular@8080",
+      "--mode",
+      "regular@8443",
+      "--set",
+      "block_global=false",
+      "-s",
+      "/addons/ingress.py",
+      "-s",
+      "/addons/enforce.py",
+      "-s",
+      "/addons/logger.py",
+      "-s",
+      "/addons/ops.py",
+      "-s",
+      "/addons/notifier.py"
+    ],
+    "CreatedAt": "52 minutes ago",
+    "CIDFile": "",
+    "Exited": false,
+    "ExitedAt": -62135596800,
+    "ExitCode": 0,
+    "Id": "be5b38bbee636f3bc40838b6b8ccf7e0da5ee380e080cb2f864d6899b8f99c15",
+    "Image": "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268",
+    "ImageID": "d7425b6d0552a46dad133ecb3aca888f0ef00cccd0295b0250ed6fd08c567ef7",
+    "IsInfra": false,
+    "Labels": null,
+    "Mounts": [
+      "/var/run/cells",
+      "/addons",
+      "/policy.json",
+      "/tmp",
+      "/home/mitmproxy/.mitmproxy",
+      "/logs"
+    ],
+    "Names": [
+      "warden"
+    ],
+    "Namespaces": {
+
+    },
+    "Networks": [
+      "proxy-external"
+    ],
+    "Pid": 56348,
+    "Pod": "",
+    "PodName": "",
+    "Ports": [
+      {
+        "host_ip": "",
+        "container_port": 8443,
+        "host_port": 8443,
+        "range": 1,
+        "protocol": "tcp"
+      }
+    ],
+    "Restarts": 0,
+    "Size": null,
+    "StartedAt": 1779124344,
+    "State": "running",
+    "Status": "Up 52 minutes",
+    "Created": 1779124344
+  }
+]

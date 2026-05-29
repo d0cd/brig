@@ -1,6 +1,6 @@
 # Brig SDK Specification
 
-Version 0.2.0 | Python 3.10+
+Version 0.3.0 | Python 3.10+
 
 ## Import
 

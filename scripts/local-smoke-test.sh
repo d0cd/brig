@@ -63,21 +63,21 @@ fi
 
 # ---------------------------------------------------------------------------
 info ""
-info "Phase 2: brig init"
+info "Phase 2: brig system init"
 # ---------------------------------------------------------------------------
 
 if [ ! -d "$HOME/.brig" ]; then
-    echo "  Running brig init..."
-    $BRIG init
+    echo "  Running brig system init..."
+    $BRIG system init
     if [ -f "$HOME/.brig/lima.yaml" ]; then
-        pass "brig init created ~/.brig/lima.yaml"
+        pass "brig system init created ~/.brig/lima.yaml"
     else
-        fail "brig init did not create lima.yaml"
+        fail "brig system init did not create lima.yaml"
     fi
     if [ -f "$HOME/.brig/cells/network-policy.json" ]; then
-        pass "brig init created default policy"
+        pass "brig system init created default policy"
     else
-        fail "brig init did not create policy"
+        fail "brig system init did not create policy"
     fi
 else
     pass "~/.brig already exists"

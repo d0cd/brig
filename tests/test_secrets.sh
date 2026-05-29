@@ -24,6 +24,12 @@
 set -euo pipefail
 
 VM_NAME="${CELL_VM_NAME:-cell}"
+# Honor BRIG_HOME so a dev running `make smoke` doesn't mutate their
+# real ~/.brig/secrets/ directory. CI E2E leaves BRIG_HOME unset (the
+# runner is ephemeral); local invocations should
+# `export BRIG_HOME=$(mktemp -d)` before invoking.
+BRIG_HOME="${BRIG_HOME:-$HOME/.brig}"
+SECRETS_DIR="$BRIG_HOME/secrets"
 PASSED=0
 FAILED=0
 
@@ -69,18 +75,18 @@ check_vm_running() {
 
 # Create test secret files.
 create_test_secrets() {
-    echo "Creating test secrets..."
-    mkdir -p ~/.brig/secrets
-    echo "test-api-key-12345" > ~/.brig/secrets/test-api-key.txt
-    echo "test-token-67890" > ~/.brig/secrets/test-token.txt
-    chmod 600 ~/.brig/secrets/test-api-key.txt
-    chmod 600 ~/.brig/secrets/test-token.txt
+    echo "Creating test secrets in $SECRETS_DIR ..."
+    mkdir -p "$SECRETS_DIR"
+    echo "test-api-key-12345" > "$SECRETS_DIR/test-api-key.txt"
+    echo "test-token-67890" > "$SECRETS_DIR/test-token.txt"
+    chmod 600 "$SECRETS_DIR/test-api-key.txt"
+    chmod 600 "$SECRETS_DIR/test-token.txt"
 }
 
 # Clean up test secrets.
 cleanup_test_secrets() {
-    rm -f ~/.brig/secrets/test-api-key.txt
-    rm -f ~/.brig/secrets/test-token.txt
+    rm -f "$SECRETS_DIR/test-api-key.txt"
+    rm -f "$SECRETS_DIR/test-token.txt"
 }
 
 # Clean up test cells.

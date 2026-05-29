@@ -15,11 +15,11 @@ import collections
 import json
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Optional
 
 from mitmproxy import ctx, http
 
@@ -288,14 +288,24 @@ class OpsAddon:
             ctx.log.warn(f"OpsAddon: Failed to load rate config: {e}")
 
     def _start_health_server(self) -> None:
-        """Start the health check HTTP server."""
+        """Start the health check HTTP server.
+
+        Bind address defaults to 127.0.0.1 — warden is multi-homed onto
+        every per-cell network, so a 0.0.0.0 bind would expose the
+        aggregate metrics (request counts, last_request_ts) to every
+        cell that probes warden's IP on its joined network. Tenancy
+        isolation requires the health endpoint to stay inside the
+        warden container; consumers on the host can reach it via
+        `podman exec` or by publishing the port explicitly.
+        """
         import os
         port = int(os.environ.get("HEALTH_PORT", str(HEALTH_PORT)))
+        bind_host = os.environ.get("HEALTH_BIND", "127.0.0.1")
         try:
-            self.health_server = _ThreadedHTTPServer(("0.0.0.0", port), _HealthHandler)
+            self.health_server = _ThreadedHTTPServer((bind_host, port), _HealthHandler)
             self.health_thread = threading.Thread(target=self.health_server.serve_forever, daemon=True)
             self.health_thread.start()
-            ctx.log.info(f"OpsAddon: Health server started on port {port}")
+            ctx.log.info(f"OpsAddon: Health server started on {bind_host}:{port}")
         except OSError as e:
             ctx.log.warn(f"OpsAddon: Failed to start health server: {e}")
 

@@ -1,6 +1,6 @@
 # Brig Security Invariants — Living Ledger
 
-The 9 invariants from [docs/design/security.md](design/security.md) are the
+The 12 invariants from [docs/design/security.md](design/security.md) are the
 thing this project exists to uphold. This document is the single source of
 truth for **which tests prove them** and **which CI lane runs those tests**.
 
@@ -33,16 +33,15 @@ to that invariant's row — don't leave the coverage implicit.
 
 | Surface | Location |
 |---|---|
-| Enforcement | `src/addons/enforce.py` — port allowlist (80/443), literal-IP block, RFC1918/CGNAT/etc block at request + http_connect + server_connected |
+| Enforcement | `src/addons/enforce.py` — port allowlist (80/443), literal-IP block, RFC1918/CGNAT/etc block at request + http_connect + responseheaders |
 | Blocklist source | `src/addons/_common.py:BLOCKED_NETWORKS` — single source shared by enforce + notifier |
-| DNS rebinding defense | `server_connected` and `responseheaders` re-check resolved IP against `BLOCKED_NETWORKS`. Skip is **gated on `flow.metadata["host_service"]`** (set by `_handle_host_service`), not on a `(ip, port)` tuple — a tuple skip would let a DNS-rebinding allowlisted domain reach a host service. |
+| DNS rebinding defense | `responseheaders` re-checks resolved IP (`flow.server_conn.peername`) against `BLOCKED_NETWORKS`. Skip is **gated on `flow.metadata["host_service"]` / `["ingress_route"]`** (populated by `_handle_host_service` / ingress.py), not on a `(ip, port)` tuple — a tuple skip would let a DNS-rebinding allowlisted domain reach a host service. The check used to ALSO run in `server_connected`, but `data.server.close()` no longer exists on mitmproxy >= 10 (raised AttributeError, masked the would-be block) AND `data.flow` was None there so exemptions didn't fire either. Aitelier diagnosed; check now lives only in `responseheaders` where metadata is populated. |
 | Host header smuggling | `_host_header_mismatches` in `request()` and `http_connect()`. Multi-colon strings validated via `ipaddress.ip_address` so non-IPv6 inputs like `example.com:80:extra` don't silently get treated as bare IPv6. |
-| Host services | `.host.brig` virtual domains are an **intentional, scoped relaxation** of this invariant. Per-cell ACL: a cell can reach `<name>.host.brig` only if `<name>` is in its per-cell policy's `host_services` list. Cells with no per-cell policy have no host-service access. Unknown `.host.brig` domains are blocked. See `_handle_host_service()` in enforce.py. |
+| Host services | `.host.brig` virtual domains are an intentional, scoped relaxation of this invariant. The cell yaml declares `host_services: [{name, port}]`; that declaration is the sole grant. Warden reads the port from the cell's own per-cell policy file (there is no separate global registry). Cells without `host_services` in yaml have no host-service access. Unknown `.host.brig` domains are blocked. The `untrusted` profile rejects `host_services` at parse time. See `_handle_host_service()` in `src/addons/enforce.py`. |
 | Ingress | Warden ingress (port 8443) allows authenticated inbound traffic to cells. enforce.py blocks unhandled ingress requests (fail closed). CONNECT is blocked entirely on the ingress port. See `src/addons/ingress.py`. |
 | Unit test | `tests/test_addons_ops.py` — token bucket rate limiting |
 | Unit test | `tests/test_ingress.py` — ingress routing, token auth, cell IP validation (rejects `.0` / `.1` / `.255`), rate limiting |
-| Unit test | `tests/test_security_audit.py::TestServerConnectedDnsRebinding` — RFC1918, localhost, link-local, IPv4-mapped-IPv6, IPv6 link-local; flow-metadata-gated host-service skip; a naked tuple match must NOT bypass |
-| Unit test | `tests/test_security_audit.py::TestResponseHeadersDnsRebinding` — same coverage at the response stage |
+| Unit test | `tests/test_security_audit.py::TestResponseHeadersDnsRebinding` — RFC1918, localhost, link-local, IPv4-mapped-IPv6, IPv6 link-local; flow-metadata-gated host-service / ingress-route skip; a naked tuple match must NOT bypass |
 | Unit test | `tests/test_security_audit.py::TestConnectMethodEnforcement` — CONNECT to disallowed port / internal IP / literal IP / disallowed domain / ingress port |
 | Unit test | `tests/test_security_audit.py::TestNormalizeHostspecRobustness` — bracketed IPv6, multi-colon non-IPv6 strings |
 | Unit test | `tests/test_security_audit.py::TestHandleHostService` — per-cell ACL: cell with no per-cell policy is blocked; cell whose policy doesn't list the service is blocked |
@@ -94,8 +93,8 @@ proxy logs, not prevention.
 | Verify check | `src/brig/security/verify.py:verify_cell_network_members` — flags any member of a `brig-<cell>` network that isn't warden or the cell itself |
 | Unit test | `tests/test_security_verify.py::TestVerifyCellNetworkMembers::test_foreign_container` |
 | Unit test | `tests/test_security_verify.py::TestVerifyCellNetworkMembers::test_only_warden_and_cell` |
-| Gap | No E2E test that actually attaches a foreign container and asserts detection. Tracked for a future E2E test pass. |
-| CI | Unit |
+| E2E test | `tests/test_invariants_7_8.sh` — attaches a foreign container to a cell's network and asserts `brig system verify` detects it |
+| CI | Unit + E2E |
 
 ### 8. Cells Must Be Single-Homed
 
@@ -115,6 +114,151 @@ proxy logs, not prevention.
 | Unit test | `tests/test_cell_lifecycle.py::TestRunCell::test_invariant_9_proxy_must_be_running` |
 | E2E test | `tests/test_cell_lifecycle.sh` |
 | CI | Unit + E2E |
+
+### 10. host_sockets Bypass Warden by Design
+
+The prior nine invariants imply "Warden sees all cell traffic." That is
+not literally true once host_sockets are declared. The bytes flowing
+over a bind-mounted unix socket move through the kernel directly between
+the cell and the host service — no proxy interposition possible. This
+is the trade-off for supporting non-HTTP services (Postgres, Redis,
+ssh-agent) that cannot meaningfully traverse an HTTP proxy.
+
+The invariant we DO uphold:
+
+  - host_sockets are opt-in per cell yaml (no default access)
+  - The `untrusted` profile cannot declare them at all (parse-time reject)
+  - Engine sockets (docker.sock, podman.sock, etc.) are denylisted at
+    parse time AND at bridge start (defense in depth)
+  - Bridge sockets are real unix sockets, never symlinks (lstat check)
+  - Per-cell namespacing — cell A's bridge cannot be reused by cell B
+  - Every attach is audited (`log_lifecycle("host_socket_attach", ...)`)
+  - The cell startup banner explicitly says Warden does not see the
+    traffic, so operators internalize the trade-off
+
+| Surface | Location |
+|---|---|
+| Parse-time guards | `src/brig/cell/spec.py:_v_host_socket_entry`, `_v_host_sockets` |
+| Engine denylist | `src/brig/config.py:HOST_SOCKET_ENGINE_DENYLIST` |
+| Runtime TOCTOU | `src/brig/cell/reconciler.py:_attach_host_sockets` (lstat, S_ISSOCK) |
+| Bridge defense | `src/brig/cell/host_sockets_bridge.py:_validate_target` |
+| Audit | `src/brig/cell/lifecycle.py:run_cell` emits `host_socket_attach` |
+| Banner | `src/brig/cell/lifecycle.py:run_cell` prints NOTE on cells with sockets |
+| Unit tests | `tests/test_host_sockets_spec.py` (19 cases) |
+| Unit tests | `tests/test_reconciler_host_sockets.py` (7 cases) |
+| Unit tests | `tests/test_host_sockets_bridge.py` (9 cases) |
+| Unit tests | `tests/test_metadata_host_sockets.py` (3 cases) |
+| CI | Unit |
+
+### 11. TLS Passthrough Is an Explicit, Opt-In TLS-Handling Override
+
+Some hosts (Cloudflare-fronted endpoints, sites with HPKP / Encrypted Client
+Hello / strict ALPN-cipher pinning) refuse mitmproxy's relayed TLS
+handshake. The operator can opt the cell out of MITM for a specific host
+by adding it to `policy.tls_passthrough` in the cell yaml. The host then
+flows through Warden as a raw TCP tunnel after the CONNECT, routed by SNI.
+
+This is a deliberate **security model shift** for that host. Brig's MITM
+default offers full URL/body audit but loses on (a) strict-TLS compat and
+(b) credential confidentiality vs. Warden. Passthrough flips both — gains
+compat + confidentiality, loses per-URL audit + body inspection. The
+trade-off is documented and opt-in per host so the operator's act of
+adding the entry IS the security review.
+
+The invariants we DO uphold for passthrough hosts:
+
+  - **Passthrough is opt-in per cell per host.** No default-passthrough
+    list. A cell with no `tls_passthrough:` block behaves exactly as today.
+  - **Passthrough hosts MUST also appear in `policy.allow`.** Passthrough
+    is a TLS-handling override, NOT a policy bypass. Validated at parse
+    time — a `tls_passthrough` entry without a matching `allow` entry is
+    a hard validation error. Without this guard, an operator could opt a
+    host out of MITM without ever granting it allow, silently leaking
+    egress past the policy.
+  - **SNI in the client hello must match the CONNECT host** (Phase 2).
+    Otherwise a malicious cell could CONNECT to allowed-host:443 then
+    send SNI=attacker.com to abuse Warden as a generic TLS tunnel.
+  - **Audit log entries are tls_mode-tagged.** Passthrough records carry
+    SNI + bytes + duration; per-URL/body attributes are absent **by
+    construction** (Warden never decrypted them). Operators can grep for
+    `tls_mode=passthrough` to enumerate uninspected flows (Phase 3).
+  - **Untrusted profile cannot declare passthrough** (Phase 1 follow-up).
+    The trade-off requires informed operator consent; untrusted profiles
+    don't get to make that choice.
+
+| Surface | Location |
+|---|---|
+| Cell-def guard | `src/brig/cell/spec.py:_v_policy` — cross-field check that every `tls_passthrough` host appears in `allow`; rejects passthrough under the untrusted profile |
+| Spec field | `src/brig/cell/spec.py:CellSpec.policy_passthrough_tls` |
+| YAML flattening | `src/brig/commands/lifecycle_cmd.py` (`policy.tls_passthrough` → `policy_passthrough_tls`) |
+| Profile propagation | `src/brig/cell/profiles.py` (profile-level `policy.tls_passthrough` prepends to cell's list) |
+| Per-cell policy write | `src/brig/commands/lifecycle_cmd.py:_sync_cell_policy` writes `tls_passthrough` to `<cell>.json` |
+| Policy class | `src/addons/_policy.py:Policy.is_passthrough` — defense-in-depth: a host must match BOTH passthrough rules AND allow rules (a tampered policy file can't opt a host out of MITM without allow coverage) |
+| Addon hook | `src/addons/enforce.py:tls_clienthello` — reads SNI, flips `client_conn.tls_passthrough` when matched, blocks SNI/CONNECT mismatches |
+| OTel counters | `src/addons/otel_export.py:tcp_start/tcp_message/tcp_end` — `warden_passthrough_connections_total`, `warden_passthrough_bytes_total{direction}`, `warden_passthrough_duration_ms` |
+| Log shape | `src/addons/otel_export.py` tags MITM records with `tls_mode=mitm`, passthrough records with `tls_mode=passthrough`. Passthrough records omit method/path/status BY CONSTRUCTION (warden never saw them) |
+| CLI rendering | `src/brig/commands/network_cmd.py:_print_network_line` renders passthrough lines as `PASSTHROUGH <host> (NB in / NB out)` — visually distinct from `OUT:` and `INGRESS:` |
+| Unit tests | `tests/test_cell_spec.py::TestValidateCellDefinition::test_policy_tls_passthrough_*` (4 cases) |
+| Unit tests | `tests/test_passthrough_tls.py` (10 cases — `is_passthrough` defense-in-depth, wildcard semantics, untrusted-profile rejection, per-cell-policy persistence, CLI render) |
+| Unit tests | `tests/test_cell_profiles.py::test_policy_tls_passthrough_propagates_from_profile` |
+| CI | Unit |
+
+**Not yet landed** (tracked separately):
+
+  - E2E: `tests/test_passthrough_tls.sh` against a Cloudflare-fronted host (e.g. chatgpt.com), validating both the handshake-survives path and the SNI/CONNECT-mismatch rejection.
+
+### 12. Warden CA Auto-Mount Is Per-Cell, Re-Extracted From Container, Opt-Out-Able
+
+Cells need to trust Warden's MITM CA to make HTTPS requests; without
+this, every consumer rediscovers the workaround (mount CA, concat onto
+system roots, export SSL_CERT_FILE / REQUESTS_CA_BUNDLE / etc.). Brig
+stages a combined bundle (system roots + Warden CA) inside the VM and
+bind-mounts it read-only at `/run/brig/ca-bundle.crt`, then sets
+`SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` /
+`NODE_EXTRA_CA_CERTS` to point at it — but only when the cell hasn't
+already set those env vars.
+
+The invariants we DO uphold:
+
+  - **Bundle source of truth is a persistent VM-side dir owned by uid 1000.**
+    Warden's mitmproxy state lives at `/var/lib/warden/mitmproxy-state/`
+    (chowned to 1000:1000 by `warden start` before the bind mount, so
+    mitmproxy can write its CA + key). Brig reads the cert from there
+    via a direct `cat`, no `podman exec` — eliminates the auto-sudo trap
+    in vm_run (only specific cmd[0] values get sudo'd; `sh -c '...'`
+    wrappers don't) AND removes the dependency on warden being live at
+    cell-start time. A tamperer who writes to `~/.brig/state/` (invariant
+    4: untrusted) still cannot poison the bundle because the bundle is
+    staged into `/state/<cell>/` which is on the VM trust boundary, not
+    macOS.
+  - **CA generated eagerly at `warden start`, not on first proxied
+    request.** `warden start` polls `/var/lib/warden/mitmproxy-state/
+    mitmproxy-ca-cert.pem` for up to 30s after the container is healthy
+    and refuses to declare warden ready until the cert exists. Cells
+    that race a fresh `brig up` can no longer get an empty / missing
+    bundle. (Aitelier diagnosed all three of: lazy CA gen, root-owned
+    tmpfs, and sh-c bypassing auto-sudo. Each is structurally fixed.)
+  - **Bundle staged inside the VM, not on macOS.** Lima's `/state` virtio
+    mount is the trust boundary; the file lives at `/state/<cell>/ca-bundle.crt`.
+  - **Cell mount is read-only.** A compromised cell can't tamper with its
+    own trust store (still affects only itself, but limits blast radius).
+  - **Cell-set env wins.** Operators / image authors who explicitly set
+    `SSL_CERT_FILE` keep their value. Brig only fills in vars the cell
+    didn't already set.
+  - **Airgapped cells skip the bundle.** `network: none` cells have no
+    egress; no CA to validate.
+  - **Opt-out via cell yaml.** `trust_warden_ca: false` removes the mount
+    and the env vars entirely. Cells with strict pinning or custom trust
+    can take control.
+
+| Surface | Location |
+|---|---|
+| Spec field | `src/brig/cell/spec.py:CellSpec.trust_warden_ca` (default True) |
+| Validator | `src/brig/cell/spec.py:_v_trust_warden_ca` |
+| Staging | `src/brig/cell/ca_bundle.py:stage_bundle` (extracts + concats + atomic mv) |
+| Reconciler | `src/brig/cell/reconciler.py` PODMAN_RUN action invokes stage_bundle; `build_run_command` adds `--volume` and `-e SSL_CERT_FILE=...` when applicable |
+| Unit tests | `tests/test_warden_ca_mount.py` (8 cases) |
+| CI | Unit |
 
 ## State-consistency invariants
 
@@ -143,10 +287,10 @@ proxy logs, not prevention.
 | Symlink at ingress token read site | `src/brig/cell/lifecycle.py:_register_cell_ingress` calls `validate_secret_path` (covered by the symlink-escape tests above, applied at the read site) |
 | Concurrent allocator race — 50 threads | `test_network_subnet.py::TestConcurrentAllocation::test_concurrent_allocate_no_duplicates` |
 | Cell def with `network: proxy-external` | `test_cell_spec.py::TestValidateCellDefinition::test_network_proxy_external_rejected` |
-| DNS rebinding to host-service tuple | `test_security_audit.py::TestServerConnectedDnsRebinding::test_host_service_skip_requires_flow_metadata` — naked (ip,port) match must not bypass |
+| DNS rebinding to host-service tuple | `test_security_audit.py::TestResponseHeadersDnsRebinding::test_does_not_skip_without_metadata` — naked (ip,port) match must not bypass |
 | Webhook redirect to internal host | `notifier.py` urllib fallback uses a redirect-disabling opener; urllib3 path uses `assert_hostname` and `cert_reqs=CERT_REQUIRED` |
 | Cell with deny-all reaching host service | `test_security_audit.py::TestHandleHostService::test_no_cell_policy_blocked` |
-| Ingress route pointing at warden gateway IP | `src/addons/ingress.py` `_reload_routes` rejects host octets `< 2` (audit M4) |
+| Ingress route pointing at warden gateway IP | `src/addons/ingress.py` `_reload_routes` rejects host octets `< 2` |
 
 ## CI wiring
 

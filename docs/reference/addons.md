@@ -9,7 +9,7 @@ by `make _copy-addons`. They run inside the warden container at `/addons/`.
 
 ## Required addons
 
-These load on every `brig up`. Without them the proxy refuses to start.
+These load on every `brig system up`. Without them the proxy refuses to start.
 
 ### `_common.py`
 
@@ -28,17 +28,52 @@ from here rather than copying.
 The policy gate. For every request:
 
 1. Check listen port (egress on 8080, ingress on 8443).
-2. If the request targets `<name>.host.brig`, route to host services (per-cell ACL gated).
+2. If the request targets `<name>.host.brig`, route to host services
+   via the cell's own `host_services` map (declared in the cell yaml).
 3. Reject non-80/443 ports.
 4. Reject literal IPs and internal IP ranges.
 5. Reject Host-header smuggling (CR/LF/NUL or Host ≠ URL host).
-6. Apply per-cell policy (deny-then-allow); if the cell has no per-cell policy, fall through to global.
-7. Apply global policy; default deny.
+6. Apply per-cell policy (deny-then-allow). Cells with no per-cell
+   policy block everything — fail closed, no implicit global allow.
 
-Also installs `server_connected` and `responseheaders` hooks that close
-connections that resolve into `BLOCKED_NETWORKS` (DNS rebinding defense). The
-skip for host-service rewrites is gated on `flow.metadata["host_service"]`,
-not on a `(ip, port)` tuple.
+Also installs a `responseheaders` hook that blocks responses whose
+server peer resolved into `BLOCKED_NETWORKS` (DNS rebinding defense).
+The skip for warden-routed flows is gated on `flow.metadata["host_service"]`
+/ `["ingress_route"]`, not on a `(ip, port)` tuple. (Prior versions also
+ran the check in `server_connected`, but mitmproxy ≥ 10 removed
+`data.server.close()` so the kill silently no-op'd and `data.flow` was
+None there anyway — see `docs/INVARIANTS.md` invariant 2.)
+
+A `tls_clienthello` hook implements invariant 11 (TLS passthrough): for
+hosts that match both `policy.allow` and `policy.tls_passthrough` AND
+whose SNI equals the CONNECT host, warden tunnels TCP raw instead of
+MITM-ing. Fails closed: if the CONNECT host can't be read (mitmproxy
+API quirk) or SNI doesn't match, passthrough is NOT flipped — the
+flow falls through to MITM and the cell sees a cert error.
+
+A `tcp_start` hook gates per-cell access for raw TCP `host_services`
+(invariant 11/MVP+):
+  - Resolves cell from peer IP via the subnet-map.
+  - Loads the cell's per-cell policy.
+  - Allows only if the listening port appears in `cell.tcp_host_services_map`.
+  - Tags `flow.metadata["host_service_protocol"] = "tcp"` so otel_export
+    emits per-service counters; logger writes a `TCP HOST_SERVICE`
+    audit line.
+  - Skips TLS-passthrough flows (different mechanism).
+  - Fail-closed on any unexpected mitmproxy API shape.
+
+OTel passthrough metrics emitted via `otel_export.py` `tcp_start` /
+`tcp_message` / `tcp_end` hooks:
+
+| Metric | Cardinality |
+|---|---|
+| `warden_passthrough_connections_total{cell,host}` | one counter per (cell, SNI) |
+| `warden_passthrough_bytes_total{cell,host,direction}` | direction ∈ {in, out} |
+| `warden_passthrough_duration_ms{cell,host}` | histogram |
+
+These surface in `brig system stats` as `PT/CONN` / `PT/IN` / `PT/OUT`
+columns (the `PT/*` callout appears when any cell had passthrough
+connections).
 
 Configured via `~/.brig/cells/network-policy.json`:
 

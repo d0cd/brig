@@ -53,8 +53,14 @@ LOG_DIR = Path("/logs")
 # Default max log file size per cell (100MB).
 DEFAULT_MAX_LOG_SIZE = 100 * 1024 * 1024
 
-# Number of rotated log files to keep.
-MAX_ROTATED_FILES = 1
+# Number of rotated log files to keep on top of the live one.
+#
+# Sizing example: a cell at 100 req/s with 1KB log entries fills 100MB in
+# ~17 minutes. 4 generations + live = ~85 minutes of history before the
+# oldest rotation is dropped. Tunable per workload — bump if you need a
+# longer window, or lower DEFAULT_MAX_LOG_SIZE for more frequent rotation
+# at the cost of more inodes.
+MAX_ROTATED_FILES = 4
 
 # Default log file for unknown sources.
 UNKNOWN_LOG_FILE = LOG_DIR / "unknown.jsonl"

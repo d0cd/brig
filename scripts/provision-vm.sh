@@ -22,10 +22,10 @@ SHELL_CMD="limactl shell --workdir / $LIMA_VM --"
 # verify locally before merging:
 #   curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/${RELEASE}/${ARCH}/runsc.sha512" \
 #       | sha512sum -c
-GVISOR_RELEASE="20251015"
+GVISOR_RELEASE="20260511.0"
 declare -A GVISOR_SHA512_BY_ARCH=(
-    [aarch64]="REPLACE_WITH_ARM64_SHA512_FROM_RELEASE_PAGE"
-    [x86_64]="REPLACE_WITH_AMD64_SHA512_FROM_RELEASE_PAGE"
+    [aarch64]="1a1da6060bbfb98fcd98304a7e73afb2c23a897ae4a8bf741e1c6a16cf07e0cd14bcd9d0f0e51aff201feb0cf8d19952f944aeb5eb5d92b091509374b9702a26"
+    [x86_64]="e227a71c95e794119f6648a44083df945392c6cd457f36abbc49c2b6e0b87c7f01b94e6bf4632f4cb22ee34fbec7a2c34ca03d30efa9c689db76a6215a6e44e1"
 )
 
 echo "Provisioning VM '$LIMA_VM'..."

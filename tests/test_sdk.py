@@ -1,7 +1,7 @@
 """Tests for brig.sdk — programmatic interface."""
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from brig.errors import BrigError
 from brig.sdk import Brig, Cell, CellNotFoundError, ProfileError
@@ -43,7 +43,7 @@ class TestBrigRunSync(unittest.TestCase):
 
 
 class TestBrigListSync(unittest.TestCase):
-    @patch("brig.sdk.vm_run")
+    @patch("brig.cell.lifecycle.vm_run")
     def test_list_empty(self, mock_run):
         import subprocess
         mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
@@ -52,7 +52,7 @@ class TestBrigListSync(unittest.TestCase):
         cells = b.list_sync()
         self.assertEqual(cells, [])
 
-    @patch("brig.sdk.vm_run")
+    @patch("brig.cell.lifecycle.vm_run")
     def test_list_with_cells(self, mock_run):
         import json
         import subprocess

@@ -16,20 +16,20 @@ brig run --policy-allow 'api.target.com' python:3.12 python fetch_and_analyze.py
 brig secrets add api-key
 brig run --name scraper --secret api-key --profile supervised \
     python:3.12 python scrape.py
-brig logs scraper
-brig cp scraper:/work/results.json ./results.json
-brig rm scraper
+brig cell logs scraper
+brig cell cp scraper:/work/results.json ./results.json
+brig cell rm scraper
 ```
 
 ## Long-running background cell
 
 ```bash
 brig run --name worker -d --timeout 1h --profile dev python:3.12 bash
-brig exec worker -- python process.py
-brig files worker
-brig cp worker:/work/output.csv ./
-brig stop worker
-brig rm worker
+brig cell exec worker -- python process.py
+brig cell files worker
+brig cell cp worker:/work/output.csv ./
+brig cell stop worker
+brig cell rm worker
 ```
 
 ## Agent SDK usage
@@ -50,27 +50,31 @@ print(result.stdout)  # {"status": "ok"}
 ## Daily operations
 
 ```bash
-brig up          # start VM + warden
-brig list        # see running cells
-brig verify      # check security invariants
-brig down        # stop everything
-brig down --vm   # also stop the VM
+brig system up          # start VM + warden
+brig cell list        # see running cells
+brig system verify      # check security invariants
+brig system down        # stop everything
+brig system down --vm   # also stop the VM
 ```
 
 ## Policy management
 
+Policy lives per-cell. Shared defaults belong in a trust profile
+referenced from the cell yaml's `profile:` field.
+
 ```bash
-brig policy show                                # global policy
-brig policy set global --allow '*.example.com'  # add to allowlist
-brig policy set mycell --deny 'evil.com'        # per-cell deny
-brig policy show mycell --effective             # merged view
+brig policy show mycell                         # show this cell's policy
+brig policy set mycell --allow '*.example.com'  # extend allowlist
+brig policy set mycell --deny 'evil.com'        # extend denylist
+brig policy test mycell api.github.com          # simulate a request
+brig policy rm mycell                           # clear (cell will block all egress)
 ```
 
 ## Troubleshooting
 
 ```bash
-brig health          # check VM + proxy status
-brig verify          # check all 9 security invariants
-brig diagnose mycell # inspect a specific cell
-brig inspect mycell  # raw container details
+brig system doctor --quick          # check VM + proxy status
+brig system verify          # check all 12 security invariants
+brig cell diagnose mycell # inspect a specific cell
+brig cell inspect mycell  # raw container details
 ```

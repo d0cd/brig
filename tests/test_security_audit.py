@@ -10,7 +10,6 @@ Covers:
 """
 
 import json
-import os
 import sys
 import tempfile
 import unittest
@@ -34,6 +33,7 @@ from logger import RequestLogger  # noqa: E402
 
 from brig.cell.reconciler import build_run_command  # noqa: E402
 from brig.cell.spec import CellSpec  # noqa: E402
+from brig.errors import BrigError  # noqa: E402
 from brig.network.subnet import allocate, free  # noqa: E402
 
 
@@ -67,10 +67,15 @@ class TestHandleHostService(unittest.TestCase):
     def setUp(self):
         self.enforcer = PolicyEnforcer()
         self.enforcer._host_ip = "192.168.64.1"
-        self.enforcer.host_services = {"mydb": 5432, "redis": 6379}
-        # Per-cell policy that grants access to mydb and redis (H1).
+        # Flattened model: per-cell policy carries {name, port} dicts
+        # directly. There is no separate global host_services registry
+        # in the flattened model — enforce.py looks up ports from the
+        # cell's own policy.
         self.allow_policy = Policy(
-            allow=[], deny=[], host_services=["mydb", "redis"],
+            allow=[], deny=[], host_services=[
+                {"name": "mydb", "port": 5432},
+                {"name": "redis", "port": 6379},
+            ],
         )
 
     def test_valid_host_service_rewrites(self):
@@ -85,14 +90,16 @@ class TestHandleHostService(unittest.TestCase):
         self.assertEqual(flow.metadata["host_service"], "mydb")
 
     def test_unknown_service_blocked(self):
-        """Unknown .host.brig service is blocked."""
+        """Service not in cell's per-cell host_services map is blocked
+        (flattened model — no separate global registry to fall back to)."""
         flow = _make_flow(host="unknown-svc.host.brig", port=443)
         self.enforcer._handle_host_service(
             flow, "unknown-svc.host.brig", "cell-a", self.allow_policy,
         )
 
         self.assertTrue(flow.metadata.get("blocked"))
-        self.assertIn("unknown host service", flow.metadata.get("block_reason", ""))
+        reason = flow.metadata.get("block_reason", "")
+        self.assertTrue("not declared" in reason or "unknown" in reason)
 
     def test_no_host_ip_blocked(self):
         """When host IP is not discovered, host service requests are blocked."""
@@ -121,17 +128,20 @@ class TestHandleHostService(unittest.TestCase):
             flow, "mydb.host.brig", "cell-without-policy", None,
         )
         self.assertTrue(flow.metadata.get("blocked"))
-        self.assertIn("no host_services configured", flow.metadata.get("block_reason", ""))
+        self.assertIn("no host_services declared", flow.metadata.get("block_reason", ""))
 
     def test_cell_policy_without_service_blocked(self):
         """H1: cell whose policy doesn't list the service is blocked."""
-        deny_policy = Policy(allow=[], deny=[], host_services=["redis"])
+        deny_policy = Policy(
+            allow=[], deny=[],
+            host_services=[{"name": "redis", "port": 6379}],
+        )
         flow = _make_flow(host="mydb.host.brig", port=443)
         self.enforcer._handle_host_service(
             flow, "mydb.host.brig", "cell-a", deny_policy,
         )
         self.assertTrue(flow.metadata.get("blocked"))
-        self.assertIn("not in cell", flow.metadata.get("block_reason", ""))
+        self.assertIn("not declared", flow.metadata.get("block_reason", ""))
 
 
 # ---------------------------------------------------------------------------
@@ -278,21 +288,21 @@ class TestSeccompProfileValidation(unittest.TestCase):
     def test_unconfined_rejected(self, mock_vm_run):
         """seccomp_profile='unconfined' must be rejected."""
         spec = self._make_spec("unconfined")
-        with self.assertRaises(ValueError, msg="unconfined"):
+        with self.assertRaises(BrigError, msg="unconfined"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
     def test_unconfined_case_insensitive(self, mock_vm_run):
         """seccomp_profile='Unconfined' must also be rejected (case-insensitive)."""
         spec = self._make_spec("Unconfined")
-        with self.assertRaises(ValueError, msg="unconfined"):
+        with self.assertRaises(BrigError, msg="unconfined"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
     def test_path_with_slash_rejected(self, mock_vm_run):
         """seccomp_profile with '/' is rejected (must be filename only)."""
         spec = self._make_spec("/etc/seccomp.json")
-        with self.assertRaises(ValueError, msg="path"):
+        with self.assertRaises(BrigError, msg="path"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
@@ -300,7 +310,7 @@ class TestSeccompProfileValidation(unittest.TestCase):
         """seccomp_profile with '..' is rejected."""
         # URL-encoded ".." won't trigger the check, but literal ".." will.
         spec_literal = self._make_spec("../../../etc/seccomp.json")
-        with self.assertRaises(ValueError, msg="path"):
+        with self.assertRaises(BrigError, msg="path"):
             build_run_command(spec_literal, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
@@ -338,49 +348,36 @@ class TestSubnetMapWriting(unittest.TestCase):
         self.lock_file = Path(self.tmpdir) / "allocator.lock"
         self.map_file = Path(self.tmpdir) / "subnet-map.json"
 
-    def _patch_write_subnet_map(self):
-        """Return a patch that redirects _write_subnet_map to use self.map_file."""
-        from brig.network.subnet import _write_subnet_map as orig_fn
-        map_file = self.map_file
-
-        def patched_write(state, mf=None):
-            return orig_fn(state, map_file=map_file)
-
-        return patch("brig.network.subnet._write_subnet_map", side_effect=patched_write)
-
     def test_allocate_creates_map_file(self):
         """After allocate(), subnet-map.json exists with correct mapping."""
-        with self._patch_write_subnet_map():
-            allocate("test-cell", self.state_file, self.lock_file)
+        allocate("test-cell", self.state_file, self.lock_file)
 
-            self.assertTrue(self.map_file.exists(), "subnet-map.json must exist after allocate")
-            mapping = json.loads(self.map_file.read_text())
-            self.assertEqual(mapping["10.60.1.0/24"], "test-cell")
+        self.assertTrue(self.map_file.exists(), "subnet-map.json must exist after allocate")
+        mapping = json.loads(self.map_file.read_text())
+        self.assertEqual(mapping["10.60.1.0/24"], "test-cell")
 
     def test_free_updates_map_file(self):
         """After free(), the freed cell is removed from subnet-map.json."""
-        with self._patch_write_subnet_map():
-            allocate("cell-a", self.state_file, self.lock_file)
-            allocate("cell-b", self.state_file, self.lock_file)
-            free("cell-a", self.state_file, self.lock_file)
+        allocate("cell-a", self.state_file, self.lock_file)
+        allocate("cell-b", self.state_file, self.lock_file)
+        free("cell-a", self.state_file, self.lock_file)
 
-            mapping = json.loads(self.map_file.read_text())
-            self.assertNotIn("10.60.1.0/24", mapping, "Freed cell must not appear in map")
-            self.assertEqual(mapping["10.60.2.0/24"], "cell-b")
+        mapping = json.loads(self.map_file.read_text())
+        self.assertNotIn("10.60.1.0/24", mapping, "Freed cell must not appear in map")
+        self.assertEqual(mapping["10.60.2.0/24"], "cell-b")
 
     def test_map_file_written_atomically(self):
         """Map file is written via temp+rename (no partial writes visible)."""
-        with self._patch_write_subnet_map():
-            allocate("cell-a", self.state_file, self.lock_file)
+        allocate("cell-a", self.state_file, self.lock_file)
 
-            # Verify the file is valid JSON (not a partial write).
-            content = self.map_file.read_text()
-            mapping = json.loads(content)  # Would raise on partial write.
-            self.assertIsInstance(mapping, dict)
+        # Verify the file is valid JSON (not a partial write).
+        content = self.map_file.read_text()
+        mapping = json.loads(content)  # Would raise on partial write.
+        self.assertIsInstance(mapping, dict)
 
-            # Verify it is a regular file (rename target), not a temp file.
-            stat = self.map_file.stat()
-            self.assertTrue(stat.st_size > 0)
+        # Verify it is a regular file (rename target), not a temp file.
+        stat = self.map_file.stat()
+        self.assertTrue(stat.st_size > 0)
 
 
 # ---------------------------------------------------------------------------
@@ -456,76 +453,16 @@ class TestLoggerCellNameValidation(unittest.TestCase):
 # 7. Invariant tests added per audit (closes documented gaps in INVARIANTS.md)
 # ---------------------------------------------------------------------------
 
-class TestServerConnectedDnsRebinding(unittest.TestCase):
-    """Inv. 2: server_connected/responseheaders close connections that resolve
-    into BLOCKED_NETWORKS (DNS rebinding defense). Skip ONLY when the flow we
-    rewrote ourselves carries the host_service metadata flag.
-    """
-
-    def setUp(self):
-        self.enforcer = PolicyEnforcer()
-        self.enforcer._host_ip = "192.168.64.1"
-
-    def _make_server_data(self, ip: str, port: int = 443, flow=None):
-        data = MagicMock()
-        data.server.peername = (ip, port)
-        # mitmproxy 10+: data.flow is the associated HTTP flow when applicable.
-        if flow is not None:
-            data.flow = flow
-        else:
-            # Explicitly remove `flow` so getattr returns None.
-            del data.flow
-        return data
-
-    def test_rfc1918_blocked(self):
-        data = self._make_server_data("10.0.0.5")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_localhost_blocked(self):
-        data = self._make_server_data("127.0.0.1")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_link_local_blocked(self):
-        data = self._make_server_data("169.254.169.254")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_ipv4_mapped_ipv6_blocked(self):
-        data = self._make_server_data("::ffff:10.0.0.5")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_ipv6_link_local_blocked(self):
-        data = self._make_server_data("fe80::1")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_public_ip_allowed(self):
-        data = self._make_server_data("93.184.216.34")
-        self.enforcer.server_connected(data)
-        data.server.close.assert_not_called()
-
-    def test_host_service_skip_requires_flow_metadata(self):
-        """Host-service skip is keyed on flow.metadata, not (ip,port) tuple.
-        A naked tuple match (no metadata) must NOT bypass the BLOCKED check.
-        """
-        data = self._make_server_data("192.168.64.1", port=5432)
-        self.enforcer.server_connected(data)
-        data.server.close.assert_called()
-
-    def test_host_service_skip_when_metadata_set(self):
-        """When the rewritten flow has host_service metadata, skip the check."""
-        flow = MagicMock()
-        flow.metadata = {"host_service": "mydb"}
-        data = self._make_server_data("192.168.64.1", port=5432, flow=flow)
-        self.enforcer.server_connected(data)
-        data.server.close.assert_not_called()
-
-
 class TestResponseHeadersDnsRebinding(unittest.TestCase):
-    """Inv. 2: responseheaders blocks responses from blocked-IP servers."""
+    """Inv. 2: responseheaders blocks responses from blocked-IP servers.
+
+    This is the SINGLE rebinding-check enforcement point in enforce.py.
+    The check used to ALSO run in server_connected, but mitmproxy >= 10
+    removed `data.server.close()`, so that path silently no-op'd. We
+    consolidated to responseheaders (where flow.metadata is populated
+    and the host_service / ingress_route exemptions actually fire).
+    Aitelier diagnosed the latent bug.
+    """
 
     def setUp(self):
         self.enforcer = PolicyEnforcer()
@@ -544,29 +481,66 @@ class TestResponseHeadersDnsRebinding(unittest.TestCase):
         self.enforcer.responseheaders(flow)
         self.assertTrue(flow.metadata.get("blocked"))
 
+    def test_blocks_localhost_response(self):
+        flow = self._make_flow("127.0.0.1")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_blocks_link_local_response(self):
+        flow = self._make_flow("169.254.169.254")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
     def test_blocks_ipv4_mapped_response(self):
         flow = self._make_flow("::ffff:192.168.0.5")
         self.enforcer.responseheaders(flow)
         self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_blocks_ipv6_link_local_response(self):
+        flow = self._make_flow("fe80::1")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
+    def test_public_ip_allowed(self):
+        flow = self._make_flow("93.184.216.34")
+        self.enforcer.responseheaders(flow)
+        self.assertFalse(flow.metadata.get("blocked"))
 
     def test_skips_when_host_service_metadata_set(self):
         flow = self._make_flow("192.168.64.1", port=5432, host_service="mydb")
         self.enforcer.responseheaders(flow)
         self.assertFalse(flow.metadata.get("blocked"))
 
+    def test_skips_when_ingress_route_metadata_set(self):
+        """Ingress response from a cell IP in BLOCKED_NETWORKS must NOT
+        be killed — warden routed there itself. Regression for
+        aitelier-feedback #1."""
+        flow = self._make_flow("10.60.1.15", port=7777)
+        flow.metadata["ingress_route"] = "aitelier:/api"
+        self.enforcer.responseheaders(flow)
+        self.assertFalse(flow.metadata.get("blocked"))
+
     def test_does_not_skip_without_metadata(self):
-        """Without host_service metadata, even host-IP-tuple matches block."""
+        """Naked (ip, port) tuple match without flow.metadata must
+        still block. Otherwise a DNS-rebinding allowlisted domain could
+        reach a host service whose IP happens to be in BLOCKED_NETWORKS."""
         flow = self._make_flow("192.168.64.1", port=5432)
         self.enforcer.responseheaders(flow)
         self.assertTrue(flow.metadata.get("blocked"))
 
 
 class TestConnectMethodEnforcement(unittest.TestCase):
-    """CONNECT tunnels must respect the same port and policy gates."""
+    """CONNECT tunnels must respect the same port and policy gates.
+    Per-cell policy is the sole authority, so each test installs a
+    policy for the cell that owns 10.60.1.2 (the default client_ip)."""
 
     def setUp(self):
         self.enforcer = PolicyEnforcer()
-        self.enforcer.global_policy = Policy(allow=["example.com"])
+        # Bind 10.60.1.0/24 → cell "alice" so flows from 10.60.1.2 get
+        # attributed to a real cell name during policy lookup.
+        self.enforcer.subnets = MagicMock()
+        self.enforcer.subnets.get_cell_name = lambda ip: "alice"
+        self.enforcer.cell_policies["alice"] = Policy(allow=["example.com"])
 
     def test_connect_to_disallowed_port_blocked(self):
         flow = _make_flow(host="example.com", port=22, listen_port=8080)
@@ -586,6 +560,25 @@ class TestConnectMethodEnforcement(unittest.TestCase):
 
     def test_connect_to_disallowed_domain_blocked(self):
         flow = _make_flow(host="evil.com", port=443, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+        # Specifically: blocked by the cell's policy, not because no
+        # cell policy existed.
+        self.assertIn("cell policy", flow.metadata.get("block_reason", ""))
+
+    def test_connect_to_allowed_domain_passes(self):
+        """Allowed domain through the per-cell policy should not be
+        blocked. Regression for tests that previously passed for the
+        wrong reason (no cell policy → default deny)."""
+        flow = _make_flow(host="example.com", port=443, listen_port=8080)
+        self.enforcer.http_connect(flow)
+        self.assertFalse(flow.metadata.get("blocked"),
+            f"expected pass, got {flow.metadata.get('block_reason')}")
+
+    def test_connect_when_cell_has_no_policy_blocked(self):
+        """No per-cell policy = fail closed."""
+        self.enforcer.cell_policies.clear()
+        flow = _make_flow(host="example.com", port=443, listen_port=8080)
         self.enforcer.http_connect(flow)
         self.assertTrue(flow.metadata.get("blocked"))
 

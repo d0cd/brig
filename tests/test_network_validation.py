@@ -47,5 +47,3 @@ class TestIsSuspiciousDomain(unittest.TestCase):
     def test_bare_tld_wildcard(self):
         """Wildcard on bare TLD like *.xyz (one dot) is suspicious."""
         self.assertTrue(is_suspicious_domain("*.xyz"))
-
-

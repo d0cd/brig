@@ -7,9 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-05-26
+
+### Fixed
+
+- `brig cell start` now replays ingress registration with a freshly-inspected cell IP. Without this, a `brig system down` / `brig system up` cycle left the cell running but external requests through warden's `:8443` reverse proxy returned 502 indefinitely because the routes file still held the pre-restart cell IP. Ingress entries are now stored in `cell-metadata.json` (no secrets — the bearer token still lives in the secrets directory) so the start path can replay registration without the original yaml.
+
 ### Added
 
+- TCP `host_services` — declare `protocol: tcp` on a host_service entry to forward L4 traffic from the cell to a host port through warden's TCP listener. HTTP entries still go through mitmproxy at L7. Warden auto-restarts when a cell adds a new TCP host_service port that needs a listener bound.
+- TLS passthrough (invariant 11): `policy.tls_passthrough` opts a cell out of MITM for specific hosts that refuse mitmproxy's relayed handshake. Each entry must also appear in `policy.allow`; the untrusted profile cannot declare passthrough.
+- Auto-mount Warden CA bundle (invariant 12): cells get `/run/brig/ca-bundle.crt` (system roots + Warden CA) plus `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` pointed at it, unless the cell sets those env vars itself or opts out via `trust_warden_ca: false`.
+- OpenTelemetry collector subsystem (phases 1-3): sidecar collector container (pinned image digest), warden SDK instrumentation, `brig system stats` (per-cell summary scraped from the collector), `brig cell trace <trace_id>` (request trace by id), `brig cell network --otel` (read warden flows from the collector instead of per-cell JSONL), benchmark forwarding.
+- `brig image build <dir>` — wrap `podman build` inside the VM. `--use-warden` injects HTTPS_PROXY / HTTP_PROXY / NO_PROXY and mounts the Warden CA so the build's HTTP traffic flows through the same policy as runtime.
+- `brig cell trace <trace_id>` — render a request trace from the collector.
+- `brig system stats` — per-cell summary (requests, bytes, blocks) from the collector.
+- `brig system prune` detects orphan workspace directories under `~/.brig/state/` whose cell no longer exists.
+
+### Security
+
+- `image_digest` is now enforced at runtime, not just at parse time. The reconciler rewrites `image` to `image@digest` form before `podman run`, so podman refuses any mismatch at pull time.
+- Secret-name validator rejects empty strings, null bytes, and leading dashes (in addition to traversal). An empty name would previously collapse `Path("/secrets") / ""` and bind-mount the whole secrets directory into the cell.
+- Reconciler calls `validate_secret_path` before bind-mounting each secret into a cell. Defends against a symlink under `~/.brig/secrets/` escaping the directory at run time.
+- `O_NOFOLLOW` when writing secrets via `brig secrets add` so a pre-planted symlink at the target name can't redirect the write.
+- `host_socket` bridge plist freezes the connect target via `realpath` before launchd sees it; a swap of the host path after the plist is written can no longer redirect the bridge.
+- `save_cell_policy` writes are serialized under `fcntl` so concurrent `brig policy set` invocations don't interleave.
+- Ops addon's health endpoint binds to loopback inside the warden container so it isn't reachable from cells.
+- `ca_bundle` staging shell-quotes interpolated paths.
+- `BLOCKED_NETWORKS` now includes `64:ff9b::/96` (NAT64), `100::/64` (discard), and `2002::/16` (6to4) — covers IPv6 SSRF vectors the original list missed.
+- `/run/host` and `/run/brig` added to `workspace_mount` forbidden_prefixes. Shadowing either silently breaks host_sockets or the downward-API metadata.
+- Policy reload uses nanosecond mtime comparison so a sub-second rewrite triggers a reload.
+- Operations-log error redactor tightened so paths and secret values don't leak through error messages.
+- Host-side `domain_matches_rule` matches the addon's IDN encoding so YAML wildcard rules and runtime evaluation agree on punycode hosts.
+- Webhook notifier resolves the configured URL's host at config load and refuses connections that resolve to a different IP later (pins DNS).
+
+## [0.3.0] - 2026-05-18
+
+### Added
+
+- `brig prune [--cells|--logs|--subnets] [--dry-run] [--log-days N]` — cleans up stopped cells, rotated log files older than N days, and orphan subnet allocations (cells whose podman network is gone).
+- `brig.ops.logging.error()` — companion to `info`/`warn`/`debug`. All CLI error output now flows through this so `--quiet` and `--no-color` are honored uniformly.
+- `make pin-gvisor` + `scripts/pin-gvisor.sh` — fetches the current gVisor release's sha512s from the official storage bucket and rewrites `GVISOR_SHA512_BY_ARCH` in `provision-vm.sh`. Run once per gVisor version bump.
+- `make _copy-addons` now also copies `src/seccomp/*.json` to `~/.brig/cells/seccomp/`. Fixes `--seccomp-profile <name>` looking up a non-existent path inside the warden container.
+- Cross-module constant-mirror tests (`tests/test_addon_brig_constant_mirror.py`) — fails loudly if `INGRESS_PORT`, `HOST_SERVICE_SUFFIX`, or `BLOCKED_NETWORKS` drift between `brig.config` and the addons.
+- 41 new tests covering `workspace.py` sanitize/quarantine, `_log_writer.py` directly, `brig prune` parser, `brig --version`, and the new constant mirrors.
+
+### Changed
+
+- **B1**: `brig.ops.history._maybe_rotate` now runs under a sidecar `.lock` file. Two concurrent brig invocations can no longer race on the JSONL rotation rename.
+- **B2**: `tests/benchmarks/test_bench_proxy.py` updated to call `enforcer.subnets.get_cell_name` after the SubnetResolver extraction (the old `_build_subnet_index` reference broke `benchmarks.yml`).
+- **B3**: `--filter name=` callers now use the regex-anchored form `--filter name=^brig-`. A user-created container named `my-brig-foo` no longer pollutes `brig list`.
+- **B4**: `Cell.wait_sync` returns `-1` whenever the wait itself fails (subprocess error, non-zero `podman wait` returncode, or unparseable status output), so the caller can distinguish "cell exited 1" from "we couldn't wait on it".
+- **R3**: `notifier.Notifier.last_notification` (OrderedDict) is now read+written under a `threading.Lock`, defending against the LRU `popitem`/`move_to_end` invariant violation if more than one worker is ever introduced.
+- **O4**: Ingress body-size limit now comments that the check is post-buffer (mitmproxy already buffered the body before we see it); kept the cap as it still gates the *cell-side* memory.
+- **O5**: `DEFAULT_MAX_ROTATED_FILES` raised from 1 → 4. At the default 100MB/file, a 100 req/s cell now retains ~85 minutes of history before the oldest rotation drops, vs. ~17 minutes previously.
+- **C1**: `brig.__init__` no longer eagerly imports the SDK. `python -c "import brig"` and CLI startup no longer pay the cost of `brig.sdk` (which transitively imports subprocess, json, etc.). SDK attributes are still importable via `from brig import Brig`; resolved lazily via `__getattr__`.
+- **C2**: `Notifier._stop_worker` now joins its worker thread with a 1.0s timeout, matching `AsyncLogWriter.stop()`. Shutdown is now consistently bounded across both worker-thread addons.
+- **D1**: `pyproject.toml` and `brig.config.VERSION` bumped to `0.3.0`.
+- **D2**: SDK docstring example in `src/brig/__init__.py` rewritten to `print(result.stdout, end="")` so users copying it don't get the literal `\n` doubled.
+- **CI3**: Added `pre-commit` job to `ci.yml` (`SKIP=no-commit-to-branch pre-commit run --all-files`). Catches drift between `.pre-commit-config.yaml` and CI-side mypy/ruff/etc.
+- Coverage floor raised from 60% to 65% (current actual: 66%). 0.4 target: convenience_cmd / watchdog_cmd / sdk async paths → restore 70%.
+
+### Security
+
 - Host services: cells reach declared host:port pairs via `<name>.host.brig` virtual domains, rewritten by Warden to the macOS host. Per-cell ACL: cells may only reach host services explicitly listed under `host_services` in their per-cell policy. (Audit fix H1.)
+### Added (pre-0.3.0 audit-pass, included in this release)
+
 - Authenticated ingress reverse proxy through Warden: external requests to `https://warden:8443/{cell}/{prefix}/...` route to a cell-internal port after Bearer-token auth. Salted SHA-256 token hashing, constant-time comparison, per-IP auth-failure rate limiting.
 - WebSocket passthrough through Warden (logged but not re-policy-checked once the upgrade has been allowed).
 - `brig doctor` — deep environment check (PATH, Lima VM state, addon presence, directory permissions, port collisions). Complements the lighter `brig health`.

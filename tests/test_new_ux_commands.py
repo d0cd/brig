@@ -1,4 +1,4 @@
-"""Tests for the new UX commands and behaviors added in the audit pass.
+"""Tests for UX commands and behaviors.
 
 Covers:
   - brig secrets rm confirmation (require --yes)
@@ -9,7 +9,6 @@ Covers:
   - brig network --blocked filter
 """
 
-import io
 import json
 import tempfile
 import unittest
@@ -111,66 +110,27 @@ class TestCpColonParsing(unittest.TestCase):
         self.assertIsNone(_parse_cp_target("MYCELL:/work"))
 
 
-class TestHostServicePolicyShape(unittest.TestCase):
-    """Per-cell ACL stores bare names, global declaration stores name:port dicts.
-
-    See `_apply_host_service_additions(..., is_global=...)` in policy_cmd.py.
-    The addon's H1 enforcement reads `host_services_allowed: list[str]` from
-    per-cell policy; if the CLI wrote dicts here it would fail at runtime.
-    """
-
-    def test_global_writes_dicts(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        policy: dict = {}
-        _apply_host_service_additions(["mydb:5432"], policy, is_global=True)
-        self.assertEqual(policy["host_services"], [{"name": "mydb", "port": 5432}])
-
-    def test_per_cell_writes_strings(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        policy: dict = {}
-        _apply_host_service_additions(["mydb"], policy, is_global=False)
-        self.assertEqual(policy["host_services"], ["mydb"])
-
-    def test_per_cell_rejects_port_form(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        with self.assertRaises(BrigError) as ctx:
-            _apply_host_service_additions(["mydb:5432"], {}, is_global=False)
-        self.assertIn("name only", str(ctx.exception))
-
-    def test_global_rejects_bare_name(self):
-        from brig.commands.policy_cmd import _apply_host_service_additions
-        with self.assertRaises(BrigError) as ctx:
-            _apply_host_service_additions(["mydb"], {}, is_global=True)
-        self.assertIn("name:port", str(ctx.exception))
-
-    def test_remove_handles_both_schemas(self):
-        from brig.commands.policy_cmd import _apply_host_service_removals
-        global_policy = {"host_services": [{"name": "a", "port": 1}, {"name": "b", "port": 2}]}
-        _apply_host_service_removals(["a"], global_policy)
-        self.assertEqual(global_policy["host_services"], [{"name": "b", "port": 2}])
-
-        cell_policy = {"host_services": ["a", "b"]}
-        _apply_host_service_removals(["a"], cell_policy)
-        self.assertEqual(cell_policy["host_services"], ["b"])
+# TestHostServicePolicyShape removed: the _apply_host_service_*
+# helpers it covered were deleted in the host_services flattening
+# rollout. Per-cell host_services are now written by
+# _sync_host_services_policy in lifecycle_cmd from the cell yaml's
+# host_services field — covered by tests/test_host_services_phase2.py.
 
 
 class TestPolicyTest(unittest.TestCase):
     def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-        self.policy_file = Path(self.tmpdir) / "network-policy.json"
-        self.policy_file.write_text(json.dumps({
+        self.tmpdir = Path(tempfile.mkdtemp())
+        (self.tmpdir / "alice.json").write_text(json.dumps({
             "allow": ["pypi.org", "*.example.com"],
             "deny": ["evil.example.com"],
         }))
 
-    def _patch_paths(self):
-        from brig import config as cfg
-        return patch.object(cfg.HostPaths, "NETWORK_POLICY", self.policy_file)
-
     def _run(self, domain: str) -> int:
         from brig.commands.policy_cmd import cmd_policy_test
-        args = SimpleNamespace(domain=domain, path="/", method="GET")
-        with self._patch_paths():
+        args = SimpleNamespace(name="alice", domain=domain,
+                               path="/", method="GET")
+        with patch("brig.policy.policy.get_cell_policy_path",
+                   side_effect=lambda n, *a, **kw: self.tmpdir / f"{n}.json"):
             return cmd_policy_test(args)
 
     def test_allowed_domain(self):
@@ -190,7 +150,7 @@ class TestEventsFollowFlag(unittest.TestCase):
     def test_follow_flag_present_in_parser(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["events", "--follow", "--tail", "5"])
+        args = parser.parse_args(["cell", "events", "--follow", "--tail", "5"])
         self.assertTrue(args.follow)
         self.assertEqual(args.tail, 5)
 
@@ -199,7 +159,7 @@ class TestNetworkBlockedFilter(unittest.TestCase):
     def test_blocked_flag_present(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["network", "mycell", "--blocked"])
+        args = parser.parse_args(["cell", "network", "mycell", "--blocked"])
         self.assertTrue(args.blocked)
 
 
@@ -215,8 +175,9 @@ class TestDoctorRegistered(unittest.TestCase):
     def test_doctor_in_parser(self):
         from brig.cli import _build_parser
         parser = _build_parser()
-        args = parser.parse_args(["doctor"])
-        self.assertEqual(args.command, "doctor")
+        args = parser.parse_args(["system", "doctor"])
+        self.assertEqual(args.command, "system")
+        self.assertEqual(args.system_command, "doctor")
 
 
 class TestDoctorCommand(unittest.TestCase):
@@ -323,6 +284,108 @@ class TestDeprecatedCommandsRemoved(unittest.TestCase):
         parser = _build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["run", "--tor", "alpine"])
+
+
+class TestPruneCommand(unittest.TestCase):
+    def test_prune_in_parser(self):
+        from brig.cli import _build_parser
+        parser = _build_parser()
+        args = parser.parse_args(["system", "prune"])
+        self.assertEqual(args.command, "system")
+        self.assertEqual(args.system_command, "prune")
+        # Defaults: no scope flag set → all categories.
+        self.assertFalse(args.cells)
+        self.assertFalse(args.logs)
+        self.assertFalse(args.subnets)
+        self.assertFalse(args.dry_run)
+        self.assertEqual(args.log_days, 7)
+
+    def test_prune_flags(self):
+        from brig.cli import _build_parser
+        parser = _build_parser()
+        args = parser.parse_args([
+            "system", "prune", "--cells", "--dry-run", "--log-days", "30",
+        ])
+        self.assertTrue(args.cells)
+        self.assertTrue(args.dry_run)
+        self.assertEqual(args.log_days, 30)
+
+    def test_prune_dry_run_doesnt_touch_anything(self):
+        from brig.commands.system_cmd import cmd_prune
+        from unittest.mock import patch
+        # With --dry-run + empty containers + empty subnet allocator,
+        # the command should complete with rc=0 and make no podman calls.
+        with patch("brig.commands.system_cmd.vm_run") as mock_vm, \
+             patch("brig.network.subnet.list_all", return_value=[]):
+            mock_vm.return_value = SimpleNamespace(stdout="", returncode=0)
+            rc = cmd_prune(SimpleNamespace(
+                cells=True, logs=False, subnets=False,
+                dry_run=True, log_days=7,
+            ))
+        self.assertEqual(rc, 0)
+
+    def test_prune_removes_orphan_workspaces(self):
+        """State dirs with no corresponding podman container are
+        orphans; cmd_prune --cells must remove them (and leave the
+        system/ coordination dir and any live cell alone)."""
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from brig.commands.system_cmd import cmd_prune
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td)
+            (state / "system").mkdir()
+            (state / "alice" / "workspace").mkdir(parents=True)
+            (state / "ghost-1" / "workspace").mkdir(parents=True)
+            (state / "ghost-2" / "workspace").mkdir(parents=True)
+            # podman ps shows only alice as a known cell. vm_run auto-
+            # prepends sudo to podman commands, so match by membership.
+            def fake_vm(cmd, **kw):
+                if "podman" in cmd and "ps" in cmd:
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {"Names": ["brig-alice"], "State": "running"},
+                        ]),
+                    )
+                return SimpleNamespace(returncode=0, stdout="")
+            with patch("brig.commands.system_cmd.vm_run", side_effect=fake_vm), \
+                 patch("brig.cell.lifecycle.vm_run", side_effect=fake_vm), \
+                 patch("brig.network.subnet.list_all", return_value=[]), \
+                 patch("brig.config.HostPaths.STATE_DIR", state):
+                cmd_prune(SimpleNamespace(
+                    cells=True, logs=False, subnets=False,
+                    dry_run=False, log_days=7,
+                ))
+                # Assert while tempdir is still alive (the `with`
+                # block tears it down on exit).
+                self.assertTrue((state / "alice").exists(), "live cell removed")
+                self.assertTrue((state / "system").exists(), "system dir removed")
+                self.assertFalse((state / "ghost-1").exists(), "orphan not pruned")
+                self.assertFalse((state / "ghost-2").exists(), "orphan not pruned")
+
+
+class TestVersionFlag(unittest.TestCase):
+    def test_version_flag_prints_and_exits(self):
+        from brig.cli import _build_parser
+        parser = _build_parser()
+        # argparse --version exits 0 after printing.
+        with self.assertRaises(SystemExit) as ctx:
+            parser.parse_args(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_version_string_matches_brig_config(self):
+        from brig.config import VERSION
+        import brig
+        self.assertEqual(brig.__version__, VERSION)
+
+
+class TestErrorOutputUsesLogging(unittest.TestCase):
+    def test_log_error_exists(self):
+        """O1: cli.py error paths route through brig.ops.logging.error()."""
+        from brig.ops.logging import error as log_error
+        self.assertTrue(callable(log_error))
 
 
 if __name__ == "__main__":

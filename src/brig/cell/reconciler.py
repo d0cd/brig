@@ -18,9 +18,17 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
+from brig.cell.ca_bundle import (
+    IN_CELL_PATH as CA_BUNDLE_IN_CELL_PATH,
+    default_env as ca_bundle_default_env,
+    vm_bundle_path as ca_bundle_vm_path,
+)
+from brig.cell.metadata import IN_CELL_PATH, vm_source_path, write_metadata
 from brig.cell.spec import CellSpec
-from brig.config import PROXY_NAME, RUNTIME, VMPaths, container_name
+from brig.config import HostPaths, PROXY_NAME, RUNTIME, VMPaths, container_name
+from brig.errors import BrigError
 from brig.ops.logging import debug
+from brig.security.secrets import validate_secret_path
 from brig.vm.shell import vm_run
 
 
@@ -170,6 +178,35 @@ def plan_stop(cell_name: str, actual: CellState) -> list[Action]:
 _PROXY_ENV_NAMES = {"http_proxy", "https_proxy", "no_proxy", "all_proxy", "ftp_proxy"}
 
 
+def _verify_secrets_for_run(spec: CellSpec) -> None:
+    """Validate every requested secret against the host secrets dir.
+
+    Ensures each entry in spec.secrets resolves to a real file inside
+    HostPaths.SECRETS_DIR — no missing files, no symlinks that escape
+    the directory. Called from _execute_action just before the podman
+    bind-mount is emitted.
+    """
+    if not spec.secrets:
+        return
+    host_secrets_dir = HostPaths.SECRETS_DIR
+    for secret_name in spec.secrets:
+        try:
+            validate_secret_path(secret_name, host_secrets_dir)
+        except FileNotFoundError:
+            raise BrigError(
+                f"Secret '{secret_name}' not found in {host_secrets_dir}",
+                suggestion=f"Create it with: brig secrets add {secret_name}",
+            )
+        except ValueError as e:
+            raise BrigError(
+                f"Refusing to mount secret '{secret_name}': {e}",
+                suggestion=(
+                    "Check ~/.brig/secrets/ for symlinks that escape "
+                    "the secrets directory and remove them."
+                ),
+            )
+
+
 def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     """Build the podman run command for a cell.
 
@@ -187,7 +224,13 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         cmd.extend(["--network", "none"])
     else:
         if not proxy_ip:
-            raise RuntimeError("proxy_ip is required for non-airgapped cells")
+            raise BrigError(
+                "proxy_ip is required for non-airgapped cells",
+                suggestion=(
+                    "Warden's per-cell IP could not be determined. "
+                    "Try: brig system doctor"
+                ),
+            )
         cmd.extend([
             "--network", name,
             "-e", f"http_proxy=http://{proxy_ip}:8080",
@@ -198,6 +241,21 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         ])
 
     cmd.extend(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
+
+    # Safe-by-default rootfs. The cell's container-writable layer would
+    # otherwise let a hostile cell (a) fill the VM disk (shared across
+    # all cells; workspace_quota only bounds /work), and (b) stash
+    # state outside the workspace where the user wouldn't see it across
+    # stop/start. Read-only rootfs + sized tmpfs for the dirs every
+    # Linux app expects to write to. workspace_quota still applies to
+    # /work; opt-out via writable_rootfs: true in the cell spec.
+    if not spec.writable_rootfs:
+        cmd.extend([
+            "--read-only",
+            "--tmpfs", "/tmp:rw,size=64m,noexec,nosuid,nodev",
+            "--tmpfs", "/run:rw,size=16m,noexec,nosuid,nodev",
+        ])
+
     cmd.extend([
         "--memory", spec.memory,
         "--cpus", spec.cpus,
@@ -215,10 +273,9 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
 
     if spec.seccomp_profile:
         if spec.seccomp_profile.lower() == "unconfined":
-            raise ValueError("seccomp_profile='unconfined' is not allowed")
+            raise BrigError("seccomp_profile='unconfined' is not allowed")
         if "/" in spec.seccomp_profile or ".." in spec.seccomp_profile:
-            raise ValueError("seccomp_profile must be a filename, not a path")
-        # Resolve against a known profiles directory.
+            raise BrigError("seccomp_profile must be a filename, not a path")
         profile_path = VMPaths.CELLS_DIR / "seccomp" / spec.seccomp_profile
         cmd.extend(["--security-opt", f"seccomp={profile_path}"])
 
@@ -230,16 +287,41 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     for env in spec.env:
         env_key = env.split("=", 1)[0].lower() if "=" in env else env.lower()
         if env_key in _PROXY_ENV_NAMES:
-            raise ValueError(
+            raise BrigError(
                 f"Cannot override proxy environment variable: {env.split('=', 1)[0]}"
             )
         cmd.extend(["-e", env])
 
     workspace_dir = VMPaths.STATE_DIR / spec.name / "workspace"
-    cmd.extend(["-v", f"{workspace_dir}:/work:rw", "-w", "/work"])
+    cmd.extend([
+        "-v", f"{workspace_dir}:{spec.workspace_mount}:rw",
+        "-w", spec.workspace_mount,
+    ])
+    # Downward-API: read-only bind mount of the metadata JSON. The host
+    # writes it (see reconciler PODMAN_RUN handler), the cell reads it
+    # to learn its own name, workspace host path, and policy ACL.
+    cmd.extend(["-v", f"{vm_source_path(spec.name)}:{IN_CELL_PATH}:ro"])
+
+    # Warden CA bundle (system roots + Warden's MITM CA) — auto-mounted
+    # so HTTPS clients trust Warden out of the box. Skipped for airgapped
+    # cells (no egress to validate) and when the cell opts out via
+    # trust_warden_ca: false. The bundle file is staged by the PODMAN_RUN
+    # action (brig.cell.ca_bundle.stage_bundle). See INVARIANTS doc.
+    if spec.trust_warden_ca and not spec.is_airgapped:
+        cmd.extend([
+            "-v",
+            f"{ca_bundle_vm_path(spec.name)}:{CA_BUNDLE_IN_CELL_PATH}:ro",
+        ])
+        for env in ca_bundle_default_env(spec.env):
+            cmd.extend(["-e", env])
 
     if spec.secrets:
-        secrets_dir = Path("/secrets")
+        # Note: the host-side symlink / existence check for each secret
+        # happens in _execute_action(PODMAN_RUN) via _verify_secrets_for_run
+        # so build_run_command stays pure and unit-testable. Without that
+        # check, a symlink in ~/.brig/secrets/<name> could redirect the
+        # bind-mount to an arbitrary host path.
+        secrets_dir = Path("/secrets")  # in-VM virtiofs view
         for secret_name in spec.secrets:
             resolved = secrets_dir / secret_name
             cmd.extend(["-v", f"{resolved}:/run/secrets/{secret_name}:ro"])
@@ -249,10 +331,81 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.workdir:
         cmd.extend(["--workdir", spec.workdir])
 
+    _attach_host_sockets(spec, cmd)
+
     cmd.append(spec.image)
     cmd.extend(spec.command)
 
     return cmd
+
+
+def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
+    """Append `--volume` args for each declared host_socket, after
+    re-checking that the bridge socket is actually present and is a
+    real unix socket file (not a symlink, not a regular file).
+
+    This is the runtime TOCTOU defense — the static checks at yaml
+    parse time can't see the bridge directory, and the bridge is
+    populated by the macOS-side launchd unit (Phase 4). If the bridge
+    is missing, refuse cell start with a clear error rather than
+    letting podman create an empty dir at the source path.
+    """
+    if not spec.host_sockets:
+        return
+
+    from brig.config import VMPaths
+    # Per-cell bridge dir so two cells declaring the same physical host
+    # service (e.g. both want /tmp/postgres.sock) each get their own
+    # bridge socket. No reference counting; bridges live with the cell.
+    bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR)) / spec.name
+    for entry in spec.host_sockets:
+        name = entry["name"]
+        mount_point = entry["mount_point"]
+        mode = entry.get("mode", "ro")
+        source = bridge_dir / f"{name}.sock"
+
+        # lstat (NOT stat) so symlinks don't get followed silently.
+        # Symlinks AT the bridge path OR anywhere in its ancestor
+        # chain could redirect the bind-mount to attacker-controlled
+        # storage. We require:
+        #   - source exists, is a real socket, not a symlink
+        #   - every ancestor directory is also not a symlink
+        #   - realpath of source still lives under bridge_dir
+        import os as _os
+        import stat as _stat
+        try:
+            st = source.lstat()
+        except FileNotFoundError:
+            raise BrigError(
+                f"host_socket '{name}': bridge socket not found at {source}",
+                suggestion="Is the launchd bridge running? Try: brig up",
+            )
+        if _stat.S_ISLNK(st.st_mode):
+            raise BrigError(
+                f"host_socket '{name}': bridge path {source} is a symlink. "
+                f"Refusing to mount — bridge sockets must be real files."
+            )
+        if not _stat.S_ISSOCK(st.st_mode):
+            raise BrigError(
+                f"host_socket '{name}': bridge path {source} is not a "
+                f"unix socket (mode={oct(st.st_mode)})."
+            )
+        # Realpath canonicalizes the entire ancestor chain in one
+        # call — any symlinked parent dir (e.g. someone replaced the
+        # per-cell bridge dir with a link elsewhere) gets resolved
+        # here, defeating a post-lstat parent-dir swap. Then require
+        # the canonical path to live under the canonical bridge_dir
+        # (resolve both sides; macOS /tmp → /private/tmp makes a raw
+        # comparison falsely flag every real path as escaping).
+        real_source = _os.path.realpath(str(source))
+        real_root = _os.path.realpath(str(bridge_dir))
+        if not real_source.startswith(real_root + "/"):
+            raise BrigError(
+                f"host_socket '{name}': bridge socket realpath {real_source} "
+                f"escapes bridge dir {real_root}"
+            )
+
+        cmd.extend(["-v", f"{source}:{mount_point}:{mode}"])
 
 
 _ROLLBACK_MAP = {
@@ -305,12 +458,15 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         from brig.network.subnet import get
         info = get(action.cell_name)
         if info is None:
-            raise RuntimeError(f"No subnet allocated for {action.cell_name}")
+            raise BrigError(f"No subnet allocated for {action.cell_name}")
         r = _run_cmd([
             "podman", "network", "create", "--internal", "--subnet", info.subnet, name,
         ])
         if r.returncode != 0:
-            raise RuntimeError(f"Failed to create network: {r.stderr}")
+            raise BrigError(
+                f"Failed to create network for {action.cell_name}: {r.stderr.strip()}",
+                suggestion="Check VM state with: brig system doctor",
+            )
 
     elif action.type == ActionType.CONNECT_PROXY:
         r = _run_cmd(["podman", "network", "connect", name, PROXY_NAME])
@@ -319,9 +475,27 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
 
     elif action.type == ActionType.PODMAN_RUN:
         spec = action.params["spec"]
+        # Host-side secret-path validation: refuse to start the cell if
+        # any requested secret is missing or its path escapes the secrets
+        # directory via symlink. Runs here — not in build_run_command —
+        # so unit tests can drive build_run_command without needing real
+        # files on disk.
+        _verify_secrets_for_run(spec)
         # Ensure workspace directory exists inside the VM before podman mounts it.
         workspace = VMPaths.STATE_DIR / spec.name / "workspace"
         _run_cmd(["mkdir", "-p", str(workspace)])
+        # Write the cell metadata file (downward API) so it's in place when
+        # podman creates the read-only bind mount at /run/brig/cell.json.
+        write_metadata(spec.name, spec.workspace_mount,
+                       host_sockets=spec.host_sockets,
+                       ingress=spec.ingress)
+        # Stage the combined CA bundle inside the VM so HTTPS clients in
+        # the cell trust Warden's MITM cert. Re-extracted from Warden
+        # every start so a CA rotation doesn't leave cells with stale
+        # trust. Skipped for airgapped cells and explicit opt-outs.
+        if spec.trust_warden_ca and not spec.is_airgapped:
+            from brig.cell.ca_bundle import stage_bundle
+            stage_bundle(spec.name)
         proxy_ip = None
         if not spec.is_airgapped:
             # Retry — network connect may not have propagated yet.
@@ -335,12 +509,24 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
                     break
                 time.sleep(1)
             if not proxy_ip:
-                raise RuntimeError(f"Could not determine proxy IP on {name}")
+                raise BrigError(
+                    f"Could not determine proxy IP on network {name}",
+                    suggestion=(
+                        "Warden may not be connected to the cell network. "
+                        "Try: brig up"
+                    ),
+                )
 
         cmd = build_run_command(spec, proxy_ip)
         r = _run_cmd(cmd, timeout=120)
         if r.returncode != 0:
-            raise RuntimeError(f"podman run failed: {r.stderr}")
+            raise BrigError(
+                f"podman run failed: {r.stderr.strip()}",
+                suggestion=(
+                    f"Check the cell's logs: brig cell logs {spec.name}\n"
+                    "Or run diagnostics:    brig system doctor"
+                ),
+            )
         result.container_id = r.stdout.strip()
 
     elif action.type == ActionType.PODMAN_STOP:

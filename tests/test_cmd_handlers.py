@@ -9,11 +9,50 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-from brig.cell.reconciler import CellState, ReconcileResult
-from brig.cell.spec import CellSpec
+from brig.cell.reconciler import ReconcileResult
 from brig.errors import BrigError
+
+
+class TestCmdStartReplayIngress(unittest.TestCase):
+    """`brig cell start` must replay ingress registration with the
+    freshly-inspected cell IP. Without this, a `brig system down/up`
+    cycle leaves the cell running but ingress requests through warden's
+    :8443 reverse proxy return 502.
+    """
+
+    def test_start_with_ingress_in_metadata_replays_registration(self):
+        from brig.commands.lifecycle_cmd import cmd_start
+        ingress_entries = [
+            {"name": "api", "port": 8000,
+             "path_prefix": "/api", "auth": "token"},
+        ]
+        with patch("brig.network.proxy.proxy_running", return_value=True), \
+             patch("brig.commands.lifecycle_cmd._refresh_metadata_for_start"), \
+             patch("brig.commands.lifecycle_cmd.vm_run") as mock_vm, \
+             patch("brig.cell.metadata.read_ingress",
+                   return_value=ingress_entries) as mock_read, \
+             patch("brig.cell.lifecycle.register_ingress_for") as mock_reg:
+            import subprocess
+            mock_vm.return_value = subprocess.CompletedProcess([], 0, "", "")
+            rc = cmd_start(types.SimpleNamespace(name="cell-with-ingress"))
+        self.assertEqual(rc, 0)
+        mock_read.assert_called_once_with("cell-with-ingress")
+        mock_reg.assert_called_once_with("cell-with-ingress", ingress_entries)
+
+    def test_start_without_ingress_in_metadata_skips_registration(self):
+        from brig.commands.lifecycle_cmd import cmd_start
+        with patch("brig.network.proxy.proxy_running", return_value=True), \
+             patch("brig.commands.lifecycle_cmd._refresh_metadata_for_start"), \
+             patch("brig.commands.lifecycle_cmd.vm_run") as mock_vm, \
+             patch("brig.cell.metadata.read_ingress", return_value=[]), \
+             patch("brig.cell.lifecycle.register_ingress_for") as mock_reg:
+            import subprocess
+            mock_vm.return_value = subprocess.CompletedProcess([], 0, "", "")
+            rc = cmd_start(types.SimpleNamespace(name="cell-without"))
+        self.assertEqual(rc, 0)
+        mock_reg.assert_not_called()
 
 
 class TestCmdRunProfileMerge(unittest.TestCase):
@@ -133,25 +172,24 @@ class TestCmdRunValidation(unittest.TestCase):
 
 
 class TestCmdPolicySet(unittest.TestCase):
-    """Test policy set command handler."""
+    """Test policy set command handler — per-cell only."""
 
-    def test_global_policy_edit(self):
+    def test_per_cell_edit_appends_allow(self):
+        from brig.commands.policy_cmd import cmd_policy_set
         with tempfile.TemporaryDirectory() as tmpdir:
-            policy_path = Path(tmpdir) / "network-policy.json"
-            policy_path.write_text(json.dumps({"allow": ["existing.com"], "deny": []}))
-
-            with patch("brig.commands.policy_cmd.HostPaths") as mock_paths:
-                mock_paths.NETWORK_POLICY = policy_path
-                from brig.commands.policy_cmd import cmd_policy_set
-
-                args = types.SimpleNamespace(
-                    name="global", allow=["new.com"], deny=None,
-                    remove_allow=None, remove_deny=None,
-                )
-                with patch("brig.commands.policy_cmd.log_policy_change"):
-                    with patch("warden.proxy.reload_policy", return_value=True):
-                        cmd_policy_set(args)
-
-            policy = json.loads(policy_path.read_text())
+            policy_dir = Path(tmpdir)
+            (policy_dir / "alice.json").write_text(
+                json.dumps({"allow": ["existing.com"], "deny": []})
+            )
+            args = types.SimpleNamespace(
+                name="alice", allow=["new.com"], deny=None,
+                remove_allow=None, remove_deny=None,
+            )
+            with patch("brig.policy.policy.get_cell_policy_path",
+                       side_effect=lambda n, *a, **kw: policy_dir / f"{n}.json"), \
+                 patch("brig.commands.policy_cmd.log_policy_change"), \
+                 patch("brig.cell.metadata.refresh_metadata_if_present"):
+                cmd_policy_set(args)
+            policy = json.loads((policy_dir / "alice.json").read_text())
             self.assertIn("existing.com", policy["allow"])
             self.assertIn("new.com", policy["allow"])

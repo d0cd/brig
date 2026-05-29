@@ -62,11 +62,11 @@ brig run --file mycell.yaml                            # from definition file
 ### Manage cells
 
 ```bash
-brig list                     # list all cells
-brig logs mycell -f           # follow logs
-brig exec mycell -- ls -la    # run command in cell
-brig stop mycell              # graceful stop
-brig rm mycell                # remove cell + network + subnet
+brig cell list                     # list all cells
+brig cell logs mycell -f           # follow logs
+brig cell exec mycell -- ls -la    # run command in cell
+brig cell stop mycell              # graceful stop
+brig cell rm mycell                # remove cell + network + subnet
 ```
 
 ### Secrets
@@ -81,7 +81,7 @@ brig run --secret api-key alpine cat /run/secrets/api-key
 ### Profiles
 
 ```bash
-brig profiles                               # list available profiles
+brig system profiles                               # list available profiles
 brig run --profile untrusted alpine sh      # 512m, 1 cpu, restricted
 brig run --profile dev alpine sh            # 4g, 4 cpus, generous
 brig run --network none alpine sh           # fully airgapped
@@ -90,21 +90,24 @@ brig run --network none alpine sh           # fully airgapped
 ### Policy
 
 ```bash
-brig policy show                            # show global policy
-brig policy set global --allow '*.example.com'  # add to global allowlist
-brig policy set mycell --deny evil.com      # per-cell deny
-brig policy show mycell --effective         # merged global + per-cell
+brig policy show mycell                              # show a cell's policy
+brig policy set mycell --allow '*.example.com'       # extend cell allowlist
+brig policy set mycell --deny evil.com               # extend cell denylist
+brig policy test mycell api.example.com              # dry-run a host against the policy
+brig policy rm mycell                                # drop the per-cell policy file
 ```
+
+Policy commands always operate against a named cell; the cell yaml is the source of truth for what each cell can reach.
 
 ### System
 
 ```bash
-brig up                       # start everything (VM + warden)
-brig down                     # stop everything
-brig down --vm                # also stop the VM
-brig verify                   # check all 9 security invariants
-brig health                   # system health check
-brig diagnose mycell          # debug a specific cell
+brig system up                       # start everything (VM + warden)
+brig system down                     # stop everything
+brig system down --vm                # also stop the VM
+brig system verify                   # check all 12 security invariants
+brig system doctor --quick                   # system health check
+brig cell diagnose mycell          # debug a specific cell
 ```
 
 ## Network Policy
@@ -131,7 +134,7 @@ Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
 | Per-cell networks | No lateral movement between cells |
 | Warden proxy | Egress filtering, logging, rate limiting |
 
-9 security invariants, all tested. Run `brig verify` to check.
+12 security invariants, all tested. Run `brig system verify` to check.
 
 ## Development
 
@@ -147,12 +150,15 @@ make bench                    # benchmarks
 
 - [Quickstart](docs/learning/quickstart.md)
 - [Concepts](docs/learning/concepts.md)
+- [Hosting an agent](docs/learning/host-an-agent.md) — end-to-end agent + host-service walkthrough
 - [Troubleshooting](docs/learning/troubleshooting.md)
 - [Cell Definition Reference](docs/design/cell-definition.md)
 - [Architecture](docs/design/architecture.md)
 - [Security Design](docs/design/security.md) — and the [supply-chain notes](docs/design/supply-chain.md)
 - [SDK Specification](docs/sdk-spec.md)
+- [Brig CLI Reference](docs/reference/brig-cli.md)
 - [Warden CLI Reference](docs/reference/warden-cli.md)
+- [Cell Metadata Reference](docs/reference/cell-metadata.md) — `/run/brig/cell.json` schema and workspace-passthrough security model
 - [Addons Reference](docs/reference/addons.md)
 - [Security Invariants](docs/INVARIANTS.md)
 

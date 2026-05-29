@@ -344,6 +344,14 @@ class IngressRouter:
             return
 
         # Check request body size.
+        #
+        # LIMITATION: mitmproxy has already buffered the body into memory by
+        # the time this check runs, so this gate is post-allocation and
+        # only protects the cell-side application (and downstream memory)
+        # from large payloads. Auth still gates this — an unauthenticated
+        # client can't make warden buffer a body, since 401 returns earlier.
+        # For a true wire-level cap, mitmproxy stream mode would have to be
+        # configured for the ingress listener; we don't do that today.
         if flow.request.content and len(flow.request.content) > MAX_INGRESS_BODY_SIZE:
             flow.response = http.Response.make(
                 413, "Request body too large", {"Content-Type": "text/plain"}
@@ -368,8 +376,11 @@ class IngressRouter:
         # in the target cell application.
         flow.request.headers["Host"] = f"{route.cell_ip}:{route.port}"
 
-        # Tag for logging.
+        # Tag for logging. `cell` is what the logger keys log files on,
+        # so setting it here makes ingress hits appear in
+        # `brig cell network <cell>` instead of going to unknown.jsonl.
         flow.metadata["ingress"] = True
+        flow.metadata["cell"] = route.cell
         flow.metadata["ingress_cell"] = route.cell
         flow.metadata["ingress_route"] = route.name
         flow.metadata["ingress_client_ip"] = client_ip
@@ -378,6 +389,55 @@ class IngressRouter:
             f"INGRESS: {client_ip} -> {route.cell}:{route.port}"
             f"{remaining_path} ({route.name})"
         )
+
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        """Pass SSE / streaming responses through unbuffered.
+
+        mitmproxy buffers response bodies by default so addons can
+        inspect them. For Server-Sent-Events (Content-Type:
+        text/event-stream) and other long-lived streaming protocols
+        (chunked agent message streams, NDJSON), buffering is fatal —
+        the proxy holds bytes until the server closes, so the client
+        sees "everything at once at session close" instead of a
+        stream. Setting `flow.response.stream = True` in this hook
+        flips mitmproxy into pass-through mode for the response body.
+
+        Scoped to ingress flows only: egress (cell → outside) still
+        buffers so enforce.py's response-side checks (DNS rebinding,
+        etc.) keep working on per-request bodies. Ingress responses
+        come from cells we already trust on this listener and don't
+        need body inspection.
+
+        Aitelier diagnosed this — SA's ACP bridge emits
+        `agent_message_chunk` notifications via SSE; without
+        passthrough the client never sees them before session close.
+        """
+        if not flow.metadata.get("ingress_route"):
+            return
+        if flow.response is None:
+            return
+        # Case-insensitive header lookup. mitmproxy's Headers class
+        # normalizes for us, but `flow.response.headers.get(...)` is
+        # case-sensitive on plain dicts (tests) and on some mitmproxy
+        # versions in edge cases. Iterating keys with `.lower()`
+        # comparison keeps the code correct against any header
+        # container that supports `.items()`.
+        content_type = ""
+        try:
+            for k, v in flow.response.headers.items():
+                if isinstance(k, str) and k.lower() == "content-type":
+                    content_type = str(v).lower()
+                    break
+        except AttributeError:
+            return
+        # Strip any `; charset=...` suffix before comparing.
+        media_type = content_type.split(";", 1)[0].strip()
+        if media_type == "text/event-stream":
+            flow.response.stream = True
+            ctx.log.info(
+                f"INGRESS STREAM: passthrough for "
+                f"{flow.metadata.get('cell')}:{flow.metadata.get('ingress_route')}"
+            )
 
 
 addons = [IngressRouter()]

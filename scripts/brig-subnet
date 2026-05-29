@@ -16,7 +16,7 @@ if src_dir.exists():
     sys.path.insert(0, str(src_dir))
 
 from brig.network.subnet import (
-    allocate, free, get, list_all, index_to_subnet, validate_index,
+    allocate, free, get, list_all, validate_index,
 )
 
 

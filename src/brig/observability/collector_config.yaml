@@ -1,0 +1,70 @@
+# OpenTelemetry Collector configuration for brig.
+#
+# Receives signals from warden (OTLP/gRPC on 4317, OTLP/HTTP on 4318)
+# and exposes a Prometheus scrape endpoint on 9464 for `brig system
+# stats` to read. External export can be added by operators editing
+# the `exporters` and `service.pipelines` sections below.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Cap memory before pushing to the queue; refuse new spans before
+  # the collector OOMs. limit_mib is per-process, not the cgroup cap.
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    # 200ms is small enough that `brig system stats --watch` feels live
+    # but large enough that gRPC overhead is amortized.
+    timeout: 200ms
+    send_batch_size: 1024
+
+exporters:
+  # Prometheus scrape endpoint — brig system stats hits :9464/metrics.
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    namespace: brig
+    # Convert OTel histograms to prometheus histograms.
+    send_timestamps: true
+    metric_expiration: 24h
+  # Default in-memory trace store; the CLI reads recent spans via
+  # the debug exporter's exported file. For real trace storage,
+  # operators add an OTLP exporter pointing at Tempo / Jaeger here.
+  file/traces:
+    path: /var/lib/otel/traces.jsonl
+    rotation:
+      max_megabytes: 100
+      max_days: 7
+      max_backups: 3
+  # Same shape for logs — brig cell network reads from here.
+  file/logs:
+    path: /var/lib/otel/logs.jsonl
+    rotation:
+      max_megabytes: 100
+      max_days: 7
+      max_backups: 5
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [file/traces]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [file/logs]

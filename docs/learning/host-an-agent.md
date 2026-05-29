@@ -1,0 +1,140 @@
+# Hosting an agent in brig
+
+This guide walks through running an agent inside a brig cell so it can talk
+to a local model API server on the macOS host through the Warden proxy.
+We'll use the [the cell Agent](https://github.com/NousResearch/my-cell-agent)
+(NousResearch) as the example, but the same pattern works for any
+container that needs cell-isolated egress plus a route back to a service
+on the host.
+
+> **Production-shaped reference**: `cells/<your-cell>/` in this repo is the
+> canonical worked example — a real `Containerfile`, a `my-cell.yaml`
+> cell spec, a brig-aware entrypoint, and a phase-by-phase validation
+> plan at `cells/<your-cell>/VALIDATION.md`. Start from there and adapt; the
+> generic walk-through below covers the same pattern with placeholder
+> names.
+
+> Prereqs (already done on this machine):
+> - Brig is installed and `brig system up` succeeds.
+> - A model API server is listening on `127.0.0.1:$MODEL_PORT` on the host.
+> - The cell yaml declares the host service:
+>   `host_services: [{name: model, port: $MODEL_PORT}]`
+>   (warden will forward `model.host.brig` → `host:$MODEL_PORT`).
+>
+> Verify with `brig system doctor --quick` → both checks `[OK]`.
+
+## 1. Build the agent image inside the VM
+
+Brig runs containers inside the Lima VM via rootful podman, so the image
+needs to be available there — not in host docker. From the agent's source
+tree:
+
+```bash
+limactl shell brig -- sudo podman build \
+    -t localhost/my-agent:dev \
+    -f Dockerfile .
+```
+
+Lima mounts the host home read-only into the VM by default, so a host-side
+build context resolves directly:
+
+```bash
+limactl shell brig -- sudo podman build \
+    -t localhost/my-agent:dev \
+    -f "$HOME/path/to/agent/Dockerfile" \
+    "$HOME/path/to/agent"
+```
+
+## 2. Declare the host service in the cell yaml
+
+The cell yaml is the single source of truth. Declaring the host
+service in the yaml constitutes the grant; no separate `brig policy`
+step is required.
+
+```yaml
+# my-agent.cell.yaml
+name: my-agent
+image: localhost/my-agent:dev
+host_services:
+  - {name: model, port: 4000}
+```
+
+Verify after running:
+
+```bash
+cat ~/.brig/state/system/policies/my-agent.json
+# Should show: "host_services": [{"name": "model", "port": 4000}]
+```
+
+## 3. Add any required secrets
+
+```bash
+echo "$MY_API_KEY" | brig secrets add my-api-key
+```
+
+Secrets are mounted into the cell as files under `/run/secrets/<name>` and
+the cell entrypoint can bridge them to env vars as needed.
+
+## 4. Launch the cell
+
+```bash
+brig run \
+    --name my-agent \
+    --profile dev \
+    --secret my-api-key \
+    --detach \
+    localhost/my-agent:dev \
+    [agent args...]
+```
+
+Notes:
+- `--profile dev` gives 4 GB / 4 CPU. Tighten with `--memory 2g --cpus 2`
+  once you know the workload.
+- For a one-shot smoke test, drop `--detach` and pass a `--query` or
+  `--exec` style flag to the agent's entrypoint.
+- **Cell stays alive only as long as PID 1 runs.** If the agent's default
+  command prints help and exits, the cell flips to `stopped` in a few
+  hundred ms. For an interactive cell you'll attach `brig cell exec` to
+  repeatedly, either pick a long-running default command (e.g. the
+  agent's gateway / daemon mode) or override:
+  ```yaml
+  # cell yaml — keeps the cell alive without any agent logic
+  command: ["sleep", "infinity"]
+  ```
+  Then drive work via `brig cell exec my-agent -- <whatever>`.
+
+## 5. Verify it's reaching the host service
+
+```bash
+brig cell logs my-agent -f                    # agent stdout
+brig cell network my-agent --tail 20          # warden's view of the cell's egress
+brig cell network my-agent --blocked          # any requests warden refused
+```
+
+A working setup shows `GET /v1/... -> 200` lines in `brig cell network`, with
+the cell's name in the warden log file inside the VM.
+
+## 6. Cleanup
+
+```bash
+brig cell stop my-agent
+brig cell rm my-agent
+brig policy rm my-agent      # remove per-cell ACL (drops back to global)
+brig secrets rm my-api-key
+```
+
+## Troubleshooting
+
+- **`host service '<name>': not declared in cell '<cell>' yaml`** — the
+  cell yaml's `host_services` list doesn't include `<name>`. Add it,
+  then `brig cell rm <cell> && brig run --file <yaml>`.
+- **`cell '<cell>' has no host_services declared`** — no per-cell
+  policy at all. The cell yaml needs a `host_services:` block.
+- **`Connection refused` on host** — the service isn't listening. Confirm
+  with `curl http://127.0.0.1:<port>/`.
+- **`Cell exited (1)` with no useful logs** — the agent entrypoint likely
+  exited because some required dir under `/work` couldn't be created. Make
+  sure your profile mounts the cell workspace (the `dev` profile does).
+- **Stale subnet after a failed run** — re-running `brig run --name X`
+  after the previous attempt errored out leaves the cell + network behind.
+  `brig cell rm -f X` clears it.

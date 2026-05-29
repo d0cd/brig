@@ -87,11 +87,15 @@ def test_bench_domain_normalization_idn(benchmark, policy_rule_class):
 
 @pytest.mark.bench
 def test_bench_subnet_lookup_200(benchmark, policy_enforcer_class, subnet_map_large):
-    """Cell attribution from IP with 200 subnets — proves O(1) dict lookup."""
+    """Cell attribution from IP with 200 subnets — proves O(1) dict lookup.
+
+    Subnet logic was extracted into addons/_common.SubnetResolver during
+    the audit pass; we now poke the resolver directly on the enforcer.
+    """
     enforcer = policy_enforcer_class()
-    enforcer.subnet_map = subnet_map_large
-    enforcer._build_subnet_index()
-    benchmark(enforcer._get_cell_name, "10.60.200.5")
+    enforcer.subnets.subnet_map = subnet_map_large
+    enforcer.subnets._build_index()
+    benchmark(enforcer.subnets.get_cell_name, "10.60.200.5")
 
 
 # =========================================================================

@@ -13,7 +13,9 @@ repos:
       - id: no-commit-to-branch
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.0
+    # Keep in lockstep with uv.lock — local pre-commit and CI must
+    # agree on which lint rules fire (audit C4).
+    rev: v0.15.8
     hooks:
       - id: ruff
 

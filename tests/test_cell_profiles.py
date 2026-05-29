@@ -55,11 +55,33 @@ class TestApplyProfile(unittest.TestCase):
         self.assertEqual(merged["memory"], "4g")  # Spec wins.
         self.assertEqual(merged["cpus"], "1")  # Profile fills.
 
-    def test_policy_merge(self):
+    def test_policy_merge_into_flat_lists(self):
+        """Profile's nested policy.allow/deny prepends to the spec's
+        flat policy_allow / policy_deny lists (the CellSpec shape)."""
         spec = {"name": "test"}
-        profile = {"policy": {"allow": ["example.com"], "deny": []}}
+        profile = {"policy": {"allow": ["example.com"], "deny": ["bad.com"]}}
         merged = apply_profile(spec, profile)
-        self.assertEqual(merged["policy"]["allow"], ["example.com"])
+        self.assertEqual(merged["policy_allow"], ["example.com"])
+        self.assertEqual(merged["policy_deny"], ["bad.com"])
+
+    def test_policy_profile_extends_existing_lists(self):
+        """Profile baseline + cell additions both included; profile
+        first (so cell adds extend it)."""
+        spec = {"policy_allow": ["cell.com"]}
+        profile = {"policy": {"allow": ["base.com"]}}
+        merged = apply_profile(spec, profile)
+        self.assertEqual(merged["policy_allow"], ["base.com", "cell.com"])
+
+    def test_policy_tls_passthrough_propagates_from_profile(self):
+        """Profile's policy.tls_passthrough prepends to the spec's flat
+        policy_passthrough_tls list, same shape as allow/deny."""
+        spec = {"name": "test"}
+        profile = {"policy": {
+            "allow": ["chatgpt.com"],
+            "tls_passthrough": ["chatgpt.com"],
+        }}
+        merged = apply_profile(spec, profile)
+        self.assertEqual(merged["policy_passthrough_tls"], ["chatgpt.com"])
 
     def test_labels_merge(self):
         spec = {"labels": {"custom": "value"}}

@@ -10,7 +10,14 @@ Use with `brig run --file mycell.yaml`.
 name: my-cell                    # Lowercase alphanumeric, max 63 chars
 image: python:3.12               # Container image (OCI)
 
-# Command (optional — defaults to image entrypoint)
+# Command (optional — defaults to image entrypoint).
+# The cell stays running only as long as PID 1 (this command) is alive.
+# If your command prints help and exits (a common default for CLI tools),
+# the cell flips to `stopped` within milliseconds — which surprises users
+# who want to attach via `brig cell exec` repeatedly. Either give the
+# command its long-running mode (e.g. `["myapp", "serve"]`) or, for an
+# explicitly long-lived "exec into me" cell, use `["sleep", "infinity"]`
+# and drive work via `brig cell exec`.
 command: ["python", "app.py"]    # List of strings, or single string
 
 # Environment variables
@@ -36,7 +43,8 @@ pids_limit: 512                  # Max processes (prevents fork bombs)
 network: default                 # "default" = per-cell isolated network via Warden
                                  # "none"    = air-gapped, no network access
 
-# Network policy (per-cell override, merged with global policy)
+# Network policy. Per-cell — no global file to merge with. Trust
+# profiles can contribute a baseline allow/deny that this block extends.
 policy:
   allow:
     - "api.github.com"           # Simple domain string
@@ -46,12 +54,56 @@ policy:
       methods: ["GET", "POST"]
   deny:
     - "*.evil.com"               # Deny rules take precedence over allow
+  # Optional: hosts to skip Warden MITM for. Each entry must be covered
+  # by an allow entry (exact or wildcard). Warden tunnels TCP raw after
+  # the CONNECT, routed by SNI — for hosts whose TLS won't survive
+  # mitmproxy (HPKP, ECH, Cloudflare bot-fp). Trades per-URL audit for
+  # handshake compat + credential confidentiality. See invariant 11.
+  tls_passthrough:
+    - "chatgpt.com"
+    - "auth.openai.com"
+
+# Trust Warden's MITM CA out of the box. When true (default), brig stages
+# a combined bundle (system roots + Warden CA) inside the VM and bind-
+# mounts it read-only at /run/brig/ca-bundle.crt, plus sets SSL_CERT_FILE
+# / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS to point
+# at it — only for env vars the cell didn't already declare. Set to
+# false for cells with strict cert pinning or that manage their own
+# trust store. See invariant 12.
+#
+# Foot-gun: do NOT also set SSL_CERT_FILE in your image's entrypoint
+# or ENV. Brig's auto-mount only fills vars the cell didn't already
+# declare — an entrypoint-side override points cells at a cached or
+# stale CA, and silent TLS hangs follow when Warden's CA rotates
+# (mitmproxy presents a valid cert client-side, the upstream handshake
+# fails, the proxy drops with no signal back). `brig system doctor`
+# now flags this by comparing each cell's staged ca-bundle.crt against
+# Warden's current CA; run it if a previously-working cell starts
+# hanging on HTTPS after a `brig system up/down` cycle.
+#
+# Related: if you `brig image build --use-warden`, do NOT COPY the
+# warden CA from /etc/ssl/certs/warden-ca.crt into the final image.
+# That bakes a soon-to-rotate CA into the layer; runtime cells then
+# trust a stale cert. Mount-at-runtime is the supported pattern.
+trust_warden_ca: true
 
 # Timeout
 timeout: "30m"                   # Auto-kill after duration (30s, 5m, 2h, 1d)
 
 # Workspace
 workspace_quota: "500m"          # Max workspace size
+
+# Cell rootfs writability. Default false (safe). When false, brig runs the
+# cell with --read-only rootfs + sized tmpfs at /tmp (64m) and /run (16m).
+# The cell can still write to /work (its workspace).
+#
+# Set to true for images whose entrypoint needs to write outside /work,
+# /tmp, /run — e.g. legacy daemons that write to /var/log, dev images
+# that install/build at runtime. Opting in means the cell can (a) DoS
+# the shared VM disk by filling its writable layer, and (b) hide state
+# outside the workspace across stop/start. Don't opt in for cells that
+# run untrusted code.
+writable_rootfs: false
 
 # Execution mode
 detach: false                    # Run in background
@@ -76,6 +128,33 @@ ingress:
     port: 8642
     path_prefix: /webhooks
     auth: token
+
+# Host services — forwarding from cell to host port, through Warden.
+# Declaration here is the grant; no separate registration step.
+#
+# protocol: http (default) — L7 rewrite at <name>.host.brig (any path),
+#                            full URL+method audit, MITM applies.
+# protocol: tcp             — L4 forward via warden TCP listener.
+#                            Cell connects to <name>.host.brig:<port>
+#                            with a normal TCP client (psql, redis-cli,
+#                            etc.). Audit is connection-level (cell,
+#                            service, bytes, duration); no per-request
+#                            inspection. Same trust boundary as HTTP
+#                            host_services — warden stays in the path.
+# Untrusted profile rejects both at parse time.
+host_services:
+  - {name: litellm, port: 4000}                          # HTTP (default)
+  - {name: db, port: 5432, protocol: tcp}                # TCP — Postgres
+  - {name: redis, port: 6379, protocol: tcp}             # TCP — Redis
+
+# Host sockets — bind-mount macOS unix sockets into the cell for
+# non-HTTP protocols (Postgres, Redis, ssh-agent). Bytes flow
+# kernel-direct; Warden is not in the path.
+host_sockets:
+  - name: postgres
+    host_path: /tmp/postgres.sock
+    mount_point: /run/host/postgres.sock
+    mode: rw
 ```
 
 ## Ingress
@@ -90,7 +169,17 @@ https://warden:8443/{cell_name}/{path_prefix}/...
 
 Requirements:
 - Each request must include `Authorization: Bearer <token>`
-- Token is stored as a Brig secret: `brig secrets add {cell}-ingress-token`
+- Token is stored as a Brig secret with a strict naming convention:
+  - **Preferred:** `<cell-name>-ingress-token` — per-cell token, rotate
+    independently of other cells. Example: cell named `aitelier` reads
+    `~/.brig/secrets/aitelier-ingress-token`.
+  - **Fallback:** `ingress-token` — a single shared token across all
+    cells. Convenient for dev, not recommended for prod.
+  - The cell-name-prefixed file wins when both exist.
+  - If a cell declares `ingress` with `auth: token` and **neither**
+    secret exists, `brig run` fails with a hard error pointing at the
+    expected filename (see `brig cell preflight`).
+  - Register with: `openssl rand -hex 32 | brig secrets add <cell-name>-ingress-token -`
 - `network` must be `default` (ingress is incompatible with airgapped cells)
 - Maximum 8 ingress entries per cell
 
@@ -134,57 +223,168 @@ The env var name is derived from the filename:
 Application reads the file at runtime — secret values never appear in env vars,
 process listings, or container inspect output.
 
+## Host Sockets
+
+Bind-mount macOS-side unix sockets into the cell at a path under
+`/run/host/`. Bytes flow directly between the cell and the host
+service through the kernel; Warden is not in the path. This is the
+mechanism for non-HTTP services (Postgres, Redis, MySQL, ssh-agent)
+that cannot traverse an HTTP proxy.
+
+```yaml
+host_sockets:
+  - name: postgres                       # alphanumeric+hyphens, max 31 chars
+    host_path: /tmp/postgres.sock        # absolute, must be a real unix socket
+    mount_point: /run/host/postgres.sock # must start with /run/host/
+    mode: rw                             # ro (default) or rw
+```
+
+Then from inside the cell:
+
+```python
+import psycopg
+psycopg.connect("host=/run/host/postgres.sock dbname=app")
+```
+
+Requirements:
+
+- `host_path` must exist on the macOS host and be a real unix socket
+  (not a symlink, not a regular file)
+- `socat` must be installed (`brew install socat`) — used by the
+  launchd bridge
+- Maximum 8 host_sockets per cell
+- The `untrusted` profile rejects `host_sockets` at parse time:
+  bypassing Warden via a kernel side channel is incompatible with
+  the profile's threat model.
+
+Security properties:
+
+- Opt-in per cell yaml (no default access)
+- Engine sockets (`docker.sock`, `podman.sock`, `containerd.sock`,
+  `crio.sock`, `firecracker.sock`, `limactl.sock`) are denied
+- Bridge sockets are real unix sockets — symlinks rejected at runtime
+- Per-cell namespacing: two cells declaring the same physical service
+  each get their own bridge instance
+- Every attach is logged (`brig system history` or
+  `~/.brig/state/system/lifecycle.jsonl`)
+- Cell startup prints a NOTE that Warden does not see this traffic
+
+Limitations:
+
+- No per-request observability. Warden's HTTP audit does not apply
+  to raw TCP or binary protocols.
+- No automatic detection: every socket is declared in the cell yaml.
+- Cannot expose services that lack a unix-socket transport. See
+  [Raw TCP host services (via `protocol: tcp`)](#raw-tcp-host-services-via-protocol-tcp)
+  below for affected protocols and workarounds.
+
 ## Host Services
 
-Cells cannot reach the macOS host by default (private IPs are blocked).
-Host services allow cells to reach specific host-side services through
-virtual `.host.brig` domains.
+Cells cannot reach the macOS host by default; private IPs are blocked
+by Warden. Host services expose specific host-side HTTP/HTTPS services
+to a cell through virtual `<name>.host.brig` domains. Traffic is
+routed through Warden, so every request is HTTP-audited.
 
-Declaration is two-step:
+Declaration lives entirely in the cell yaml; there is no separate
+global registry or per-cell ACL:
 
-1. **Global policy** declares the (name → port) mapping that warden knows
-   how to forward:
-   ```bash
-   brig policy set global --host-service aitelier:7777
-   brig policy set global --host-service litellm:4000
-   ```
-
-2. **Per-cell policy** opts the cell into reaching specific services. By
-   default a cell has *no* host-service access; you must add the names you
-   want it to reach (audit fix H1):
-   ```bash
-   brig policy set hermes --host-service aitelier
-   ```
-
-   Or write the per-cell policy file directly:
-   ```json
-   {
-     "allow": ["api.github.com"],
-     "deny": [],
-     "host_services": ["aitelier"]
-   }
-   ```
+```yaml
+host_services:
+  - {name: db, port: 5432}
+  - {name: litellm, port: 4000}
+```
 
 From inside the cell:
 ```bash
-curl http://aitelier.host.brig/v1/health
+curl http://db.host.brig/health
+curl http://litellm.host.brig/v1/chat/completions
 ```
 
-Warden intercepts `.host.brig` requests and rewrites them to the macOS
-host IP + declared port. The cell never sees the real host IP.
+Warden intercepts `<name>.host.brig` requests, looks up the port in the
+cell's own host_services map, and rewrites to (host_ip, port). The cell
+never sees the real host IP.
 
 Security properties:
-- Only declared services are reachable (not a blanket private IP bypass)
-- A cell can only reach services in **its own** `host_services` list
-  (per-cell ACL — global declaration is necessary but not sufficient)
-- Cells with no per-cell policy have **no** host-service access
-- All traffic logged with `host_service` attribution
-- Virtual domains only resolve through the proxy
-- Unknown `.host.brig` domains are blocked
+
+- Only declared services are reachable; this is not a blanket
+  private-IP bypass.
+- The cell yaml is the grant. No separate registration step is
+  required or supported.
+- Cells without `host_services` in yaml have no host-service access.
+- All traffic is logged with `host_service` attribution.
+- Virtual domains only resolve through the proxy.
+- Unknown `.host.brig` domains are blocked.
+- The `untrusted` profile rejects `host_services` at parse time.
 - DNS rebinding to `(host_ip, host_service_port)` from an allowlisted
-  domain is detected: the host-service skip on `BLOCKED_NETWORKS` is
-  gated on `flow.metadata["host_service"]`, not on the destination tuple
-  (audit fix H4)
+  domain is detected. The host-service skip on `BLOCKED_NETWORKS` is
+  gated on `flow.metadata["host_service"]`, not on the destination
+  tuple, so a poisoned DNS response cannot reuse the exemption.
+
+### Choosing between host_services and host_sockets
+
+| | host_services | host_sockets |
+|---|---|---|
+| Protocol | HTTP/HTTPS only | Anything (TCP via unix socket) |
+| Audit | Per-request through Warden | Connect/disconnect only |
+| Address from cell | `<name>.host.brig` (DNS) | `/run/host/<name>.sock` (filesystem) |
+| Setup | `host_services: [{name, port}]` | `host_sockets: [{name, host_path, mount_point}]` + socat |
+| Use for | API gateways, model serving, anything HTTP | Postgres, Redis, MongoDB, MySQL, ssh-agent, anything with a unix socket |
+
+Most database and RPC clients in active development support unix
+sockets — Postgres, MySQL, Redis, MongoDB, and gRPC across most
+languages. Combined with HTTP via `host_services` (egress) and
+`ingress` (inbound), the unix-socket path via `host_sockets` covers
+the common cell-to-host access patterns.
+
+### Raw TCP host services (via `protocol: tcp`)
+
+Cells reach TCP services on the host with the same `host_services`
+block, using `protocol: tcp`. Warden binds a listener per declared
+port (mitmproxy `--mode reverse:tcp`) and forwards raw bytes to
+`host.lima.internal:<port>` — single trust boundary, connection-level
+audit (no per-message body inspection, which is opaque for binary DB
+wire protocols anyway).
+
+```yaml
+host_services:
+  - {name: db, port: 5432, protocol: tcp}     # Postgres
+  - {name: redis, port: 6379, protocol: tcp}
+  - {name: mongo, port: 27017, protocol: tcp}
+```
+
+In the cell, the upstream is reachable on the same port with a normal
+TCP client:
+
+    psql -h db.host.brig -p 5432 ...
+    redis-cli -h redis.host.brig -p 6379 ...
+
+Operational notes:
+
+- **First add of a TCP service triggers a warden restart** so the new
+  `--mode reverse:tcp` listener binds. `brig run` prompts before
+  restart (warden restart drops every running cell's open egress for
+  ~5s). Re-run with `--yes` to auto-confirm.
+- **Reserved ports**: 8080 (warden HTTP proxy) and 8443 (ingress) are
+  rejected at parse time.
+- **Untrusted profile** rejects `protocol: tcp` — adversarial cells
+  stay HTTP-only and inspectable.
+- **TCP host_services bypass mitmproxy MITM** — no URL audit, no body
+  inspection. Audit shape is connection-level (cell, service, bytes,
+  duration) via `tcp_start`.
+
+Patterns where TCP host_services or `host_sockets` (unix-socket
+variant) is the right answer:
+
+- Database protocols (Postgres, MySQL, MongoDB, Redis, Cassandra)
+- SSH from cell to a host bastion
+- gRPC-over-h2c
+- Replica-set / service discovery that probes by DNS
+- Legacy TCP-only drivers (Oracle JDBC, MSSQL TDS)
+
+`host_sockets` is still preferred when the upstream already speaks
+unix sockets — bypass-of-warden is total there (see invariant 10).
+TCP host_services preserve warden in the path for audit + connection
+limits.
 
 ## Examples
 

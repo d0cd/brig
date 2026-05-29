@@ -14,7 +14,7 @@ import json
 import os
 from pathlib import Path
 
-from brig.config import HostPaths, VMPaths
+from brig.config import HostPaths
 from brig.ops.atomic import atomic_write_json
 from brig.ops.logging import debug, info
 

@@ -9,8 +9,9 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-from brig.config import CONTAINER_PREFIX, PROXY_NAME, VM_NAME, HostPaths
-from brig.ops.logging import info, output, warn
+from brig.config import VM_NAME, HostPaths
+from brig.errors import BrigError
+from brig.ops.logging import debug, output
 
 
 def cmd_up(args: Any) -> int:
@@ -54,17 +55,14 @@ def cmd_up(args: Any) -> int:
     else:
         output("VM is running")
 
-    # Step 4: start warden if not running.
-    from brig.vm.shell import vm_run
-    result = vm_run(  # type: ignore[assignment]
-        ["podman", "inspect", "warden", "--format", "{{.State.Status}}"],
-        timeout=5,
-    )
-    if result.returncode == 0 and result.stdout.strip() == "running":
+    # Step 4: start warden if not running. Use warden.proxy.is_running()
+    # (the same check warden.proxy.start() uses internally) so cmd_up and
+    # start() can't disagree about state.
+    from warden.proxy import is_running, start
+    if is_running():
         output("Warden is running")
     else:
         output("Starting warden...")
-        from warden.proxy import start
         if not start():
             output("ERROR: Failed to start warden")
             return 1
@@ -79,19 +77,28 @@ def cmd_down(args: Any) -> int:
     """Handle `brig down` — stop everything.
 
     Steps:
-      1. Stop all running cells.
-      2. Stop warden.
-      3. Optionally stop VM (--vm flag).
+      1. Stop all running cells (via stop_cell so ingress / host_socket
+         bridges are torn down consistently per-cell).
+      2. Sweep any orphan host_socket bridges whose cell already exited.
+      3. Stop warden.
+      4. Optionally stop VM (--vm flag).
     """
-    from brig.vm.shell import vm_run
+    from brig.cell.lifecycle import list_cell_containers, stop_cell
 
-    # Stop all cells.
-    result = vm_run(["podman", "ps", "--format", "{{.Names}}", "--filter", f"name={CONTAINER_PREFIX}"])
-    if result.returncode == 0 and result.stdout.strip():
-        for name in result.stdout.strip().split("\n"):
-            if name and name != PROXY_NAME:
-                output(f"Stopping {name}...")
-                vm_run(["podman", "stop", "-t", "5", name])
+    # Stop each running cell through the full lifecycle path. Wrap in
+    # try/except so a single misbehaving cell doesn't strand the others
+    # (e.g., already mid-shutdown, deregistered externally, etc.).
+    for cell_name, _entry in list_cell_containers(include_stopped=False):
+        output(f"Stopping {cell_name}...")
+        try:
+            stop_cell(cell_name)
+        except BrigError as e:
+            debug(f"stop_cell({cell_name}) returned: {e}")
+
+    # Sweep orphan host_socket bridges — launchd plists whose cells were
+    # already stopped (or removed) before this `brig down`. Idempotent;
+    # no-op when there's nothing to clean.
+    _bootout_all_host_socket_bridges()
 
     # Stop warden.
     from warden.proxy import stop
@@ -105,6 +112,34 @@ def cmd_down(args: Any) -> int:
 
     output("Brig stopped")
     return 0
+
+
+def _bootout_all_host_socket_bridges() -> None:
+    """Enumerate every loaded host_socket bridge plist and bootout it,
+    regardless of which cell it belongs to. Used by `brig down` so we
+    don't leak orphan bridges across system restarts.
+    """
+    from brig.cell.host_sockets_bridge import (
+        LABEL_PREFIX, PLIST_DIR, stop_cell_bridges,
+    )
+    if not PLIST_DIR.exists():
+        return
+    cells_with_bridges: set[str] = set()
+    for plist in PLIST_DIR.iterdir():
+        name = plist.name
+        if not name.startswith(LABEL_PREFIX) or not name.endswith(".plist"):
+            continue
+        rest = name[len(LABEL_PREFIX):-len(".plist")]
+        if "." not in rest:
+            continue
+        cell_name = rest.split(".", 1)[0]
+        cells_with_bridges.add(cell_name)
+    for cell_name in cells_with_bridges:
+        output(f"Tearing down host_socket bridges for {cell_name}...")
+        try:
+            stop_cell_bridges(cell_name)
+        except Exception as e:
+            output(f"  (warn) failed to bootout bridges for {cell_name}: {e}")
 
 
 def cmd_profiles(args: Any) -> int:

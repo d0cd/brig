@@ -6,9 +6,7 @@ and rollback cleans up on failure.
 
 import json
 import subprocess
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from brig.cell.reconciler import (
@@ -17,7 +15,6 @@ from brig.cell.reconciler import (
     ReconcileResult,
     _execute_action,
     apply,
-    build_run_command,
     plan_run,
 )
 from brig.cell.spec import CellSpec
@@ -27,10 +24,12 @@ from brig.config import CONTAINER_PREFIX, PROXY_NAME
 class TestApplyFiresCorrectCommands(unittest.TestCase):
     """Test that apply() fires the right podman commands in order."""
 
+    @patch("brig.cell.ca_bundle.vm_run")
     @patch("brig.cell.reconciler.vm_run")
     @patch("brig.network.subnet.get")
     @patch("brig.network.subnet.allocate")
-    def test_full_create_sequence(self, mock_allocate, mock_get, mock_vm_run):
+    def test_full_create_sequence(self, mock_allocate, mock_get,
+                                   mock_vm_run, mock_ca_vm_run):
         """Fresh cell: allocate → create network → connect proxy → run."""
         from brig.network.subnet import SubnetInfo
         subnet_info = SubnetInfo(
@@ -53,6 +52,7 @@ class TestApplyFiresCorrectCommands(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "container-id-abc\n", "")
 
         mock_vm_run.side_effect = fake_vm_run
+        mock_ca_vm_run.return_value = subprocess.CompletedProcess([], 0, "", "")
 
         spec = CellSpec(name="test", image="alpine", command=["echo", "hi"])
         from brig.cell.reconciler import CellState
@@ -185,8 +185,9 @@ class TestApplyRollbackOnFailure(unittest.TestCase):
 class TestExecuteActionWorkspace(unittest.TestCase):
     """Test that PODMAN_RUN creates the workspace directory."""
 
+    @patch("brig.cell.ca_bundle.vm_run")
     @patch("brig.cell.reconciler.vm_run")
-    def test_workspace_dir_created_before_run(self, mock_vm_run):
+    def test_workspace_dir_created_before_run(self, mock_vm_run, mock_ca_vm_run):
         """mkdir -p for the workspace should be called before podman run."""
         calls = []
         def fake_vm_run(cmd, **kwargs):
@@ -199,6 +200,7 @@ class TestExecuteActionWorkspace(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, 0, "abc\n", "")
 
         mock_vm_run.side_effect = fake_vm_run
+        mock_ca_vm_run.return_value = subprocess.CompletedProcess([], 0, "", "")
 
         spec = CellSpec(name="test", image="alpine")
         result = ReconcileResult(success=True)

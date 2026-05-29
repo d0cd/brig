@@ -12,12 +12,12 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from brig.config import ALLOCATOR_LOCK_FILE, CELL_NAME_PATTERN, SUBNET_MAP_FILE, SUBNET_STATE_FILE
+from brig.config import ALLOCATOR_LOCK_FILE, CELL_NAME_PATTERN, SUBNET_STATE_FILE
+from brig.ops.atomic import atomic_write_json
 
 SUBNET_PREFIX = "10.60"
 MIN_INDEX = 1
@@ -44,7 +44,14 @@ def validate_index(index: int) -> bool:
 
 
 def _load_state(state_file: Path = SUBNET_STATE_FILE) -> dict:
-    """Load subnet allocation state from file."""
+    """Load subnet allocation state from file.
+
+    UNLOCKED — caller must hold the allocator file lock (fcntl.LOCK_SH or
+    LOCK_EX on ALLOCATOR_LOCK_FILE). Direct reads without the lock can
+    observe a torn file in the rename window. All callers in this module
+    (allocate/free/get/list_all/get_subnet_map) wrap _load_state in a lock;
+    if you add a new caller, do the same.
+    """
     default: dict = {"next_index": 1, "allocated": {}, "freed": []}
     if not state_file.exists():
         return default
@@ -76,25 +83,15 @@ def _load_state(state_file: Path = SUBNET_STATE_FILE) -> dict:
 
 def _save_state(state: dict, state_file: Path = SUBNET_STATE_FILE) -> None:
     """Save state atomically (write to temp, fsync, rename)."""
+    # State dir must be 0700 — holds the subnet allocator + audit logs.
+    # atomic_write_json does mkdir(parents=True) but doesn't force 0700,
+    # so re-chmod after to tighten if the dir already existed looser.
     state_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # Tighten perms in case the dir already existed with looser permissions.
     try:
         os.chmod(state_file.parent, 0o700)
     except OSError:
         pass
-    fd, tmp_path = tempfile.mkstemp(dir=state_file.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(state, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(tmp_path, str(state_file))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(state_file, state)
 
 
 def _build_subnet_map(state: dict) -> dict[str, str]:
@@ -106,26 +103,14 @@ def _build_subnet_map(state: dict) -> dict[str, str]:
     return mapping
 
 
-def _write_subnet_map(state: dict, map_file: Path = SUBNET_MAP_FILE) -> None:
+def _write_subnet_map(state: dict, *, map_file: Path) -> None:
     """Write subnet-map.json atomically for enforce.py consumption.
 
-    Must be called under the allocator lock.
+    Must be called under the allocator lock. `map_file` is keyword-only with
+    no default — a silent default here once let pytest clobber the user's
+    real subnet-map.json when tests overrode only state_file.
     """
-    mapping = _build_subnet_map(state)
-    map_file.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(dir=map_file.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(mapping, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(tmp_path, str(map_file))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    atomic_write_json(map_file, _build_subnet_map(state))
 
 
 def allocate(
@@ -167,7 +152,7 @@ def allocate(
             }
 
             _save_state(state, state_file)
-            _write_subnet_map(state)
+            _write_subnet_map(state, map_file=state_file.parent / "subnet-map.json")
 
             return SubnetInfo(
                 cell_name=cell_name,
@@ -205,7 +190,7 @@ def free(
                 state["freed"].sort()
 
             _save_state(state, state_file)
-            _write_subnet_map(state)
+            _write_subnet_map(state, map_file=state_file.parent / "subnet-map.json")
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 

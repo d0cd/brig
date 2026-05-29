@@ -205,17 +205,62 @@ class PolicyTraceConfig:
 
 
 class Policy:
-    """Parsed policy with allow/deny rules and optional host-service ACL."""
+    """Parsed policy with allow/deny rules and optional host-service map.
+
+    host_services entries are dicts {"name": str, "port": int}; the
+    dict shape is the only supported form. Populates
+    host_services_map: dict[name, port].
+
+    tls_passthrough is a list of host patterns (same wildcard semantics
+    as allow/deny). When a passthrough host's SNI is seen at TLS
+    client-hello time, Warden tunnels TCP without decrypting (no MITM).
+    See is_passthrough() for the defense-in-depth allow-list check.
+    """
 
     def __init__(self, allow: list = None, deny: list = None,
-                 host_services: list = None):
+                 host_services: list = None,
+                 tls_passthrough: list = None):
         self.allow_rules = [PolicyRule(r) for r in (allow or [])]
         self.deny_rules = [PolicyRule(r) for r in (deny or [])]
-        # host_services: list of allowed host-service names. None means
-        # "no per-cell ACL configured"; empty list means "deny all".
-        self.host_services_allowed: Optional[set[str]] = (
-            set(host_services) if host_services is not None else None
-        )
+        self.passthrough_rules = [PolicyRule(r) for r in (tls_passthrough or [])]
+        # HTTP host_services: name -> port. Used by enforce.py to rewrite
+        # `<name>.host.brig` requests at L7.
+        self.host_services_map: Optional[dict] = None
+        # TCP host_services: name -> port. Same shape, separate dict so
+        # enforce.py can quickly distinguish: HTTP entries get the L7
+        # rewrite, TCP entries are forwarded by warden's `--mode tcp@PORT`
+        # listener with a tcp_start hook checking this map.
+        self.tcp_host_services_map: Optional[dict] = None
+        if host_services is not None:
+            self.host_services_map = {}
+            self.tcp_host_services_map = {}
+            for item in host_services:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name")
+                port = item.get("port")
+                protocol = item.get("protocol", "http")
+                if isinstance(name, str) and isinstance(port, int):
+                    if protocol == "tcp":
+                        self.tcp_host_services_map[name] = port
+                    elif protocol == "http":
+                        self.host_services_map[name] = port
+                    else:
+                        # Unknown protocol on a tampered on-disk policy
+                        # (invariant 4: state dir untrusted). Fail-safe:
+                        # drop the entry entirely rather than degrade to
+                        # HTTP. Log so the operator sees it during
+                        # warden-log inspection.
+                        try:
+                            import logging
+                            logging.getLogger("brig.warden").warning(
+                                "Policy: dropping host_service '%s' with "
+                                "unknown protocol %r — only http/tcp "
+                                "are valid",
+                                name, protocol,
+                            )
+                        except Exception:
+                            pass
         # Build reverse-label tries for O(k) domain lookup.
         self._allow_trie = DomainTrie()
         for rule in self.allow_rules:
@@ -223,9 +268,31 @@ class Policy:
         self._deny_trie = DomainTrie()
         for rule in self.deny_rules:
             self._deny_trie.insert(rule)
+        self._passthrough_trie = DomainTrie()
+        for rule in self.passthrough_rules:
+            self._passthrough_trie.insert(rule)
         # Pre-build rule -> index map for O(1) trace lookups.
         self._rule_index = {id(r): i for i, r in enumerate(self.deny_rules)}
         self._rule_index.update({id(r): i for i, r in enumerate(self.allow_rules)})
+
+    def is_passthrough(self, host: str) -> bool:
+        """True iff host matches a passthrough rule AND an allow rule.
+
+        Defense in depth: the brig CLI's schema validator already enforces
+        that passthrough hosts appear in allow at parse time. Re-checking
+        here means a tampered on-disk policy file cannot opt a host out
+        of MITM without also having allow coverage. Without this, an
+        attacker who can write a per-cell policy file (invariant 4: macOS
+        state dir is untrusted) could bypass policy by adding ONLY a
+        passthrough entry. Fail closed if either check misses.
+        """
+        if not self.passthrough_rules:
+            return False
+        pt_matches = self._passthrough_trie.lookup(host)
+        if not any(r.matches_domain(host) for r in pt_matches):
+            return False
+        allow_matches = self._allow_trie.lookup(host)
+        return any(r.matches_domain(host) for r in allow_matches)
 
     def is_allowed(self, host: str, path: str, method: str,
                    trace_config: PolicyTraceConfig = None) -> tuple[bool, str, dict]:

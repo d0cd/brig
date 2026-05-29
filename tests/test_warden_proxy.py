@@ -10,13 +10,43 @@ from warden.proxy import container_exists, get_status, is_running, reload_policy
 class TestIsRunning(unittest.TestCase):
     @patch("warden.proxy.vm_run")
     def test_running(self, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess([], 0, "warden\n", "")
+        # Inspect returns the State.Status directly.
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "running\n", "")
         self.assertTrue(is_running())
 
     @patch("warden.proxy.vm_run")
-    def test_not_running(self, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess([], 0, "\n", "")
+    def test_exited_container_reports_not_running(self, mock_run):
+        # Container exists but is stopped — must not be reported as running,
+        # so cmd_up's recovery path kicks in instead of falsely returning OK.
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "exited\n", "")
         self.assertFalse(is_running())
+
+    @patch("warden.proxy.vm_run")
+    def test_no_such_container(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess([], 125, "", "no such container")
+        self.assertFalse(is_running())
+
+    @patch("warden.proxy.vm_run")
+    def test_inspect_command_shape(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "running\n", "")
+        is_running()
+        args = mock_run.call_args[0][0]
+        # Must inspect by exact name (not a substring filter), and read State.Status.
+        self.assertEqual(args[:2], ["podman", "inspect"])
+        self.assertIn("{{.State.Status}}", args)
+
+
+class TestPodmanFilterIsAnchored(unittest.TestCase):
+    @patch("warden.proxy.vm_run")
+    def test_filter_is_regex_anchored(self, mock_run):
+        # container_exists() uses _podman_ps under the hood; the filter must
+        # be ^warden$ so a stray container named "warden-old" doesn't match.
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        container_exists()
+        args = mock_run.call_args[0][0]
+        filter_args = [a for i, a in enumerate(args) if i and args[i - 1] == "--filter"]
+        self.assertTrue(any(f == "name=^warden$" for f in filter_args),
+                        f"expected name=^warden$ in --filter values, got {filter_args}")
 
 
 class TestContainerExists(unittest.TestCase):

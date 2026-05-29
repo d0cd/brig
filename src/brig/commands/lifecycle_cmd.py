@@ -8,15 +8,62 @@ All podman commands route through vm_run() to execute inside the Lima VM.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 from brig.cell.lifecycle import kill_cell, rm_cell, run_cell, stop_cell
 from brig.cell.profiles import apply_profile, load_profile
 from brig.cell.spec import CellSpec, load_cell_definition, validate_cell_definition
-from brig.config import CONTAINER_PREFIX, PROXY_NAME, container_name
+from brig.config import CONTAINER_PREFIX, container_name
 from brig.errors import BrigError
 from brig.ops.logging import info, output
 from brig.vm.shell import vm_run, vm_run_interactive
+
+
+_DIGEST_RE = __import__("re").compile(r"@sha(?:256|512):[0-9a-f]{40,}$")
+
+
+def _warn_unverified_image(image: str) -> None:
+    """Stderr-only warning if `image` is from a registry and lacks a
+    digest pin. Local builds (localhost/* and dotless single names) and
+    digest-pinned refs are silent.
+
+    Brig doesn't refuse — verification is a publishing trust decision
+    that varies by user. We just make the absence visible so a careless
+    `brig run someorg/their-image:latest` doesn't slip through quietly.
+
+    Honors the `suppress_unverified_image_warn` config flag (set via
+    `brig config set suppress_unverified_image_warn true`) for users
+    who have made an explicit trust decision and want quiet runs.
+    """
+    if not image:
+        return
+    if image.startswith("localhost/"):
+        return
+    if _DIGEST_RE.search(image):
+        return
+    if _suppress_unverified_warn():
+        return
+    # No registry component (e.g. "alpine") is an implicit Docker Hub pull,
+    # which is the most common trust-by-default footgun. Warn anyway.
+    info(
+        f"WARN: image {image!r} is unpinned and unverified. "
+        f"Pin a digest (image@sha256:...) or verify with: "
+        f"brig image verify {image}\n"
+        f"  (silence with: brig config set suppress_unverified_image_warn true)"
+    )
+
+
+def _suppress_unverified_warn() -> bool:
+    """Read the suppress flag from CONFIG_FILE. Missing/unreadable
+    config is treated as 'warn' (the safe default)."""
+    import json as _json
+    from brig.config import CONFIG_FILE
+    try:
+        with open(CONFIG_FILE) as f:
+            return bool(_json.load(f).get("suppress_unverified_image_warn", False))
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return False
 
 
 def cmd_run(args: Any) -> int:
@@ -33,11 +80,48 @@ def cmd_run(args: Any) -> int:
                        "before the container command? e.g. brig run --memory 512m alpine -- sh",
         )
 
-    # Auto-generate name if not provided.
-    if not args.name:
-        from brig.cell.names import generate_name
-        args.name = generate_name()
-        info(f"Auto-generated name: {args.name}")
+    # `brig run cells/foo` is a common confusion — that's a build context,
+    # not an image ref. If the arg looks like a host directory (contains
+    # '/' AND exists on disk as a dir), surface the build vs run distinction
+    # before podman tries to pull and fails opaquely.
+    if args.image and "/" in args.image and not args.image.startswith("localhost/"):
+        from pathlib import Path as _P
+        if _P(args.image).is_dir():
+            raise BrigError(
+                f"'{args.image}' is a directory, not an image reference",
+                suggestion=(
+                    f"Did you mean to build it first?\n"
+                    f"  brig image build {args.image}\n"
+                    f"  brig run localhost/{_P(args.image).name}:latest ..."
+                ),
+            )
+
+    # Catch the inverse: flags AFTER a valid image. nargs=REMAINDER swallows
+    # everything so `brig run alpine --memory 256m sh` puts `--memory 256m sh`
+    # into container_cmd. The cell starts and tries to exec `--memory` as the
+    # command, fails with "executable not found", and the user can't tell
+    # why. Flag a brig-style flag in container_cmd[0] before that happens.
+    _BRIG_FLAG_TOKENS = {
+        "--memory", "-m", "--cpus", "--name", "-n", "--env", "-e",
+        "--secret", "-s", "--profile", "--file", "-f", "--network",
+        "--detach", "-d", "--rm", "--timeout", "--workspace-quota",
+        "--label", "-l", "--pids-limit", "--image-digest", "--workdir",
+        "--policy-allow", "--policy-deny",
+    }
+    cmd_tail = args.container_cmd or []
+    # Strip the optional leading -- separator before checking.
+    first = cmd_tail[1] if cmd_tail and cmd_tail[0] == "--" else (cmd_tail[0] if cmd_tail else None)
+    if first in _BRIG_FLAG_TOKENS:
+        raise BrigError(
+            f"'{first}' looks like a brig flag but appears after the image",
+            suggestion=(
+                "Brig flags must precede the image. If you meant to pass it to "
+                f"the container, escape it: brig run ... {args.image} -- {first} ..."
+            ),
+        )
+
+    if args.image:
+        _warn_unverified_image(args.image)
 
     # Strip leading -- from REMAINDER args.
     container_cmd = args.container_cmd or []
@@ -47,8 +131,11 @@ def cmd_run(args: Any) -> int:
     if not args.image and not args.file:
         raise BrigError("Image is required unless --file is specified")
 
+    # Name resolution: --name flag wins, then the yaml's name: field (if any),
+    # then auto-generate. The previous order auto-generated before loading the
+    # file, which made `--file foo.yaml` with `name: my-cell` get an auto-name.
     spec_kwargs: dict[str, Any] = {
-        "name": args.name,
+        "name": args.name or "",  # may be filled from yaml below
         "image": args.image or "",
         "command": container_cmd,
         "env": args.env or [],
@@ -60,11 +147,28 @@ def cmd_run(args: Any) -> int:
         "workdir": getattr(args, "workdir", None),
     }
 
+    # Precedence: CLI flag > yaml > profile > defaults. Build up from
+    # least-specific to most-specific: apply profile first, then merge
+    # yaml on top, then CLI flag overrides below.
+
+    if args.profile:
+        profile = load_profile(args.profile)
+        merged = apply_profile(spec_kwargs, profile)
+        spec_kwargs.update(merged)
+
     if args.file:
         cell_def = load_cell_definition(args.file)
         errors = validate_cell_definition(cell_def, args.file)
         if errors:
             raise BrigError("Invalid cell definition:\n  - " + "\n  - ".join(errors))
+        # Special-cased fields:
+        #   - image / name: --flag wins over yaml (handled by the
+        #     `not getattr(args, key, None)` check).
+        #   - command: --container_cmd (positional) wins over yaml.
+        #   - env: additive — yaml entries appended to --env entries.
+        #   - policy: nested {allow, deny} flattens to policy_allow /
+        #     policy_deny, extending whatever the profile contributed.
+        # All other CellSpec-valid fields fall through to the generic merge.
         for key in ("image", "name"):
             if key in cell_def and not getattr(args, key, None):
                 spec_kwargs[key] = cell_def[key]
@@ -76,11 +180,31 @@ def cmd_run(args: Any) -> int:
             if isinstance(env_list, dict):
                 env_list = [f"{k}={v}" for k, v in env_list.items()]
             spec_kwargs["env"] = (args.env or []) + env_list
-
-    if args.profile:
-        profile = load_profile(args.profile)
-        merged = apply_profile(spec_kwargs, profile)
-        spec_kwargs.update(merged)
+        if isinstance(cell_def.get("policy"), dict):
+            for src_key, dst_key in (("allow", "policy_allow"),
+                                      ("deny", "policy_deny"),
+                                      ("tls_passthrough", "policy_passthrough_tls")):
+                src = cell_def["policy"].get(src_key) or []
+                if src:
+                    spec_kwargs[dst_key] = list(spec_kwargs.get(dst_key) or []) + list(src)
+        # host_services from yaml EXTEND the profile baseline, same as
+        # policy.allow/deny. A plain generic-merge would replace, which
+        # silently drops profile-declared services when the yaml has any.
+        if isinstance(cell_def.get("host_services"), list):
+            spec_kwargs["host_services"] = (
+                list(spec_kwargs.get("host_services") or [])
+                + list(cell_def["host_services"])
+            )
+        # Generic merge for everything else the validator accepts.
+        import dataclasses as _dc
+        _spec_field_names = {f.name for f in _dc.fields(CellSpec)}
+        _already_handled = {
+            "image", "name", "command", "env", "ingress", "policy",
+            "host_services",
+        }
+        for key, val in cell_def.items():
+            if key in _spec_field_names and key not in _already_handled:
+                spec_kwargs[key] = val
 
     if args.memory:
         spec_kwargs["memory"] = args.memory
@@ -94,15 +218,35 @@ def cmd_run(args: Any) -> int:
         spec_kwargs["timeout"] = args.timeout
     if args.workspace_quota:
         spec_kwargs["workspace_quota"] = args.workspace_quota
+    # --policy-allow / --policy-deny EXTEND profile + yaml entries
+    # (consistent with how yaml extends the profile baseline). To
+    # replace, edit the yaml. Single-tenant: there's no security gain
+    # from "CLI clobbers all" because the operator owns every layer.
     if args.policy_allow:
-        spec_kwargs["policy_allow"] = args.policy_allow
+        spec_kwargs["policy_allow"] = (
+            list(spec_kwargs.get("policy_allow") or []) + list(args.policy_allow)
+        )
     if args.policy_deny:
-        spec_kwargs["policy_deny"] = args.policy_deny
+        spec_kwargs["policy_deny"] = (
+            list(spec_kwargs.get("policy_deny") or []) + list(args.policy_deny)
+        )
 
     # Ingress from cell definition file (no CLI flag — file-only).
     if args.file:
         if "ingress" in cell_def:
             spec_kwargs["ingress"] = cell_def["ingress"]
+
+    # Yaml is canonical: a `--file <yaml>` invocation must spell its
+    # name. CLI shorthand (`brig run alpine echo hi`) still auto-names.
+    if not spec_kwargs.get("name"):
+        if args.file:
+            raise BrigError(
+                f"Cell yaml {args.file} is missing required field: name",
+                suggestion="Add `name: <cell-name>` to the yaml",
+            )
+        from brig.cell.names import generate_name
+        spec_kwargs["name"] = generate_name()
+        info(f"Auto-generated name: {spec_kwargs['name']}")
 
     # Filter to CellSpec fields only — profiles may add extra keys like 'runtime'.
     import dataclasses
@@ -110,6 +254,13 @@ def cmd_run(args: Any) -> int:
     spec_kwargs = {k: v for k, v in spec_kwargs.items() if k in valid_fields}
 
     spec = CellSpec(**spec_kwargs)
+    _sync_cell_policy(spec)
+    # If this cell declares TCP host_services on ports warden hasn't
+    # bound yet, warden needs to restart (mitmproxy can't hot-add
+    # listeners). Prompts the operator unless --yes is set; refuses to
+    # continue silently because warden restart drops every other
+    # cell's open egress for ~5s.
+    _maybe_restart_warden_for_tcp(spec, yes=getattr(args, "yes", False))
 
     from brig.ops.logging import Spinner
     with Spinner(f"Starting cell '{spec.name}'...") as spinner:
@@ -121,6 +272,275 @@ def cmd_run(args: Any) -> int:
 
     if result.container_id:
         output(result.container_id[:12])
+
+    # Detect cells that exit immediately and turn the cryptic outcome into
+    # actionable feedback. The most common causes — image's CMD prints help
+    # and exits, or the image tried to write somewhere read-only — look like
+    # brig brokenness from the user's side.
+    if result.success and spec.detach:
+        _check_immediate_exit(spec.name)
+    return 0
+
+
+def _maybe_restart_warden_for_tcp(spec: CellSpec, yes: bool = False) -> None:
+    """Restart warden if this cell needs a TCP listener that isn't bound.
+
+    mitmproxy can't hot-add `--mode reverse:tcp` listeners, so a new TCP
+    host_service in a cell yaml requires warden restart for the listener
+    to come up. Restart kills every live cell's open egress for ~5s,
+    so we prompt the operator unless `--yes`. Operators who would
+    rather defer the restart get a clean abort + suggestion.
+
+    No-op for cells without TCP host_services, or when warden already
+    has all the cell's ports bound.
+    """
+    spec_tcp_ports = sorted({
+        e["port"] for e in (spec.host_services or [])
+        if isinstance(e, dict) and e.get("protocol") == "tcp"
+        and isinstance(e.get("port"), int)
+    })
+    if not spec_tcp_ports:
+        return
+    from warden.proxy import get_bound_tcp_ports
+    bound = set(get_bound_tcp_ports())
+    missing = [p for p in spec_tcp_ports if p not in bound]
+    if not missing:
+        return
+    info(
+        f"Cell '{spec.name}' declares TCP host_services on port(s) "
+        f"{missing} that warden hasn't bound yet."
+    )
+    if not yes:
+        output(
+            "Restarting warden will drop every running cell's open "
+            "egress connections for ~5s while the new listener binds."
+        )
+        try:
+            answer = input("Proceed with warden restart? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "n"
+        if answer not in ("y", "yes"):
+            raise BrigError(
+                "Aborted: warden restart declined",
+                suggestion=(
+                    "Re-run with --yes to auto-confirm, OR\n"
+                    "  brig system restart  # bind the new listener "
+                    "manually, then re-run this cell"
+                ),
+            )
+    from warden.proxy import start as warden_start, stop as warden_stop
+    info("Restarting warden to bind new TCP listener(s)...")
+    warden_stop()
+    if not warden_start():
+        raise BrigError(
+            "Warden restart failed",
+            suggestion="brig system doctor",
+        )
+    info(f"Warden restarted; TCP listener(s) on {missing} now bound")
+
+
+def _check_immediate_exit(cell_name: str) -> None:
+    """Sleep briefly, then probe whether the cell already exited. If it
+    did, scan its stderr/stdout for known error patterns and append a
+    suggestion. Otherwise just note that it stopped quickly.
+
+    Called after detached `brig run` so users get a signal when the cell
+    they thought started is actually already gone. Best-effort: any
+    error here is swallowed (we don't want to fail the run on a
+    diagnostic).
+    """
+    import time
+    time.sleep(1.5)
+    try:
+        cn = container_name(cell_name)
+        status = vm_run(
+            ["podman", "inspect", cn, "--format", "{{.State.Status}}"],
+            timeout=5,
+        )
+        if status.returncode != 0:
+            return
+        if status.stdout.strip() == "running":
+            return  # All good — cell is still alive.
+
+        # Cell exited quickly. Pull recent logs and look for a known cause.
+        logs = vm_run(
+            ["podman", "logs", "--tail", "50", cn], timeout=5,
+        )
+        log_text = (logs.stdout or "") + (logs.stderr or "")
+        hint = _diagnose_exit(log_text)
+        info(
+            f"NOTE: cell '{cell_name}' exited shortly after start.{hint} "
+            f"See: brig cell logs {cell_name}"
+        )
+    except Exception:  # noqa: BLE001 — pure diagnostic, never fail the run
+        pass
+
+
+def _diagnose_exit(log_text: str) -> str:
+    """Heuristic — match common failure patterns and return an actionable
+    fragment that fits into the NOTE: line. Returns '' if no match."""
+    s = log_text.lower()
+    if "read-only file system" in s or "errno 30" in s:
+        # Lead with the writable paths because relocating writes is the
+        # better fix; writable_rootfs:true is the escape hatch.
+        return (
+            " Image tried to write to a read-only path. Writable paths "
+            "inside the cell: /work (workspace, persists), /tmp (tmpfs, "
+            "64m), /run (tmpfs, 16m). Common fix is to redirect writes "
+            "into one of these — e.g. `export HOME=/tmp/home` and stage "
+            "credentials there. If the image legitimately needs to write "
+            "outside those paths, set writable_rootfs: true in the cell spec."
+        )
+    if "executable file not found" in s and "bash" in s:
+        return (
+            " The image likely doesn't ship /bin/bash; try sh."
+        )
+    return ""
+
+
+def _sync_cell_policy(spec: CellSpec) -> None:
+    """Write the cell's allow / deny / host_services to its per-cell
+    policy file. Replace semantics: the yaml is the source of truth,
+    so anything in the file that's no longer in the spec is dropped.
+
+    Skips the write if the on-disk policy already matches the spec —
+    idempotent re-runs don't churn mtime or noise the audit log.
+    """
+    from brig.policy.policy import load_cell_policy, save_cell_policy
+
+    desired = {
+        "allow": list(spec.policy_allow or []),
+        "deny": list(spec.policy_deny or []),
+        "host_services": list(spec.host_services or []),
+        "tls_passthrough": list(spec.policy_passthrough_tls or []),
+    }
+    existing = load_cell_policy(spec.name) or {}
+    current = {
+        "allow": existing.get("allow", []),
+        "deny": existing.get("deny", []),
+        "host_services": existing.get("host_services", []),
+        "tls_passthrough": existing.get("tls_passthrough", []),
+    }
+    if desired == current:
+        return
+
+    # Preserve any other keys the on-disk policy may carry (e.g.
+    # rate_limits) so we don't accidentally drop unrelated config.
+    merged = dict(existing)
+    merged.update(desired)
+    save_cell_policy(spec.name, merged)
+
+    # Log host_services diffs (the only field with operator-visible
+    # semantics worth flagging — allow/deny changes are too noisy to
+    # log line-by-line).
+    def _names(items):
+        return {e["name"] for e in items if isinstance(e, dict) and "name" in e}
+    added = _names(desired["host_services"]) - _names(current["host_services"])
+    removed = _names(current["host_services"]) - _names(desired["host_services"])
+    for n in sorted(added):
+        info(f"host_service granted: {spec.name} → {n} (from cell yaml)")
+    for n in sorted(removed):
+        info(f"host_service revoked: {spec.name} → {n} (no longer in cell yaml)")
+
+
+def cmd_preflight(args: Any) -> int:
+    """Handle `brig cell preflight <yaml>`.
+
+    Dry-run check: parses the yaml and verifies every host-side
+    requirement it implies (declared secrets exist, declared
+    host_socket targets exist, declared ingress entries have a
+    token secret, image exists or is buildable). Prints a checklist
+    with a one-line fix for each gap.
+
+    Replaces the iterative "brig run → error → fix one thing →
+    re-run" loop with a single diff. No mutations; safe to run
+    anytime.
+    """
+    from brig.cell.spec import load_cell_definition, validate_cell_definition
+    from brig.config import HostPaths
+
+    cell_def = load_cell_definition(args.file)
+    errors = validate_cell_definition(cell_def, args.file)
+    fail_count = 0
+
+    def _check(label: str, ok: bool, fix: str = "") -> None:
+        nonlocal fail_count
+        marker = "OK  " if ok else "FAIL"
+        output(f"  [{marker}] {label}")
+        if not ok:
+            fail_count += 1
+            if fix:
+                output(f"         fix: {fix}")
+
+    cell_name = cell_def.get("name", "<unnamed>")
+    output(f"Preflight for cell '{cell_name}' ({args.file})")
+    output("=" * 60)
+
+    # 1. Spec validity.
+    _check(
+        "cell yaml validates",
+        not errors,
+        fix=("Fix errors:\n         " + "\n         ".join(errors)
+             if errors else ""),
+    )
+
+    # 2. Secrets exist.
+    for secret in cell_def.get("secrets", []):
+        if not isinstance(secret, str):
+            continue
+        p = HostPaths.SECRETS_DIR / secret
+        _check(
+            f"secret: {secret}", p.exists(),
+            fix=f"brig secrets add {secret}",
+        )
+
+    # 3. Ingress token (if any ingress entry uses auth: token).
+    ingress_entries = cell_def.get("ingress") or []
+    needs_token = any(
+        isinstance(e, dict) and e.get("auth") == "token" for e in ingress_entries
+    )
+    if needs_token:
+        primary = HostPaths.SECRETS_DIR / f"{cell_name}-ingress-token"
+        fallback = HostPaths.SECRETS_DIR / "ingress-token"
+        ok = primary.exists() or fallback.exists()
+        _check(
+            f"ingress token: {primary.name}", ok,
+            fix=f"openssl rand -hex 32 | brig secrets add {primary.name} -",
+        )
+
+    # 4. host_sockets — targets exist and are sockets on the host.
+    import os as _os
+    import stat as _stat
+    for entry in cell_def.get("host_sockets") or []:
+        if not isinstance(entry, dict):
+            continue
+        host_path = entry.get("host_path", "")
+        name = entry.get("name", "?")
+        try:
+            st = _os.lstat(host_path)
+            is_sock = _stat.S_ISSOCK(st.st_mode) and not _stat.S_ISLNK(st.st_mode)
+        except (FileNotFoundError, OSError):
+            is_sock = False
+        _check(
+            f"host_socket target: {name} → {host_path}", is_sock,
+            fix="Start the service that provides this socket, or "
+                "correct host_path.",
+        )
+
+    # 5. socat installed if host_sockets are declared.
+    if cell_def.get("host_sockets"):
+        import shutil as _shutil
+        _check(
+            "socat installed (host_sockets bridge dependency)",
+            bool(_shutil.which("socat")),
+            fix="brew install socat",
+        )
+
+    output("=" * 60)
+    if fail_count:
+        output(f"FAILED: {fail_count} check(s) — fix above, then re-run")
+        return 1
+    output("All preflight checks passed.")
     return 0
 
 
@@ -135,35 +555,50 @@ def cmd_kill(args: Any) -> int:
 
 
 def cmd_rm(args: Any) -> int:
-    rm_cell(args.name, force=args.force)
+    import sys
+    from brig.cell.lifecycle import _workspace_has_content
+
+    keep = getattr(args, "keep_workspace", False)
+    # If the cell's workspace has files and the user didn't explicitly
+    # opt to keep or force, ask before deleting. Closes the silent-data-loss
+    # foot-gun where the user expects docker semantics (rm preserves
+    # volumes) and loses unexpected data.
+    if not keep and not args.force and _workspace_has_content(args.name):
+        if not sys.stdin.isatty():
+            raise BrigError(
+                f"Cell '{args.name}' has files in its workspace; refusing to "
+                f"delete non-interactively.",
+                suggestion=(
+                    f"brig cell rm {args.name} --keep-workspace   # preserve files\n"
+                    f"  OR  brig cell rm -f {args.name}            # force delete"
+                ),
+            )
+        prompt = (
+            f"Cell '{args.name}' workspace contains files. "
+            f"Delete? [y/N/keep] "
+        )
+        try:
+            answer = input(prompt).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer in ("k", "keep"):
+            keep = True
+        elif answer not in ("y", "yes"):
+            output("Aborted.")
+            return 1
+
+    rm_cell(args.name, force=args.force, keep_workspace=keep)
     return 0
 
 
 def cmd_list(args: Any) -> int:
-    result = vm_run(
-        ["podman", "ps", "-a", "--format", "json", "--filter", f"name={CONTAINER_PREFIX}"],
-    )
-    if result.returncode != 0:
-        return 1
-
-    try:
-        containers = json.loads(result.stdout) if result.stdout.strip() else []
-    except json.JSONDecodeError:
-        return 1
-
+    from brig.cell.lifecycle import list_cell_containers
     fmt = getattr(args, "format", "table")
-    if fmt == "json":
-        output(json.dumps(containers, indent=2))
-        return 0
+    cells = list_cell_containers(include_stopped=True)
 
-    cells = []
-    for c in containers:
-        names = c.get("Names", "")
-        # Podman 4.x returns Names as a string; 5.x as a list.
-        name = names[0] if isinstance(names, list) else names
-        if name == PROXY_NAME:
-            continue
-        cells.append((name, c))
+    if fmt == "json":
+        output(json.dumps([entry for _, entry in cells], indent=2))
+        return 0
 
     if not cells:
         output("No cells found")
@@ -171,16 +606,14 @@ def cmd_list(args: Any) -> int:
 
     if fmt == "wide":
         output(f"{'NAME':<25} {'STATUS':<12} {'CREATED':<22} {'NETWORK':<25} {'IMAGE'}")
-        for name, c in cells:
-            cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+        for cell, c in cells:
             networks = c.get("Networks") or []
             network = ",".join(networks)[:25] if networks else "-"
             created = c.get("CreatedAt", "")[:22]
             output(f"{cell:<25} {c.get('State', ''):<12} {created:<22} {network:<25} {c.get('Image', '')}")
     else:
         output(f"{'NAME':<25} {'STATUS':<12} {'IMAGE':<30}")
-        for name, c in cells:
-            cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
+        for cell, c in cells:
             output(f"{cell:<25} {c.get('State', ''):<12} {c.get('Image', ''):<30}")
     return 0
 
@@ -204,15 +637,81 @@ def cmd_files(args: Any) -> int:
     return vm_run_interactive(["podman", "exec", cn, "ls", "-la", path])
 
 
+def cmd_read(args: Any) -> int:
+    """Handle `brig cell read <cell> <relpath>` — stream a workspace file
+    to stdout via the race-free safe_open primitive.
+
+    This is the language-agnostic safe-read replacement for the (now
+    removed) workspace.host_path field in cell.json. Consumers in any
+    language can do:
+
+        brig cell read mycell input.json > /tmp/local-copy
+
+    instead of opening the host path directly. Each path component is
+    walked with O_NOFOLLOW so a cell-planted symlink raises
+    WorkspaceEscape rather than letting the host follow it.
+    """
+    import sys
+    from brig.workspace.validation import safe_open, WorkspaceEscape
+
+    try:
+        with safe_open(args.name, args.path, "rb") as f:
+            # Stream in chunks so a large file doesn't blow RAM.
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+        return 0
+    except WorkspaceEscape as e:
+        raise BrigError(
+            f"Refused: {e}",
+            suggestion="A path component is a symlink or escapes the workspace root.",
+        )
+    except FileNotFoundError:
+        raise BrigError(f"Not found: {args.path} in cell '{args.name}'")
+
+
 def cmd_logs(args: Any) -> int:
+    """Tail a cell's container stdout/stderr (wraps `podman logs`).
+
+    Empty output usually means the cell's app writes to a file inside
+    the container instead of stdout — common for daemons and agent
+    runtimes (SA, claude-acp, etc.). In that case, use
+    `brig cell exec <name> -- cat /var/log/<app>.log` or
+    `brig cell read <name> <path>` to inspect the file directly.
+
+    Hermes-feedback-driven: detect the empty case for the non-follow
+    path and surface the hint inline so operators don't waste time
+    wondering why `brig cell logs` is silent.
+    """
     cn = container_name(args.name)
     cmd = ["podman", "logs"]
-    if getattr(args, "follow", False):
+    follow = getattr(args, "follow", False)
+    if follow:
         cmd.append("-f")
     if getattr(args, "tail", None):
         cmd.extend(["--tail", str(args.tail)])
     cmd.append(cn)
-    return vm_run_interactive(cmd)
+    # Follow mode wants TTY passthrough; can't capture.
+    if follow:
+        return vm_run_interactive(cmd)
+    # Snapshot mode: capture so we can detect empty output and hint.
+    result = vm_run(cmd, capture=True, timeout=30)
+    if result.returncode == 0:
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        # Empty stdout + stderr likely means file-based logging.
+        if not (result.stdout.strip() or result.stderr.strip()):
+            from brig.ops.logging import info
+            info(
+                f"(no stdout/stderr from '{args.name}' — if the app logs "
+                f"to a file, try: brig cell exec {args.name} -- "
+                f"cat /var/log/<app>.log)"
+            )
+        return 0
+    sys.stderr.write(result.stderr)
+    return result.returncode
 
 
 def _parse_cp_target(spec: str) -> tuple[str, str] | None:
@@ -290,15 +789,62 @@ def cmd_start(args: Any) -> int:
             "Warden proxy is not running",
             suggestion="Start with: brig up",
         )
+    # Refresh the cell metadata so /run/brig/cell.json's `started_at`
+    # reflects this start, not the original create. workspace_mount is
+    # preserved from whatever the cell was created with (bind mounts are
+    # fixed at container-create time; we can't change them on start).
+    _refresh_metadata_for_start(args.name)
     cn = container_name(args.name)
     result = vm_run(["podman", "start", cn])
     if result.returncode != 0:
         raise BrigError(
             f"Failed to start cell '{args.name}': {result.stderr.strip()}",
-            suggestion="Check if cell exists with: brig list",
+            suggestion="Check if cell exists with: brig cell list",
         )
+    # Replay ingress registration with the freshly-inspected cell IP.
+    # podman may assign a different IP after stop/start, leaving the
+    # routes file pointing at a stale address; without this, external
+    # requests through warden's :8443 reverse proxy return 502 until
+    # the operator does `brig cell rm + brig run --file` to rebuild.
+    from brig.cell.lifecycle import register_ingress_for
+    from brig.cell.metadata import read_ingress
+    ingress_entries = read_ingress(args.name)
+    if ingress_entries:
+        register_ingress_for(args.name, ingress_entries)
     info(f"Cell '{args.name}' started")
     return 0
+
+
+def _refresh_metadata_for_start(cell_name: str) -> None:
+    """Rewrite /run/brig/cell.json on restart with a fresh `started_at`.
+
+    Preserves the original workspace_mount, host_sockets, and ingress —
+    bind mounts and ingress configuration are fixed at create time, so
+    these come from the prior metadata write rather than being re-derived.
+    If the file is missing or unreadable (cell predates cell.json), write
+    a default-mount fallback.
+    """
+    from brig.cell.metadata import refresh_metadata_if_present, write_metadata
+    if refresh_metadata_if_present(cell_name) is None:
+        write_metadata(cell_name, "/work")
+
+
+def cmd_restart(args: Any) -> int:
+    """Handle `brig cell restart <name>` — stop (if running) then start.
+
+    Composite of stop_cell + cmd_start. Refreshes the cell metadata's
+    started_at via cmd_start's existing path.
+    """
+    from brig.cell.lifecycle import observe, stop_cell
+    actual = observe(args.name)
+    if not actual.exists:
+        raise BrigError(
+            f"Cell '{args.name}' does not exist",
+            suggestion="brig cell list  # see what's there",
+        )
+    if actual.running:
+        stop_cell(args.name)
+    return cmd_start(args)
 
 
 def cmd_wait(args: Any) -> int:
@@ -363,7 +909,7 @@ def cmd_stats(args: Any) -> int:
     if hasattr(args, "name") and args.name:
         cmd.append(container_name(args.name))
     else:
-        cmd.extend(["--filter", f"name={CONTAINER_PREFIX}"])
+        cmd.extend(["--filter", f"name=^{CONTAINER_PREFIX}"])
     return vm_run_interactive(cmd)
 
 
@@ -423,21 +969,111 @@ def cmd_export(args: Any) -> int:
     if pids and pids > 0:
         cell_def["pids_limit"] = pids
 
-    # Output as YAML-like format (no pyyaml dependency needed for output).
+    # Per-cell policy (allow / deny / host_services). The yaml is
+    # canonical, the per-cell policy file mirrors it, and warden
+    # reads that file — so it's the authoritative running state.
+    from brig.policy.policy import load_cell_policy
+    cell_policy = load_cell_policy(args.name) or {}
+    allow = cell_policy.get("allow") or []
+    deny = cell_policy.get("deny") or []
+    if allow or deny:
+        policy_block: dict = {}
+        if allow:
+            policy_block["allow"] = list(allow)
+        if deny:
+            policy_block["deny"] = list(deny)
+        cell_def["policy"] = policy_block
+    host_services = cell_policy.get("host_services") or []
+    if host_services:
+        cell_def["host_services"] = list(host_services)
+
+    # Ingress routes (from the host-side ingress-routes.json, written
+    # at cell start by lifecycle._register_cell_ingress).
+    from brig.config import HostPaths
+    ingress = _ingress_for_cell(args.name, HostPaths.INGRESS_ROUTES_FILE)
+    if ingress:
+        cell_def["ingress"] = ingress
+
+    # host_sockets — projected to {name, mount_point, mode} (host_path
+    # stays off the wire for the same reason it's omitted from the
+    # downward-API metadata).
+    sockets = _host_sockets_from_metadata(args.name)
+    if sockets:
+        cell_def["host_sockets"] = sockets
+
     output(f"# Cell definition exported from '{args.name}'")
-    output(f"# Save as: {args.name}.yaml")
-    output(f"# Run with: brig run --file {args.name}.yaml")
+    output("# Self-contained: brig run --file <this-file> will reproduce the cell.")
     output("")
-    for key, val in cell_def.items():
-        if isinstance(val, list):
-            output(f"{key}:")
-            for item in val:
-                output(f"  - {json.dumps(item) if not isinstance(item, str) else item}")
-        elif isinstance(val, dict):
+    _emit_yaml(cell_def)
+    return 0
+
+
+def _ingress_for_cell(cell_name: str, routes_file) -> list:
+    try:
+        data = json.loads(routes_file.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    routes = data.get("routes") or []
+    return [
+        {"name": r.get("name"),
+         "port": r.get("port"),
+         "path_prefix": r.get("path_prefix"),
+         "auth": "token"}
+        for r in routes
+        if isinstance(r, dict) and r.get("cell") == cell_name
+    ]
+
+
+def _host_sockets_from_metadata(cell_name: str) -> list:
+    from brig.cell.metadata import _host_metadata_path
+    try:
+        meta = json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+    entries = meta.get("host_sockets") or []
+    return [
+        {"name": e["name"], "mount_point": e["mount_point"]}
+        for e in entries
+        if isinstance(e, dict) and "name" in e and "mount_point" in e
+    ]
+
+
+def _emit_yaml(d: dict) -> None:
+    """Minimal yaml emitter that handles the shapes cell_def uses
+    (scalars, list of scalars, list of dicts, nested dicts). Avoids
+    pulling in pyyaml just for output.
+
+    Strings are always JSON-quoted to dodge yaml metachars: bare
+    `*.example.com` parses as a yaml alias reference, bare `1.0` as
+    a float, leading-`!`/`&`/`>`/`|`/`#` as tag/anchor/block-scalar
+    markers. JSON quoting is yaml-valid for any string and keeps the
+    round-trip through load_cell_definition correct.
+    """
+    def _scalar(v):
+        return json.dumps(v)
+
+    for key, val in d.items():
+        if isinstance(val, dict):
             output(f"{key}:")
             for k, v in val.items():
-                output(f"  {k}: {v}")
+                if isinstance(v, list):
+                    output(f"  {k}:")
+                    for item in v:
+                        output(f"    - {_scalar(item)}")
+                else:
+                    output(f"  {k}: {_scalar(v)}")
+        elif isinstance(val, list):
+            if val and all(isinstance(x, dict) for x in val):
+                output(f"{key}:")
+                for item in val:
+                    first = True
+                    for k, v in item.items():
+                        prefix = "  - " if first else "    "
+                        output(f"{prefix}{k}: {_scalar(v)}")
+                        first = False
+            else:
+                output(f"{key}:")
+                for item in val:
+                    output(f"  - {_scalar(item)}")
         else:
-            output(f"{key}: {val}")
-
-    return 0
+            output(f"{key}: {_scalar(val)}")

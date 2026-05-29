@@ -28,7 +28,48 @@ env:
   CELL_VM_NAME: cell
 
 jobs:
+  gvisor-pin-drift:
+    # Re-fetch the pinned sha512 from upstream and assert it still matches
+    # the value in scripts/provision-vm.sh + src/brig/vm/lima.yaml.template.
+    # Drift means Google rotated the binary under us; either the pin needs
+    # updating or the bucket was tampered with. Cron-only — every PR run
+    # would hammer the bucket for no value (file-sync check in ci.yml is
+    # sufficient on PRs).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Fetch upstream sha512 + compare to pin
+        run: ./scripts/check-gvisor-pin.sh --fetch
+
+  # GitHub-hosted macos-15 runners are themselves M-series VMs and
+  # don't expose nested virtualization (`kern.hv_support` == 0). The
+  # E2E suite drives a real Lima VM + podman + gVisor, which Apple's
+  # Virtualization framework refuses to start without VZ
+  # (`VZErrorDomain Code=2 "Virtualization is not available on this
+  # hardware."`). Probe once in a tiny preflight job; gate the
+  # expensive e2e job on the result. Same pattern in fresh-install.yml.
+  check-vz:
+    runs-on: macos-15
+    timeout-minutes: 2
+    outputs:
+      available: ${{ steps.hv.outputs.available }}
+    steps:
+      - id: hv
+        run: |
+          HV=$(sysctl -n kern.hv_support 2>/dev/null || echo 0)
+          echo "kern.hv_support=$HV"
+          if [ "$HV" = "1" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::E2E will be skipped — nested virtualization unavailable on this runner. Re-run on a self-hosted bare-metal macOS host or via workflow_dispatch on a paid runner with nested-virt support."
+          fi
+
   e2e:
+    needs: check-vz
+    if: needs.check-vz.outputs.available == 'true'
     runs-on: macos-15
     timeout-minutes: 90
 
@@ -55,8 +96,11 @@ jobs:
         timeout-minutes: 1
         run: mkdir -p ~/.brig/{cells/addons,secrets,state/system}
 
-      - name: Copy CI Lima YAML
-        run: cp .github/e2e/lima-ci.yaml ~/.brig/lima.yaml
+      - name: Copy Lima YAML
+        # Use the same template `brig init` ships. Removes the need for a
+        # separate `.github/e2e/lima-ci.yaml` file and keeps CI in lockstep
+        # with what users actually get.
+        run: cp src/brig/vm/lima.yaml.template ~/.brig/lima.yaml
 
       - name: Install addons
         run: |
@@ -84,7 +128,7 @@ jobs:
         id: vm-cache
         with:
           path: ~/.lima/cell/
-          key: lima-vm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/e2e/lima-ci.yaml') }}
+          key: lima-vm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/brig/vm/lima.yaml.template') }}
 
       - name: Create VM (cache miss)
         if: steps.vm-cache.outputs.cache-hit != 'true'
@@ -198,6 +242,38 @@ jobs:
         continue-on-error: true
         run: tests/test_warden_features.sh
 
+      - name: "Test: Stream Passthrough (B4 WebSocket + B5 SSE keepalive)"
+        id: test_stream_passthrough
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_stream_passthrough.sh
+
+      - name: "Test: Invariants 7+8 (foreign container / multi-homed cell)"
+        id: test_invariants_7_8
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_invariants_7_8.sh
+
+      - name: "Test: Host Sockets E2E (invariant 10)"
+        # tests/test_host_sockets_e2e.sh auto-skips when launchd isn't
+        # present, so this step is a no-op on Linux runners — but the
+        # macOS-15 E2E runner exercises the launchd bridge + socat
+        # forwarding path that invariant 10 hangs on.
+        id: test_host_sockets_e2e
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_host_sockets_e2e.sh
+
+      - name: "Test: Ingress survives brig system down/up"
+        # Regression for the aitelier-reported 502 after
+        # `brig system down && brig system up && brig cell start`.
+        # Verifies cmd_start replays ingress registration with the
+        # freshly-inspected cell IP.
+        id: test_ingress_replay_e2e
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_ingress_replay_e2e.sh
+
       - name: "Benchmark: Stack Overhead"
         id: test_overhead
         timeout-minutes: 15
@@ -218,7 +294,12 @@ jobs:
             "${{ steps.test_observability.outcome }}" \
             "${{ steps.test_hardening.outcome }}" \
             "${{ steps.test_per_cell_policy.outcome }}" \
-            "${{ steps.test_warden_features.outcome }}"
+            "${{ steps.test_warden_features.outcome }}" \
+            "${{ steps.test_stream_passthrough.outcome }}" \
+            "${{ steps.test_invariants_7_8.outcome }}" \
+            "${{ steps.test_host_sockets_e2e.outcome }}" \
+            "${{ steps.test_ingress_replay_e2e.outcome }}" \
+            "${{ steps.test_overhead.outcome }}"
           do
             if [ "$step" = "failure" ]; then
               FAILED=$((FAILED + 1))

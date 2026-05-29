@@ -32,11 +32,13 @@ def _run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
 def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
     """Shared query: list cell containers and their inspect data.
 
-    Returns (cell_names, container_infos) or None on failure.
+    Returns (cell_names, container_infos) or None on failure. Uses the
+    module-local `_run` alias for both calls so tests can mock the
+    verify-side subprocess seam independently of list_cell_containers.
     """
     result = _run([
         "podman", "ps", "-a", "--format", "json",
-        "--filter", f"name={CONTAINER_PREFIX}",
+        "--filter", f"name=^{CONTAINER_PREFIX}",
     ])
     if not result.stdout.strip():
         return [], []
@@ -50,7 +52,8 @@ def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
         n = c.get("Names", "")
         return n[0] if isinstance(n, list) else n
 
-    cell_names = [_name(c) for c in containers if _name(c) != PROXY_NAME]
+    from brig.config import INFRA_CONTAINER_NAMES
+    cell_names = [_name(c) for c in containers if _name(c) not in INFRA_CONTAINER_NAMES]
     if not cell_names:
         return [], []
 

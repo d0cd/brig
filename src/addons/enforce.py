@@ -41,7 +41,7 @@ from typing import Optional
 
 from mitmproxy import ctx, http
 
-from _common import BLOCKED_NETWORKS, SubnetResolver
+from _common import BLOCKED_NETWORKS, SubnetResolver, is_blocked_ip  # noqa: F401 (BLOCKED_NETWORKS re-exported for the constant-mirror test)
 # Re-exported for tests and any external addons that import policy types
 # from `enforce` for historical reasons. Implementation lives in _policy.
 from _policy import (  # noqa: F401
@@ -71,21 +71,40 @@ ALLOWED_PORTS = {80, 443}
 # Maximum number of cell policies to cache (LRU eviction beyond this).
 MAX_CACHED_CELL_POLICIES = 1000
 
+# Per-cell policy JSON files are mounted from the brig CLI side. brig
+# writes them via atomic_write_json; the writer has no explicit size cap.
+# Cap reads here so a malformed / tampered file can't OOM warden by
+# loading a multi-gigabyte JSON. 1 MiB is well above any realistic
+# policy (1000 rules ≈ ~100 KiB at the verbose end).
+MAX_POLICY_FILE_BYTES = 1024 * 1024
+
+
+def _stat_signature(path: Path) -> tuple[int, int]:
+    """Return (st_mtime_ns, st_size) — a fingerprint resilient to coarse
+    filesystem mtime resolution. Same-second policy rewrites can collide
+    on float-precision mtime but rarely on size, so the tuple catches
+    edits that a `!=` on `st_mtime` would silently drop.
+    """
+    st = path.stat()
+    return (st.st_mtime_ns, st.st_size)
+
 
 class PolicyEnforcer:
     """mitmproxy addon for policy enforcement."""
 
     def __init__(self):
-        self.global_policy = Policy()
         self.cell_policies: collections.OrderedDict[str, Policy] = collections.OrderedDict()
         self.subnets = SubnetResolver(SUBNET_MAP_FILE)
-        self.policy_mtime = 0.0
-        self.cell_policy_mtimes: dict[str, float] = {}
+        # mtime is tracked as (st_mtime_ns, st_size) so coarse-grained
+        # filesystem mtimes (HFS+ has 1-second resolution; some tmpfs
+        # variants in CI are similar) can't hide a same-second policy
+        # rewrite — a float-equality comparison on st_mtime alone would
+        # silently skip reload for edits within the same wall-clock second.
+        self.policy_mtime: tuple[int, int] = (0, 0)
+        self.cell_policy_mtimes: dict[str, tuple[int, int]] = {}
         self.trace_config = PolicyTraceConfig()
         self._cell_policy_lock = threading.Lock()
         self._reload_lock = threading.RLock()
-        # Host services: name → port mapping for cell → host forwarding.
-        self.host_services: dict[str, int] = {}
         self._host_ip: str = ""
 
     def load(self, loader):
@@ -163,7 +182,7 @@ class PolicyEnforcer:
         try:
             policy_changed = (
                 POLICY_FILE.exists() and
-                POLICY_FILE.stat().st_mtime != self.policy_mtime
+                _stat_signature(POLICY_FILE) != self.policy_mtime
             )
             subnet_changed = (
                 SUBNET_MAP_FILE.exists() and
@@ -172,12 +191,12 @@ class PolicyEnforcer:
             policy_dir_changed = False
             if CELL_POLICY_DIR.exists():
                 # Detect adds / removes / edits to per-cell policies via dir mtime.
-                dir_mtime = CELL_POLICY_DIR.stat().st_mtime
+                dir_mtime_ns = CELL_POLICY_DIR.stat().st_mtime_ns
                 if not hasattr(self, "_cell_policy_dir_mtime"):
-                    self._cell_policy_dir_mtime = 0.0
-                policy_dir_changed = dir_mtime != self._cell_policy_dir_mtime
+                    self._cell_policy_dir_mtime = 0
+                policy_dir_changed = dir_mtime_ns != self._cell_policy_dir_mtime
                 if policy_dir_changed:
-                    self._cell_policy_dir_mtime = dir_mtime
+                    self._cell_policy_dir_mtime = dir_mtime_ns
         except OSError:
             return
 
@@ -207,63 +226,18 @@ class PolicyEnforcer:
                         f"Policy file not found: {POLICY_FILE}"
                     )
                 ctx.log.warn(f"PolicyEnforcer: Policy file not found: {POLICY_FILE}")
-                self.global_policy = Policy()
                 return
 
-            mtime = POLICY_FILE.stat().st_mtime
-            if mtime == self.policy_mtime:
-                return  # No change.
+            sig = _stat_signature(POLICY_FILE)
+            if sig == self.policy_mtime:
+                return
 
             with open(POLICY_FILE, "r") as f:
                 data = json.load(f)
 
-            self.global_policy = Policy(
-                allow=data.get("allow", []),
-                deny=data.get("deny", [])
-            )
+            self.trace_config = PolicyTraceConfig(data.get("policy_trace", {}))
+            self.policy_mtime = sig
 
-            # Load policy trace configuration.
-            trace_config = data.get("policy_trace", {})
-            self.trace_config = PolicyTraceConfig(trace_config)
-
-            # Load host services with strict validation.
-            new_host_services: dict[str, int] = {}
-            for svc in data.get("host_services", []):
-                if not isinstance(svc, dict):
-                    continue
-                svc_name = svc.get("name")
-                svc_port = svc.get("port")
-                if not isinstance(svc_name, str) or not isinstance(svc_port, int):
-                    continue
-                # Validate name: lowercase alphanumeric + hyphens, max 31 chars.
-                if not re.match(r'^[a-z0-9][a-z0-9-]{0,30}$', svc_name):
-                    ctx.log.warn(
-                        f"PolicyEnforcer: Skipping host service with invalid name: "
-                        f"{svc_name!r}"
-                    )
-                    continue
-                # Validate port: 1-65535.
-                if svc_port < 1 or svc_port > 65535:
-                    ctx.log.warn(
-                        f"PolicyEnforcer: Skipping host service '{svc_name}' with "
-                        f"invalid port: {svc_port}"
-                    )
-                    continue
-                new_host_services[svc_name] = svc_port
-            self.host_services = new_host_services
-
-            self.policy_mtime = mtime
-
-            ctx.log.info(
-                f"PolicyEnforcer: Loaded policy - "
-                f"{len(self.global_policy.allow_rules)} allow, "
-                f"{len(self.global_policy.deny_rules)} deny rules"
-            )
-            if self.host_services:
-                ctx.log.info(
-                    f"PolicyEnforcer: {len(self.host_services)} host services: "
-                    f"{', '.join(sorted(self.host_services))}"
-                )
             if self.trace_config.enabled:
                 ctx.log.info("PolicyEnforcer: Policy tracing enabled")
 
@@ -285,10 +259,25 @@ class PolicyEnforcer:
 
             for policy_file in CELL_POLICY_DIR.glob("*.json"):
                 cell_name = policy_file.stem
-                mtime = policy_file.stat().st_mtime
+                stat = policy_file.stat()
+                sig = (stat.st_mtime_ns, stat.st_size)
+
+                # Size cap — refuse to load files larger than
+                # MAX_POLICY_FILE_BYTES. Fail-closed: a too-large file
+                # leaves the previous policy (if any) in place; cells
+                # without a prior policy hit the existing "no per-cell
+                # policy" block at request time. Logged so operators
+                # see the rejection.
+                if stat.st_size > MAX_POLICY_FILE_BYTES:
+                    ctx.log.error(
+                        f"PolicyEnforcer: skipping policy '{cell_name}' "
+                        f"({stat.st_size} bytes > "
+                        f"{MAX_POLICY_FILE_BYTES} byte cap)"
+                    )
+                    continue
 
                 with self._cell_policy_lock:
-                    if self.cell_policy_mtimes.get(cell_name) == mtime:
+                    if self.cell_policy_mtimes.get(cell_name) == sig:
                         continue  # No change.
 
                     # Evict least recently used policy if at capacity.
@@ -306,8 +295,9 @@ class PolicyEnforcer:
                             allow=data.get("allow", []),
                             deny=data.get("deny", []),
                             host_services=data.get("host_services"),
+                            tls_passthrough=data.get("tls_passthrough", []),
                         )
-                        self.cell_policy_mtimes[cell_name] = mtime
+                        self.cell_policy_mtimes[cell_name] = sig
                         ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
                     except (json.JSONDecodeError, IOError) as e:
                         ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
@@ -316,17 +306,13 @@ class PolicyEnforcer:
             ctx.log.error(f"PolicyEnforcer: Failed to scan cell policies: {e}")
 
     def _is_internal_ip(self, host: str) -> bool:
-        """Check if host is an internal/reserved IP address."""
-        try:
-            addr = host[1:-1] if host.startswith("[") and host.endswith("]") else host
-            ip = ipaddress.ip_address(addr)
-            for network in BLOCKED_NETWORKS:
-                if ip in network:
-                    return True
-        except ValueError:
-            # Not an IP address (domain name).
-            pass
-        return False
+        """Check if host is an internal/reserved IP address.
+
+        Delegates to _common.is_blocked_ip so the membership check and the
+        bracketed-IPv6 unwrap stay in one place. Returns False for
+        non-IP hosts (domain names), matching the prior behavior.
+        """
+        return is_blocked_ip(host)
 
     def _is_literal_ip(self, host: str) -> bool:
         """Check if host is a literal IP address (not a domain)."""
@@ -460,29 +446,22 @@ class PolicyEnforcer:
             )
             return
 
-        # Check 4: Per-cell policy (if exists).
         cell_policy = self._lookup_cell_policy(cell_name)
-        if cell_policy:
-            allowed, reason, trace = cell_policy.is_allowed(host, path, method, self.trace_config)
-            if trace and self.trace_config.enabled:
-                flow.metadata["policy_trace"] = trace
-            if allowed:
-                flow.metadata["policy_reason"] = f"cell:{reason}"
-                return
-            # Cell policy exists but didn't allow — block without falling through.
-            self._block(flow, f"cell policy: {reason}")
+        if cell_policy is None:
+            self._block(
+                flow,
+                f"cell '{cell_name or 'unknown'}' has no per-cell policy",
+            )
             return
-
-        # Check 5: Global policy.
-        allowed, reason, trace = self.global_policy.is_allowed(host, path, method, self.trace_config)
+        allowed, reason, trace = cell_policy.is_allowed(
+            host, path, method, self.trace_config,
+        )
         if trace and self.trace_config.enabled:
             flow.metadata["policy_trace"] = trace
         if allowed:
-            flow.metadata["policy_reason"] = f"global:{reason}"
+            flow.metadata["policy_reason"] = f"cell:{reason}"
             return
-
-        # Default: Block.
-        self._block(flow, f"global policy: {reason}")
+        self._block(flow, f"cell policy: {reason}")
 
     def _lookup_cell_policy(self, cell_name: Optional[str]) -> Optional[Policy]:
         """Look up the cell policy and update LRU position. Returns None if no policy."""
@@ -503,10 +482,9 @@ class PolicyEnforcer:
     ) -> None:
         """Route a .host.brig request to the macOS host.
 
-        Validates the service name, rewrites host/port, tags metadata.
-        Blocks if service is unknown, host IP is not discovered, or the
-        cell's policy does not include the service in its host_services
-        allowlist (per-cell ACL).
+        Looks up the port in the cell's per-cell host_services map.
+        Blocks if host IP isn't discovered, the cell has no per-cell
+        policy, or the requested name isn't in the cell's map.
         """
         service_name = host[: -len(HOST_SERVICE_SUFFIX)]
         safe_name = re.sub(r'[\x00-\x1f\x7f]', '', service_name)
@@ -515,24 +493,22 @@ class PolicyEnforcer:
             self._block(flow, f"host service '{safe_name}': host IP not discovered")
             return
 
-        service_port = self.host_services.get(service_name)
-        if service_port is None:
-            self._block(flow, f"unknown host service: {safe_name}")
-            return
-
-        # Per-cell host_services ACL. Cells without a per-cell policy have
-        # no host-service access — host services must be granted explicitly.
-        if cell_policy is None or cell_policy.host_services_allowed is None:
+        # Per-cell host_services map. Cells without a per-cell policy have
+        # no host-service access — host services must be declared in the
+        # cell yaml.
+        if cell_policy is None or cell_policy.host_services_map is None:
             self._block(
                 flow,
                 f"host service '{safe_name}': cell '{cell_name or 'unknown'}' "
-                f"has no host_services configured",
+                f"has no host_services declared",
             )
             return
-        if service_name not in cell_policy.host_services_allowed:
+        service_port = cell_policy.host_services_map.get(service_name)
+        if service_port is None:
             self._block(
                 flow,
-                f"host service '{safe_name}': not in cell '{cell_name}' allowlist",
+                f"host service '{safe_name}': not declared in cell "
+                f"'{cell_name}' yaml",
             )
             return
 
@@ -617,52 +593,225 @@ class PolicyEnforcer:
         client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
         cell_name = self.subnets.get_cell_name(client_ip)
 
-        # Check per-cell policy.
         cell_policy = self._lookup_cell_policy(cell_name)
-        if cell_policy:
-            allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
-            if not allowed:
-                self._block(flow, f"cell policy: {reason}")
+        if cell_policy is None:
+            self._block(
+                flow,
+                f"cell '{cell_name or 'unknown'}' has no per-cell policy",
+            )
             return
-
-        # Check global policy.
-        allowed, reason, _ = self.global_policy.is_allowed(host, "/", "CONNECT")
+        allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
         if not allowed:
-            self._block(flow, f"global policy: {reason}")
+            self._block(flow, f"cell policy: {reason}")
 
-    def server_connected(self, data):
-        """Check resolved IP against blocked ranges after DNS resolution.
+    def tls_clienthello(self, data) -> None:
+        """Decide MITM vs passthrough at TLS client-hello time.
 
-        Fails closed: if IP validation raises an exception, kill the connection.
-        Skips check for connections we explicitly rewrote to a host service
-        (gated by flow.metadata, not just by the (ip, port) tuple — a tuple
-        match alone would let a DNS-rebinding allowlisted domain reach a
-        host service that resolves to the same private (ip, port) pair).
+        Invariant 11 (docs/INVARIANTS.md): a cell that has declared
+        `policy.tls_passthrough: [host]` AND has `host` in
+        `policy.allow` opts that host out of MITM. Warden tunnels TCP
+        bytes after the CONNECT, routed by SNI; never sees cleartext.
+
+        Two security checks here:
+
+        1. **SNI/CONNECT match.** Reject if the SNI in the client hello
+           doesn't equal the host from the preceding CONNECT request.
+           Otherwise a malicious cell could CONNECT to allowed-host:443,
+           then send SNI=attacker.com to abuse warden as a generic TLS
+           tunnel for arbitrary hosts.
+
+        2. **Passthrough requires both lists.** `is_passthrough` is
+           defense-in-depth — it only returns True when the SNI matches
+           BOTH a passthrough rule AND an allow rule. A tampered policy
+           file that lists a host only in `tls_passthrough` cannot
+           bypass the allow gate.
+
+        On error we leave passthrough off and let MITM proceed; that
+        fails closed (cell sees a TLS error rather than silently
+        leaking past inspection).
         """
         try:
-            # Skip ONLY if this server connection was created for a flow that
-            # we rewrote in _handle_host_service. The flow attribute is
-            # populated for HTTP flows in mitmproxy >= 10.
-            flow = getattr(data, "flow", None)
-            if flow is not None and flow.metadata.get("host_service"):
+            sni = getattr(getattr(data, "client_hello", None), "sni", None)
+            if not sni:
+                return
+            sni = sni.strip().lower()
+            client_conn = getattr(data, "context", None)
+            client_conn = getattr(client_conn, "client", None)
+            # mitmproxy populates context.client.sni from the hello once
+            # parsed, but we read directly from the hello to get the
+            # raw value before any normalization.
+            peer = getattr(client_conn, "peername", None) if client_conn else None
+            client_ip = peer[0] if peer else None
+            if not client_ip:
                 return
 
-            peername = data.server.peername
-            if peername:
-                ip_str = peername[0]
-                ip = ipaddress.ip_address(ip_str)
-                for net in BLOCKED_NETWORKS:
-                    if ip in net:
-                        ctx.log.warn(f"BLOCKED: DNS rebinding detected - resolved to {ip_str}")
-                        data.server.close()
-                        return
+            # CONNECT host comes from the http_connect flow; mitmproxy
+            # stores it on the client connection's sni/alpn context, but
+            # the most reliable cross-version source is the proxy's
+            # server-address-resolution metadata. mitmproxy 10+ sets
+            # data.context.client.proxy_mode / sni / etc. — use the
+            # server-side address pre-resolution, which is the CONNECT
+            # target.
+            connect_host = None
+            server = getattr(getattr(data, "context", None), "server", None)
+            address = getattr(server, "address", None) if server else None
+            if address and len(address) >= 1 and isinstance(address[0], str):
+                connect_host = address[0].strip().lower()
+
+            # FAIL CLOSED: if we couldn't read the CONNECT host, we
+            # cannot verify SNI/CONNECT match. Treat as a mismatch —
+            # don't flip passthrough. Otherwise a cell could exploit
+            # a mitmproxy-API quirk that leaves context.server.address
+            # unpopulated to ship arbitrary SNI through the tunnel
+            # (would let warden tunnel to attacker.com after CONNECT to
+            # allowed.com). The cell-visible failure is identical to
+            # the SNI≠CONNECT case: TLS handshake fails because
+            # mitmproxy will present its own MITM cert for the host
+            # in the CONNECT, which won't match the SNI the cell sent.
+            if connect_host is None:
+                ctx.log.warn(
+                    f"PASSTHROUGH skipped: CONNECT host unreadable, "
+                    f"sni={sni}, falling through to MITM"
+                )
+                return
+            if sni != connect_host:
+                ctx.log.warn(
+                    f"BLOCKED: SNI/CONNECT mismatch sni={sni} connect={connect_host}"
+                )
+                return
+
+            cell_name = self.subnets.get_cell_name(client_ip)
+            cell_policy = self._lookup_cell_policy(cell_name)
+            if cell_policy is None:
+                return
+
+            if cell_policy.is_passthrough(sni):
+                # Flip mitmproxy's passthrough switch — connection is
+                # tunneled raw after this point. Tag context so audit
+                # log lines (server_connected, response*) can mark
+                # tls_mode=passthrough.
+                if client_conn is not None:
+                    setattr(client_conn, "tls_passthrough", True)
+                # Persist for later hooks. Use a dict on data.context if
+                # mitmproxy exposes one; otherwise set an attribute on
+                # the client connection.
+                if client_conn is not None:
+                    metadata = getattr(client_conn, "metadata", None)
+                    if isinstance(metadata, dict):
+                        metadata["tls_mode"] = "passthrough"
+                        metadata["passthrough_sni"] = sni
+                ctx.log.info(
+                    f"PASSTHROUGH: cell={cell_name} sni={sni} (no MITM, SNI-routed)"
+                )
+        except Exception as e:
+            # Fail closed by NOT flipping passthrough. The TLS handshake
+            # will then proceed in MITM mode; the cell will hit the cert
+            # error (existing behavior pre-passthrough) rather than
+            # silently leaking through.
+            ctx.log.warn(f"tls_clienthello error, defaulting to MITM: {e}")
+
+    # DNS-rebinding check lives in responseheaders() only. The earlier
+    # server_connected variant depended on a latent mitmproxy-API bug
+    # (`data.server.close()` no longer exists on >= 10, AttributeError
+    # masked the would-be block), and `data.flow` was None at that hook
+    # for warden-routed flows so the host_service / ingress exemptions
+    # were a no-op too. responseheaders fires after request() and
+    # http_connect() populate metadata, so the exemptions actually
+    # gate correctly. Aitelier diagnosed this; see INVARIANTS doc.
+
+    def tcp_start(self, flow) -> None:
+        """Per-cell access control for TCP host_service flows.
+
+        Warden listens on `--mode reverse:tcp://host.lima.internal:<port>@<port>`
+        for every TCP host_service port that ANY cell has declared.
+        That makes the listener reachable from every cell network —
+        but per-cell access must come from the cell's own policy:
+        only cells that declared the service in their cell yaml should
+        be able to use the listener.
+
+        Decision (defense in depth, matches the HTTP host_service
+        check in http_connect/_handle_host_service):
+          1. Resolve cell from peer IP (existing subnet-map lookup).
+          2. Load cell's per-cell policy.
+          3. If the listening port isn't in cell.tcp_host_services_map,
+             kill the flow.
+          4. Otherwise tag metadata so otel_export's tcp_* hooks can
+             emit per-cell + per-service counters and the audit log
+             distinguishes TCP-host-service from TLS-passthrough flows.
+
+        Cells that wouldn't have policy (system flows, unknown peer)
+        are killed fail-closed. The TLS passthrough flow uses
+        tls_clienthello to flip `client_conn.tls_passthrough` BEFORE
+        tcp_start fires; this hook still runs for those flows, but
+        the existing passthrough metadata tells us to skip the
+        host_service check.
+        """
+        try:
+            client = getattr(flow, "client_conn", None)
+            # Skip if this is a TLS-passthrough flow — different
+            # mechanism (invariant 11), gated by SNI not host_service.
+            meta = getattr(client, "metadata", None) or {}
+            if meta.get("tls_mode") == "passthrough":
+                return
+            peer = getattr(client, "peername", None)
+            client_ip = peer[0] if peer else None
+            if not client_ip:
+                self._kill_tcp(flow, "no peer IP")
+                return
+            server = getattr(flow, "server_conn", None)
+            address = getattr(server, "address", None) if server else None
+            listen_port = address[1] if address and len(address) >= 2 else None
+            if not isinstance(listen_port, int):
+                self._kill_tcp(flow, "no listen port")
+                return
+            cell_name = self.subnets.get_cell_name(client_ip)
+            cell_policy = self._lookup_cell_policy(cell_name)
+            if cell_policy is None:
+                self._kill_tcp(
+                    flow,
+                    f"cell '{cell_name or 'unknown'}' has no per-cell policy",
+                )
+                return
+            tcp_map = getattr(cell_policy, "tcp_host_services_map", None) or {}
+            allowed_ports = set(tcp_map.values())
+            if listen_port not in allowed_ports:
+                self._kill_tcp(
+                    flow,
+                    f"cell '{cell_name}' did not declare TCP "
+                    f"host_service on port {listen_port}",
+                )
+                return
+            # Identify which service this is (first name with the
+            # matching port — operators usually have one service per
+            # port; ties get the lexically-first name).
+            svc_name = next(
+                (n for n, p in sorted(tcp_map.items()) if p == listen_port),
+                "unknown",
+            )
+            flow.metadata["cell"] = cell_name
+            flow.metadata["host_service"] = svc_name
+            flow.metadata["host_service_protocol"] = "tcp"
+            flow.metadata["host_service_port"] = listen_port
+            ctx.log.info(
+                f"TCP HOST_SERVICE: {cell_name} -> {svc_name}:{listen_port}"
+            )
+        except Exception as e:
+            # Fail closed on any unexpected mitmproxy API shape change.
+            ctx.log.warn(f"tcp_start error, killing flow: {e}")
+            self._kill_tcp(flow, "tcp_start internal error")
+
+    def _kill_tcp(self, flow, reason: str) -> None:
+        """Kill a TCP flow with an audit log entry. mitmproxy's flow.kill()
+        terminates both ends; we tag metadata first so the logger addon
+        records the denial in the same shape as HTTP blocks."""
+        safe_reason = re.sub(r'[\x00-\x1f\x7f]', '', reason)
+        ctx.log.warn(f"BLOCKED tcp: {safe_reason}")
+        flow.metadata["blocked"] = True
+        flow.metadata["block_reason"] = safe_reason
+        try:
+            flow.kill()
         except Exception:
-            # Fail closed: kill the connection on any parse/validation error.
-            ctx.log.warn("BLOCKED: server_connected failed to validate IP, closing connection")
-            try:
-                data.server.close()
-            except OSError:
-                pass
+            pass
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
         """Log WebSocket messages on established connections.
@@ -691,19 +840,28 @@ class PolicyEnforcer:
         """
         if not flow.server_conn or not flow.server_conn.peername:
             return
-        # Skip blocked-IP check ONLY for our own host-service rewrites.
-        if flow.metadata.get("host_service"):
+        # Skip blocked-IP check for flows warden's own addon chain
+        # routed: host_service rewrites (this addon) and ingress flows
+        # (ingress.py routed to cell IP). Both are warden's choices.
+        if (flow.metadata.get("host_service")
+                or flow.metadata.get("ingress_route")):
             return
         try:
             ip_str = flow.server_conn.peername[0]
-            ip = ipaddress.ip_address(ip_str)
-            for net in BLOCKED_NETWORKS:
-                if ip in net:
-                    reason = f"DNS rebinding: resolved to {ip_str}"
-                    self._block(flow, reason)
-                    return
-        except (ValueError, IndexError):
-            # Fail closed: block on any parse/validation error.
+        except (IndexError, AttributeError):
+            self._block(flow, "IP validation failed in responseheaders")
+            return
+        if is_blocked_ip(ip_str):
+            self._block(flow, f"DNS rebinding: resolved to {ip_str}")
+            return
+        # is_blocked_ip returns False for unparseable input; treat
+        # unparseable peer IPs as fail-closed since we cannot prove the
+        # server isn't internal.
+        try:
+            ipaddress.ip_address(
+                ip_str[1:-1] if ip_str.startswith("[") and ip_str.endswith("]") else ip_str
+            )
+        except ValueError:
             self._block(flow, "IP validation failed in responseheaders")
 
 

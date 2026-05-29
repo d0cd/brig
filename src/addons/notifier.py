@@ -60,7 +60,6 @@ from _notifier_state import (
     CircuitBreakerConfig,
     CircuitBreakerState,
     NotificationConfig,
-    _is_safe_webhook_url,
     _redact_notification_path,
     _redact_url_for_logging,
     _resolve_webhook_url,
@@ -76,10 +75,7 @@ except ImportError:
     URLLIB3_AVAILABLE = False
 
 
-# Policy file path.
 POLICY_FILE = Path("/policy.json")
-
-# Dead letter queue file path.
 DEAD_LETTER_FILE = Path("/var/run/cells/dead-letters.json")
 
 
@@ -90,6 +86,7 @@ class Notifier:
         self.config = NotificationConfig()
         self.policy_mtime = 0.0
         self.last_notification: collections.OrderedDict[str, float] = collections.OrderedDict()
+        self._last_notification_lock = threading.Lock()
         self.notification_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
         self.worker_thread: Optional[threading.Thread] = None
         self.running = False
@@ -163,9 +160,21 @@ class Notifier:
 
             notifications = data.get("notifications", {})
             webhook_url = notifications.get("webhook_url", "")
-            if webhook_url and not _is_safe_webhook_url(webhook_url):
-                ctx.log.error("Notifier: webhook URL targets internal network, disabling")
-                webhook_url = ""
+            resolved_ip = ""
+            resolved_hostname = ""
+            resolved_port = 0
+            if webhook_url:
+                safe, resolved_ip, resolved_hostname, resolved_port = (
+                    _resolve_webhook_url(webhook_url)
+                )
+                if not safe:
+                    ctx.log.error(
+                        "Notifier: webhook URL targets internal network, disabling"
+                    )
+                    webhook_url = ""
+                    resolved_ip = ""
+                    resolved_hostname = ""
+                    resolved_port = 0
             filters = notifications.get("filters", {})
             cb_config = notifications.get("circuit_breaker", {})
 
@@ -182,6 +191,9 @@ class Notifier:
                     base_backoff=cb_config.get("base_backoff", DEFAULT_BASE_BACKOFF),
                     max_backoff=cb_config.get("max_backoff", DEFAULT_MAX_BACKOFF),
                 ),
+                resolved_ip=resolved_ip,
+                resolved_hostname=resolved_hostname,
+                resolved_port=resolved_port,
             )
             self.policy_mtime = mtime
 
@@ -205,12 +217,20 @@ class Notifier:
         ctx.log.info("Notifier: Worker started")
 
     def _stop_worker(self) -> None:
-        """Stop background worker."""
+        """Stop background worker.
+
+        Mirrors the pattern in _log_writer.AsyncLogWriter.stop(): set the
+        flag, signal via a sentinel, then join with a bounded timeout so
+        warden shutdown can't hang on a stuck worker.
+        """
         self.running = False
         try:
             self.notification_queue.put_nowait(None)
         except queue.Full:
             pass
+        if self.worker_thread:
+            self.worker_thread.join(timeout=1.0)
+            self.worker_thread = None
 
     def _worker(self) -> None:
         """Background worker for sending notifications."""
@@ -343,13 +363,26 @@ class Notifier:
                 return False, str(e)
 
     def _send_notification(self, notification: dict) -> None:
-        """Send notification to webhook with circuit breaker and retry logic."""
+        """Send notification to webhook with circuit breaker and retry logic.
+
+        Uses the resolved IP/hostname pinned at config-load time rather
+        than re-resolving DNS every call — re-resolving would let an
+        attacker who controls the webhook DNS return a public IP first
+        (passing BLOCKED_NETWORKS) and an internal IP later. Pinning
+        means the only way to change the connect target is to reload
+        the config, which re-runs the SSRF gate.
+        """
         if not self.config.webhook_url:
             return
 
-        safe, resolved_ip, hostname, port = _resolve_webhook_url(self.config.webhook_url)
-        if not safe:
-            ctx.log.warn("Notifier: webhook URL targets internal network, skipping")
+        resolved_ip = self.config.resolved_ip
+        hostname = self.config.resolved_hostname
+        port = self.config.resolved_port
+        if not resolved_ip or not hostname or not port:
+            ctx.log.warn(
+                "Notifier: webhook URL has no pinned resolution, skipping "
+                "(config reload required)"
+            )
             return
 
         if not self._check_circuit_breaker():
@@ -395,7 +428,8 @@ class Notifier:
             if not any(p in block_reason for p in self.config.block_reasons):
                 return False
         now = time.time()
-        last = self.last_notification.get(cell_name, 0)
+        with self._last_notification_lock:
+            last = self.last_notification.get(cell_name, 0)
         if now - last < self.config.min_interval_seconds:
             return False
         return True
@@ -413,13 +447,15 @@ class Notifier:
         if not self._should_notify(cell_name, block_reason):
             return
 
-        # Update last notification time with LRU eviction.
-        if cell_name not in self.last_notification:
-            if len(self.last_notification) >= MAX_TRACKED_CELLS:
-                self.last_notification.popitem(last=False)
-        else:
-            self.last_notification.move_to_end(cell_name)
-        self.last_notification[cell_name] = time.time()
+        # Update last notification time with LRU eviction (single-writer for
+        # the OrderedDict invariant — popitem/move_to_end aren't atomic).
+        with self._last_notification_lock:
+            if cell_name not in self.last_notification:
+                if len(self.last_notification) >= MAX_TRACKED_CELLS:
+                    self.last_notification.popitem(last=False)
+            else:
+                self.last_notification.move_to_end(cell_name)
+            self.last_notification[cell_name] = time.time()
 
         notification = {
             "event": "request_blocked",

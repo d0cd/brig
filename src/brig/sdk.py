@@ -15,17 +15,15 @@ Usage:
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from brig.cell.lifecycle import kill_cell, rm_cell, run_cell, stop_cell
 from brig.vm.shell import vm_run
 from brig.cell.profiles import apply_profile, load_profile
-from brig.cell.reconciler import CellState, ReconcileResult, observe
+from brig.cell.reconciler import observe
 from brig.cell.spec import CellSpec
-from brig.config import CELL_NAME_PATTERN, CONTAINER_PREFIX, PROXY_NAME, container_name
+from brig.config import CELL_NAME_PATTERN, container_name
 from brig.errors import BrigError
 
 
@@ -87,15 +85,24 @@ class Cell:
         return await asyncio.to_thread(self.wait_sync, timeout)
 
     def wait_sync(self, timeout: int | None = None) -> int:
-        """Synchronous wait for cell to exit. Returns -1 on subprocess error."""
+        """Synchronous wait for cell to exit.
+
+        Returns the cell's exit code (0 = success, non-zero = the cell's own
+        exit), OR -1 to signal that the wait itself failed (subprocess error,
+        timeout, or podman returned an unparseable status). The caller can
+        distinguish a real "command exited 1" from a wait failure by checking
+        for -1 explicitly.
+        """
         import subprocess as _subprocess
         cmd = ["podman", "wait", self._cn]
         try:
             result = vm_run(cmd, timeout=timeout)
         except (_subprocess.SubprocessError, OSError):
             return -1
+        if result.returncode != 0:
+            return -1
         code = result.stdout.strip()
-        return int(code) if code.isdigit() else 1
+        return int(code) if code.isdigit() else -1
 
     async def stop(self) -> None:
         await asyncio.to_thread(stop_cell, self.name)
@@ -183,6 +190,7 @@ class Brig:
         detach: bool = True,
         timeout: str | None = None,
         labels: list[str] | None = None,
+        host_sockets: list[dict[str, Any]] | None = None,
     ) -> Cell:
         """Run a new cell. Returns a Cell handle."""
         return await asyncio.to_thread(
@@ -191,6 +199,7 @@ class Brig:
             secrets=secrets, memory=memory, cpus=cpus,
             pids_limit=pids_limit, network=network, profile=profile,
             detach=detach, timeout=timeout, labels=labels,
+            host_sockets=host_sockets,
         )
 
     def run_sync(
@@ -208,8 +217,14 @@ class Brig:
         detach: bool = True,
         timeout: str | None = None,
         labels: list[str] | None = None,
+        host_sockets: list[dict[str, Any]] | None = None,
     ) -> Cell:
-        """Synchronous version of run()."""
+        """Synchronous version of run().
+
+        host_sockets: list of dicts with keys {name, host_path, mount_point,
+        mode?}. Same validation rules as the cell yaml (see
+        docs/design/cell-definition.md). Bypasses Warden by design.
+        """
         if not CELL_NAME_PATTERN.match(name):
             raise BrigError(f"Invalid cell name: {name}")
 
@@ -225,6 +240,7 @@ class Brig:
             "network": network,
             "detach": detach,
             "labels": labels or [],
+            "host_sockets": host_sockets or [],
         }
 
         if timeout:
@@ -236,6 +252,18 @@ class Brig:
                 spec_kwargs = apply_profile(spec_kwargs, prof)
             except ValueError as e:
                 raise ProfileError(str(e))
+
+        # CellSpec.__post_init__ only validates name + coerces numeric
+        # strings. The security boundary for host_sockets / ingress /
+        # policy lives in validate_cell_definition — without this call,
+        # an SDK caller bypasses the engine-socket denylist, path
+        # traversal checks, and the untrusted-profile rejection.
+        from brig.cell.spec import validate_cell_definition
+        validation_errors = validate_cell_definition(spec_kwargs)
+        if validation_errors:
+            raise BrigError(
+                "Invalid cell spec:\n  " + "\n  ".join(validation_errors),
+            )
 
         # Filter to only CellSpec fields (profiles may add extra keys like 'runtime').
         import dataclasses
@@ -328,31 +356,11 @@ class Brig:
 
     def list_sync(self) -> list[CellInfo]:
         """Synchronous version of list()."""
-        result = vm_run(
-            ["podman", "ps", "-a", "--format", "json",
-             "--filter", f"name={CONTAINER_PREFIX}"],
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-
-        try:
-            containers = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            return []
-
-        cells = []
-        for c in containers:
-            names = c.get("Names", "")
-            name = names[0] if isinstance(names, list) else names
-            if name == PROXY_NAME:
-                continue
-            cell_name = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
-            cells.append(CellInfo(
-                name=cell_name,
-                status=c.get("State", ""),
-                image=c.get("Image", ""),
-            ))
-        return cells
+        from brig.cell.lifecycle import list_cell_containers
+        return [
+            CellInfo(name=cell, status=c.get("State", ""), image=c.get("Image", ""))
+            for cell, c in list_cell_containers(include_stopped=True)
+        ]
 
     def cell(self, name: str) -> Cell:
         """Get a handle to an existing cell."""

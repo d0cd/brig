@@ -43,6 +43,15 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network("::ffff:0:0/96"),
     ipaddress.ip_network("2001:db8::/32"),
     ipaddress.ip_network("ff00::/8"),
+    # Additional IPv6 ranges that can encapsulate or route to private
+    # address space and let an attacker tunnel around the basic RFC1918
+    # blocklist.
+    #   - 64:ff9b::/96  RFC6052 well-known NAT64 prefix (can map to v4)
+    #   - 100::/64      RFC6666 discard-only address block
+    #   - 2002::/16     RFC3056 6to4, can encapsulate RFC1918 v4
+    ipaddress.ip_network("64:ff9b::/96"),
+    ipaddress.ip_network("100::/64"),
+    ipaddress.ip_network("2002::/16"),
 ]
 
 

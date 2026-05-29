@@ -12,17 +12,29 @@ subprocess.run() directly.
 from __future__ import annotations
 
 import subprocess
-from typing import Any
 
 from brig.config import VM_NAME
 from brig.ops.logging import debug
 
 # Sensitive flags whose following argument should be redacted in logs.
 _SENSITIVE_FLAGS = {"--secret", "--password", "--token", "--key", "--value"}
+# Env-var names whose value should never appear in debug logs. Matches
+# common credential patterns (literal or via -e KEY=VALUE / --env KEY=VALUE).
+# Substring match — `MYAPP_API_KEY` still redacts because KEY is in the set.
+_SENSITIVE_ENV_SUBSTRINGS = (
+    "PASSWORD", "PASSWD", "TOKEN", "SECRET", "API_KEY", "APIKEY",
+    "PRIVATE_KEY", "BEARER", "AUTH", "CREDENTIAL",
+)
 
 
 def _redact_cmd(cmd: list[str]) -> str:
-    """Redact sensitive arguments for debug logging."""
+    """Redact sensitive arguments for debug logging.
+
+    Also redacts the value of env-var assignments whose KEY contains a
+    known-credential substring (PASSWORD, TOKEN, SECRET, etc.) — common
+    for `podman run -e KEY=VALUE` patterns where a leak through debug
+    logs is the most likely accidental disclosure path.
+    """
     redacted: list[str] = []
     skip_next = False
     for arg in cmd:
@@ -34,9 +46,18 @@ def _redact_cmd(cmd: list[str]) -> str:
             skip_next = True
         elif "=" in arg and arg.split("=", 1)[0] in _SENSITIVE_FLAGS:
             redacted.append(f"{arg.split('=', 1)[0]}=***")
+        elif "=" in arg and _is_sensitive_env(arg.split("=", 1)[0]):
+            # -e PASSWORD=xyz, --env API_KEY=zzz, MYAPP_BEARER=...
+            redacted.append(f"{arg.split('=', 1)[0]}=***")
         else:
             redacted.append(arg)
     return " ".join(redacted)
+
+
+def _is_sensitive_env(name: str) -> bool:
+    """True if the env-var name plausibly holds a credential."""
+    upper = name.upper()
+    return any(s in upper for s in _SENSITIVE_ENV_SUBSTRINGS)
 
 
 def vm_run(
@@ -57,7 +78,7 @@ def vm_run(
         timeout: Timeout in seconds (None for no timeout).
     """
     # Rootful podman and system commands inside Lima need sudo.
-    if cmd and cmd[0] in ("podman", "mkdir", "du"):
+    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown", "cp", "rm"):
         cmd = ["sudo"] + cmd
 
     full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
@@ -78,7 +99,7 @@ def vm_run_interactive(cmd: list[str]) -> int:
     Used for: brig exec -it, brig shell, brig attach.
     Returns the exit code.
     """
-    if cmd and cmd[0] in ("podman", "mkdir", "du"):
+    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown"):
         cmd = ["sudo"] + cmd
     full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
     debug(f"VM interactive: {_redact_cmd(cmd)}")

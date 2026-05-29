@@ -139,7 +139,7 @@ xattr -w com.apple.quarantine "0181;$(printf %x $(date +%s));brig;$(uuidgen)" ~/
 **Rules:**
 
 1. **Default runtime is gVisor** — set in containers.conf, not just CLI flag
-2. **`brig list` shows runtime** — always visible which runtime a cell uses
+2. **`brig cell list` shows runtime** — always visible which runtime a cell uses
 3. **Native runtime requires explicit opt-in** — via `--profile dev` (or another non-gVisor profile)
 4. **Runtime is verified at startup** — don't rely solely on config defaults
 
@@ -237,7 +237,7 @@ done
 
 **Why this matters:** Attribution relies on source subnet. If a container joins multiple networks, it may have multiple IP addresses. The proxy cannot reliably attribute traffic to the correct cell.
 
-**Enforcement (in `brig verify`):**
+**Enforcement (in `brig system verify`):**
 
 ```bash
 verify_cell_single_homed() {
@@ -259,9 +259,93 @@ verify_cell_single_homed() {
 
 ### Invariant 9: Proxy Must Be Running Before Cells Start
 
-**Rule:** `brig run` and `brig start` must verify the proxy is running and healthy before starting any cell.
+**Rule:** `brig run` and `brig cell start` must verify the proxy is running and healthy before starting any cell.
 
 **Why this matters:** If cells start without a running proxy, they will have no network path. This creates a confusing debugging experience.
+
+---
+
+### Invariant 10: `host_sockets` Bypass Warden by Design
+
+**Rule:** A cell that declares `host_sockets: [...]` in its yaml bind-mounts a macOS-side unix socket into the cell at a path under `/run/host/`. Bytes flow kernel-direct between the cell and the host service — no proxy interposition possible.
+
+**Why this matters:** Some upstream services (Postgres / Redis / ssh-agent) don't speak HTTP and can't meaningfully traverse a CONNECT-style proxy. The `host_sockets` primitive trades audit visibility for protocol generality.
+
+**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 10):
+
+1. **Opt-in per cell yaml.** No default access; the operator's act of writing the entry IS the security review.
+2. **Untrusted profile cannot declare `host_sockets`** at parse time. Adversarial cells don't get side channels.
+3. **Engine sockets (`docker.sock`, `podman.sock`, …) are denylisted** at parse time AND at bridge-start (defense in depth).
+4. **Bridge sockets are real unix sockets, never symlinks** (lstat check defends against TOCTOU swap of the bridge path).
+5. **Per-cell namespacing** — cell A's bridge can't be reused by cell B.
+6. **Every attach is audited** via `log_lifecycle("host_socket_attach", …)`.
+7. **The cell startup banner** explicitly says Warden does not see the traffic, so operators internalize the trade-off.
+
+For host services that DO speak TCP but aren't worth bypassing Warden entirely, `host_services` with `protocol: tcp` keeps Warden in the path (connection-level audit only — see cell-definition.md).
+
+---
+
+### Invariant 11: TLS Passthrough Is an Explicit, Opt-In TLS-Handling Override
+
+**Rule:** A cell that declares `policy.tls_passthrough: [<host>]` in its yaml — *with* the same host listed in `policy.allow` — tells Warden to tunnel that host's TLS traffic raw, without decrypting. Warden routes by SNI; no MITM, no body inspection, no per-URL log entry.
+
+**Why this matters:** Some hosts can't survive mitmproxy. Sites using HTTP Public Key Pinning, Encrypted Client Hello, strict ALPN/cipher pinning, or Cloudflare's bot-fingerprinting TLS (e.g. `chatgpt.com`) refuse the relayed handshake. Brig's default mode keeps full audit visibility but loses on these endpoints. Passthrough flips the trade-off explicitly.
+
+**The trade-off table** — operators who add an entry to `tls_passthrough` are choosing column 2 for that host:
+
+| Concern | MITM (default) | Passthrough (opt-in) |
+|---|---|---|
+| Host allowlist enforcement | via Host header | via SNI in client hello |
+| Per-URL/method audit log | yes | no — only SNI + bytes + duration |
+| Body inspection / DLP | yes | no |
+| Warden sees credentials in cleartext | yes | no |
+| Survives HPKP / ECH / strict ALPN | no | yes |
+| Detect runaway exfil by volume | yes (bytes counter) | yes (same counter) |
+| Detect *specific URL* exfil | yes | no |
+
+For an agent runtime holding the operator's provider credentials (Claude OAuth, OpenAI keys), passthrough is arguably *more* secure than MITM in a multi-tenant world — Warden never sees the bearer token. Today's single-operator model treats this as an opt-in trade-off; multi-tenant brig will eventually require passthrough for credentialed flows.
+
+**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 11):
+
+1. Passthrough is opt-in per cell per host. No default.
+2. Passthrough hosts MUST also appear in `policy.allow`. The schema validator rejects entries that aren't. Passthrough is a TLS-handling override, never a policy bypass.
+3. At runtime, Warden's `Policy.is_passthrough` re-checks both lists — a tampered policy file that lists a host *only* in `tls_passthrough` cannot bypass MITM (defense in depth against invariant 4: state dir untrusted).
+4. SNI in the client hello must match the CONNECT host. Otherwise a malicious cell could CONNECT to allowed-host:443 and SNI=attacker.com to abuse Warden as a generic tunnel.
+5. Untrusted profile cannot declare passthrough. Adversarial cells must remain inspectable.
+6. Audit log entries are tagged `tls_mode=mitm` or `tls_mode=passthrough`. Passthrough entries omit method/path/status BY CONSTRUCTION (Warden never decrypted them). `brig cell network` renders passthrough lines as `PASSTHROUGH <host> (NB in / NB out)`; `brig system stats` shows `PT/CONN` and `PT/BYTES` columns.
+
+**Cell yaml shape:**
+
+```yaml
+policy:
+  allow:
+    - api.anthropic.com         # MITM (default)
+    - registry.npmjs.org
+    - chatgpt.com               # required: passthrough hosts MUST be allow'd
+  tls_passthrough:
+    - chatgpt.com               # turns off MITM for this host
+    - auth.openai.com
+```
+
+Two lists, not one with attributes, so `grep -l tls_passthrough cells/*.yaml` answers "which cells have un-inspected egress?" in a single command.
+
+---
+
+### Invariant 12: Warden CA Auto-Mount Is Per-Cell, Re-Extracted From Container, Opt-Out-Able
+
+**Rule:** Cells with `trust_warden_ca: true` (the default) get a combined system+Warden CA bundle bind-mounted at `/run/brig/ca-bundle.crt`, with `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` auto-exported. Bundle is staged from the live Warden container at every cell start — not cached on macOS.
+
+**Why this matters:** Without auto-mount, every brig-cell consumer rediscovers a manual workaround (extract CA → concat onto system roots → export the four env vars). Auto-mount also lets brig handle CA rotation transparently: every cell start re-extracts the current Warden CA, so a `brig system restart` (which can rotate the CA) doesn't leave cells with stale trust.
+
+**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 12):
+
+1. **Bundle source-of-truth is `/var/lib/warden/mitmproxy-state/`** on the VM — a persistent dir owned by uid 1000 (mitmproxy user). Bind-mounted into Warden so mitmproxy can write the CA. Brig reads via plain `cat` — no `podman exec` (audit eliminated that surface; see commits 51082fd, 6b51eed).
+2. **CA generated eagerly at `warden start`.** Polls for the cert file up to 30s after container is healthy; refuses to declare Warden ready until it exists. Cells racing a fresh `brig system up` can no longer get an empty bundle.
+3. **Bundle staged inside the VM, not on macOS.** Lives at `/state/<cell>/ca-bundle.crt`; the VM is the trust boundary (invariant 4 keeps macOS state untrusted).
+4. **Cell-side mount is read-only.** Compromised cell can't tamper with its own trust store.
+5. **Cell-set env wins.** Operators / image authors who explicitly set `SSL_CERT_FILE` keep their value (brig only fills vars the cell didn't declare). **Foot-gun:** if the image sets `SSL_CERT_FILE` differently from `/run/brig/ca-bundle.crt`, a Warden CA rotation can produce silent TLS hangs. `brig system doctor` now inspects each running cell's effective `Config.Env` and warns on mismatch.
+6. **Airgapped cells (`network: none`) skip the mount.** No egress = no CA to validate.
+7. **Opt-out via `trust_warden_ca: false`.** For cells with strict pinning or that manage their own trust store.
 
 ---
 
@@ -304,7 +388,7 @@ brig run --name cell-b --rm -- cat /work/secret.txt
 # Should fail: file not found
 
 # Cleanup
-brig kill cell-a && brig rm cell-a
+brig cell kill cell-a && brig cell rm cell-a
 ```
 
 ### Test 5: Cell Can't See Another Cell's Processes
@@ -318,7 +402,7 @@ brig run --name cell-b --rm -- ps aux
 # Should only show cell-b's own processes
 
 # Cleanup
-brig kill cell-a && brig rm cell-a
+brig cell kill cell-a && brig cell rm cell-a
 ```
 
 ### Test 6: No Foreign Containers Attached to Cell Networks
@@ -356,7 +440,7 @@ brig run --name cell-b --rm -- curl -m 5 http://cell-a:9000/
 echo "Exit code: $?"  # MUST be non-zero
 
 # Cleanup
-brig kill cell-a && brig rm cell-a
+brig cell kill cell-a && brig cell rm cell-a
 ```
 
 ### Test 9: Proxy Only Exposes Port 8080
@@ -436,7 +520,7 @@ else:
 brig run --name test-identity -d -- sleep 300
 
 # Make a request and check proxy log
-brig exec test-identity -- curl -s https://httpbin.org/ip
+brig cell exec test-identity -- curl -s https://httpbin.org/ip
 sleep 1
 
 # Check last log entry
@@ -444,7 +528,7 @@ limactl shell --workdir / brig -- sudo tail -1 /var/log/brig/network/test-identi
 # Should show src_ip within expected subnet
 
 # Cleanup
-brig kill test-identity && brig rm test-identity
+brig cell kill test-identity && brig cell rm test-identity
 ```
 
 ---
@@ -465,7 +549,7 @@ brig kill test-identity && brig rm test-identity
 
 3. Recreate the network:
    ```bash
-   brig rm my-cell
+   brig cell rm my-cell
    brig run -f cells/my-cell.yaml
    ```
 
@@ -485,7 +569,7 @@ brig kill test-identity && brig rm test-identity
 
 1. Run verification:
    ```bash
-   brig verify
+   brig system verify
    ```
 
 2. Disconnect the container:
@@ -500,19 +584,19 @@ brig kill test-identity && brig rm test-identity
 ### Soft Reset (restart cells and proxy)
 
 ```bash
-brig stop --all
+brig cell stop --all
 warden restart
-brig start --all
+brig cell start --all
 ```
 
 ### Hard Reset (kill everything, keep state)
 
 ```bash
-brig kill --all
+brig cell kill --all
 warden stop
 limactl shell --workdir / brig -- sudo 'for net in $(podman network ls -q | grep "^brig-"); do podman network rm "$net" 2>/dev/null; done'
-brig up
-brig start --all
+brig system up
+brig cell start --all
 ```
 
 ### VM Restart (preserves macOS state)
@@ -520,7 +604,7 @@ brig start --all
 ```bash
 limactl stop brig && limactl start brig
 # Proxy starts automatically via systemd
-brig start --all
+brig cell start --all
 ```
 
 ### VM Recreate (clean slate VM, preserves macOS state)
@@ -528,7 +612,7 @@ brig start --all
 ```bash
 limactl delete brig && make setup
 # All VM state destroyed and rebuilt
-brig start --all
+brig cell start --all
 ```
 
 ### Full Reset (destroy everything)
