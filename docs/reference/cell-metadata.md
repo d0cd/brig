@@ -10,11 +10,11 @@ The pattern mirrors Kubernetes' downward API and cloud instance
 metadata: brig writes a small JSON file on the host, podman bind-mounts
 it read-only into the cell. The cell can read but cannot modify it.
 
-## Schema (v2)
+## Schema (v3)
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "name": "my-cell",
   "started_at": "2026-05-18T17:30:00Z",
   "workspace": {
@@ -24,6 +24,7 @@ it read-only into the cell. The cell can read but cannot modify it.
   "ingress": [
     {"name": "api", "port": 8000, "path_prefix": "/api", "auth": "token"}
   ],
+  "image_digest": "sha256:abc...",
   "policy": {
     "host_services": ["model"]
   }
@@ -32,13 +33,30 @@ it read-only into the cell. The cell can read but cannot modify it.
 
 | Field | Type | Notes |
 |---|---|---|
-| `version` | int | Schema version. Currently `2`. Bumps on breaking shape changes. |
+| `version` | int | Schema version. Currently `3`. Bumps on shape changes. |
 | `name` | string | Cell name, matches `--name` / yaml `name:`. |
 | `started_at` | string | RFC 3339 UTC timestamp of cell creation. |
 | `workspace.mount_point` | string | Path inside the cell, default `/work`, overridable via `workspace_mount` in the cell spec. |
 | `policy.host_services` | string[] | Per-cell host-service ACL — the names of host services this cell may reach. Ports live in the per-cell policy file on disk; metadata exposes names only. |
 | `host_sockets[]` | `[{name, mount_point}]` | Unix sockets bind-mounted into the cell from the host (host_path is intentionally omitted). |
-| `ingress[]` | `[{name, port, path_prefix, auth}]` | Ingress endpoints the cell publishes through warden's `:8443` reverse proxy. The bearer token itself is never stored here — it lives in `~/.brig/secrets/<cell>-ingress-token`. `brig cell start` uses this list to replay route registration with a freshly-inspected cell IP after a `brig system down` / `up` cycle. |
+| `ingress[]` | `[{name, port, path_prefix, auth}]` | Ingress endpoints the cell publishes through warden's `:8443` reverse proxy. `auth` is `token` (default; the bearer token is never stored here — it lives in `~/.brig/secrets/<cell>-ingress-token`) or `none` (transparent pass-through, no token). `brig cell start` uses this list to replay route registration with a freshly-inspected cell IP after a `brig system down` / `up` cycle. |
+| `image_digest` | string? | Optional. Set when the cell was created with a pinned digest. `brig cell start` re-verifies the container's current image digest against this value before letting the cell start. |
+
+### What changed in v3
+
+v2 → v3 added two optional fields:
+
+- `ingress` — lets `brig cell start` replay route registration without
+  the original yaml after a `brig system down`/`up` cycle. No secrets
+  land here; the bearer token still lives in the secrets directory.
+- `image_digest` — lets `brig cell start` re-verify the digest pin
+  before letting the container start, closing the
+  `podman commit + restart` operator-side bypass.
+
+Both fields are additive; a v2 reader sees them as unknown keys and
+ignores them. Bumping to v3 reflects that the writer's output shape
+changed, so a future reader checking `version >= 3` can rely on
+`image_digest` / `ingress` semantics.
 
 ### What changed in v2
 

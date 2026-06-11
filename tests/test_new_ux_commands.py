@@ -76,7 +76,7 @@ class TestSecretsRmConfirmation(unittest.TestCase):
 
 class TestRunFlagAfterImageGuard(unittest.TestCase):
     def test_image_starting_with_dash_rejected(self):
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         args = SimpleNamespace(
             image="-m",
             container_cmd=["alpine", "sh"],
@@ -93,28 +93,47 @@ class TestRunFlagAfterImageGuard(unittest.TestCase):
 
 class TestCpColonParsing(unittest.TestCase):
     def test_local_path_with_colon_not_treated_as_cell(self):
-        from brig.commands.lifecycle_cmd import _parse_cp_target
+        from brig.commands.lifecycle_inspect import _parse_cp_target
         self.assertIsNone(_parse_cp_target("./out:put.txt"))
         self.assertIsNone(_parse_cp_target("/abs/with:colon"))
 
     def test_valid_cell_target(self):
-        from brig.commands.lifecycle_cmd import _parse_cp_target
+        from brig.commands.lifecycle_inspect import _parse_cp_target
         self.assertEqual(
             _parse_cp_target("mycell:/work/out.json"),
             ("mycell", "/work/out.json"),
         )
 
+    def test_copy_out_argv_uses_parsed_path(self):
+        """cell→host: the in-cell path must be the PARSED path, not the full
+        'cell:path' spec — else podman cp sees brig-mycell:mycell:/path."""
+        from brig.commands import lifecycle_inspect as li
+        with patch("brig.workspace.workspace.vm_run") as mock_run, \
+             patch("brig.workspace.workspace._sanitize_file"), \
+             patch("brig.workspace.workspace._apply_quarantine"), \
+             patch("pathlib.Path.is_dir", return_value=False):
+            mock_run.return_value = SimpleNamespace(returncode=0, stderr="")
+            li.cmd_cp(SimpleNamespace(src="mycell:/work/out.txt", dst="./out.txt"))
+        self.assertEqual(
+            mock_run.call_args[0][0],
+            ["podman", "cp", "brig-mycell:/work/out.txt", "./out.txt"],
+        )
+
+    def test_copy_in_argv_uses_parsed_path(self):
+        """host→cell: the in-cell dest must be the PARSED path."""
+        from brig.commands import lifecycle_inspect as li
+        with patch("brig.workspace.workspace.vm_run") as mock_run:
+            mock_run.return_value = SimpleNamespace(returncode=0, stderr="")
+            li.cmd_cp(SimpleNamespace(src="./in.txt", dst="mycell:/work/in.txt"))
+        self.assertEqual(
+            mock_run.call_args[0][0],
+            ["podman", "cp", "./in.txt", "brig-mycell:/work/in.txt"],
+        )
+
     def test_invalid_cell_name_not_treated_as_cell(self):
         # Uppercase is not a valid cell name.
-        from brig.commands.lifecycle_cmd import _parse_cp_target
+        from brig.commands.lifecycle_inspect import _parse_cp_target
         self.assertIsNone(_parse_cp_target("MYCELL:/work"))
-
-
-# TestHostServicePolicyShape removed: the _apply_host_service_*
-# helpers it covered were deleted in the host_services flattening
-# rollout. Per-cell host_services are now written by
-# _sync_host_services_policy in lifecycle_cmd from the cell yaml's
-# host_services field — covered by tests/test_host_services_phase2.py.
 
 
 class TestPolicyTest(unittest.TestCase):
@@ -253,8 +272,7 @@ class TestPolicyRm(unittest.TestCase):
 
     def test_rm_deletes_existing(self):
         from brig.commands import policy_cmd
-        with patch.object(policy_cmd, "delete_cell_policy", self._delete_with_test_dir), \
-             patch("warden.proxy.reload_policy", side_effect=ImportError):
+        with patch.object(policy_cmd, "delete_cell_policy", self._delete_with_test_dir):
             rc = policy_cmd.cmd_policy_rm(SimpleNamespace(name="mycell"))
         self.assertEqual(rc, 0)
         self.assertFalse((self.policy_dir / "mycell.json").exists())
@@ -364,6 +382,30 @@ class TestPruneCommand(unittest.TestCase):
                 self.assertTrue((state / "system").exists(), "system dir removed")
                 self.assertFalse((state / "ghost-1").exists(), "orphan not pruned")
                 self.assertFalse((state / "ghost-2").exists(), "orphan not pruned")
+
+
+    def test_prune_subnets_sweeps_orphan_ingress_routes(self):
+        """Freeing an orphan subnet must also drop its ingress route, so a
+        reused /24 index can't inherit a stale route + auth token."""
+        from unittest.mock import patch
+        from brig.commands.system_cmd import cmd_prune
+
+        # podman network ls returns no networks → the allocated cell is orphan.
+        mock_vm = SimpleNamespace(stdout="", returncode=0)
+        ghost = SimpleNamespace(cell_name="ghost", subnet="10.60.9.0/24")
+        with patch("brig.commands.system_cmd.vm_run", return_value=mock_vm), \
+             patch("brig.network.subnet.list_all", side_effect=[[ghost], []]), \
+             patch("brig.network.subnet.free") as mock_free, \
+             patch("brig.network.ingress.sweep_orphan_routes",
+                   return_value=1) as mock_sweep:
+            rc = cmd_prune(SimpleNamespace(
+                cells=False, logs=False, subnets=True,
+                dry_run=False, log_days=7,
+            ))
+        self.assertEqual(rc, 0)
+        mock_free.assert_called_once_with("ghost")
+        # After freeing the orphan, the live set is empty → route swept.
+        mock_sweep.assert_called_once_with(live_cells=set())
 
 
 class TestVersionFlag(unittest.TestCase):

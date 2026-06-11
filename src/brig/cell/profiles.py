@@ -18,9 +18,8 @@ PROFILES_DIR = BRIG_HOME / "profiles"
 # Built-in profiles. Each is a partial cell definition (no name/image/command).
 #
 # `runtime` is intentionally omitted: invariant 5 requires gVisor (`runsc`)
-# and the reconciler hardcodes `--runtime runsc`. The field used to be set
-# here but was never propagated by apply_profile() — keeping it would have
-# implied configurability that doesn't exist.
+# and the reconciler hardcodes `--runtime runsc`, so a profile-level runtime
+# would imply a configurability that does not exist.
 BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
     "untrusted": {
         "memory": "512m",
@@ -65,18 +64,29 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
 def load_profile(name: str, profiles_dir: Path = PROFILES_DIR) -> dict[str, Any]:
     """Load a trust profile by name.
 
-    Checks user profiles directory first, then built-in profiles.
-    Raises ValueError if not found.
+    Built-in profile names are reserved — a user profile file with the
+    same name is refused outright so it can't silently shadow the
+    builtin. This is load-bearing for `untrusted`, where the untrusted
+    cell's adversarial-code guarantees come from the profile NAME being
+    `untrusted`; if a user-defined file at ~/.brig/profiles/untrusted.yaml
+    were loaded instead, the operator could remove the host_sockets /
+    host_services / tls_passthrough rejections by editing one file.
+
+    Raises ValueError if not found or if a user file shadows a builtin.
     """
-    # User-defined profiles.
     for ext in (".yaml", ".yml", ".json"):
         user_profile = profiles_dir / f"{name}{ext}"
         if user_profile.exists():
+            if name in BUILTIN_PROFILES:
+                raise ValueError(
+                    f"User profile {user_profile} shadows the built-in "
+                    f"'{name}' profile, which is not allowed. Rename "
+                    f"the file to a different profile name."
+                )
             debug(f"Loading user profile: {user_profile}")
             from brig.cell.spec import load_cell_definition
             return load_cell_definition(str(user_profile))
 
-    # Built-in profiles.
     if name in BUILTIN_PROFILES:
         debug(f"Loading built-in profile: {name}")
         return BUILTIN_PROFILES[name].copy()

@@ -56,7 +56,7 @@ podman network rm "brig-${CELL_NAME}"
 
 **Rules:**
 
-1. Proxy listens ONLY on port 8080 on the internal interface
+1. Warden's egress proxy listens on port 8080 on the internal interface. (Ingress adds 8443, and each declared `protocol: tcp` host_service adds its port — all on warden's internal IP, gated by `enforce.py`'s per-cell policy.)
 2. CONNECT method allowed ONLY to port 443 (HTTPS)
 3. CONNECT to literal IPs is blocked (domain allowlist only)
 4. CONNECT to RFC1918/link-local/localhost/CGNAT is blocked
@@ -181,31 +181,34 @@ Measured on Apple Silicon (Lima VZ, steady-state inside running container):
 
 **Key insight:** gVisor has zero overhead for pure compute. The 3x cost applies only to syscalls. Network I/O through the Warden proxy is unaffected because it flows through the cell's network stack, not the filesystem.
 
-#### Choosing a Runtime
+#### Choosing a Profile
 
-| Profile | Runtime | Threat Model | Use Case |
-|---------|---------|-------------|----------|
-| `untrusted` | gVisor | Unknown/hostile code | Running submissions from strangers |
-| `supervised` | gVisor | Semi-trusted, defense-in-depth | AI agents, CI runners |
-| `dev` | crun + seccomp | Your own code | Development, fast iteration |
-| `airgapped` | gVisor | No network, maximum isolation | Offline compute |
-| `honeypot` | gVisor | Adversarial; capture telemetry | Studying malware behaviour |
+| Profile | Threat Model | Use Case |
+|---------|-------------|----------|
+| `untrusted` | Unknown/hostile code | Running submissions from strangers |
+| `supervised` | Semi-trusted, defense-in-depth | AI agents, CI runners |
+| `dev` | Your own code | Development, fast iteration |
+| `airgapped` | No network, maximum isolation | Offline compute |
+| `honeypot` | Adversarial; capture telemetry | Studying malware behaviour |
 
-Use gVisor when the code is untrusted and you want protection against unknown kernel exploits. Use crun when the code is trusted and syscall-heavy performance matters — the VM + seccomp + network isolation still provide strong protection.
+All profiles run on gVisor (`runsc`): invariant 5 forbids a silent runtime
+downgrade, so the reconciler hardcodes `--runtime runsc` and profiles cannot
+override it. Profiles differ in resource limits, seccomp, and network defaults
+— not in the kernel-isolation boundary.
 
 ---
 
 ### Invariant 6: Only Infrastructure Containers May Attach to `proxy-external`
 
-**Rule:** Only `warden` may attach to `proxy-external`. No cell containers.
+**Rule:** Only brig's own infrastructure containers may attach to `proxy-external` — `warden` and the OTel collector (`brig-otel`). No cell containers. (The enforced allowlist is `INFRA_CONTAINER_NAMES` in `src/brig/config.py`; `verify_proxy_network` checks membership.)
 
-**Why this matters:** The `proxy-external` network has outbound internet access. Any container attached to it inherits the VM-level egress rules but bypasses per-cell isolation.
+**Why this matters:** The `proxy-external` network has outbound internet access. Any container attached to it inherits the VM-level egress rules but bypasses per-cell isolation. The collector qualifies as infrastructure: it is brig-managed and pinned, runs no untrusted workload, is on this network only so warden can resolve its OTLP endpoint by name, and **no cell can reach it** — cells live on their own `brig-<cell>` `--internal` networks with no route to `proxy-external`.
 
 **Enforcement:**
 
 ```bash
 # Verify only infrastructure containers are on proxy-external:
-ALLOWED="warden"
+ALLOWED="warden brig-otel"
 containers=$(podman network inspect proxy-external --format '{{range .Containers}}{{.Name}} {{end}}')
 for c in $containers; do
   if ! echo "$ALLOWED" | grep -qw "$c"; then
@@ -312,7 +315,7 @@ For an agent runtime holding the operator's provider credentials (Claude OAuth, 
 3. At runtime, Warden's `Policy.is_passthrough` re-checks both lists — a tampered policy file that lists a host *only* in `tls_passthrough` cannot bypass MITM (defense in depth against invariant 4: state dir untrusted).
 4. SNI in the client hello must match the CONNECT host. Otherwise a malicious cell could CONNECT to allowed-host:443 and SNI=attacker.com to abuse Warden as a generic tunnel.
 5. Untrusted profile cannot declare passthrough. Adversarial cells must remain inspectable.
-6. Audit log entries are tagged `tls_mode=mitm` or `tls_mode=passthrough`. Passthrough entries omit method/path/status BY CONSTRUCTION (Warden never decrypted them). `brig cell network` renders passthrough lines as `PASSTHROUGH <host> (NB in / NB out)`; `brig system stats` shows `PT/CONN` and `PT/BYTES` columns.
+6. Passthrough connections are audited at the TLS handshake via the connection-level `PASSTHROUGH: cell=… sni=…` log line (`enforce.py:tls_clienthello`). Method/path/status/bytes are absent BY CONSTRUCTION — Warden never decrypts, and a true (`ignore_connection`) passthrough tunnel produces no mitmproxy flow, so the per-byte/connection `tcp_*` hooks and `warden_passthrough_*` counters never fire. MITM OTel records are tagged `tls_mode=mitm` (the JSONL flow log written by `logger.py` carries no `tls_mode` field).
 
 **Cell yaml shape:**
 
@@ -335,17 +338,36 @@ Two lists, not one with attributes, so `grep -l tls_passthrough cells/*.yaml` an
 
 **Rule:** Cells with `trust_warden_ca: true` (the default) get a combined system+Warden CA bundle bind-mounted at `/run/brig/ca-bundle.crt`, with `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` auto-exported. Bundle is staged from the live Warden container at every cell start — not cached on macOS.
 
-**Why this matters:** Without auto-mount, every brig-cell consumer rediscovers a manual workaround (extract CA → concat onto system roots → export the four env vars). Auto-mount also lets brig handle CA rotation transparently: every cell start re-extracts the current Warden CA, so a `brig system restart` (which can rotate the CA) doesn't leave cells with stale trust.
+**Why this matters:** Without auto-mount, every brig-cell consumer rediscovers a manual workaround (extract CA → concat onto system roots → export the four env vars). Auto-mount also lets brig handle CA rotation transparently: every cell start re-extracts the current Warden CA, so a `brig system down && brig system up` (which can rotate the CA) doesn't leave cells with stale trust.
 
 **Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 12):
 
-1. **Bundle source-of-truth is `/var/lib/warden/mitmproxy-state/`** on the VM — a persistent dir owned by uid 1000 (mitmproxy user). Bind-mounted into Warden so mitmproxy can write the CA. Brig reads via plain `cat` — no `podman exec` (audit eliminated that surface; see commits 51082fd, 6b51eed).
+1. **Bundle source-of-truth is `/var/lib/warden/mitmproxy-state/`** on the VM — a persistent dir owned by uid 1000 (mitmproxy user). Bind-mounted into Warden so mitmproxy can write the CA. Brig reads via plain `cat` — no `podman exec` (that surface was eliminated).
 2. **CA generated eagerly at `warden start`.** Polls for the cert file up to 30s after container is healthy; refuses to declare Warden ready until it exists. Cells racing a fresh `brig system up` can no longer get an empty bundle.
 3. **Bundle staged inside the VM, not on macOS.** Lives at `/state/<cell>/ca-bundle.crt`; the VM is the trust boundary (invariant 4 keeps macOS state untrusted).
 4. **Cell-side mount is read-only.** Compromised cell can't tamper with its own trust store.
 5. **Cell-set env wins.** Operators / image authors who explicitly set `SSL_CERT_FILE` keep their value (brig only fills vars the cell didn't declare). **Foot-gun:** if the image sets `SSL_CERT_FILE` differently from `/run/brig/ca-bundle.crt`, a Warden CA rotation can produce silent TLS hangs. `brig system doctor` now inspects each running cell's effective `Config.Env` and warns on mismatch.
 6. **Airgapped cells (`network: none`) skip the mount.** No egress = no CA to validate.
 7. **Opt-out via `trust_warden_ca: false`.** For cells with strict pinning or that manage their own trust store.
+
+---
+
+### Invariant 13: Scoped Host Mounts Are Opt-In, Bounded, and Bypass Warden by Design
+
+**Rule:** A `supervised`/`dev` cell may bind-mount an operator-chosen host directory into itself via `mounts:` (read-only by default, `rw` opt-in), bounded by the VM-level `mount_roots` allowlist. Like `host_sockets`, the bytes flow between the cell and the host files directly — Warden does not mediate them.
+
+**Why this matters:** Agents frequently need a real working tree (a repo to edit, a dataset to read) that's larger or more persistent than `/work`, and copying everything in and out is slow and loses edits. `mounts:` trades audit visibility over those files for direct, persistent access — with the host exposure bounded to roots the operator explicitly allowlisted at the VM level.
+
+**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 13):
+
+1. **Opt-in per cell yaml.** No default access; the `untrusted` profile rejects `mounts:` at parse time.
+2. **Bounded by `mount_roots`.** A mount's `host_path` realpath must resolve under a declared VM-level `mount_roots` entry — a cell cannot reach host trees the operator did not allowlist. Re-resolved and re-checked at attach time (TOCTOU-safe), not just at parse time.
+3. **`mount_point` cannot shadow** a system path or the cell's `/work` (parse-time).
+4. **Symlinks inside the mount cannot escape** the subtree to a VM path — container mount-namespace isolation makes such a symlink dangle (verified under runsc AND crun, so it does not rely on gVisor; see `docs/design/mount-symlink-hardening.md`).
+5. **Every attach is audited** via `log_lifecycle("mount_attach", …)`, and the cell startup banner states Warden does not see these bytes.
+6. **Residual risk is host-side, by design.** A cell can plant a symlink pointing out of the shared folder that a *host* consumer might follow (confused-deputy). `brig cell mount-scan` reports/quarantines such symlinks; consumers must treat cell-written files as untrusted. Brig sandboxes the cell's execution, not the fate of files it writes.
+
+`mount_roots` is empty by default — the whole feature is off until an operator opts the VM in. See `docs/design/host-mounts.md` for the full design.
 
 ---
 
@@ -443,43 +465,46 @@ echo "Exit code: $?"  # MUST be non-zero
 brig cell kill cell-a && brig cell rm cell-a
 ```
 
-### Test 9: Proxy Only Exposes Port 8080
+### Test 9: Proxy Exposes Only Expected Ports
 
 ```bash
 brig run --name test-portscan --rm -- sh -c '
   apk add --no-cache nmap >/dev/null 2>&1
-  nmap -p 1-65535 proxy --open -T4 2>/dev/null | grep "^[0-9]"
+  nmap -p 1-65535 warden --open -T4 2>/dev/null | grep "^[0-9]"
 '
-# Should output ONLY: 8080/tcp open  http-proxy
+# For a cell with no ingress and no TCP host_services: ONLY 8080/tcp (http-proxy).
+# A cell that declares ingress also sees 8443; a `protocol: tcp` host_service also
+# sees its declared port (e.g. 5432). All listeners are gated by enforce.py policy.
 ```
 
 ### Test 10: Proxy Is Not a Gateway
 
 ```bash
 # Try CONNECT to non-443 port (should be rejected)
-brig run --name test --rm -- curl -s -x http://proxy:8080 http://example.com:8080/
+brig run --name test --rm -- curl -s -x http://warden:8080 http://example.com:8080/
 # Expected: 403 Forbidden
 
 # Try CONNECT to literal IP (should be rejected)
-brig run --name test --rm -- curl -s -x http://proxy:8080 https://142.250.80.46/
+brig run --name test --rm -- curl -s -x http://warden:8080 https://142.250.80.46/
 # Expected: 403 Forbidden
 
 # Try CONNECT to internal range (should be rejected)
-brig run --name test --rm -- curl -s -x http://proxy:8080 http://10.50.0.1/
+brig run --name test --rm -- curl -s -x http://warden:8080 http://10.50.0.1/
 # Expected: 403 Forbidden
 ```
 
 ### Test 11: Default Runtime Check
 
 ```bash
-# Run without specifying runtime (should use gVisor)
+# Run without specifying a profile (should use gVisor)
 brig run --name test-default --rm -- cat /proc/version
-# Should show gVisor
+# Should contain "gvisor"
 
-# Verify the only way to opt out of gVisor is to pick a non-gVisor profile.
-# `brig run` has no `--runtime` flag — runtime is set by the profile.
-brig run --name test --profile dev -- echo hello   # Uses crun.
-brig run --name test --profile untrusted -- echo hello   # Uses gVisor.
+# Runtime is fixed at runsc and is NOT profile-selectable (invariant 5):
+# the reconciler hardcodes `--runtime runsc` and `brig run` has no
+# `--runtime` flag. Every profile runs on gVisor.
+brig run --name test-dev --rm --profile dev -- cat /proc/version        # contains "gvisor"
+brig run --name test-untrusted --rm --profile untrusted -- cat /proc/version  # contains "gvisor"
 ```
 
 ### Test 12: IPv6 Is Disabled
@@ -584,19 +609,18 @@ brig cell kill test-identity && brig cell rm test-identity
 ### Soft Reset (restart cells and proxy)
 
 ```bash
-brig cell stop --all
-warden restart
-brig cell start --all
+brig system down              # stop all cells + warden
+brig system up                # restart warden
+brig cell start <name>        # restart each cell you need
 ```
 
 ### Hard Reset (kill everything, keep state)
 
 ```bash
-brig cell kill --all
-warden stop
+brig system down              # stop all cells + warden
 limactl shell --workdir / brig -- sudo 'for net in $(podman network ls -q | grep "^brig-"); do podman network rm "$net" 2>/dev/null; done'
 brig system up
-brig cell start --all
+brig cell start <name>        # repeat for each cell to restart
 ```
 
 ### VM Restart (preserves macOS state)
@@ -604,7 +628,7 @@ brig cell start --all
 ```bash
 limactl stop brig && limactl start brig
 # Proxy starts automatically via systemd
-brig cell start --all
+brig cell start <name>        # repeat for each cell to restart
 ```
 
 ### VM Recreate (clean slate VM, preserves macOS state)
@@ -612,7 +636,7 @@ brig cell start --all
 ```bash
 limactl delete brig && make setup
 # All VM state destroyed and rebuilt
-brig cell start --all
+brig cell start <name>        # repeat for each cell to restart
 ```
 
 ### Full Reset (destroy everything)
@@ -628,11 +652,11 @@ limactl delete brig && make setup
 After any recovery:
 
 ```bash
-# Quick smoke test
-brig run --name recovery-test --rm -- curl -m 5 https://httpbin.org/ip
+# Quick smoke test (egress is default-deny — allow the test host)
+brig run --name recovery-test --rm --policy-allow httpbin.org -- curl -m 5 https://httpbin.org/ip
 
-# Full verification suite
-brig test isolation
+# Re-check the runtime-verifiable invariants
+brig system verify
 ```
 
 ---
@@ -653,16 +677,6 @@ security:
 ```yaml
 # In cell definition
 network: none  # No network at all
-```
-
-### Egress Rate Limits
-
-```yaml
-# Future: in network-policy.json
-rate_limits:
-  per_cell:
-    requests_per_minute: 1000
-    bytes_per_minute: 100MB
 ```
 
 ### Per-Cell Proxy

@@ -92,6 +92,7 @@ timeout: "30m"                   # Auto-kill after duration (30s, 5m, 2h, 1d)
 
 # Workspace
 workspace_quota: "500m"          # Max workspace size
+workspace_mount: /work           # Mount point for the cell's writable workspace (default /work)
 
 # Cell rootfs writability. Default false (safe). When false, brig runs the
 # cell with --read-only rootfs + sized tmpfs at /tmp (64m) and /run (16m).
@@ -105,8 +106,29 @@ workspace_quota: "500m"          # Max workspace size
 # run untrusted code.
 writable_rootfs: false
 
+# Seccomp profile (optional). Filename of a profile staged under
+# ~/.brig/cells/seccomp/ (e.g. default.json); must be a bare filename, never a
+# path or "unconfined". Omit to use the container runtime's default profile.
+seccomp_profile: default.json
+
 # Execution mode
 detach: false                    # Run in background
+
+# Restart policy (default: no). "always" re-launches the cell on
+# `brig system up` whenever its container is gone — e.g. a VM restart drops
+# every container. brig persists the full spec at run time to replay it.
+# An *exited* cell (still present, e.g. `brig cell stop`) is left alone, but a
+# VM restart drops the container, so a stopped restart:always cell DOES
+# relaunch on the next up; use `brig cell rm` to keep one down for good.
+restart: always
+
+# Process user (podman --user; uid[:gid] or name[:group]). Default: the image's
+# USER. gVisor presents virtiofs host mounts (and /work) as owned by 0:0 inside
+# the cell, so a non-root cell can't own a rw `mounts:` dir — set user: "0" to
+# run the cell as root and let it fully read/write/rewrite the mount. Writes
+# still land owned by the operator on macOS, so readback is unaffected. Running
+# as root *inside* the gVisor+VM sandbox is not a host-privilege change.
+user: "0"
 
 # Working directory inside container (default: /work)
 workdir: /app
@@ -116,18 +138,31 @@ labels:
   team: platform
   purpose: scraping
 
-# Ingress — authenticated reverse proxy for inbound traffic (optional)
-# Warden routes external requests to cell-internal ports by path prefix.
-# All ingress is token-authenticated and logged.
+# Ingress — reverse proxy for inbound traffic (optional). Warden routes
+# external requests to cell-internal ports by path prefix; all routes are logged.
+#
+# auth: token (default) — brig is the gate. The bearer token comes from a secret
+#   named `<cell-name>-ingress-token` (preferred) or `ingress-token` (fallback);
+#   register it before `brig run`, e.g.:
+#     openssl rand -hex 32 | brig secrets add <cell-name>-ingress-token -
+#   A cell that declares auth: token with no matching secret fails to start.
+# auth: none — transparent pass-through: brig does NOT authenticate; the cell's
+#   own app is the gate (the Authorization header and ?query are passed through
+#   untouched). Use for services that authenticate themselves or for browser/
+#   Electron WebSocket clients that can't send an Authorization header. The
+#   trade-off is explicit, mirroring tls_passthrough: you give up brig's
+#   perimeter gate for that route. Rejected on the `untrusted` profile and
+#   announced at run time (audit event + operator NOTE). A route that omits
+#   `auth` defaults to token (fail-secure).
 ingress:
   - name: api                   # Alphanumeric + hyphens, max 31 chars
     port: 8642                   # Cell-internal port (1-65535)
     path_prefix: /api            # Route prefix (must start with /)
-    auth: token                  # Auth method (only "token" supported)
-  - name: webhooks
-    port: 8642
-    path_prefix: /webhooks
-    auth: token
+    auth: token                  # "token" (brig gates) or "none" (app gates)
+  - name: dashboard             # e.g. a self-authenticating UI with WS
+    port: 9119
+    path_prefix: /dashboard
+    auth: none
 
 # Host services — forwarding from cell to host port, through Warden.
 # Declaration here is the grant; no separate registration step.
@@ -155,19 +190,27 @@ host_sockets:
     host_path: /tmp/postgres.sock
     mount_point: /run/host/postgres.sock
     mode: rw
+
+# Host mounts — bind-mount a host directory into the cell, bounded by the
+# VM-level `mount_roots` allowlist. ro by default; rw needs `user: "0"` (above).
+# Warden does not mediate these bytes. supervised/dev only; untrusted rejects.
+# See "Host Mounts" below and invariant 13.
+mounts:
+  - {name: repo, host_path: /Users/you/work/repo, mount_point: /workspace, mode: rw}
 ```
 
 ## Ingress
 
 Cells have no inbound connectivity by default. Declaring `ingress` enables
-authenticated reverse proxying through Warden.
+reverse proxying through Warden — gated by a token (`auth: token`, default) or
+transparent (`auth: none`, the app authenticates itself).
 
 External requests reach the cell via:
 ```
 https://warden:8443/{cell_name}/{path_prefix}/...
 ```
 
-Requirements:
+Requirements (`auth: token` routes — `auth: none` routes have none):
 - Each request must include `Authorization: Bearer <token>`
 - Token is stored as a Brig secret with a strict naming convention:
   - **Preferred:** `<cell-name>-ingress-token` — per-cell token, rotate
@@ -185,7 +228,10 @@ Requirements:
 
 Security properties:
 - Opt-in (zero inbound unless declared)
-- Token-authenticated with salted SHA-256 hashing
+- `auth: token` (default) gates with a salted-SHA-256 Bearer token; `auth: none`
+  is transparent pass-through (the cell's app is the gate) — opt-in, rejected on
+  the untrusted profile, audited at run time. A route omitting `auth` defaults to
+  token (fail-secure).
 - Path-scoped (only declared prefixes are routed)
 - All inbound traffic logged
 - CONNECT tunneling blocked on ingress port
@@ -385,6 +431,40 @@ variant) is the right answer:
 unix sockets — bypass-of-warden is total there (see invariant 10).
 TCP host_services preserve warden in the path for audit + connection
 limits.
+
+## Host Mounts
+
+Bind-mount an operator-chosen host directory into the cell (ro default, rw
+opt-in). For a sandboxed agent that edits a real host folder in place. See
+`docs/design/host-mounts.md`.
+
+```yaml
+mounts:
+  - {name: repo, host_path: /Users/you/work/repo, mount_point: /workspace, mode: rw}
+  - {name: refdata, host_path: /Users/you/work/corpus, mount_point: /data}   # mode: ro default
+```
+
+Prerequisite — declare the allowlisted root(s) once (VM-level; a VM recreate
+applies the change):
+
+```
+brig config set mount_roots /Users/you/work
+```
+
+Rules:
+- `host_path` realpath must resolve under a configured `mount_roots` entry and
+  be an existing directory.
+- `mount_roots` may not be `/`, `$HOME`, `~/.ssh`/`~/.aws`/`~/.gnupg`/…, `~/.brig`,
+  `/etc`, or an ancestor/descendant of those; each root's basename (its
+  `/mnt/host/<slug>`) must be unique.
+- `mount_point` must be absolute, not shadow a system path or the cell's
+  workspace mount (`/work`).
+- Maximum 8 mounts per cell.
+- The `untrusted` profile rejects `mounts:` at parse time.
+- **Warden does not see these bytes** (like `host_sockets`). The cell can't
+  symlink-escape the subtree (mount-namespace isolation), but it *can* plant a
+  symlink a host consumer might follow — scan with `brig cell mount-scan <cell>`
+  before consuming cell-written files, and treat them as untrusted.
 
 ## Examples
 

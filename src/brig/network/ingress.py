@@ -8,7 +8,6 @@ concurrent modification when multiple cells start/stop simultaneously.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -16,6 +15,7 @@ from pathlib import Path
 
 from brig.config import HostPaths
 from brig.ops.atomic import atomic_write_json
+from brig.ops.locking import locked_file
 from brig.ops.logging import debug, info
 
 
@@ -51,7 +51,7 @@ def register_ingress(
     cell_name: str,
     cell_ip: str,
     ingress_spec: list[dict],
-    auth_token: str,
+    auth_token: str | None = None,
 ) -> None:
     """Register ingress routes for a cell.
 
@@ -59,7 +59,8 @@ def register_ingress(
         cell_name: Cell name.
         cell_ip: Cell's IP on its network (from podman inspect).
         ingress_spec: List of ingress entries from CellSpec.
-        auth_token: Raw bearer token for authentication.
+        auth_token: Raw bearer token. Required only for `auth: token` routes;
+            may be None when every route is `auth: none` (transparent).
     """
     if not ingress_spec:
         return
@@ -68,35 +69,34 @@ def register_ingress(
     lock_file = routes_file.with_suffix(".lock")
     routes_file.parent.mkdir(parents=True, exist_ok=True)
 
-    token_hash, token_salt = _hash_token(auth_token)
+    # Hash once, attached only to `auth: token` routes. `auth: none` routes
+    # carry no secret — brig doesn't gate them.
+    token_hash, token_salt = _hash_token(auth_token) if auth_token else ("", "")
 
-    with open(lock_file, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            data = _load_routes(routes_file)
+    with locked_file(lock_file):
+        data = _load_routes(routes_file)
 
-            # Remove any existing routes for this cell (idempotent).
-            data["routes"] = [
-                r for r in data["routes"] if r.get("cell") != cell_name
-            ]
+        # Remove any existing routes for this cell (idempotent).
+        data["routes"] = [
+            r for r in data["routes"] if r.get("cell") != cell_name
+        ]
 
-            # Add new routes.
-            for entry in ingress_spec:
-                data["routes"].append({
-                    "cell": cell_name,
-                    "cell_ip": cell_ip,
-                    "name": entry["name"],
-                    "port": entry["port"],
-                    "path_prefix": entry["path_prefix"],
-                    "auth": entry["auth"],
-                    "auth_secret_hash": token_hash,
-                    "auth_salt": token_salt,
-                })
+        # Add new routes.
+        for entry in ingress_spec:
+            gated = entry["auth"] != "none"
+            data["routes"].append({
+                "cell": cell_name,
+                "cell_ip": cell_ip,
+                "name": entry["name"],
+                "port": entry["port"],
+                "path_prefix": entry["path_prefix"],
+                "auth": entry["auth"],
+                "auth_secret_hash": token_hash if gated else "",
+                "auth_salt": token_salt if gated else "",
+            })
 
-            atomic_write_json(routes_file, data)
-            info(f"Registered {len(ingress_spec)} ingress routes for '{cell_name}'")
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+        atomic_write_json(routes_file, data)
+        info(f"Registered {len(ingress_spec)} ingress routes for '{cell_name}'")
 
 
 def deregister_ingress(cell_name: str) -> None:
@@ -107,18 +107,40 @@ def deregister_ingress(cell_name: str) -> None:
     if not routes_file.exists():
         return
 
-    with open(lock_file, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            data = _load_routes(routes_file)
-            before = len(data["routes"])
-            data["routes"] = [
-                r for r in data["routes"] if r.get("cell") != cell_name
-            ]
-            after = len(data["routes"])
+    with locked_file(lock_file):
+        data = _load_routes(routes_file)
+        before = len(data["routes"])
+        data["routes"] = [
+            r for r in data["routes"] if r.get("cell") != cell_name
+        ]
+        after = len(data["routes"])
 
-            if before != after:
-                atomic_write_json(routes_file, data)
-                debug(f"Deregistered {before - after} ingress routes for '{cell_name}'")
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+        if before != after:
+            atomic_write_json(routes_file, data)
+            debug(f"Deregistered {before - after} ingress routes for '{cell_name}'")
+
+
+def sweep_orphan_routes(live_cells: set[str]) -> int:
+    """Drop routes for cells not in `live_cells`. Returns count removed.
+
+    When the subnet allocator reuses a freed index, a new cell at the
+    same private IP would otherwise inherit the prior cell's hashed
+    auth token. Sweeping at known-safe moments (after `brig system
+    down`, on `brig system prune`) keeps the routes file in sync with
+    allocated cells.
+    """
+    routes_file = HostPaths.INGRESS_ROUTES_FILE
+    if not routes_file.exists():
+        return 0
+    lock_file = routes_file.with_suffix(".lock")
+    with locked_file(lock_file):
+        data = _load_routes(routes_file)
+        before = len(data["routes"])
+        data["routes"] = [
+            r for r in data["routes"] if r.get("cell") in live_cells
+        ]
+        removed = before - len(data["routes"])
+        if removed:
+            atomic_write_json(routes_file, data)
+            debug(f"Swept {removed} orphan ingress routes")
+        return removed

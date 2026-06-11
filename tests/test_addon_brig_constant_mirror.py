@@ -10,25 +10,25 @@ Add a row here whenever a new mirrored constant pair is introduced.
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
-# Stub mitmproxy so the addon modules can be imported in the test env.
-_mock = MagicMock()
-sys.modules.setdefault("mitmproxy", _mock)
-sys.modules.setdefault("mitmproxy.ctx", _mock.ctx)
-sys.modules.setdefault("mitmproxy.http", _mock.http)
+import pytest
 
-_ADDONS_DIR = str(Path(__file__).parent.parent / "src" / "addons")
+pytest.importorskip("mitmproxy", reason="install dev extras: uv pip install -e '.[dev]'")
+
+_ADDONS_DIR = str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons")
 if _ADDONS_DIR not in sys.path:
     sys.path.insert(0, _ADDONS_DIR)
 
 
-def test_host_service_suffix_matches():
-    """brig.config.HOST_SERVICE_DOMAIN_SUFFIX (if/when reintroduced) and
-    enforce.py:HOST_SERVICE_SUFFIX must agree on '.host.brig'."""
+def test_host_service_suffix_value_pinned():
+    """Pin enforce.py:HOST_SERVICE_SUFFIX to the wire-protocol value '.host.brig'.
+
+    This is a value check, not a cross-module mirror: brig.config has no
+    counterpart (host_services are read from per-cell policy, not a global
+    registry). If brig.config ever exports the suffix, make this an equality
+    assertion between the two.
+    """
     from enforce import HOST_SERVICE_SUFFIX
-    # brig.config doesn't currently export this — but the value is fixed
-    # at the wire-protocol layer. If config ever re-adds it, assert match.
     assert HOST_SERVICE_SUFFIX == ".host.brig"
 
 
@@ -48,6 +48,19 @@ def test_max_ingress_per_cell_implied_by_validator():
     """
     from brig.config import MAX_INGRESS_PER_CELL
     assert 1 <= MAX_INGRESS_PER_CELL <= 64
+
+
+def test_warden_reserved_ports_match():
+    """_policy.py hardcodes WARDEN_RESERVED_PORTS as a literal {8080, 8443}
+    because addons can't import warden.* — guard it against drift by tying it to
+    brig.config's PROXY_PORT/INGRESS_PORT (the source warden.proxy derives from).
+    """
+    from _policy import WARDEN_RESERVED_PORTS as addon_ports
+    from brig.config import INGRESS_PORT, PROXY_PORT
+    assert addon_ports == frozenset({PROXY_PORT, INGRESS_PORT}), (
+        f"WARDEN_RESERVED_PORTS drift: _policy={addon_ports}, "
+        f"brig.config={{{PROXY_PORT}, {INGRESS_PORT}}}"
+    )
 
 
 def test_blocked_networks_single_source():

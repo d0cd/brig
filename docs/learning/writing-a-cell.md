@@ -92,7 +92,7 @@ time.
 ## Accepting inbound HTTP from the host
 
 Declare an `ingress` entry to make a cell-internal port reachable
-from outside the VM through warden's authenticated reverse proxy on
+from outside the VM through warden's reverse proxy on
 `https://warden:8443/<cell>/<prefix>/...`.
 
 ```yaml
@@ -108,6 +108,10 @@ ingress:
 
 `auth: token` requires a secret named `<cell>-ingress-token` (or
 `ingress-token` as a fallback). Add it with `brig secrets add agent-ingress-token`.
+Use `auth: none` instead for a service that authenticates itself (or a browser
+WebSocket client that can't send an `Authorization` header) — brig then proxies
+transparently and the app is the gate. `auth: none` isn't allowed on the
+`untrusted` profile.
 
 ## Egress policy
 

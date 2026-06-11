@@ -77,6 +77,26 @@ class TestHostServicesPortValidation(unittest.TestCase):
         ]})
         self.assertTrue(errs)
 
+    def test_privileged_tcp_port_rejected(self):
+        # The mitmproxy user runs non-root under --cap-drop ALL, so a TCP
+        # listener on a privileged port (<1024) fails to bind and crashes
+        # the single mitmdump process — warden never comes up. Reject early.
+        from brig.cell.spec import validate_cell_definition
+        for bad in (22, 443, 1023):
+            errs = validate_cell_definition({**_base(), "host_services": [
+                {"name": "svc", "port": bad, "protocol": "tcp"},
+            ]})
+            self.assertTrue(errs, f"tcp port={bad} accepted")
+
+    def test_privileged_port_ok_for_http(self):
+        # HTTP host_services are virtual-domain rewrites, not bound listeners,
+        # so a privileged port is fine for them.
+        from brig.cell.spec import validate_cell_definition
+        errs = validate_cell_definition({**_base(), "host_services": [
+            {"name": "svc", "port": 443, "protocol": "http"},
+        ]})
+        self.assertFalse(errs, errs)
+
 
 class TestCountLimit(unittest.TestCase):
     def test_too_many_rejected(self):

@@ -83,13 +83,27 @@ def copy_in(cell_name: str, src: str, dst: str, quota: str | None = None) -> Non
 
 def _sanitize_tree(root: Path) -> None:
     """Walk a directory tree and sanitize each file."""
-    for dirpath, _, filenames in os.walk(root):
+    root_resolved = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Directory symlinks land in `dirnames`; os.walk (followlinks=False)
+        # doesn't descend into them, but a symlinked dir escaping the tree
+        # (e.g. `out -> ~/.ssh`) would otherwise be left live in the copied-out
+        # destination. Prune those before they reach the host.
+        for dirname in list(dirnames):
+            dpath = Path(dirpath) / dirname
+            if dpath.is_symlink():
+                try:
+                    dpath.resolve().relative_to(root_resolved)
+                except ValueError:
+                    warn(f"Removing dir symlink escaping tree: {dpath}")
+                    dpath.unlink()
+                    dirnames.remove(dirname)
         for filename in filenames:
             filepath = Path(dirpath) / filename
             if filepath.is_symlink():
                 # Reject symlinks pointing outside the tree.
                 try:
-                    filepath.resolve().relative_to(root.resolve())
+                    filepath.resolve().relative_to(root_resolved)
                 except ValueError:
                     warn(f"Removing symlink escaping tree: {filepath}")
                     filepath.unlink()
@@ -154,3 +168,46 @@ def _get_path_size(path: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+def find_escaping_symlinks(root: Path) -> list[tuple[Path, Path]]:
+    """Walk `root` and return (symlink, resolved_target) for every symlink
+    whose realpath escapes `root`.
+
+    Host-side guard for `mounts:` — an untrusted cell with a rw mount can plant
+    a symlink pointing out of the shared folder (e.g. -> ~/.ssh/id_rsa); a host
+    consumer that follows it escapes the folder. Same escaping-symlink check
+    the copy-out sanitizer applies, surfaced as a standalone scan. Does not
+    follow directory symlinks while walking.
+    """
+    root_resolved = root.resolve()
+    escaping: list[tuple[Path, Path]] = []
+
+    def _escapes(p: Path) -> bool:
+        try:
+            p.resolve().relative_to(root_resolved)
+            return False
+        except (ValueError, OSError):
+            return True
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in list(dirnames) + filenames:
+            p = Path(dirpath) / name
+            if p.is_symlink() and _escapes(p):
+                escaping.append((p, Path(os.path.realpath(p))))
+            # Don't descend into symlinked dirs (followlinks=False already
+            # prevents os.walk from doing so).
+    return escaping
+
+
+def quarantine_escaping_symlinks(root: Path) -> list[Path]:
+    """Remove symlinks under `root` whose realpath escapes it; return the
+    removed paths."""
+    removed: list[Path] = []
+    for link, _target in find_escaping_symlinks(root):
+        try:
+            link.unlink()
+            removed.append(link)
+        except OSError as e:
+            warn(f"Could not remove escaping symlink {link}: {e}")
+    return removed

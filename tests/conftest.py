@@ -26,6 +26,14 @@ src_dir = str(Path(__file__).parent.parent / "src")
 if src_dir not in sys.path:
     sys.path.insert(0, src_dir)
 
+# The warden addons are flat-loaded by mitmproxy and import each other as flat
+# modules (`from _common import ...`). Put their dir on the path so tests import
+# them the same way the container does (`from ingress import ...`), matching the
+# runtime /addons layout rather than treating them as a brig submodule.
+addons_dir = str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons")
+if addons_dir not in sys.path:
+    sys.path.insert(0, addons_dir)
+
 
 def make_unix_socket(td, name: str = "svc.sock") -> Path:
     """Create a bound AF_UNIX listener at td/name and return its path.

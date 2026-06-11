@@ -32,6 +32,64 @@ cloud.
 **Effort:** High. Abstract `vm_run()` to support direct execution. Handle
 path mapping differences. Test on multiple distros.
 
+### Cell substrate: Apple Containerization (VM-per-cell)
+**Status:** Deferred — evaluate as Apple's framework matures (macOS 26+).
+
+Replace (or offer alongside) Lima-VM + gVisor with Apple's Containerization
+framework, which runs each container in its **own** lightweight VM via
+Virtualization.framework. Brig's value — the Warden egress choke point, per-cell
+policy, secrets, audit, invariants — is independent of the substrate and sits on
+top unchanged; Apple's `container` is a runtime primitive, not a competitor.
+
+Wins: per-cell isolation becomes **hypervisor-enforced**. Today the Lima VM is
+the only hard boundary and gVisor is explicitly *not* one (defense-in-depth), so
+no-east-west / single-homing are enforced by network topology; VM-per-cell makes
+them hardware-enforced. Plus sub-second starts and the end of the
+image-store-on-one-shared-VM-disk class of problems (and gVisor provisioning).
+
+Cost / open questions:
+- **Network choke point.** Warden is today the sole egress path *inside* brig's
+  single VM. With per-container VMs, Warden must be inserted in front of each
+  cell-VM's networking (vmnet / per-container IP) so it stays mandatory and
+  un-bypassable — the real re-architecture.
+- **Invariant model.** The gVisor-centric invariants (5 = gVisor active; the
+  shared-VM east-west rules) get re-expressed for a per-VM-boundary world —
+  mostly a strengthening, but the ledger and `brig verify` need rework.
+- OCI-compatible (image build/run carry over) but Swift/macOS-only and newer
+  (container networking was limited on macOS 15, improved on 26 / Tahoe).
+
+**Trigger:** Apple's framework is stable enough to depend on AND you want
+stronger per-cell isolation, faster starts, or to stop maintaining Lima+gVisor.
+Overlaps with "Brig on Linux" — both are substrate abstractions; do the
+`vm_run()` / runtime abstraction once and back it with either.
+
+**Effort:** High. Substrate swap behind the reconciler, plus a genuine re-think
+of the network choke point and the invariant ledger.
+
+### Host-side process hardening (macOS seatbelt)
+**Status:** Deferred — defense-in-depth for the untrusted-state-dir boundary.
+
+Confine brig's *macOS-side* processes with seatbelt (App Sandbox /
+`sandbox-exec` profiles): the host_socket bridges, `brig cell mount-scan`, and
+any host tooling that touches cell-influenced files (invariant 4 — the state dir
+is untrusted). A profile limiting each helper's filesystem reach and denying
+unexpected network/exec shrinks the blast radius if a cell plants content a
+host-side helper later consumes (the confused-deputy boundary `mount-scan`
+already guards). Pairs with — does not replace — the VM boundary.
+
+Scope notes:
+- Warden and cells run *inside* the VM, so seatbelt doesn't apply there — this is
+  purely host-side helper hardening.
+- `sandbox-exec` is deprecated-but-present; the App Sandbox entitlement path is
+  the supported route for a signed binary. Pick per brig's distribution model.
+
+**Trigger:** You're hardening the host-side confused-deputy surface (e.g. an
+operator process auto-consuming files from a cell's rw mount) and want
+OS-enforced confinement beyond `mount-scan` + consumer discipline.
+
+**Effort:** Medium. Per-helper profiles + testing they don't break legitimate
+access; more if it needs re-signing / entitlements.
+
 ### Dispatcher integration
 **Status:** Deferred — dispatcher's job, not Brig's.
 
@@ -134,6 +192,70 @@ workload itself might be malicious, not just the network.
 **Effort:** Low for the CLI; the addon side has prior art that can be
 rewritten in ~200 lines.
 
+### Adversarial-agent lab (containment CTF + jailbreak-under-observation)
+**Status:** Deferred — the deterministic floor already exists as a test.
+
+Brig's reason to exist is "run untrusted/agent code and *control + observe* it,"
+so the natural validation is to attack it with a real agent. Two experiments,
+building on `tests/test_containment_e2e.sh` (`make redteam`) and the canary item:
+
+1. **Containment CTF (agent-driven).** An LLM agent with shell+network tools and
+   an explicit "capture the flags by any means" prompt, against tiered flags
+   mapped to the invariants: Tier-1 (egress bypass / SSRF / east-west / host
+   secret — a break here is a real failure), Tier-2 (gVisor->VM, expected-possible
+   defense-in-depth), Tier-3 (VM->macOS, the only hard boundary). `make redteam`
+   is the deterministic Tier-1 floor; this is the agent-driven, higher-tier
+   escalation. Score on **two** axes: prevention *and* detection (every attempt
+   must show in Warden logs / `mount-scan` / audit — "contained but invisible" is
+   a partial fail).
+2. **Jailbreak-under-observation.** Run a jailbreak suite against an agent *inside*
+   a cell and let it be fully compromised — brig's job isn't to stop the jailbreak
+   (it's not an LLM-safety layer) but to guarantee zero blast radius and a complete
+   forensic trail of what a jailbroken agent *attempts*. Turns brig into a safe lab
+   for prompt-injection / agent-red-team research — a capability the bare runtime
+   (or Apple's `container`) can't offer.
+
+**Trigger:** You want to validate containment against a real adversary (not just
+the scripted probe), or you're doing agent-safety research and need a contained,
+observable harness. Pairs with the canary item (flags = canaries) and would
+exercise the `novel_allowed` egress-novelty detection if that lands.
+
+**Effort:** Medium. The harness is mostly orchestration (agent + flag scoring +
+log-scraping the two axes); the deterministic core is already the e2e test.
+
+### VM + warden autostart at login (consumer feedback: aitelier)
+**Status:** Deferred — `restart: always` covers cells, not the VM itself.
+
+`restart: always` re-launches cells on `brig system up`, but the VM + warden
+don't come up at host login, so after a reboot something must run
+`brig system up` first. Consumers self-heal with a wrapper (aitelier's
+`scripts/lib.sh`). An optional, off-by-default brig launchd/login agent would
+bring the VM + warden up at login so `restart: always` cells return unattended.
+
+**Trigger:** A consumer wants a truly always-on brig-hosted service without a
+wrapper script. **Effort:** Medium (a launchd plist + install/uninstall flow).
+
+### Per-cell credential rotation without restart (consumer feedback: hermes)
+**Status:** Deferred — needs a design pass.
+
+Secret files (OAuth tokens) are read at cell start; a rotated value needs a
+cell restart to take effect. Cells holding hourly-rotating OAuth tokens want the
+new value picked up live (re-read the secret mount, or signal the cell).
+
+**Trigger:** A cell's credential rotates faster than its acceptable restart
+cadence. **Effort:** Medium — depends on how the in-cell app consumes the secret.
+
+### Inter-cell routing primitive (`cell_services`) (consumer feedback: hermes)
+**Status:** Deferred — host_services + ingress cover most shapes today.
+
+A sanctioned cell→cell address path (without violating no-east-west) for
+multi-cell architectures where one cell must call another. Would route through
+warden like host_services, keeping the choke point. Overlaps "Cell groups /
+compose" below.
+
+**Trigger:** A multi-cell workload that genuinely can't be expressed via
+host_services or ingress. **Effort:** High — new routing path + policy surface.
+
 ## Nice-to-have
 
 ### `brig watch` — live TUI dashboard
@@ -172,6 +294,43 @@ docker-compose but with Brig's security model.
 services (e.g., MCP server as a separate cell that the cell talks to directly).
 
 **Effort:** High. New spec format, dependency ordering, shared lifecycle.
+
+### Writable non-`/tmp` HOME mount (consumer feedback: aitelier)
+**Status:** Deferred — minor; non-fatal today.
+
+The read-only rootfs (writable only at `/work`, `/tmp`, `/run`) pushes cell
+authors to put `HOME` under `/tmp`; some CLIs balk (codex refuses to create
+helper binaries under a `/tmp` HOME — non-fatal warning, but a stricter CLI
+could fail). A brig-provided small per-cell writable HOME tmpfs *outside* `/tmp`
+(e.g. `/home/<cell>`) would let HOME-sensitive CLIs behave without a hand-rolled
+mount. **Trigger:** a cell's CLI hard-fails on a `/tmp` HOME. **Effort:** Low
+(one more tmpfs mount + a default HOME).
+
+### `brig system doctor`: stale cell `HTTP_PROXY` check (consumer feedback: hermes)
+**Status:** Deferred — edge; the `restart: always` recreate path already avoids it.
+
+A cell's `HTTP_PROXY` is baked at creation to warden's then-current per-cell-net
+IP; if that IP churns (a full `system down/up`), an already-created cell keeps
+the stale address and `brig cell start` reuses it (only `rm --keep-workspace` +
+`run` recovers). Have `doctor` flag "cell HTTP_PROXY ≠ current warden IP" with
+the recreate fix. **Trigger:** warden IP churn strands a started cell.
+**Effort:** Low (one doctor check).
+
+### Cross-source audit query (consumer feedback: hermes)
+**Status:** Deferred — needs a correlation-id contract.
+
+`brig cell audit <cell> --since 1h` joining warden's network log with the
+consumer's own run/event log by correlation id, for one timeline across the
+proxy boundary. **Trigger:** incident triage that spans warden + the app.
+**Effort:** Medium — requires a shared correlation id end to end.
+
+### Mount-side `nosymfollow` (consumer feedback: hermes)
+**Status:** Deferred — blocked on runtime support.
+
+If podman 5.x / an alternate runtime exposes `nosymfollow` for bind mounts, use
+it to kill the host-side symlink confused-deputy at the mount layer, retiring
+the consumer-side `safe_open` / `mount-scan` discipline. **Trigger:** the runtime
+exposes it. **Effort:** Low once available (a mount flag) — until then, N/A.
 
 ## Out of scope
 

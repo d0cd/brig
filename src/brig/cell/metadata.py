@@ -10,18 +10,29 @@ writes a small JSON file on the host, podman bind-mounts it read-only
 into the cell at `/run/brig/cell.json`. The cell can read but not
 modify it.
 
-Schema (v2):
+Schema (v3):
     {
-      "version": 2,
+      "version": 3,
       "name": "<cell-name>",
       "started_at": "<RFC 3339 UTC>",
       "workspace": {
         "mount_point": "/work"
       },
+      "host_sockets": [{"name": ..., "mount_point": ...}, ...],
+      "ingress":      [{"name": ..., "port": int,
+                        "path_prefix": ..., "auth": "token"}, ...],
+      "image_digest": "sha256:..."  // optional; only when pinned
       "policy": {
-        "host_services": ["<svc-name>", ...]   // per-cell ACL (may be empty)
+        "host_services": ["<svc-name>", ...]   // per-cell ACL
       }
     }
+
+What changed since v2:
+  - `ingress` added so `brig cell start` can replay route registration
+    without the original yaml. No secrets land here.
+  - `image_digest` added so `brig cell start` can re-verify the pinned
+    digest before letting the container start.
+  Both fields are optional and additive — v2 readers ignore them.
 
 Why v2 dropped `workspace.host_path`: publishing the absolute host
 path made it trivial for a consumer to do plain `open(host_path)`,
@@ -50,7 +61,7 @@ from brig.config import HostPaths, VMPaths
 from brig.ops.atomic import atomic_write_json
 from brig.policy.policy import load_cell_policy
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 IN_CELL_PATH = "/run/brig/cell.json"
 
 
@@ -66,12 +77,63 @@ def _vm_metadata_path(cell_name: str) -> Path:
     return VMPaths.STATE_DIR / cell_name / "cell-metadata.json"
 
 
+def _host_spec_path(cell_name: str) -> Path:
+    """Where brig persists a `restart: always` cell's full spec, so
+    `brig system up` can replay it after a VM restart drops the container."""
+    return HostPaths.STATE_DIR / cell_name / "cell-spec.json"
+
+
+def write_cell_spec(spec: Any) -> None:
+    """Persist a cell's full spec when restart == "always" (else remove any
+    stale copy). Mode 0600 since env values may carry sensitive data."""
+    import dataclasses
+    if getattr(spec, "restart", "no") != "always":
+        remove_cell_spec(spec.name)
+        return
+    atomic_write_json(_host_spec_path(spec.name), dataclasses.asdict(spec), mode=0o600)
+
+
+def remove_cell_spec(cell_name: str) -> None:
+    """Delete a cell's persisted restart spec so it can't be resurrected by
+    restart:always on the next `brig system up`."""
+    try:
+        _host_spec_path(cell_name).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def read_cell_spec(cell_name: str) -> dict[str, Any] | None:
+    """Read a persisted cell spec, or None if absent/unreadable."""
+    import json as _json
+    try:
+        data = _json.loads(_host_spec_path(cell_name).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def restorable_cell_specs() -> list[dict[str, Any]]:
+    """All persisted specs whose restart policy is "always"."""
+    out: list[dict[str, Any]] = []
+    base = HostPaths.STATE_DIR
+    if not base.is_dir():
+        return out
+    for entry in sorted(base.iterdir()):
+        if not entry.is_dir():
+            continue
+        spec = read_cell_spec(entry.name)
+        if spec and spec.get("restart") == "always":
+            out.append(spec)
+    return out
+
+
 def build_metadata(
     cell_name: str,
     workspace_mount: str,
     started_at: datetime | None = None,
     host_sockets: list[dict[str, Any]] | None = None,
     ingress: list[dict[str, Any]] | None = None,
+    image_digest: str | None = None,
 ) -> dict[str, Any]:
     """Compose the cell metadata payload. Pure function for testability.
 
@@ -121,23 +183,29 @@ def build_metadata(
             "host_services": _per_cell_host_services(cell_name),
         },
     }
+    if image_digest:
+        payload["image_digest"] = image_digest
     return payload
 
 
 def _per_cell_host_services(cell_name: str) -> list[str]:
-    """Read the cell's per-cell policy and return its host_services ACL.
+    """Read the cell's per-cell policy and return its host_services ACL
+    as a list of names.
 
-    Returns an empty list if no per-cell policy exists (the default —
-    cells have no host-service access until granted).
+    The on-disk shape is `[{name, port, protocol}, ...]` — the in-cell
+    metadata only exposes the names (no port leak into the cell's view
+    of its own ACL). Returns empty list if no per-cell policy exists.
     """
     policy = load_cell_policy(cell_name)
     if not policy:
         return []
-    services = policy.get("host_services", [])
-    # The per-cell shape stores bare names (strings). Defensively filter to
-    # strings only in case someone hand-edited the file with the global
-    # shape (dicts with name+port).
-    return [s for s in services if isinstance(s, str)]
+    names: list[str] = []
+    for s in policy.get("host_services", []):
+        if isinstance(s, dict) and isinstance(s.get("name"), str):
+            names.append(s["name"])
+        elif isinstance(s, str):
+            names.append(s)
+    return names
 
 
 def refresh_metadata_if_present(cell_name: str) -> Path | None:
@@ -149,9 +217,9 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     no metadata file (cell was never started, or was removed).
 
     Bind mounts are fixed at podman-create time, so the cell's running
-    container can't pick up a new workspace_mount — we preserve whatever
-    was originally set. The policy field is the only one that can drift
-    out of sync; that's what this fixes.
+    container can't pick up a new workspace_mount — the original is
+    preserved. The policy field is the only one that can drift out of
+    sync, so it is re-synced here.
     """
     import json as _json
     existing = _host_metadata_path(cell_name)
@@ -172,6 +240,7 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     return write_metadata(
         cell_name, workspace_mount,
         host_sockets=prior_sockets, ingress=prior_ingress,
+        image_digest=read_image_digest(cell_name),
     )
 
 
@@ -195,11 +264,43 @@ def read_ingress(cell_name: str) -> list[dict[str, Any]]:
     ]
 
 
+def read_host_sockets(cell_name: str) -> list[dict[str, Any]]:
+    """Return the cell's stored host_sockets entries from cell-metadata.json.
+
+    Only the cell-visible projection (name, mount_point) is stored — host_path
+    is deliberately omitted (the file is mounted into the untrusted cell), so
+    bridges cannot be reconstructed from this alone. Used to detect that a
+    cell declares host_sockets, not to recreate them.
+    """
+    import json as _json
+    try:
+        payload = _json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return []
+    return [e for e in (payload.get("host_sockets", []) or []) if isinstance(e, dict)]
+
+
+def read_image_digest(cell_name: str) -> str | None:
+    """Return the cell's stored image_digest from cell-metadata.json.
+
+    None when the cell was created without a pinned digest, the file
+    predates the field, or is unreadable.
+    """
+    import json as _json
+    try:
+        payload = _json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return None
+    val = payload.get("image_digest")
+    return val if isinstance(val, str) and val else None
+
+
 def write_metadata(
     cell_name: str,
     workspace_mount: str,
     host_sockets: list[dict[str, Any]] | None = None,
     ingress: list[dict[str, Any]] | None = None,
+    image_digest: str | None = None,
 ) -> Path:
     """Write the cell's metadata JSON to the host path. Returns the path.
 
@@ -214,6 +315,7 @@ def write_metadata(
     payload = build_metadata(
         cell_name, workspace_mount,
         host_sockets=host_sockets, ingress=ingress,
+        image_digest=image_digest,
     )
     target = _host_metadata_path(cell_name)
     atomic_write_json(target, payload, mode=0o644)

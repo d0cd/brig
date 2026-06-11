@@ -1,17 +1,18 @@
-"""Tests for addons.ops — merged metrics, rate limiting, and health addon."""
+"""Tests for addons.ops — merged metrics, rate limiting, and health addon.
 
-import sys
+Imports the real mitmproxy (installed via the dev extras) so an API
+drift in mitmproxy surfaces as a unit-test failure instead of an E2E
+surprise. Tests skip if mitmproxy is unavailable — `uv pip install -e
+'.[dev]'` to enable.
+"""
+
 import unittest
 
 import pytest
-from unittest.mock import MagicMock
 
-# Mock mitmproxy before importing.
-sys.modules["mitmproxy"] = MagicMock()
-sys.modules["mitmproxy.http"] = MagicMock()
-sys.modules["mitmproxy.ctx"] = MagicMock()
+pytest.importorskip("mitmproxy", reason="install dev extras: uv pip install -e '.[dev]'")
 
-from addons.ops import OpsAddon, TokenBucket
+from ops import OpsAddon, TokenBucket
 
 
 class TestTokenBucket(unittest.TestCase):

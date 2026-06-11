@@ -12,7 +12,7 @@ Lifecycle:
   - `brig run` calls start_cell_bridges(spec.name, spec.host_sockets)
     BEFORE the reconciler attempts the cell start. The runtime check
     in the reconciler then sees the bridge socket and proceeds.
-  - `brig stop` / `brig rm` calls stop_cell_bridges(spec.name) to
+  - `brig cell stop` / `brig cell rm` calls stop_cell_bridges(spec.name) to
     bootout the launchd jobs and remove plist files.
 
 Threat surface: socat now sits on the trust path between cell and host
@@ -129,8 +129,12 @@ def generate_plist(
 """
 
 
-def _validate_target(host_path: str) -> None:
+def _validate_target(host_path: str) -> str:
     """Runtime guard: reject engine sockets and non-socket targets.
+
+    Returns the validated canonical realpath so the caller can freeze THAT
+    exact value into the launchd plist — recomputing realpath at write time
+    would reopen a TOCTOU window between validation and freeze.
 
     Defense in depth:
       - Realpath-resolve to defeat symlinks at ANY level (parent dir
@@ -170,14 +174,12 @@ def _validate_target(host_path: str) -> None:
             f"host_socket target {host_path} is a symlink — "
             f"refusing to bridge through a symlink",
         )
-    # Realpath canonicalizes the entire ancestor chain — any symlink
-    # at any level gets resolved here, so a post-validation swap of a
-    # parent directory can't redirect us to attacker-controlled
-    # storage. We then stat (NOT lstat) the realpath: realpath already
-    # collapsed any symlinks; we just want S_ISSOCK on the canonical
-    # path. A normal /tmp → /private/tmp Mac-ism is fine; what we
-    # reject is a final-target that isn't actually a socket.
-    real = os.path.realpath(host_path)
+    # Reuse the single `real` resolved above for the socket check — resolving
+    # a second time would let the denylist decision and the frozen/returned
+    # value diverge if the filesystem changed between the two calls. We stat
+    # (NOT lstat) the canonical path: realpath already collapsed any symlinks;
+    # we just want S_ISSOCK on it. A normal /tmp → /private/tmp Mac-ism is
+    # fine; what we reject is a final target that isn't actually a socket.
     try:
         real_st = os.stat(real)
     except FileNotFoundError:
@@ -190,6 +192,15 @@ def _validate_target(host_path: str) -> None:
             f"host_socket target {host_path} is not a unix socket "
             f"(realpath={real}, mode={oct(real_st.st_mode)})",
         )
+    # socat treats ',' as its address-option separator, so a comma in the
+    # canonical path would be parsed as filename + options in the generated
+    # `UNIX-CONNECT:<real>` plist line. Refuse it (XML-escaping doesn't help).
+    if "," in real:
+        raise BrigError(
+            f"host_socket target realpath {real} contains a comma, which "
+            f"socat would misparse as an option separator — rename the path",
+        )
+    return real
 
 
 def start_cell_bridges(
@@ -213,9 +224,12 @@ def start_cell_bridges(
             suggestion="brew install socat",
         )
 
-    # Validate every target up front so we don't half-bridge.
+    # Validate every target up front so we don't half-bridge, capturing the
+    # canonical realpath each one validated to (keyed by socket name) so the
+    # write loop freezes the exact validated path rather than re-resolving.
+    validated_real: dict[str, str] = {}
     for entry in host_sockets:
-        _validate_target(entry["host_path"])
+        validated_real[entry["name"]] = _validate_target(entry["host_path"])
 
     bridge_dir = _bridge_dir_for_cell(cell_name)
     bridge_dir.mkdir(parents=True, exist_ok=True)
@@ -225,7 +239,6 @@ def start_cell_bridges(
     try:
         for entry in host_sockets:
             sock_name = entry["name"]
-            target = entry["host_path"]
             label = _label_for(cell_name, sock_name)
             bridge = _bridge_path(cell_name, sock_name)
             plist = _plist_path(cell_name, sock_name)
@@ -236,12 +249,11 @@ def start_cell_bridges(
                 bridge.unlink()
 
             # Freeze the connect target by writing the realpath into the
-            # plist instead of the literal path. _validate_target() above
-            # already rejected leaf symlinks and ancestor-chain redirects,
-            # but socat would otherwise follow any post-validation symlink
-            # swap. Baking the canonical path into the launchd config closes
-            # that window — socat connects to a fixed inode chain.
-            target_real = os.path.realpath(target)
+            # plist instead of the literal path. Use the exact value that
+            # _validate_target() resolved-and-checked above; re-resolving here
+            # would reopen the validate→freeze TOCTOU a swapped symlink could
+            # exploit. socat then connects to a fixed canonical path.
+            target_real = validated_real[sock_name]
             xml = generate_plist(
                 label=label, socat_bin=socat,
                 bridge_path=str(bridge), target_path=target_real,
@@ -265,6 +277,12 @@ def start_cell_bridges(
                         f"{res.stderr.strip()}",
                     )
 
+            # Track the label as soon as the job is loaded — BEFORE waiting for
+            # the socket. The job has KeepAlive=true and respawns socat, so a
+            # readiness timeout below must still reach the rollback boot-out;
+            # appending only after _wait_for_socket would leak the live job.
+            started.append(label)
+
             if not _wait_for_socket(bridge):
                 raise BrigError(
                     f"bridge socket for '{sock_name}' did not appear at "
@@ -272,8 +290,7 @@ def start_cell_bridges(
                     f"check /tmp/{label}.err.log",
                 )
 
-            started.append(label)
-            info(f"host_socket bridge started: {sock_name} → {target}")
+            info(f"host_socket bridge started: {sock_name} → {target_real}")
     except Exception:
         for label in started:
             # Best-effort cleanup; ignore errors here so the original

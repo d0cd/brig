@@ -68,8 +68,16 @@ class TestVerifyAgainstRealPodman(unittest.TestCase):
         inspect = json.loads(_load("inspect_warden.json"))[0]
         networks = list(inspect["NetworkSettings"]["Networks"].keys())
         template_output = " ".join(networks)
+        # Second call enumerates proxy-external members; only warden (infra)
+        # is attached in a healthy system.
+        members_output = json.dumps([
+            {"name": "proxy-external", "containers": {"abc": {"name": "warden"}}}
+        ])
         with patch("brig.security.verify.vm_run") as mock_vm:
-            mock_vm.return_value = _completed(template_output)
+            mock_vm.side_effect = [
+                _completed(template_output),
+                _completed(members_output),
+            ]
             result = verify_proxy_network()
             self.assertTrue(result.passed, msg=result.message)
 

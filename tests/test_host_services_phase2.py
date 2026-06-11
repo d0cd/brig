@@ -23,7 +23,7 @@ def _spec(host_services=None):
 class TestPolicyParsesFlattenedShape(unittest.TestCase):
     def test_dict_shape_populates_map(self):
         import sys
-        sys.path.insert(0, "src/addons")
+        sys.path.insert(0, "src/brig/warden_addons")
         try:
             from _policy import Policy
             p = Policy(host_services=[
@@ -36,7 +36,7 @@ class TestPolicyParsesFlattenedShape(unittest.TestCase):
 
     def test_bare_name_entries_dropped(self):
         import sys
-        sys.path.insert(0, "src/addons")
+        sys.path.insert(0, "src/brig/warden_addons")
         try:
             from _policy import Policy
             p = Policy(host_services=["db", "redis"])
@@ -46,7 +46,7 @@ class TestPolicyParsesFlattenedShape(unittest.TestCase):
 
     def test_none_means_no_grant(self):
         import sys
-        sys.path.insert(0, "src/addons")
+        sys.path.insert(0, "src/brig/warden_addons")
         try:
             from _policy import Policy
             p = Policy(host_services=None)
@@ -54,10 +54,45 @@ class TestPolicyParsesFlattenedShape(unittest.TestCase):
             sys.path.pop(0)
         self.assertIsNone(p.host_services_map)
 
+    def test_out_of_range_and_reserved_http_ports_dropped(self):
+        """The on-disk policy is untrusted (invariant 4): a tampered file
+        must not rewrite a .host.brig request to an arbitrary or reserved
+        host port (Warden-as-gateway). Bad entries are dropped."""
+        import sys
+        sys.path.insert(0, "src/brig/warden_addons")
+        try:
+            from _policy import Policy
+            p = Policy(host_services=[
+                {"name": "zero", "port": 0, "protocol": "http"},
+                {"name": "negative", "port": -1, "protocol": "http"},
+                {"name": "huge", "port": 70000, "protocol": "http"},
+                {"name": "proxy", "port": 8080, "protocol": "http"},
+                {"name": "ingress", "port": 8443, "protocol": "http"},
+                {"name": "ok", "port": 4000, "protocol": "http"},
+            ])
+        finally:
+            sys.path.pop(0)
+        # Out-of-range and warden-reserved ports are dropped; valid survives.
+        self.assertEqual(p.host_services_map, {"ok": 4000})
+
+    def test_out_of_range_and_reserved_tcp_ports_dropped(self):
+        import sys
+        sys.path.insert(0, "src/brig/warden_addons")
+        try:
+            from _policy import Policy
+            p = Policy(host_services=[
+                {"name": "bad", "port": 99999, "protocol": "tcp"},
+                {"name": "ingress", "port": 8443, "protocol": "tcp"},
+                {"name": "ok", "port": 5432, "protocol": "tcp"},
+            ])
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(p.tcp_host_services_map, {"ok": 5432})
+
 
 class TestSyncHostServicesPolicy(unittest.TestCase):
     def _run(self, host_services, prior=None):
-        from brig.commands.lifecycle_cmd import _sync_cell_policy
+        from brig.commands.lifecycle_run import _sync_cell_policy
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             policy_dir = td / "policies"
@@ -67,7 +102,7 @@ class TestSyncHostServicesPolicy(unittest.TestCase):
             logs: list[str] = []
             with patch("brig.policy.policy.get_cell_policy_path",
                        side_effect=lambda name, *a, **kw: policy_dir / f"{name}.json"), \
-                 patch("brig.commands.lifecycle_cmd.info",
+                 patch("brig.cell.lifecycle.info",
                        side_effect=logs.append):
                 _sync_cell_policy(_spec(host_services=host_services))
             after = None

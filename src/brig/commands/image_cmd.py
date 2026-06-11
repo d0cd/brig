@@ -9,7 +9,7 @@ import re
 import subprocess
 import tarfile
 from pathlib import Path
-from typing import Any
+import argparse
 
 from brig.vm.shell import vm_run
 from brig.errors import BrigError
@@ -50,12 +50,12 @@ def _resolve_warden_ip() -> str:
     # Prefer the proxy-external bridge; that's the one the build
     # container's host-networking namespace can reach.
     ext = nets.get(PROXY_EXTERNAL_NETWORK) or {}
-    ip = ext.get("IPAddress", "")
+    ip = str(ext.get("IPAddress", ""))
     if ip:
         return ip
     raise BrigError(
         f"Warden is not attached to network '{PROXY_EXTERNAL_NETWORK}'",
-        suggestion="brig system restart  (force warden to rejoin)",
+        suggestion="brig system down && brig system up  (force warden to rejoin)",
     )
 
 
@@ -228,7 +228,7 @@ def _stream_tar_context(ctx: Path, patterns: list[str]) -> bytes:
     return buf.getvalue()
 
 
-def cmd_build(args: Any) -> int:
+def cmd_build(args: argparse.Namespace) -> int:
     """Handle `brig image build <context-dir>` — build a container image.
 
     Brig runs podman inside the Lima VM, and only ~/.brig/* is mounted
@@ -278,12 +278,11 @@ def cmd_build(args: Any) -> int:
         build_args += ["--build-arg", ba]
 
     # --use-warden routes build-time HTTP(S) traffic through warden
-    # using the standard HTTPS_PROXY pattern. Closes the build/runtime
-    # asymmetry aitelier reported: today's build path is fast+unfiltered,
-    # runtime is slow+MITM'd, so operators pre-bake ~230 MB binaries to
-    # avoid timeouts. With --use-warden the build hits the same warden
-    # path as runtime; subsequent layer caches amortize the warden
-    # overhead.
+    # using the standard HTTPS_PROXY pattern. Without it the build path is
+    # fast+unfiltered while runtime is slow+MITM'd, tempting operators to
+    # pre-bake large binaries to avoid timeouts. With --use-warden the build
+    # hits the same warden path as runtime; subsequent layer caches amortize
+    # the warden overhead.
     extra_mounts: list[str] = []
     if getattr(args, "use_warden", False):
         from brig.cell.ca_bundle import VM_WARDEN_CA_FILE
@@ -291,7 +290,7 @@ def cmd_build(args: Any) -> int:
         if not proxy_running():
             raise BrigError(
                 "Warden proxy is not running",
-                suggestion="Start with: brig up  (or omit --use-warden)",
+                suggestion="Start with: brig system up  (or omit --use-warden)",
             )
         # Pre-check the warden CA file exists. We mount it into the
         # build container below; if it's missing podman build fails
@@ -302,7 +301,7 @@ def cmd_build(args: Any) -> int:
             raise BrigError(
                 f"Warden CA cert is missing at {VM_WARDEN_CA_FILE}",
                 suggestion=(
-                    "Bring warden up first: brig up\n"
+                    "Bring warden up first: brig system up\n"
                     "  (warden generates its CA at startup; the build "
                     "would have no cert to mount otherwise)"
                 ),
@@ -313,7 +312,8 @@ def cmd_build(args: Any) -> int:
         # We pass the gateway IP literal — DNS for `warden.brig` isn't
         # plumbed into the build container's resolv.conf.
         warden_ip = _resolve_warden_ip()
-        proxy_url = f"http://{warden_ip}:8080"
+        from brig.config import PROXY_PORT
+        proxy_url = f"http://{warden_ip}:{PROXY_PORT}"
         # NO_PROXY excludes localhost so build-time sidecars (test
         # servers, etc.) don't try to proxy through warden. The list is
         # what apt/curl/npm/pip all recognize.
@@ -365,17 +365,22 @@ def cmd_build(args: Any) -> int:
     return 0
 
 
-def cmd_pull(args: Any) -> int:
-    """Handle `brig pull` — pull and cache an image.
+def cmd_pull(args: argparse.Namespace) -> int:
+    """Handle `brig image pull` — pull and cache an image.
 
     Streams podman's progress directly to the user's terminal (instead
     of capturing it) so large pulls don't look frozen. podman writes
     layer-by-layer progress to stderr; with capture=False the user sees
     it live.
     """
+    if args.image.startswith("-"):
+        raise BrigError(
+            f"'{args.image}' must not start with '-' (would be parsed as a "
+            f"podman flag)"
+        )
     info(f"Pulling {args.image}...")
     result = vm_run(
-        ["podman", "pull", args.image],
+        ["podman", "pull", "--", args.image],
         capture=False,
     )
     if result.returncode != 0:
@@ -384,32 +389,40 @@ def cmd_pull(args: Any) -> int:
     return 0
 
 
-def cmd_warmup(args: Any) -> int:
-    """Handle `brig warmup` — pre-pull images for a profile."""
-    from brig.cell.profiles import load_profile
+def cmd_warmup(args: argparse.Namespace) -> int:
+    """Handle `brig image warmup` — pre-pull the warden proxy base image.
 
-    profile_name = getattr(args, "profile", None)
-    if profile_name:
-        load_profile(profile_name)  # Validate profile exists.
-
-    # Warmup just ensures the proxy image is available.
+    Profiles don't carry an image (they set resource/network/policy
+    defaults), so there's nothing profile-specific to warm; this just ensures
+    the mitmproxy base image the warden image builds from is cached.
+    """
     output("Warming up proxy image...")
+    from warden.proxy import BASE_IMAGE
     result = vm_run(
-        ["podman", "image", "exists",
-         "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268"],
+        ["podman", "image", "exists", BASE_IMAGE],
     )
     if result.returncode != 0:
         output("Pulling proxy image...")
-        vm_run(
-            ["podman", "pull",
-             "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268"],
+        pull = vm_run(
+            ["podman", "pull", BASE_IMAGE],
         )
+        if pull.returncode != 0:
+            raise BrigError(
+                f"Failed to warm up proxy image: {pull.stderr.strip()}",
+                suggestion="Check VM/network connectivity, then retry; "
+                           "brig system doctor",
+            )
     output("Warmup complete")
     return 0
 
 
-def cmd_verify_image(args: Any) -> int:
-    """Handle `brig image-verify` — verify image signature."""
+def cmd_verify_image(args: argparse.Namespace) -> int:
+    """Handle `brig image verify` — verify image signature."""
+    if args.image.startswith("-"):
+        raise BrigError(
+            f"'{args.image}' must not start with '-' (would be parsed as a "
+            f"cosign/podman flag)"
+        )
     ok, msg, details = verify_image_signature(
         args.image,
         key=getattr(args, "key", None),

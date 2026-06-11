@@ -21,8 +21,8 @@ processors:
     limit_mib: 256
     spike_limit_mib: 64
   batch:
-    # 200ms is small enough that `brig system stats --watch` feels live
-    # but large enough that gRPC overhead is amortized.
+    # 200ms is small enough that live metric reads feel current but large
+    # enough that gRPC overhead is amortized.
     timeout: 200ms
     send_batch_size: 1024
 
@@ -34,16 +34,8 @@ exporters:
     # Convert OTel histograms to prometheus histograms.
     send_timestamps: true
     metric_expiration: 24h
-  # Default in-memory trace store; the CLI reads recent spans via
-  # the debug exporter's exported file. For real trace storage,
-  # operators add an OTLP exporter pointing at Tempo / Jaeger here.
-  file/traces:
-    path: /var/lib/otel/traces.jsonl
-    rotation:
-      max_megabytes: 100
-      max_days: 7
-      max_backups: 3
-  # Same shape for logs — brig cell network reads from here.
+  # File store for warden's per-request log records — brig cell network reads
+  # from here.
   file/logs:
     path: /var/lib/otel/logs.jsonl
     rotation:
@@ -60,10 +52,6 @@ service:
       receivers: [otlp]
       processors: [memory_limiter, batch]
       exporters: [prometheus]
-    traces:
-      receivers: [otlp]
-      processors: [memory_limiter, batch]
-      exporters: [file/traces]
     logs:
       receivers: [otlp]
       processors: [memory_limiter, batch]

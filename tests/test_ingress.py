@@ -54,6 +54,36 @@ class TestIngressSpecValidation(unittest.TestCase):
         errors = validate_cell_definition(cell_def)
         self.assertEqual(errors, [])
 
+    def test_auth_none_accepted(self):
+        cell_def = {
+            "name": "test", "image": "alpine",
+            "ingress": [
+                {"name": "dash", "port": 9119, "path_prefix": "/dash", "auth": "none"},
+            ],
+        }
+        self.assertEqual(validate_cell_definition(cell_def), [])
+
+    def test_auth_none_rejected_on_untrusted_profile(self):
+        cell_def = {
+            "name": "test", "image": "alpine", "profile": "untrusted",
+            "ingress": [
+                {"name": "dash", "port": 9119, "path_prefix": "/dash", "auth": "none"},
+            ],
+        }
+        errs = validate_cell_definition(cell_def)
+        self.assertTrue(any("auth: none" in e for e in errs), errs)
+
+    def test_auth_token_still_ok_on_untrusted_profile(self):
+        # token ingress must remain allowed on untrusted — only `none` is gated.
+        cell_def = {
+            "name": "test", "image": "alpine", "profile": "untrusted",
+            "ingress": [
+                {"name": "api", "port": 8642, "path_prefix": "/api", "auth": "token"},
+            ],
+        }
+        errs = validate_cell_definition(cell_def)
+        self.assertFalse(any("ingress" in e for e in errs), errs)
+
     def test_ingress_not_list(self):
         errors = validate_cell_definition({"ingress": "bad"})
         self.assertTrue(any("must be a list" in e for e in errors))
@@ -146,7 +176,7 @@ class TestIngressSpecValidation(unittest.TestCase):
 
     def test_ingress_invalid_auth_method(self):
         errors = validate_cell_definition({"ingress": [
-            {"name": "api", "port": 8080, "path_prefix": "/api", "auth": "none"},
+            {"name": "api", "port": 8080, "path_prefix": "/api", "auth": "basic"},
         ]})
         self.assertTrue(any("auth" in e and "must be one of" in e for e in errors))
 
@@ -231,6 +261,34 @@ class TestIngressRouteManagement(unittest.TestCase):
         self.assertNotIn("test-token-123", self.routes_file.read_text())
 
     @patch("brig.network.ingress.HostPaths")
+    def test_register_auth_none_needs_no_token(self, mock_paths):
+        mock_paths.INGRESS_ROUTES_FILE = self.routes_file
+        from brig.network.ingress import register_ingress
+        register_ingress(
+            "mycell", "10.60.1.2",
+            [{"name": "dash", "port": 9119, "path_prefix": "/dash", "auth": "none"}],
+            None,  # transparent — no token
+        )
+        route = json.loads(self.routes_file.read_text())["routes"][0]
+        self.assertEqual(route["auth"], "none")
+        self.assertEqual(route["auth_secret_hash"], "")
+        self.assertEqual(route["auth_salt"], "")
+
+    @patch("brig.network.ingress.HostPaths")
+    def test_register_mixed_auth_only_token_route_gets_hash(self, mock_paths):
+        mock_paths.INGRESS_ROUTES_FILE = self.routes_file
+        from brig.network.ingress import register_ingress
+        register_ingress(
+            "mycell", "10.60.1.2",
+            [{"name": "api", "port": 8642, "path_prefix": "/api", "auth": "token"},
+             {"name": "dash", "port": 9119, "path_prefix": "/dash", "auth": "none"}],
+            "test-token-123",
+        )
+        routes = {r["name"]: r for r in json.loads(self.routes_file.read_text())["routes"]}
+        self.assertTrue(routes["api"]["auth_secret_hash"])      # gated
+        self.assertEqual(routes["dash"]["auth_secret_hash"], "")  # open
+
+    @patch("brig.network.ingress.HostPaths")
     def test_register_idempotent(self, mock_paths):
         """Registering the same cell twice replaces routes, doesn't duplicate."""
         mock_paths.INGRESS_ROUTES_FILE = self.routes_file
@@ -294,6 +352,98 @@ class TestIngressRouteManagement(unittest.TestCase):
         self.assertEqual(len(data["routes"]), 1)
         self.assertEqual(data["routes"][0]["cell"], "cell2")
 
+    @patch("brig.network.ingress.HostPaths")
+    def test_sweep_orphan_routes_drops_unallocated(self, mock_paths):
+        """sweep_orphan_routes deletes routes whose cell isn't currently
+        allocated a subnet. Defends against subnet reuse handing a new
+        cell another cell's auth hash."""
+        mock_paths.INGRESS_ROUTES_FILE = self.routes_file
+        from brig.network.ingress import register_ingress, sweep_orphan_routes
+        register_ingress("alive", "10.60.1.2",
+            [{"name": "api", "port": 8000, "path_prefix": "/a", "auth": "token"}],
+            "t1")
+        register_ingress("ghost", "10.60.2.2",
+            [{"name": "api", "port": 8000, "path_prefix": "/g", "auth": "token"}],
+            "t2")
+
+        removed = sweep_orphan_routes(live_cells={"alive"})
+
+        self.assertEqual(removed, 1)
+        routes = json.loads(self.routes_file.read_text())["routes"]
+        self.assertEqual([r["cell"] for r in routes], ["alive"])
+
+    @patch("brig.network.ingress.HostPaths")
+    def test_sweep_orphan_routes_noop_when_clean(self, mock_paths):
+        mock_paths.INGRESS_ROUTES_FILE = self.routes_file
+        from brig.network.ingress import register_ingress, sweep_orphan_routes
+        register_ingress("alive", "10.60.1.2",
+            [{"name": "api", "port": 8000, "path_prefix": "/a", "auth": "token"}],
+            "t1")
+        removed = sweep_orphan_routes(live_cells={"alive"})
+        self.assertEqual(removed, 0)
+
+
+class TestRegisterIngressForValidation(unittest.TestCase):
+    """register_ingress_for accepts ingress entries from on-disk metadata
+    (untrusted per invariant 4) and must re-validate them with the same
+    rules `_v_ingress_entry` applies at yaml parse time."""
+
+    def _entry(self, **over):
+        e = {"name": "api", "port": 8000, "path_prefix": "/api", "auth": "token"}
+        e.update(over)
+        return e
+
+    def test_tampered_port_zero_rejected(self):
+        from unittest.mock import patch
+        from brig.cell.lifecycle import register_ingress_for
+        from brig.errors import BrigError
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value={"NetworkSettings": {"Networks":
+                       {"brig-c": {"IPAddress": "10.60.1.2"}}}}):
+            with self.assertRaises(BrigError):
+                register_ingress_for("c", [self._entry(port=0)])
+
+    def test_tampered_port_out_of_range_rejected(self):
+        from unittest.mock import patch
+        from brig.cell.lifecycle import register_ingress_for
+        from brig.errors import BrigError
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value={"NetworkSettings": {"Networks":
+                       {"brig-c": {"IPAddress": "10.60.1.2"}}}}):
+            with self.assertRaises(BrigError):
+                register_ingress_for("c", [self._entry(port=99999)])
+
+    def test_tampered_path_prefix_rejected(self):
+        from unittest.mock import patch
+        from brig.cell.lifecycle import register_ingress_for
+        from brig.errors import BrigError
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value={"NetworkSettings": {"Networks":
+                       {"brig-c": {"IPAddress": "10.60.1.2"}}}}):
+            for bad in ("not-absolute", "/with/../traversal", "/has spaces"):
+                with self.assertRaises(BrigError, msg=f"prefix {bad!r}"):
+                    register_ingress_for("c", [self._entry(path_prefix=bad)])
+
+    def test_unknown_auth_method_rejected(self):
+        from unittest.mock import patch
+        from brig.cell.lifecycle import register_ingress_for
+        from brig.errors import BrigError
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value={"NetworkSettings": {"Networks":
+                       {"brig-c": {"IPAddress": "10.60.1.2"}}}}):
+            with self.assertRaises(BrigError):
+                register_ingress_for("c", [self._entry(auth="bearer")])
+
+    def test_missing_required_field_rejected(self):
+        from unittest.mock import patch
+        from brig.cell.lifecycle import register_ingress_for
+        from brig.errors import BrigError
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value={"NetworkSettings": {"Networks":
+                       {"brig-c": {"IPAddress": "10.60.1.2"}}}}):
+            with self.assertRaises(BrigError):
+                register_ingress_for("c", [{"name": "api", "port": 8000}])
+
 
 class TestIngressAddonRouteMatching(unittest.TestCase):
     """Test the ingress addon route matching logic."""
@@ -301,7 +451,7 @@ class TestIngressAddonRouteMatching(unittest.TestCase):
     def _make_route(self, **kwargs):
         # Import from addons path — need to handle the path.
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
         try:
             from ingress import IngressRoute
         finally:
@@ -340,7 +490,7 @@ class TestIngressAddonTokenAuth(unittest.TestCase):
 
     def _get_router_class(self):
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
         try:
             from ingress import IngressRouter
         finally:
@@ -367,6 +517,24 @@ class TestIngressAddonTokenAuth(unittest.TestCase):
         request.headers = {"Authorization": "Bearer wrong-token"}
 
         self.assertFalse(Router._validate_token(request, token_hash))
+
+    def test_salted_token(self):
+        """Validation must apply the salt: production uses a real 16-byte
+        salt, so the hash is sha256(salt + token), not sha256(token)."""
+        Router = self._get_router_class()
+        salt = "0123456789abcdef"
+        token = "my-secret-token"
+        expected = hashlib.sha256((salt + token).encode()).hexdigest()
+
+        request = MagicMock()
+        request.headers = {"Authorization": f"Bearer {token}"}
+
+        self.assertTrue(Router._validate_token(request, expected, salt))
+        # The UNsalted hash must NOT validate when a salt is in force.
+        unsalted = hashlib.sha256(token.encode()).hexdigest()
+        self.assertFalse(Router._validate_token(request, unsalted, salt))
+        # A different salt must also fail.
+        self.assertFalse(Router._validate_token(request, expected, "ffffffffffffffff"))
 
     def test_missing_auth_header(self):
         """Missing Authorization header should fail."""
@@ -395,14 +563,84 @@ class TestIngressAddonTokenAuth(unittest.TestCase):
 
         self.assertFalse(Router._validate_token(request, "somehash"))
 
-    def test_constant_time_comparison(self):
-        """Token comparison uses hmac.compare_digest (constant-time)."""
-        Router = self._get_router_class()
-        # This test verifies the implementation uses hmac.compare_digest
-        # by checking the source code — timing attacks are hard to test.
-        import inspect
-        source = inspect.getsource(Router._validate_token)
-        self.assertIn("hmac.compare_digest", source)
+
+class TestIngressAddonAttribution(unittest.TestCase):
+    """Rejected ingress attempts (auth fail, oversize) must attribute to the
+    cell so they appear in `brig cell network <cell>`, not unknown.jsonl."""
+
+    def _router_with_route(self, **route_kw):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
+        try:
+            from ingress import IngressRoute, IngressRouter
+        finally:
+            sys.path.pop(0)
+        defaults = {
+            "cell": "sa", "cell_ip": "10.60.1.5", "name": "api",
+            "port": 8642, "path_prefix": "/api", "auth_secret_hash": "deadbeef",
+            "auth_salt": "s",
+        }
+        defaults.update(route_kw)
+        router = IngressRouter()
+        router.routes = {"sa": [IngressRoute(defaults)]}
+        router._check_reload = lambda: None  # don't reload over injected routes
+        return router
+
+    def _flow(self, path="/sa/api/x", auth=None):
+        flow = MagicMock()
+        flow.client_conn.sockname = ("0.0.0.0", 8443)  # ingress listener port
+        flow.client_conn.peername = ("203.0.113.9", 54321)
+        flow.request.path = path
+        flow.request.headers = {"Authorization": auth} if auth else {}
+        flow.metadata = {}
+        flow.response = None
+        return flow
+
+    def test_auth_failure_attributes_to_cell(self):
+        # mitmproxy.http is a MagicMock here, so assert the fix's observable —
+        # the flow is attributed to the cell — and that the rewrite (success
+        # path) did NOT run (host left unchanged), confirming the auth-fail path.
+        router = self._router_with_route()
+        flow = self._flow(auth="Bearer wrong")
+        router.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertEqual(flow.metadata.get("cell"), "sa")
+        self.assertEqual(flow.metadata.get("ingress_route"), "api")
+        self.assertNotEqual(flow.request.host, "10.60.1.5")  # not proxied
+
+    def test_route_miss_not_attributed(self):
+        router = self._router_with_route()
+        flow = self._flow(path="/nope/x")
+        router.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertIsNone(flow.metadata.get("cell"))
+
+    def test_success_attributes_and_rewrites(self):
+        token, salt = "good-token", "s"
+        h = hashlib.sha256((salt + token).encode()).hexdigest()
+        router = self._router_with_route(auth_secret_hash=h, auth_salt=salt)
+        flow = self._flow(auth=f"Bearer {token}")
+        router.request(flow)
+        self.assertEqual(flow.metadata.get("ingress_route"), "api")
+        self.assertEqual(flow.request.host, "10.60.1.5")  # rewritten to cell
+
+    def test_auth_none_passes_through_without_token(self):
+        # No Authorization header, yet the request is proxied (no 401) — the
+        # cell's app is the gate.
+        router = self._router_with_route(auth="none")
+        flow = self._flow()
+        router.request(flow)
+        self.assertEqual(flow.request.host, "10.60.1.5")  # proxied to cell
+        self.assertEqual(flow.metadata.get("ingress_route"), "api")
+
+    def test_auth_none_preserves_authorization_header(self):
+        # Transparent: brig must NOT strip the credential the app authenticates with.
+        router = self._router_with_route(auth="none")
+        flow = self._flow(auth="Bearer app-session-token")
+        router.request(flow)
+        self.assertEqual(flow.request.headers.get("Authorization"),
+                         "Bearer app-session-token")
+        self.assertEqual(flow.request.host, "10.60.1.5")
 
 
 class TestIngressAddonCellIpValidation(unittest.TestCase):
@@ -410,7 +648,7 @@ class TestIngressAddonCellIpValidation(unittest.TestCase):
 
     def _get_router(self):
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
         try:
             from ingress import IngressRouter
         finally:
@@ -432,7 +670,7 @@ class TestIngressAddonCellIpValidation(unittest.TestCase):
             f.flush()
 
             import sys
-            sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+            sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
             try:
                 import ingress as ingress_mod
                 old_path = ingress_mod.ROUTES_FILE
@@ -460,7 +698,7 @@ class TestIngressAddonCellIpValidation(unittest.TestCase):
             f.flush()
 
             import sys
-            sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+            sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
             try:
                 import ingress as ingress_mod
                 old_path = ingress_mod.ROUTES_FILE
@@ -473,6 +711,102 @@ class TestIngressAddonCellIpValidation(unittest.TestCase):
             finally:
                 sys.path.pop(0)
 
+    def test_in_range_reserved_host_octets_rejected(self):
+        """Reserved host octets WITHIN the cell range must be rejected.
+
+        `192.168.x` is caught by the outside-range branch and never reaches
+        the reserved-octet gate; these IPs are in 10.60.0.0/16 so they
+        exercise it directly: .0 (network), .1 (warden gateway — forwarding
+        here loops back into mitmproxy), and .255 (broadcast).
+        """
+        for reserved_ip in ("10.60.1.0", "10.60.1.1", "10.60.1.255"):
+            router = self._get_router()
+            with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                             delete=False) as f:
+                json.dump({"routes": [{
+                    "cell": "evil",
+                    "cell_ip": reserved_ip,
+                    "name": "api",
+                    "port": 8642,
+                    "path_prefix": "/api",
+                    "auth_secret_hash": "abc",
+                }]}, f)
+                f.flush()
+
+                import sys
+                sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
+                try:
+                    import ingress as ingress_mod
+                    old_path = ingress_mod.ROUTES_FILE
+                    ingress_mod.ROUTES_FILE = Path(f.name)
+                    try:
+                        router._reload_routes()
+                        self.assertNotIn(
+                            "evil", router.routes,
+                            f"{reserved_ip} should be rejected as a reserved octet",
+                        )
+                    finally:
+                        ingress_mod.ROUTES_FILE = old_path
+                finally:
+                    sys.path.pop(0)
+
+
+class TestIngressRouteReloadSignature(unittest.TestCase):
+    """A same-second route rewrite (identical mtime) must still reload.
+
+    Otherwise a deregister+register that reuses a subnet index within the
+    filesystem mtime window keeps the prior cell's auth-token hash / cell_ip.
+    """
+
+    def _get_router(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
+        try:
+            from ingress import IngressRouter
+        finally:
+            sys.path.pop(0)
+        return IngressRouter()
+
+    def test_reload_detects_same_mtime_different_content(self):
+        import os
+        import sys
+
+        router = self._get_router()
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
+            json.dump({"routes": [{
+                "cell": "alpha", "cell_ip": "10.60.5.2", "name": "api",
+                "port": 8642, "path_prefix": "/api", "auth_secret_hash": "aaa",
+            }]}, f)
+            f.flush()
+            path = Path(f.name)
+
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
+        try:
+            import ingress as ingress_mod
+            old_path = ingress_mod.ROUTES_FILE
+            ingress_mod.ROUTES_FILE = path
+            try:
+                router._reload_routes()
+                self.assertIn("alpha", router.routes)
+
+                st = path.stat()
+                # New cell reuses 10.60.5.2 with a different token; pin mtime
+                # back so a float comparison would treat the file as unchanged.
+                path.write_text(json.dumps({"routes": [{
+                    "cell": "bravo", "cell_ip": "10.60.5.2", "name": "api",
+                    "port": 8642, "path_prefix": "/api",
+                    "auth_secret_hash": "bbbbbbbb",
+                }]}))
+                os.utime(path, ns=(st.st_mtime_ns, st.st_mtime_ns))
+
+                router._reload_routes()
+                self.assertIn("bravo", router.routes)
+                self.assertNotIn("alpha", router.routes)
+            finally:
+                ingress_mod.ROUTES_FILE = old_path
+        finally:
+            sys.path.pop(0)
+
 
 class TestIngressWebSocketLogging(unittest.TestCase):
     """Test that WebSocket hooks are present in enforce.py and logger.py."""
@@ -480,7 +814,7 @@ class TestIngressWebSocketLogging(unittest.TestCase):
     def test_enforce_has_websocket_hook(self):
         """enforce.py must have websocket_message method."""
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
         try:
             from enforce import PolicyEnforcer
         finally:
@@ -490,7 +824,7 @@ class TestIngressWebSocketLogging(unittest.TestCase):
     def test_logger_has_websocket_hook(self):
         """logger.py must have websocket_message method."""
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
         try:
             from logger import RequestLogger
         finally:
@@ -509,7 +843,7 @@ class TestIngressSseStreaming(unittest.TestCase):
 
     def _router(self):
         import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "addons"))
+        sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
         try:
             from ingress import IngressRouter
         finally:

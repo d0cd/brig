@@ -29,34 +29,38 @@ How we keep Brig's dependencies, container images, and CI infrastructure trustwo
 
 ## Container image maintenance
 
-The mitmproxy container image is pinned by digest:
+Warden runs a **custom** image (mitmproxy + the OpenTelemetry SDK), built
+inside the VM so wheels match the runtime arch. `src/warden/proxy.py` holds:
 
 ```python
-IMAGE = "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec..."
+WARDEN_IMAGE_TAG    = "..."          # localhost/brig-warden:<TAG>
+WARDEN_IMAGE_DIGEST = "sha256:..."   # pin verified at start (_verify_warden_image)
+BASE_IMAGE          = "docker.io/mitmproxy/mitmproxy@sha256:..."  # no-OTel fallback only
 ```
 
-To update:
+`_warden_image()` runs `localhost/brig-warden:<TAG>` whenever
+`WARDEN_IMAGE_DIGEST` is pinned (the normal case); `BASE_IMAGE` is only the
+fallback when no custom image is pinned. **Patching `BASE_IMAGE` alone does
+NOT change the launched image.** To update:
 
-1. Pull the new image: `podman pull docker.io/mitmproxy/mitmproxy:latest`
-2. Get the digest: `podman inspect --format '{{.Digest}}' docker.io/mitmproxy/mitmproxy:latest`
-3. Update `src/warden/proxy.py` with the new digest
-4. Run E2E tests: `make e2e`
-5. Commit with the mitmproxy version in the message
+1. Bump `BASE_IMAGE` and/or the OTel SDK version in `src/warden/image/Dockerfile`.
+2. Rebuild + re-pin: `./scripts/build-warden-image.sh` — it builds inside the
+   VM and rewrites `WARDEN_IMAGE_TAG` + `WARDEN_IMAGE_DIGEST` in `proxy.py`.
+3. Run E2E tests: `make e2e`
+4. Commit the one-line digest update with the version in the message.
 
 ## gVisor (runsc) bumps
 
-`scripts/provision-vm.sh` pins `GVISOR_RELEASE` and a per-arch sha512. To bump:
+`GVISOR_RELEASE` + a per-arch sha512 are pinned in **two** files that must
+stay in sync — `scripts/provision-vm.sh` and `src/brig/vm/lima.yaml.template`
+— and `scripts/check-gvisor-pin.sh` (wired into CI) hard-fails on drift. Use
+the canonical updater, which writes both:
 
 1. Pick a release from <https://github.com/google/gvisor/releases>.
-2. Fetch the sha512 from the release page (don't compute it from the same source you're pulling the binary from).
-3. Update `GVISOR_RELEASE` and the matching `GVISOR_SHA512_BY_ARCH` entry in `scripts/provision-vm.sh`.
-4. Verify locally before merging:
-
-```bash
-curl -fsSL "https://storage.googleapis.com/gvisor/releases/release/${RELEASE}/${ARCH}/runsc" \
-  | sha512sum
-# Expected sha512 must match the value you put in the script.
-```
+2. `make pin-gvisor` (or `./scripts/pin-gvisor.sh <RELEASE>`) — fetches the
+   per-arch sha512 from the release and rewrites both files.
+3. Verify: `./scripts/check-gvisor-pin.sh` (the same check CI runs).
+4. Commit; do not hand-edit only one of the two files (CI will reject it).
 
 ## Responding to CVEs
 

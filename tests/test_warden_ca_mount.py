@@ -102,7 +102,7 @@ class TestStageBundleErrorPath(unittest.TestCase):
                 ca_bundle.stage_bundle("alice")
         msg = str(ctx.exception)
         self.assertIn("Warden CA cert is missing", msg)
-        self.assertIn("brig up", ctx.exception.suggestion or "")
+        self.assertIn("brig system up", ctx.exception.suggestion or "")
 
     def test_raises_brigerror_when_concat_fails(self):
         """If the CA file IS there but the concat step itself fails

@@ -18,7 +18,8 @@ def _parse_cosign_output(stdout: str) -> dict:
     try:
         data = json.loads(stdout)
         if isinstance(data, list) and data:
-            return data[0]
+            first = data[0]
+            return first if isinstance(first, dict) else {}
         return {}
     except (json.JSONDecodeError, IndexError):
         return {}
@@ -35,15 +36,20 @@ def verify_image_signature(
 
     Returns (success, message, details) tuple.
     Note: cosign runs on macOS host, not in the VM.
+
+    Keyless verification is ADVISORY unless both certificate_identity and
+    certificate_oidc_issuer are supplied: with neither, cosign accepts a
+    signature from any Fulcio identity, so a success means "signed by
+    someone", not "signed by who you trust". Image integrity at run time is
+    enforced by digest pinning, not by this command.
     """
     result = subprocess.run(
         ["which", "cosign"], check=False, capture_output=True, text=True,
     )
     if result.returncode != 0:
-        # The previous fallback ran `podman image trust show` and accepted
-        # the image whenever ANY policy line said "accept" — even if the
-        # specific image wasn't covered by that policy's scope. That's
-        # vacuous trust. cosign is now a hard prerequisite for verification.
+        # cosign is a hard prerequisite: `podman image trust show` accepts an
+        # image whenever ANY policy line says "accept", even when the specific
+        # image isn't in that policy's scope — vacuous trust, so no fallback.
         return (
             False,
             "cosign is not installed. Install from https://docs.sigstore.dev/cosign/. "

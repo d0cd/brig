@@ -21,6 +21,12 @@ import re
 import time
 from typing import Optional
 
+# Ports warden binds for itself: 8080 (HTTP egress proxy) and 8443 (ingress).
+# A host_service must never rewrite to one of these. Mirrors
+# warden.proxy.WARDEN_RESERVED_PORTS — addons can't import brig.*/warden.*,
+# so the constant is duplicated here. Keep in sync.
+WARDEN_RESERVED_PORTS = frozenset({8080, 8443})
+
 
 class PolicyRule:
     """A parsed policy rule supporting domain, path, and method matching.
@@ -112,11 +118,18 @@ class PolicyRule:
         return host == self.domain_exact
 
     def matches_path(self, path: str) -> bool:
-        """Check if path matches this rule's path patterns."""
+        """Check if path matches this rule's path patterns.
+
+        Matched against the path WITHOUT its query string — a path filter scopes
+        endpoints, not query values, so `/v1/x` allows `/v1/x?foo=bar`. Patterns
+        are globs over the whole path (a `*` spans `/`), so `/v1/*` also matches
+        `/v1/a/b`; write a narrower pattern if you need a single segment.
+        """
         if self._path_patterns is None:
             return True  # No path restriction.
+        base = path.split("?", 1)[0]
         for pattern in self._path_patterns:
-            if pattern.match(path):
+            if pattern.match(base):
                 return True
         return False
 
@@ -173,6 +186,13 @@ class DomainTrie:
         """
         host = PolicyRule._normalize_domain(host)
         labels = host.split(".")
+        # An empty label (leading/trailing/double dot, e.g. ".example.com")
+        # is a malformed host and must match nothing — otherwise the wildcard
+        # walk below would fire `*.example.com` for `.example.com`, disagreeing
+        # with PolicyRule.matches_domain / domain_matches_rule (they return
+        # False), which are documented to agree with this matcher.
+        if "" in labels:
+            return []
         labels.reverse()
 
         node = self
@@ -241,6 +261,22 @@ class Policy:
                 port = item.get("port")
                 protocol = item.get("protocol", "http")
                 if isinstance(name, str) and isinstance(port, int):
+                    # The on-disk policy is untrusted (invariant 4). Validate
+                    # the port here too — enforce.py rewrites a .host.brig
+                    # request straight to this port on the macOS host, so an
+                    # out-of-range or reserved port would turn warden into a
+                    # gateway to an arbitrary host service (invariant 2).
+                    if (port < 1 or port > 65535
+                            or port in WARDEN_RESERVED_PORTS):
+                        try:
+                            import logging
+                            logging.getLogger("brig.warden").warning(
+                                "Policy: dropping host_service '%s' with "
+                                "invalid/reserved port %r", name, port,
+                            )
+                        except Exception:
+                            pass
+                        continue
                     if protocol == "tcp":
                         self.tcp_host_services_map[name] = port
                     elif protocol == "http":

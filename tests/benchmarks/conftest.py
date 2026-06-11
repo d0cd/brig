@@ -1,7 +1,6 @@
 """Shared fixtures for benchmark tests.
 
 Provides pre-configured addon classes and test data generators.
-Uses mitmproxy mocking pattern from test_addons_unit.py.
 """
 
 import sys
@@ -10,13 +9,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# Mock mitmproxy before importing addons.
-for mod in ("mitmproxy", "mitmproxy.http", "mitmproxy.ctx", "mitmproxy.connection"):
-    if mod not in sys.modules:
-        sys.modules[mod] = MagicMock()
+# Use the real mitmproxy (a dev dependency), like the addon unit tests. The old
+# approach installed a MagicMock for the top-level `mitmproxy` module; because
+# tests/benchmarks/ sorts before the `test_*.py` files, that non-package mock
+# was left in sys.modules and poisoned every real-mitmproxy test collected later
+# in the same session (e.g. those importing `mitmproxy.proxy`). Import the real
+# module and only stub `ctx.log` — mitmproxy populates that at runtime under
+# mitmdump, so the addons' logging calls crash when exercised off-proxy.
+pytest.importorskip("mitmproxy")
+import mitmproxy.ctx  # noqa: E402
 
-# Add src/addons to path.
-ADDONS_DIR = Path(__file__).parent.parent.parent / "src" / "addons"
+if not hasattr(mitmproxy.ctx, "log"):
+    mitmproxy.ctx.log = MagicMock()
+
+# Add src/brig/warden_addons to path.
+ADDONS_DIR = Path(__file__).parent.parent.parent / "src" / "brig" / "warden_addons"
 if str(ADDONS_DIR) not in sys.path:
     sys.path.insert(0, str(ADDONS_DIR))
 

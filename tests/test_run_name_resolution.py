@@ -40,7 +40,7 @@ class TestNameResolution(unittest.TestCase):
 
     def _captured_spec(self, args) -> dict:
         """Run cmd_run with `run_cell` stubbed out; return the CellSpec dict."""
-        from brig.commands import lifecycle_cmd
+        from brig.commands import lifecycle_run
         captured: dict = {}
 
         def fake_run_cell(spec):
@@ -49,9 +49,9 @@ class TestNameResolution(unittest.TestCase):
             r.success = True
             return r
 
-        with patch.object(lifecycle_cmd, "run_cell", fake_run_cell), \
+        with patch.object(lifecycle_run, "run_cell", fake_run_cell), \
              patch("brig.ops.logging.Spinner"):
-            lifecycle_cmd.cmd_run(args)
+            lifecycle_run.cmd_run(args)
         return captured["spec"]
 
     def test_yaml_name_used_when_no_flag(self):
@@ -100,16 +100,16 @@ class TestYamlFieldsActuallyMerge(unittest.TestCase):
     merge over all CellSpec field names."""
 
     def _captured_spec(self, args):
-        from brig.commands import lifecycle_cmd
+        from brig.commands import lifecycle_run
         captured: dict = {}
         def fake_run_cell(spec):
             captured["spec"] = spec
             r = MagicMock()
             r.success = True
             return r
-        with patch.object(lifecycle_cmd, "run_cell", fake_run_cell), \
+        with patch.object(lifecycle_run, "run_cell", fake_run_cell), \
              patch("brig.ops.logging.Spinner"):
-            lifecycle_cmd.cmd_run(args)
+            lifecycle_run.cmd_run(args)
         return captured["spec"]
 
     def test_yaml_memory_honored(self):

@@ -67,7 +67,7 @@ class TestUntrustedProfileRejectsTcp(unittest.TestCase):
 
 
 class TestPolicyParsesProtocol(unittest.TestCase):
-    """addons/_policy.py:Policy splits host_services into HTTP and TCP
+    """warden_addons/_policy.py:Policy splits host_services into HTTP and TCP
     maps so enforce.py can dispatch correctly."""
 
     def _Policy(self):
@@ -76,7 +76,7 @@ class TestPolicyParsesProtocol(unittest.TestCase):
             "mitmproxy.connection",
         ):
             sys.modules.setdefault(_mod, MagicMock())
-        sys.path.insert(0, "src/addons")
+        sys.path.insert(0, "src/brig/warden_addons")
         try:
             from _policy import Policy
         finally:

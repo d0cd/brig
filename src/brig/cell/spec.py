@@ -35,8 +35,10 @@ def parse_size(size_str: str) -> int:
         raise ValueError("Empty size string")
     if size_str[-1] in _SIZE_UNITS:
         try:
+            # OverflowError: float('inf')/'1e400' make int() overflow; the
+            # callers' contract is ValueError, so normalize it here.
             return int(float(size_str[:-1]) * _SIZE_UNITS[size_str[-1]])
-        except ValueError:
+        except (ValueError, OverflowError):
             raise ValueError(f"Invalid size: {size_str}")
     try:
         return int(size_str)
@@ -119,6 +121,12 @@ class CellSpec:
     # Declaring in yaml IS the grant — there is no separate global
     # registry. See cell.validators._v_host_services.
     host_services: list[dict[str, Any]] = field(default_factory=list)
+    # mounts — bind-mount an operator-chosen host directory into the cell.
+    # Each entry: {name, host_path, mount_point, mode?}. host_path must
+    # resolve under a declared config.mount_roots() entry; ro default, rw
+    # opt-in. Bypasses Warden by design; rejected on the untrusted profile.
+    # See cell.validators._v_mounts and docs/design/host-mounts.md.
+    mounts: list[dict[str, Any]] = field(default_factory=list)
     # Trust Warden's MITM CA out of the box. When true (default), brig
     # stages a combined bundle (system roots + Warden CA) inside the VM
     # and mounts it at /run/brig/ca-bundle.crt, plus sets SSL_CERT_FILE /
@@ -127,6 +135,20 @@ class CellSpec:
     # for cells with strict cert pinning or that manage their own trust
     # store. See brig.cell.ca_bundle.
     trust_warden_ca: bool = True
+    # restart — "no" (default) or "always". An "always" cell is re-launched by
+    # `brig system up` whenever its container is gone (e.g. a VM restart drops
+    # every container). brig persists the full spec at run time to replay it.
+    # An *exited* cell (still present, e.g. `brig cell stop`) is left alone — but
+    # a VM restart drops the container, so a stopped restart:always cell DOES
+    # relaunch on the next up; use `brig cell rm` to keep one down for good.
+    restart: str = "no"
+    # user — podman --user (uid[:gid] or name[:group]); default is the image's
+    # USER. gVisor presents virtiofs host mounts (and /work) as owned by 0:0
+    # inside the cell, so only a cell running as root (user: "0") can fully own
+    # a rw `mounts:` dir (read/write/rewrite). Writes still land owned by the
+    # operator on macOS, so readback is unaffected. Running as root *inside* the
+    # gVisor+VM sandbox is not a host-privilege change (the VM is the boundary).
+    user: str | None = None
 
     def __post_init__(self) -> None:
         """Validate inputs at construction time — the system boundary.

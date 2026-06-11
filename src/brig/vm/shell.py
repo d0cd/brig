@@ -60,11 +60,49 @@ def _is_sensitive_env(name: str) -> bool:
     return any(s in upper for s in _SENSITIVE_ENV_SUBSTRINGS)
 
 
+# Single source of truth for which command basenames need sudo inside
+# the Lima VM. Rootful podman owns the container store; the mkdir/du/chown/cp/rm
+# helpers run against root-owned paths under /state/. Anything not in this
+# set runs as the unprivileged lima user.
+_AUTOSUDO_COMMANDS = frozenset({"podman", "mkdir", "du", "chown", "cp", "rm"})
+
+
+def _prepend_sudo(cmd: list[str], sudo: bool | None) -> list[str]:
+    """Decide whether to prepend `sudo` based on caller intent.
+
+    `sudo=None` (default) → auto: infer from cmd[0]. Use this for
+    podman / standard helpers — keeps the call sites uncluttered.
+    `sudo=True` → force sudo. Use when running a command whose basename
+    isn't in `_AUTOSUDO_COMMANDS` but still needs root (e.g. `sh -c <script>`
+    that writes to a root-owned dir, or `cat /var/log/<root-owned>`).
+    `sudo=False` → never sudo. Use to defeat auto-detection for a basename
+    that normally auto-sudos but in this call site shouldn't.
+
+    Bare `["sudo", ...]` is rejected — the helper owns sudo placement so
+    every call site is consistent and double-sudo can't sneak in.
+    """
+    if cmd and cmd[0] == "sudo":
+        raise ValueError(
+            "vm_run: pass sudo=True instead of prefixing the command "
+            "with 'sudo' — the helper owns sudo placement."
+        )
+    if sudo is False:
+        return cmd
+    if sudo is True:
+        return ["sudo"] + cmd
+    # Auto.
+    if cmd and cmd[0] in _AUTOSUDO_COMMANDS:
+        return ["sudo"] + cmd
+    return cmd
+
+
 def vm_run(
     cmd: list[str],
     check: bool = False,
     capture: bool = True,
     timeout: int | None = 30,
+    *,
+    sudo: bool | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command inside the Lima VM.
 
@@ -76,11 +114,10 @@ def vm_run(
         check: Raise CalledProcessError on non-zero exit.
         capture: Capture stdout/stderr.
         timeout: Timeout in seconds (None for no timeout).
+        sudo: None=auto-detect from cmd[0], True=force, False=never.
+            See `_prepend_sudo` for the auto-detect set.
     """
-    # Rootful podman and system commands inside Lima need sudo.
-    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown", "cp", "rm"):
-        cmd = ["sudo"] + cmd
-
+    cmd = _prepend_sudo(cmd, sudo)
     full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
     debug(f"VM exec: {_redact_cmd(cmd)}")
     try:
@@ -93,14 +130,13 @@ def vm_run(
         return subprocess.CompletedProcess(full_cmd, 1, "", str(e))
 
 
-def vm_run_interactive(cmd: list[str]) -> int:
+def vm_run_interactive(cmd: list[str], *, sudo: bool | None = None) -> int:
     """Run an interactive command inside the VM (no capture, TTY passthrough).
 
     Used for: brig exec -it, brig shell, brig attach.
-    Returns the exit code.
+    Returns the exit code. See `vm_run` for the `sudo` flag semantics.
     """
-    if cmd and cmd[0] in ("podman", "mkdir", "du", "chown"):
-        cmd = ["sudo"] + cmd
+    cmd = _prepend_sudo(cmd, sudo)
     full_cmd = ["limactl", "shell", "--workdir", "/", VM_NAME, "--"] + cmd
     debug(f"VM interactive: {_redact_cmd(cmd)}")
     try:

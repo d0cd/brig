@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import signal
 import time
-from typing import Any
+import argparse
 
 from brig.ops.logging import info, output, warn
 
 
-def cmd_watchdog(args: Any) -> int:
+def cmd_watchdog(args: argparse.Namespace) -> int:
     """Handle `brig watchdog` — monitor and restart warden."""
     from brig.network.proxy import proxy_running
     from warden.proxy import start, stop

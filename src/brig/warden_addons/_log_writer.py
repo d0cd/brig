@@ -34,13 +34,11 @@ try:
     def _json_encode(obj: dict) -> str:
         """Fast JSON encoding using orjson."""
         return orjson.dumps(obj).decode("utf-8")
-    JSON_ENCODER = "orjson"
 except ImportError:
     _json_encoder = json.JSONEncoder(separators=(",", ":"))
     def _json_encode(obj: dict) -> str:
         """JSON encoding using reusable encoder."""
         return _json_encoder.encode(obj)
-    JSON_ENCODER = "json"
 
 # Async logging configuration.
 ASYNC_QUEUE_SIZE = 10000
@@ -62,36 +60,19 @@ DEFAULT_MAX_LOG_SIZE = 100 * 1024 * 1024
 # at the cost of more inodes.
 MAX_ROTATED_FILES = 4
 
+# Cap on the in-memory per-file size cache. Bounds memory across cell churn
+# in the long-lived warden; entries self-heal (re-stat) after eviction.
+MAX_TRACKED_LOG_FILES = 1024
+
 # Default log file for unknown sources.
 UNKNOWN_LOG_FILE = LOG_DIR / "unknown.jsonl"
 
 
-# Pattern matching common secret query parameters.
-_SECRET_PARAM_RE = re.compile(
-    r'([?&])'
-    r'(key|api_key|apikey|token|access_token|secret|password|auth|authorization|'
-    r'client_secret|private_key|signing_key|bearer)'
-    r'=([^&]*)',
-    re.IGNORECASE,
-)
-
-
-def _redact_path(path: str) -> str:
-    """Redact sensitive query string parameters from a request path.
-
-    URL-decodes the path in a loop until stable to prevent double-encoding
-    bypass (e.g., %2561pi%255Fkey=secret). Limited to 5 iterations to
-    prevent pathological inputs from causing excessive CPU use.
-    """
-    from urllib.parse import unquote
-    prev = None
-    decoded = path
-    for _ in range(5):
-        prev = decoded
-        decoded = unquote(decoded)
-        if decoded == prev:
-            break
-    return _SECRET_PARAM_RE.sub(r'\1\2=REDACTED', decoded)
+# Log-safe path redaction (query-param secrets + secret path segments) lives in
+# _common so every sink — logger, notifier, otel — shares one classifier and a
+# credential can't be masked in one log yet leak in another. Re-exported under
+# the original name; importers (logger.py, otel_export.py) are unchanged.
+from _common import redact_path as _redact_path  # noqa: E402,F401
 
 
 class AsyncLogWriter:
@@ -210,6 +191,11 @@ class AsyncLogWriter:
         """
         with self._lock:
             if log_file not in self._file_sizes:
+                # Bound the cache across cell churn (warden is long-lived, one
+                # entry per distinct cell-name log). Eviction is safe: a write
+                # to an evicted file re-stats the on-disk size below.
+                if len(self._file_sizes) >= MAX_TRACKED_LOG_FILES:
+                    del self._file_sizes[next(iter(self._file_sizes))]
                 try:
                     self._file_sizes[log_file] = log_file.stat().st_size if log_file.exists() else 0
                 except (IOError, OSError):

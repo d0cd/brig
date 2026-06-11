@@ -13,6 +13,7 @@ desired state because plan() recomputes from current reality.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
@@ -25,7 +26,7 @@ from brig.cell.ca_bundle import (
 )
 from brig.cell.metadata import IN_CELL_PATH, vm_source_path, write_metadata
 from brig.cell.spec import CellSpec
-from brig.config import HostPaths, PROXY_NAME, RUNTIME, VMPaths, container_name
+from brig.config import HostPaths, PROXY_NAME, PROXY_PORT, RUNTIME, VMPaths, container_name
 from brig.errors import BrigError
 from brig.ops.logging import debug
 from brig.security.secrets import validate_secret_path
@@ -63,9 +64,9 @@ class CellState:
     container_name: str = ""
     network_name: str = ""
     network_exists: bool = False
+    network_internal: bool = False
     proxy_connected: bool = False
     proxy_ip: str = ""
-    runtime: str = ""
     status: str = ""
 
 
@@ -90,9 +91,33 @@ def _podman_inspect_json(name: str) -> dict | None:
         return None
     try:
         info = json.loads(result.stdout)
-        return info[0] if isinstance(info, list) else info
     except json.JSONDecodeError:
         return None
+    if isinstance(info, list):
+        info = info[0] if info else None
+    return info if isinstance(info, dict) else None
+
+
+def _network_internal(name: str) -> bool:
+    """True if the named podman network exists AND is --internal (no egress).
+
+    Cell networks must be internal — that is what delivers east-west isolation
+    (invariant 1) and keeps Warden the only egress path. The VM's network set is
+    untrusted (invariant 4), so a pre-existing same-named network is verified,
+    not assumed safe.
+    """
+    result = _run_cmd(["podman", "network", "inspect", name])
+    if result.returncode != 0:
+        return False
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        return False
+    return bool(data.get("internal", data.get("Internal", False)))
 
 
 def observe(cell_name: str) -> CellState:
@@ -107,12 +132,12 @@ def observe(cell_name: str) -> CellState:
         state.exists = True
         state.status = info.get("State", {}).get("Status", "")
         state.running = state.status == "running"
-        state.runtime = info.get("HostConfig", {}).get("Runtime", "")
 
     result = _run_cmd(["podman", "network", "exists", name])
     state.network_exists = result.returncode == 0
 
     if state.network_exists:
+        state.network_internal = _network_internal(name)
         proxy_info = _podman_inspect_json(PROXY_NAME)
         if proxy_info:
             proxy_networks = proxy_info.get("NetworkSettings", {}).get("Networks", {})
@@ -135,6 +160,20 @@ def plan_run(spec: CellSpec, actual: CellState) -> list[Action]:
 
     if actual.exists and actual.running:
         return []
+
+    # Fail closed: never adopt a pre-existing same-named network that isn't
+    # --internal. CREATE_NETWORK (the only place --internal is applied) is
+    # skipped on the reuse path below, so a leftover/tampered/operator-made
+    # non-internal `brig-<cell>` network would otherwise give the cell
+    # off-segment routes (invariant 1) and a path around Warden. The VM network
+    # set is untrusted (invariant 4), so verify rather than assume.
+    if actual.network_exists and not actual.network_internal:
+        raise BrigError(
+            f"Refusing to start '{spec.name}': network '{actual.network_name}' "
+            f"already exists but is not --internal. A non-internal cell network "
+            f"would break east-west isolation and bypass Warden. Remove it first: "
+            f"brig system down && podman network rm {actual.network_name}"
+        )
 
     # Stopped container from a previous run — clean up first.
     if actual.exists and not actual.running:
@@ -233,10 +272,10 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
             )
         cmd.extend([
             "--network", name,
-            "-e", f"http_proxy=http://{proxy_ip}:8080",
-            "-e", f"https_proxy=http://{proxy_ip}:8080",
-            "-e", f"HTTP_PROXY=http://{proxy_ip}:8080",
-            "-e", f"HTTPS_PROXY=http://{proxy_ip}:8080",
+            "-e", f"http_proxy=http://{proxy_ip}:{PROXY_PORT}",
+            "-e", f"https_proxy=http://{proxy_ip}:{PROXY_PORT}",
+            "-e", f"HTTP_PROXY=http://{proxy_ip}:{PROXY_PORT}",
+            "-e", f"HTTPS_PROXY=http://{proxy_ip}:{PROXY_PORT}",
             "-e", "no_proxy=localhost,127.0.0.1",
         ])
 
@@ -285,12 +324,15 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         cmd.append("--rm")
 
     for env in spec.env:
-        env_key = env.split("=", 1)[0].lower() if "=" in env else env.lower()
+        env_key = (env.split("=", 1)[0] if "=" in env else env).strip().lower()
         if env_key in _PROXY_ENV_NAMES:
             raise BrigError(
                 f"Cannot override proxy environment variable: {env.split('=', 1)[0]}"
             )
         cmd.extend(["-e", env])
+
+    if spec.user:
+        cmd.extend(["--user", spec.user])
 
     workspace_dir = VMPaths.STATE_DIR / spec.name / "workspace"
     cmd.extend([
@@ -325,14 +367,22 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         for secret_name in spec.secrets:
             resolved = secrets_dir / secret_name
             cmd.extend(["-v", f"{resolved}:/run/secrets/{secret_name}:ro"])
-            env_name = secret_name.rsplit(".", 1)[0].upper().replace("-", "_") + "_FILE"
+            # Strip a trailing extension, then map any non-alphanumeric (dots,
+            # dashes) to '_' so the result is a valid POSIX env name —
+            # `api.key.prod` -> `API_KEY_FILE`, not the unusable `API.KEY_FILE`.
+            env_base = secret_name.rsplit(".", 1)[0]
+            env_name = re.sub(r"[^A-Za-z0-9]", "_", env_base).upper() + "_FILE"
             cmd.extend(["-e", f"{env_name}=/run/secrets/{secret_name}"])
 
     if spec.workdir:
         cmd.extend(["--workdir", spec.workdir])
 
     _attach_host_sockets(spec, cmd)
+    _attach_mounts(spec, cmd)
 
+    # End-of-options marker so an image reference (or command token) that
+    # begins with '-' can never be parsed by podman as a flag.
+    cmd.append("--")
     cmd.append(spec.image)
     cmd.extend(spec.command)
 
@@ -357,12 +407,21 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
     # Per-cell bridge dir so two cells declaring the same physical host
     # service (e.g. both want /tmp/postgres.sock) each get their own
     # bridge socket. No reference counting; bridges live with the cell.
-    bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR)) / spec.name
+    #
+    # CRITICAL: this code runs in the HOST (macOS) process, but the `-v`
+    # mount source must be the VM-namespace path (podman runs inside the VM
+    # and sees the bridge dir at /state/..., not ~/.brig/...). So validate the
+    # HOST path (the same inode, shared into the VM via virtio-fs) and emit the
+    # VM path as the mount source. Validating the VM path here would lstat a
+    # nonexistent /state on macOS — breaking the feature and leaving the real
+    # bridge socket unchecked.
+    host_bridge_dir = HostPaths.HOST_SOCKETS_DIR / spec.name
+    vm_bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR)) / spec.name
     for entry in spec.host_sockets:
         name = entry["name"]
         mount_point = entry["mount_point"]
         mode = entry.get("mode", "ro")
-        source = bridge_dir / f"{name}.sock"
+        source = host_bridge_dir / f"{name}.sock"
 
         # lstat (NOT stat) so symlinks don't get followed silently.
         # Symlinks AT the bridge path OR anywhere in its ancestor
@@ -378,7 +437,7 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
         except FileNotFoundError:
             raise BrigError(
                 f"host_socket '{name}': bridge socket not found at {source}",
-                suggestion="Is the launchd bridge running? Try: brig up",
+                suggestion="Is the launchd bridge running? Try: brig system up",
             )
         if _stat.S_ISLNK(st.st_mode):
             raise BrigError(
@@ -398,14 +457,92 @@ def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
         # (resolve both sides; macOS /tmp → /private/tmp makes a raw
         # comparison falsely flag every real path as escaping).
         real_source = _os.path.realpath(str(source))
-        real_root = _os.path.realpath(str(bridge_dir))
+        real_root = _os.path.realpath(str(host_bridge_dir))
         if not real_source.startswith(real_root + "/"):
             raise BrigError(
                 f"host_socket '{name}': bridge socket realpath {real_source} "
                 f"escapes bridge dir {real_root}"
             )
 
-        cmd.extend(["-v", f"{source}:{mount_point}:{mode}"])
+        # Validation passed against the host path; mount the VM-namespace path.
+        cmd.extend(["-v", f"{vm_bridge_dir / f'{name}.sock'}:{mount_point}:{mode}"])
+
+
+def _resolved_mount_roots() -> list[tuple[str, str]]:
+    """[(realpath_root, slug), ...] for the configured mount_roots.
+
+    Fails closed (BrigError) if the configured roots don't validate or two
+    roots share a slug — independent of the lima-render guard, so the bind
+    can't resolve against the wrong (but still allowlisted) tree under drift.
+    """
+    import os.path as _ospath
+    from brig.config import mount_root_slug, mount_roots, validate_mount_roots
+    roots = mount_roots()
+    errs = validate_mount_roots(roots)
+    if errs:
+        raise BrigError("Invalid mount_roots: " + "; ".join(errs))
+    return [(_ospath.realpath(r.rstrip("/")), mount_root_slug(r)) for r in roots]
+
+
+def _verify_mount_sources_for_run(spec: CellSpec) -> None:
+    """Refuse to start a cell whose mount source isn't a live VM mount.
+
+    mount_roots changed without a VM recreate => /mnt/host/<slug> is absent;
+    podman -v would auto-create an empty dir and the cell would silently mount
+    VM-local storage instead of the host files. Fail closed (mirrors the
+    host_socket bridge guard).
+    """
+    if not spec.mounts:
+        return
+    roots = _resolved_mount_roots()
+    for entry in spec.mounts:
+        vm_src = _mount_bind_arg(entry, roots).rsplit(":", 2)[0]
+        r = _run_cmd(["test", "-d", vm_src])
+        if r.returncode != 0:
+            raise BrigError(
+                f"mount source {vm_src} is not present in the VM — mount_roots "
+                f"likely changed without recreating the VM.",
+                suggestion="brig system down --vm, then `limactl delete brig`, "
+                           "then brig system up",
+            )
+
+
+def _mount_bind_arg(entry: dict, roots: list[tuple[str, str]]) -> str:
+    """Translate a validated `mounts:` entry to a podman `-v` value
+    (`<vm_path>:<mount_point>:<mode>`).
+
+    Re-resolves host_path's realpath and re-confirms containment under a
+    configured root — the runtime check is the real boundary (invariant 4:
+    the cell yaml is untrusted), not the parse-time validator.
+    """
+    import os.path as _ospath
+    real = _ospath.realpath(entry["host_path"])
+    for root_real, slug in roots:
+        if real == root_real or real.startswith(root_real + "/"):
+            vm_path = VMPaths.MOUNTS_DIR / slug
+            rel = _ospath.relpath(real, root_real)
+            if rel != ".":
+                vm_path = vm_path / rel
+            return f"{vm_path}:{entry['mount_point']}:{entry.get('mode', 'ro')}"
+    raise BrigError(
+        f"mount host_path {real} is not under any configured mount_roots"
+    )
+
+
+def _attach_mounts(spec: CellSpec, cmd: list[str]) -> None:
+    """Append `--volume` args for each declared `mounts:` entry.
+
+    A cell-created symlink in the mount can't escape the subtree to a VM path
+    (container mount-namespace isolation — verified runtime-independent; see
+    docs/design/mount-symlink-hardening.md), so no in-VM symlink hardening is
+    applied here. The host-side symlink risk is mitigated by `brig cell
+    mount-scan`. We bind the realpath and re-check containment per entry.
+    """
+    if not spec.mounts:
+        return
+    roots = _resolved_mount_roots()
+    for entry in spec.mounts:
+        cmd.extend(["-v", _mount_bind_arg(entry, roots)])
 
 
 _ROLLBACK_MAP = {
@@ -481,6 +618,7 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # so unit tests can drive build_run_command without needing real
         # files on disk.
         _verify_secrets_for_run(spec)
+        _verify_mount_sources_for_run(spec)
         # Ensure workspace directory exists inside the VM before podman mounts it.
         workspace = VMPaths.STATE_DIR / spec.name / "workspace"
         _run_cmd(["mkdir", "-p", str(workspace)])
@@ -488,7 +626,8 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # podman creates the read-only bind mount at /run/brig/cell.json.
         write_metadata(spec.name, spec.workspace_mount,
                        host_sockets=spec.host_sockets,
-                       ingress=spec.ingress)
+                       ingress=spec.ingress,
+                       image_digest=spec.image_digest)
         # Stage the combined CA bundle inside the VM so HTTPS clients in
         # the cell trust Warden's MITM cert. Re-extracted from Warden
         # every start so a CA rotation doesn't leave cells with stale
@@ -513,7 +652,7 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
                     f"Could not determine proxy IP on network {name}",
                     suggestion=(
                         "Warden may not be connected to the cell network. "
-                        "Try: brig up"
+                        "Try: brig system up"
                     ),
                 )
 

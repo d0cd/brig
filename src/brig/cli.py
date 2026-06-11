@@ -37,6 +37,11 @@ _HOST_ONLY_SYSTEM = frozenset({"init", "profiles", "up", "down", "history"})
 _HOST_ONLY_IMAGE = frozenset({"verify"})
 
 
+# `cell` verb aliases → canonical verb. argparse stores the literal alias the
+# user typed, so dispatch (keyed on the canonical verb) normalizes via this map.
+_CELL_VERB_ALIASES = {"ls": "list", "status": "inspect"}
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """Build the argument parser for all brig commands."""
     parser = argparse.ArgumentParser(
@@ -57,6 +62,10 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_cell_group(sub)
     _add_image_group(sub)
     _add_system_group(sub)
+
+    # Top-level `brig ps` — docker-style shortcut for `brig cell list`.
+    p_ps = sub.add_parser("ps", help="List all cells (alias for `cell list`)")
+    p_ps.add_argument("--format", choices=["table", "wide", "json"], default="table")
 
     # External groups registered by their command modules.
     from brig.commands import secrets_cmd, policy_cmd, config_cmd
@@ -135,8 +144,11 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
         "top": "Show processes in cell",
         "diff": "Show filesystem changes since image base",
     }
+    # Convenience aliases for near-universal names (argparse normalizes the
+    # stored verb back to the primary, so dispatch needs no extra entries).
+    _ALIASES = {"inspect": ["status"]}
     for name, help_text in _ONE_ARG.items():
-        p = cs.add_parser(name, help=help_text)
+        p = cs.add_parser(name, aliases=_ALIASES.get(name, []), help=help_text)
         p.add_argument("name", help="Cell name")
 
     p_rm = cs.add_parser(
@@ -163,13 +175,26 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
     p_rename.add_argument("old_name", help="Current name")
     p_rename.add_argument("new_name", help="New name")
 
-    p_exec = cs.add_parser("exec", help="Execute command in cell")
+    p_exec = cs.add_parser(
+        "exec", help="Execute command in cell",
+        epilog="Flags (-i) must come before the cell name; everything after "
+               "the name is the command. Use '--' to pass flags to the command: "
+               "brig cell exec -i mycell -- ls -la",
+    )
     p_exec.add_argument("name", help="Cell name")
     p_exec.add_argument("-i", "--interactive", action="store_true", help="Interactive mode")
     p_exec.add_argument("exec_cmd", nargs=argparse.REMAINDER, metavar="command",
-                        help="Command to execute")
+                        help="Command to execute (everything after the cell name)")
 
-    p_list = cs.add_parser("list", help="List all cells")
+    p_mscan = cs.add_parser(
+        "mount-scan",
+        help="Scan a cell's host mounts for symlinks escaping the mounted dir",
+    )
+    p_mscan.add_argument("name", help="Cell name")
+    p_mscan.add_argument("--quarantine", action="store_true",
+                         help="Remove escaping symlinks instead of only reporting")
+
+    p_list = cs.add_parser("list", aliases=["ls"], help="List all cells")
     p_list.add_argument("--format", choices=["table", "wide", "json"], default="table")
 
     p_files = cs.add_parser("files", help="List workspace contents")
@@ -182,12 +207,6 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
     )
     p_read.add_argument("name", help="Cell name")
     p_read.add_argument("path", help="Relative path inside the workspace")
-
-    p_trace = cs.add_parser(
-        "trace",
-        help="Show a request trace from the OTel collector by trace_id",
-    )
-    p_trace.add_argument("trace_id", help="Trace ID (or prefix; first match wins)")
 
     p_logs = cs.add_parser("logs", help="View cell logs")
     p_logs.add_argument("name", help="Cell name")
@@ -215,6 +234,12 @@ def _add_cell_group(sub: argparse._SubParsersAction) -> None:
     p_events.add_argument("--tail", type=int, default=20, help="Number of entries")
     p_events.add_argument("-f", "--follow", action="store_true",
                           help="Block and print new events as they arrive")
+
+    p_ingress = cs.add_parser(
+        "ingress",
+        help="Show reachable ingress URLs (and the token secret) for a cell",
+    )
+    p_ingress.add_argument("name", help="Cell name")
 
 
 def _add_image_group(sub: argparse._SubParsersAction) -> None:
@@ -250,10 +275,17 @@ def _add_image_group(sub: argparse._SubParsersAction) -> None:
     p_verify = isub.add_parser("verify", help="Verify image signature (cosign)")
     p_verify.add_argument("image", help="Image to verify")
     p_verify.add_argument("--key", help="Cosign public key")
-    p_verify.add_argument("--keyless", action="store_true", help="Keyless verification")
+    p_verify.add_argument(
+        "--keyless", action="store_true",
+        help="Keyless (Fulcio) verification — advisory only: without an "
+        "identity/issuer constraint it confirms the image is signed, not who "
+        "signed it",
+    )
 
-    p_warmup = isub.add_parser("warmup", help="Pre-pull images for a profile")
-    p_warmup.add_argument("--profile", help="Profile name")
+    isub.add_parser(
+        "warmup",
+        help="Pre-pull the warden proxy base image into the VM cache",
+    )
 
 
 def _add_system_group(sub: argparse._SubParsersAction) -> None:
@@ -270,8 +302,7 @@ def _add_system_group(sub: argparse._SubParsersAction) -> None:
     ss.add_parser("metrics", help="Output Prometheus metrics")
     ss.add_parser("stats", help="Per-cell summary from the OTel collector")
 
-    p_verify = ss.add_parser("verify", help="Verify security invariants")
-    p_verify.add_argument("--fix", action="store_true", help="Auto-fix issues")
+    ss.add_parser("verify", help="Verify security invariants")
 
     p_doctor = ss.add_parser(
         "doctor", help="Check environment and report fixable issues",
@@ -356,12 +387,6 @@ def _stats_dispatch(args):
     return cmd_stats(args)
 
 
-def _trace_dispatch(args):
-    """Lazy import for the same reason as _stats_dispatch."""
-    from brig.observability.traces import cmd_trace
-    return cmd_trace(args)
-
-
 def main() -> None:
     """CLI entry point."""
     parser = _build_parser()
@@ -400,7 +425,8 @@ def main() -> None:
                 sys.exit(1)
 
     from brig.commands import (
-        lifecycle_cmd, system_cmd, policy_cmd,
+        lifecycle_run, lifecycle_inspect, lifecycle_control,
+        system_cmd, policy_cmd,
         network_cmd, config_cmd, image_cmd, convenience_cmd,
         secrets_cmd, watchdog_cmd,
     )
@@ -410,35 +436,37 @@ def main() -> None:
     # argparse `set_defaults(func=...)`) so command-module imports stay
     # lazy — `brig --version` / `brig --help` don't pay the import cost.
     dispatch: dict = {
-        "run": lifecycle_cmd.cmd_run,
+        "run": lifecycle_run.cmd_run,
+        "ps": lifecycle_inspect.cmd_list,
 
         # cell *
-        ("cell", "list"): lifecycle_cmd.cmd_list,
-        ("cell", "inspect"): lifecycle_cmd.cmd_inspect,
-        ("cell", "export"): lifecycle_cmd.cmd_export,
-        ("cell", "stop"): lifecycle_cmd.cmd_stop,
-        ("cell", "kill"): lifecycle_cmd.cmd_kill,
-        ("cell", "start"): lifecycle_cmd.cmd_start,
-        ("cell", "restart"): lifecycle_cmd.cmd_restart,
-        ("cell", "pause"): lifecycle_cmd.cmd_pause,
-        ("cell", "unpause"): lifecycle_cmd.cmd_unpause,
-        ("cell", "attach"): lifecycle_cmd.cmd_attach,
-        ("cell", "shell"): lifecycle_cmd.cmd_shell,
-        ("cell", "wait"): lifecycle_cmd.cmd_wait,
-        ("cell", "rm"): lifecycle_cmd.cmd_rm,
-        ("cell", "preflight"): lifecycle_cmd.cmd_preflight,
-        ("cell", "rename"): lifecycle_cmd.cmd_rename,
-        ("cell", "exec"): lifecycle_cmd.cmd_exec,
-        ("cell", "files"): lifecycle_cmd.cmd_files,
-        ("cell", "read"): lifecycle_cmd.cmd_read,
-        ("cell", "trace"): _trace_dispatch,
-        ("cell", "logs"): lifecycle_cmd.cmd_logs,
-        ("cell", "top"): lifecycle_cmd.cmd_top,
-        ("cell", "diff"): lifecycle_cmd.cmd_diff,
-        ("cell", "stats"): lifecycle_cmd.cmd_stats,
-        ("cell", "cp"): lifecycle_cmd.cmd_cp,
+        ("cell", "list"): lifecycle_inspect.cmd_list,
+        ("cell", "inspect"): lifecycle_inspect.cmd_inspect,
+        ("cell", "export"): lifecycle_inspect.cmd_export,
+        ("cell", "mount-scan"): lifecycle_inspect.cmd_mount_scan,
+        ("cell", "stop"): lifecycle_control.cmd_stop,
+        ("cell", "kill"): lifecycle_control.cmd_kill,
+        ("cell", "start"): lifecycle_control.cmd_start,
+        ("cell", "restart"): lifecycle_control.cmd_restart,
+        ("cell", "pause"): lifecycle_control.cmd_pause,
+        ("cell", "unpause"): lifecycle_control.cmd_unpause,
+        ("cell", "attach"): lifecycle_control.cmd_attach,
+        ("cell", "shell"): lifecycle_control.cmd_shell,
+        ("cell", "wait"): lifecycle_control.cmd_wait,
+        ("cell", "rm"): lifecycle_control.cmd_rm,
+        ("cell", "preflight"): lifecycle_inspect.cmd_preflight,
+        ("cell", "rename"): lifecycle_control.cmd_rename,
+        ("cell", "exec"): lifecycle_control.cmd_exec,
+        ("cell", "files"): lifecycle_inspect.cmd_files,
+        ("cell", "read"): lifecycle_inspect.cmd_read,
+        ("cell", "logs"): lifecycle_inspect.cmd_logs,
+        ("cell", "top"): lifecycle_inspect.cmd_top,
+        ("cell", "diff"): lifecycle_inspect.cmd_diff,
+        ("cell", "stats"): lifecycle_inspect.cmd_stats,
+        ("cell", "cp"): lifecycle_inspect.cmd_cp,
         ("cell", "network"): network_cmd.cmd_network,
         ("cell", "events"): network_cmd.cmd_events,
+        ("cell", "ingress"): lifecycle_inspect.cmd_ingress,
         ("cell", "diagnose"): system_cmd.cmd_diagnose,
 
         # image *
@@ -465,6 +493,10 @@ def main() -> None:
     if args.command in {"cell", "image", "system"}:
         sub_attr = f"{args.command}_command"
         sub_value = getattr(args, sub_attr)
+        # argparse stores the literal alias (e.g. "ls"); map it to the
+        # canonical verb the dispatch table is keyed on.
+        if args.command == "cell":
+            sub_value = _CELL_VERB_ALIASES.get(sub_value, sub_value)
         cmd_func = dispatch.get((args.command, sub_value))
         cmd_name = f"{args.command}.{sub_value}"
     elif args.command == "policy":

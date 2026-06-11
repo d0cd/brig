@@ -4,7 +4,7 @@ Stateless helpers + dataclasses + circuit-breaker logic for notifier.py.
 Sibling module of `notifier.py` — `_` prefix keeps mitmproxy from
 registering this as an addon. Splits roughly into:
 
-  - URL safety helpers (`_resolve_webhook_url`, `_is_safe_webhook_url`)
+  - URL safety helper (`_resolve_webhook_url`)
   - Path / URL redaction helpers
   - Tunable constants (HTTP timeout, circuit breaker defaults, etc.)
   - Config dataclasses (`CircuitBreakerConfig`, `NotificationConfig`)
@@ -13,14 +13,18 @@ registering this as an addon. Splits roughly into:
 
 from __future__ import annotations
 
-import ipaddress
-import re
 import socket as _socket
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import urlparse
 
-from _common import BLOCKED_NETWORKS
+from _common import (  # noqa: F401  (re-exported for notifier.py + tests)
+    BLOCKED_NETWORKS,
+    _high_entropy_segment,
+    collapse_path_template,
+    is_blocked_ip,
+    redact_path,
+)
 
 
 # Default minimum interval between notifications (per cell).
@@ -63,10 +67,8 @@ def _resolve_webhook_url(url: str) -> tuple[bool, str, str, int]:
         addrs = _socket.getaddrinfo(parsed.hostname, port)
         first_ip_str = ""
         for family, socktype, proto, canonname, sockaddr in addrs:
-            ip = ipaddress.ip_address(sockaddr[0])
-            for net in BLOCKED_NETWORKS:
-                if ip in net:
-                    return False, "", "", 0
+            if is_blocked_ip(sockaddr[0]):
+                return False, "", "", 0
             if not first_ip_str:
                 first_ip_str = sockaddr[0]
         if not first_ip_str:
@@ -77,35 +79,44 @@ def _resolve_webhook_url(url: str) -> tuple[bool, str, str, int]:
     return True, first_ip_str, parsed.hostname, port
 
 
-def _is_safe_webhook_url(url: str) -> bool:
-    """Validate webhook URL is not targeting internal networks."""
-    safe, _, _, _ = _resolve_webhook_url(url)
-    return safe
-
-
-# Regex matching path segments that look like secrets/tokens.
-_SECRET_PATH_RE = re.compile(
-    r"(?<=/)"                         # Preceded by /.
-    r"(?:"
-    r"[A-Fa-f0-9]{20,}"               # Long hex string.
-    r"|[A-Za-z0-9_\-]{20,}"           # Long base64-ish string.
-    r")"
-    r"(?=/|$)"                        # Followed by / or end.
-)
-
-
 def _redact_notification_path(path: str) -> str:
-    """Remove query parameters, fragments, and potential secrets from path."""
-    path = path.split("?")[0]
-    path = path.split("#")[0]
-    path = _SECRET_PATH_RE.sub("[REDACTED]", path)
-    return path
+    """Blocked-alert path: drop query/fragment (blocked alerts don't carry it),
+    then mask secret path segments via the shared _common redactor."""
+    return redact_path(path.split("?", 1)[0].split("#", 1)[0])
 
 
 def _redact_url_for_logging(url: str) -> str:
     """Return scheme + hostname only, stripping path, query, and credentials."""
     parsed = urlparse(url)
     return f"{parsed.scheme}://{parsed.hostname}"
+
+
+# Path templating for novel_allowed keys lives in _common (the shared
+# classifier all sinks use). Re-exported so notifier.py's import is unchanged.
+normalize_path_template = collapse_path_template
+
+
+def query_exfil_signal(path: str, max_query_len: int) -> bool:
+    """True if `path` carries an unusually long query string — a crude but real
+    detector for data smuggled in `?param=<payload>` on an otherwise-known path
+    (the channel path-template novelty can't see). Length, not content, so we
+    never log the (possibly secret) payload itself."""
+    parts = path.split("?", 1)
+    return len(parts) == 2 and len(parts[1]) > max_query_len
+
+
+@dataclass
+class NovelAllowedConfig:
+    """Config for first-seen detection on allow-listed hosts (the detection
+    complement to blocked-alerting). Default off; opt in via the notifications
+    block. `dry_run` logs would-be alerts without delivering — run it first to
+    confirm the baseline + ignore-lists are tight before enabling delivery."""
+    enabled: bool = False
+    cells: Optional[list] = None        # None = all cells.
+    ignore_hosts: tuple = ()            # Exact host or dot-suffix match.
+    ignore_paths: tuple = ()            # Compiled regex patterns (templates).
+    dry_run: bool = False
+    max_query_len: int = 512
 
 
 @dataclass
@@ -150,3 +161,4 @@ class NotificationConfig:
     resolved_ip: str = ""
     resolved_hostname: str = ""
     resolved_port: int = 0
+    novel_allowed: Optional["NovelAllowedConfig"] = None

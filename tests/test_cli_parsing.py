@@ -44,6 +44,26 @@ class TestBrigCliParsing(unittest.TestCase):
         args = self.parser.parse_args(["cell", "kill", "mycell"])
         self.assertEqual(args.cell_command, "kill")
 
+    def test_cell_ls_alias(self):
+        # `cell ls` parses (argparse stores the literal alias) and the
+        # dispatch alias map resolves it to the `list` verb.
+        from brig.cli import _CELL_VERB_ALIASES
+        args = self.parser.parse_args(["cell", "ls"])
+        self.assertEqual(args.cell_command, "ls")
+        self.assertEqual(_CELL_VERB_ALIASES["ls"], "list")
+
+    def test_cell_status_alias(self):
+        from brig.cli import _CELL_VERB_ALIASES
+        args = self.parser.parse_args(["cell", "status", "mycell"])
+        self.assertEqual(args.cell_command, "status")
+        self.assertEqual(args.name, "mycell")
+        self.assertEqual(_CELL_VERB_ALIASES["status"], "inspect")
+
+    def test_ps_top_level_alias(self):
+        args = self.parser.parse_args(["ps"])
+        self.assertEqual(args.command, "ps")
+        self.assertEqual(args.format, "table")
+
     def test_cell_rm_force(self):
         args = self.parser.parse_args(["cell", "rm", "-f", "mycell"])
         self.assertTrue(args.force)
@@ -164,8 +184,8 @@ class TestBrigCliParsing(unittest.TestCase):
         self.assertTrue(args.keyless)
 
     def test_image_warmup(self):
-        args = self.parser.parse_args(["image", "warmup", "--profile", "dev"])
-        self.assertEqual(args.profile, "dev")
+        args = self.parser.parse_args(["image", "warmup"])
+        self.assertEqual(args.image_command, "warmup")
 
     # --- brig system <verb> -------------------------------------------------
 
@@ -190,9 +210,10 @@ class TestBrigCliParsing(unittest.TestCase):
         args = self.parser.parse_args(["system", "doctor", "--quick"])
         self.assertTrue(args.quick)
 
-    def test_system_verify_fix(self):
-        args = self.parser.parse_args(["system", "verify", "--fix"])
-        self.assertTrue(args.fix)
+    def test_system_verify(self):
+        # The --fix flag was removed (it was a no-op); plain verify parses.
+        args = self.parser.parse_args(["system", "verify"])
+        self.assertEqual((args.command, args.system_command), ("system", "verify"))
 
     def test_system_preflight(self):
         args = self.parser.parse_args(["system", "preflight"])

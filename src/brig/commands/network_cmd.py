@@ -4,17 +4,30 @@ CLI handlers for network and event commands.
 
 from __future__ import annotations
 
+import argparse
 import json
-from typing import Any
+import re
 
-from brig.config import STATE_DIR, VMPaths
+from brig.config import CELL_NAME_PATTERN, STATE_DIR, VMPaths
 from brig.errors import BrigError
 from brig.ops.logging import output
 from brig.vm.shell import vm_run
 
 
-def cmd_network(args: Any) -> int:
-    """Handle `brig network` — view cell network activity from proxy logs.
+def _require_valid_cell_name(name: str) -> None:
+    # `name` is a plain CLI positional; it flows into a VM log path read with
+    # `cat ... sudo`. Validate against CELL_NAME_PATTERN (which forbids '/')
+    # so a crafted name can't traverse to an arbitrary file (e.g.
+    # '../../etc/passwd' -> '/etc/passwd.jsonl').
+    if not isinstance(name, str) or not CELL_NAME_PATTERN.match(name):
+        raise BrigError(
+            f"Invalid cell name '{name}': must start with a lowercase letter or "
+            f"digit, then up to 62 of [a-z0-9._-] — no uppercase, no '/'."
+        )
+
+
+def cmd_network(args: argparse.Namespace) -> int:
+    """Handle `brig cell network` — view cell network activity from proxy logs.
 
     Use --blocked to filter to only requests that warden blocked. This is the
     fastest way to answer "why was my request blocked?" — the block reason
@@ -25,6 +38,7 @@ def cmd_network(args: Any) -> int:
     scripts continue to work.
     """
     cell_name = args.name
+    _require_valid_cell_name(cell_name)
     if getattr(args, "otel", False):
         return _cmd_network_from_otel(args)
 
@@ -33,7 +47,7 @@ def cmd_network(args: Any) -> int:
     # view of that path, and the Lima user can't read mitmproxy-owned files,
     # so read them with sudo via vm_run.
     log_path = VMPaths.LOG_DIR / f"{cell_name}.jsonl"
-    result = vm_run(["sudo", "cat", str(log_path)], timeout=10)
+    result = vm_run(["cat", str(log_path)], timeout=10, sudo=True)
     if result.returncode != 0:
         output(f"No network logs for cell '{cell_name}'")
         return 0
@@ -66,7 +80,7 @@ def cmd_network(args: Any) -> int:
     return 0
 
 
-def _cmd_network_from_otel(args: Any) -> int:
+def _cmd_network_from_otel(args: argparse.Namespace) -> int:
     """Read the cell's request log from the OTel collector's logs file.
 
     The collector's file/logs exporter writes one OTLP ResourceLogs
@@ -83,8 +97,11 @@ def _cmd_network_from_otel(args: Any) -> int:
         output("No collector logs available")
         return 0
 
+    # Walk forward (oldest → newest) and collect every match, then take the
+    # last `tail`. A single batch line can hold more than `tail` records, so
+    # breaking early would render the oldest of that batch, not the newest.
     matches: list[dict] = []
-    for line in reversed(result.stdout.splitlines()):
+    for line in result.stdout.splitlines():
         if not line.strip():
             continue
         try:
@@ -114,25 +131,35 @@ def _cmd_network_from_otel(args: Any) -> int:
                         "bytes_in": attrs.get("bytes_in", 0),
                         "bytes_out": attrs.get("bytes_out", 0),
                     })
-                    if len(matches) >= tail:
-                        break
-        if len(matches) >= tail:
-            break
 
-    for entry in reversed(matches):
+    for entry in matches[-tail:]:
         _print_network_line(entry)
     return 0
 
 
+# C0 controls + DEL + C1 controls. Stripped from cell-controlled fields before
+# they reach the operator's terminal (ANSI/CR log-line forgery defense).
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _clean(value: object) -> str:
+    return _CONTROL_CHARS_RE.sub("", str(value))
+
+
 def _print_network_line(entry: dict) -> None:
     ts = entry.get("ts") or entry.get("timestamp", "")
-    method = entry.get("method", "")
-    host = entry.get("host", "")
-    path = entry.get("path", "")
+    # host/path/method/reason are cell-controlled and stored raw in the JSONL
+    # (and _redact_path runs unquote, which DECODES %1b→ESC / %0d→CR). Strip
+    # C0/C1 control bytes before printing so a cell can't inject ANSI escapes
+    # or CRs to forge/erase lines in the operator's terminal — mirrors the
+    # sanitize enforce.py applies before logging.
+    method = _clean(entry.get("method", ""))
+    host = _clean(entry.get("host", ""))
+    path = _clean(entry.get("path", ""))
     status = entry.get("status", entry.get("status_code", ""))
     blocked = entry.get("blocked")
     tag = " [BLOCKED]" if blocked else ""
-    reason = f" ({entry.get('block_reason', '')})" if blocked else ""
+    reason = f" ({_clean(entry.get('block_reason', ''))})" if blocked else ""
     # Invariant 11: passthrough flows have no method/path/status — only
     # SNI (host) + bytes. Render distinctly so operators can grep them
     # from MITM lines.
@@ -146,10 +173,10 @@ def _print_network_line(entry: dict) -> None:
         return
     ingress_route = entry.get("ingress_route")
     if ingress_route:
-        ingress_src = entry.get("ingress_src_ip", entry.get("src_ip", "?"))
+        ingress_src = _clean(entry.get("ingress_src_ip", entry.get("src_ip", "?")))
         output(
             f"{ts} INGRESS: {ingress_src} -> {method} {host}{path} "
-            f"-> {status} (route={ingress_route}){tag}{reason}"
+            f"-> {status} (route={_clean(ingress_route)}){tag}{reason}"
         )
     else:
         output(f"{ts} OUT: {method} {host}{path} -> {status}{tag}{reason}")
@@ -158,8 +185,14 @@ def _print_network_line(entry: dict) -> None:
 def _attrs_to_dict(attrs: list[dict]) -> dict:
     out: dict = {}
     for a in attrs:
+        if not isinstance(a, dict):
+            continue
         key = a.get("key")
+        if not isinstance(key, str):
+            continue
         val = a.get("value", {})
+        if not isinstance(val, dict):
+            continue
         for typ in ("stringValue", "intValue", "doubleValue", "boolValue"):
             if typ in val:
                 out[key] = val[typ]
@@ -167,8 +200,8 @@ def _attrs_to_dict(attrs: list[dict]) -> dict:
     return out
 
 
-def cmd_events(args: Any) -> int:
-    """Handle `brig events` — print lifecycle events.
+def cmd_events(args: argparse.Namespace) -> int:
+    """Handle `brig cell events` — print lifecycle events.
 
     With --follow, blocks and prints new events as they appear.
     """

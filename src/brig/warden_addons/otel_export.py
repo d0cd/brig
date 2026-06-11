@@ -1,13 +1,14 @@
 """OpenTelemetry instrumentation for warden.
 
-Exports per-request metrics to the OTel collector running as a
-sibling container. Loaded as a mitmproxy addon alongside enforce.py
-and logger.py. No-op if the OTel SDK isn't installed in the image
-(bare mitmproxy fallback path).
+Exports per-request metrics and structured log records to the OTel
+collector running as a sibling container. Loaded as a mitmproxy addon
+alongside enforce.py and logger.py. No-op if the OTel SDK isn't
+installed in the image (bare mitmproxy fallback path).
 
 Metric cardinality is bounded — labels include cell name, decision,
-and method, never host or path. Per-host attribution lives in
-traces, not metrics, to keep series count manageable.
+and method, never host or path. Per-host/per-request detail lives in
+the log records (`brig cell network --otel`), not metrics, to keep
+series count manageable.
 """
 
 from __future__ import annotations
@@ -17,24 +18,25 @@ import time
 
 from mitmproxy import ctx, http
 
+# Same query-string secret redaction the JSONL sink applies, so both audit
+# sinks scrub `?api_key=...` consistently. Warden logs request paths by design
+# (egress must be observable, invariant 3); redaction strips known secret
+# params while keeping the endpoint for audit.
+from _log_writer import _redact_path
+
 try:
-    from opentelemetry import _logs, metrics, trace
+    from opentelemetry import _logs, metrics
     from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
         OTLPLogExporter,
     )
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import (
         OTLPMetricExporter,
     )
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
-        OTLPSpanExporter,
-    )
     from opentelemetry.sdk._logs import LoggerProvider, LogRecord
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
     _OTEL_AVAILABLE = True
 except ImportError:
     _OTEL_AVAILABLE = False
@@ -47,19 +49,19 @@ _PASSTHROUGH_BYTES_OUT_KEY = "otel_passthrough_bytes_out"
 
 
 class OtelExporter:
-    """mitmproxy addon: emit request metrics + spans to OTLP.
+    """mitmproxy addon: emit request metrics + structured log records to OTLP.
 
     HTTP flows (default MITM mode) emit the full per-request shape:
     method, host, path, status, bytes, duration. Passthrough flows
-    (invariant 11) tunnel raw TCP, so warden never sees the request
-    line or response — only SNI, total bytes, and duration. They
-    emit through the warden_passthrough_* counters with tls_mode
-    explicitly tagged so audits never confuse the two modes.
+    (invariant 11) tunnel raw TCP via `data.ignore_connection`, which
+    leaves no flow object — so the tcp_start/tcp_message/tcp_end hooks
+    (and the warden_passthrough_* counters they would feed) do not fire
+    today; passthrough's only audit trail is the connection-level log
+    line in enforce.py. See the NOTE on tcp_end.
     """
 
     def __init__(self) -> None:
         self.meter = None
-        self.tracer = None
         self.logger = None
         self.requests_total = None
         self.request_duration_ms = None
@@ -93,13 +95,6 @@ class OtelExporter:
             resource=resource, metric_readers=[metric_reader],
         ))
         self.meter = metrics.get_meter("brig.warden")
-
-        tracer_provider = TracerProvider(resource=resource)
-        tracer_provider.add_span_processor(BatchSpanProcessor(
-            OTLPSpanExporter(endpoint=endpoint, insecure=True),
-        ))
-        trace.set_tracer_provider(tracer_provider)
-        self.tracer = trace.get_tracer("brig.warden")
 
         logger_provider = LoggerProvider(resource=resource)
         logger_provider.add_log_record_processor(BatchLogRecordProcessor(
@@ -152,15 +147,14 @@ class OtelExporter:
         flow.metadata[_REQUEST_START_KEY] = time.monotonic()
 
     def tcp_start(self, flow) -> None:
-        """Tag passthrough flows at TCP-tunnel start.
+        """Snapshot start time + byte counters for a passthrough TCP flow.
 
-        When enforce.py flips `client_conn.tls_passthrough = True` in
-        tls_clienthello, the connection becomes a TCPFlow instead of an
-        HTTPFlow — request()/response() never fire. We snapshot the
-        start time + SNI here, accumulate bytes in tcp_message, emit in
-        tcp_end. Non-passthrough TCPFlows (CONNECT tunnels in MITM
-        mode produce HTTPFlows, so this only fires for passthrough)
-        get a defensive no-op early return so partial init can't crash.
+        NOTE: enforce.py engages passthrough via `data.ignore_connection =
+        True`, which makes mitmproxy build an *ignored* TCP layer with no flow
+        object — so this hook (and tcp_message / tcp_end) never fires for real
+        passthrough today, and the `passthrough_*` metrics stay empty by
+        design. Kept for a possible future flow-bearing relay; see
+        docs/INVARIANTS.md invariant 11 and tcp_end's note.
         """
         if self.passthrough_connections_total is None:
             return
@@ -196,6 +190,10 @@ class OtelExporter:
         client = getattr(flow, "client_conn", None)
         metadata = getattr(client, "metadata", {}) or {}
         sni = metadata.get("passthrough_sni") or "unknown"
+        # NOTE: with passthrough engaged via ignore_connection, mitmproxy
+        # builds an ignored TCPLayer (flow=None) and never fires tcp_start/
+        # tcp_message/tcp_end — so this hook does not run for real passthrough
+        # flows. Kept for any future flow-bearing relay; see INVARIANTS inv 11.
         cell = flow.metadata.get("cell") or "unknown"
         bytes_in = flow.metadata.get(_PASSTHROUGH_BYTES_IN_KEY, 0)
         bytes_out = flow.metadata.get(_PASSTHROUGH_BYTES_OUT_KEY, 0)
@@ -217,6 +215,9 @@ class OtelExporter:
         if self.logger is not None:
             self.logger.emit(LogRecord(
                 timestamp=time.time_ns(),
+                # Emitted outside any span; pass zero ids (not None) so the OTLP
+                # encoder's _encode_span_id/_encode_trace_id get ints, not None.
+                trace_id=0, span_id=0, trace_flags=0,
                 severity_text="INFO",
                 body=f"PASSTHROUGH {sni}",
                 attributes={
@@ -270,17 +271,21 @@ class OtelExporter:
         # is the default for HTTP flows; passthrough flows emit through
         # tcp_end and have tls_mode=passthrough.
         if self.logger is not None:
+            safe_path = _redact_path(flow.request.path)
             self.logger.emit(LogRecord(
                 timestamp=time.time_ns(),
+                # Span-less record — zero ids so the OTLP encoder gets ints.
+                trace_id=0, span_id=0, trace_flags=0,
                 severity_text="WARN" if blocked else "INFO",
-                body=f"{method} {flow.request.host}{flow.request.path}",
+                body=f"{method} {flow.request.host}{safe_path}",
                 attributes={
                     "cell": cell,
+                    "src_ip": flow.metadata.get("client_ip", ""),
                     "decision": decision,
                     "tls_mode": "mitm",
                     "method": method,
                     "host": flow.request.host,
-                    "path": flow.request.path,
+                    "path": safe_path,
                     "status": flow.response.status_code if flow.response else 0,
                     "duration_ms": duration_ms,
                     "bytes_in": req_bytes,

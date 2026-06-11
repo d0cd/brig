@@ -108,6 +108,69 @@ class TestStartBridges(unittest.TestCase):
                     )])
             self.assertIn("socket", str(ctx.exception).lower())
 
+    def test_validate_target_returns_canonical_realpath(self):
+        from brig.cell.host_sockets_bridge import _validate_target
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            real_dir = Path(td) / "realdir"
+            real_dir.mkdir()
+            sock = _real_socket(real_dir, "pg.sock")
+            link_dir = Path(td) / "linkdir"
+            link_dir.symlink_to(real_dir)
+            # Access via the symlinked PARENT (leaf is not a symlink, so it
+            # passes the leaf-symlink ban) — the returned value must be the
+            # canonical realpath with the parent symlink collapsed.
+            returned = _validate_target(str(link_dir / "pg.sock"))
+            self.assertEqual(returned, os.path.realpath(str(sock)))
+            self.assertNotIn("linkdir", returned)
+
+    def test_validate_target_rejects_leaf_symlink(self):
+        """A symlink AT the target path (not just a parent) is refused —
+        the lstat S_ISLNK ban, distinct from the realpath parent-collapse."""
+        from brig.cell.host_sockets_bridge import _validate_target
+        from brig.errors import BrigError
+        with tempfile.TemporaryDirectory() as td:
+            sock = _real_socket(Path(td), "real.sock")
+            link = Path(td) / "link.sock"
+            link.symlink_to(sock)
+            with self.assertRaises(BrigError) as ctx:
+                _validate_target(str(link))
+            self.assertIn("symlink", str(ctx.exception).lower())
+
+    def test_plist_freezes_value_validate_target_returned(self):
+        """The plist must bake the EXACT value _validate_target returned, not a
+        realpath re-derived at write time — that's the validate→freeze TOCTOU
+        the change closes. We make _validate_target return a sentinel and a
+        write-time recompute (the old behavior) return something different; the
+        plist must contain the sentinel and never the recomputed value."""
+        from brig.cell.host_sockets_bridge import start_cell_bridges
+        FROZEN = "/validated/at/check/time.sock"
+        SWAPPED = "/swapped/after/validation.sock"
+        with tempfile.TemporaryDirectory() as td:
+            plist_dir = Path(td) / "LaunchAgents"
+            bridge_root = Path(td) / "host-sockets"
+            mock_run = MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+            with patch("brig.cell.host_sockets_bridge._find_socat",
+                       return_value="/opt/homebrew/bin/socat"), \
+                 patch("brig.cell.host_sockets_bridge._validate_target",
+                       return_value=FROZEN) as vt, \
+                 patch("os.path.realpath", return_value=SWAPPED), \
+                 patch("brig.cell.host_sockets_bridge._launchctl", mock_run), \
+                 patch("brig.cell.host_sockets_bridge.PLIST_DIR", plist_dir), \
+                 patch("brig.cell.host_sockets_bridge._bridge_dir_for_cell",
+                       return_value=bridge_root / "alice"), \
+                 patch("brig.cell.host_sockets_bridge._bridge_path",
+                       return_value=bridge_root / "alice" / "pg.sock"), \
+                 patch("brig.cell.host_sockets_bridge._wait_for_socket",
+                       return_value=True):
+                start_cell_bridges("alice", [_socket_entry(
+                    host_path="/tmp/whatever.sock"
+                )])
+            vt.assert_called_once_with("/tmp/whatever.sock")
+            plist = (plist_dir / "com.brig.host-socket.alice.pg.plist").read_text()
+            self.assertIn(FROZEN, plist)        # the validated value is frozen
+            self.assertNotIn(SWAPPED, plist)    # NOT a write-time recompute
+
     def test_engine_socket_target_still_blocked(self):
         """Defense in depth — spec-layer denylist already rejects, but
         if someone bypasses spec validation (SDK direct call), the
@@ -144,11 +207,19 @@ class TestStartBridges(unittest.TestCase):
                 start_cell_bridges("alice", [_socket_entry(
                     host_path=str(target)
                 )])
-            # Plist file written
+            # Plist file written, and it wires socat from the bridge socket
+            # (cell side) to the host target (so a wrong-target regression fails).
             plist = plist_dir / "com.brig.host-socket.alice.pg.plist"
             self.assertTrue(plist.exists())
-            # launchctl was invoked at least once
-            self.assertTrue(mock_run.called)
+            content = plist.read_text()
+            self.assertIn(str(target), content)                            # CONNECT: host socket
+            self.assertIn(str(bridge_root / "alice" / "pg.sock"), content)  # LISTEN: cell-side bridge
+            self.assertIn("com.brig.host-socket.alice.pg", content)        # label
+            # launchctl was invoked with this plist (the load).
+            self.assertTrue(
+                any(str(plist) in str(call) for call in mock_run.call_args_list),
+                "launchctl was not invoked with the plist path",
+            )
 
 
 class TestStopBridges(unittest.TestCase):

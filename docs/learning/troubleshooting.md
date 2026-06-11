@@ -40,13 +40,13 @@ Common causes, in order of likelihood:
 
 1. **Addons missing.** If `~/.brig/cells/addons/enforce.py` doesn't exist:
    ```bash
-   make _copy-addons
+   brig system up   # syncs addons from the installed package and (re)starts warden
    ```
+   (`make _copy-addons` does the same one-shot staging if you only want to copy.)
 
-2. **Policy file is malformed.** Validate it:
-   ```bash
-   limactl shell brig -- warden policy validate
-   ```
+2. **Policy file is malformed.** `warden start` refuses to boot on an
+   unparseable `network-policy.json` — check the JSON syntax of
+   `~/.brig/cells/network-policy.json`.
 
 3. **State drift.** The subnet allocator state and podman's actual networks
    disagree (e.g. you `podman rm`'d a network outside brig):
@@ -68,7 +68,9 @@ brig cell network <cell> --blocked
 Shows the most recent blocked requests with the block reason inline.
 Common reasons:
 
-- `not in allowlist` — domain isn't in `network-policy.json`'s `allow` list.
+- `not in allowlist` — domain isn't in the cell's per-cell `allow` list (or the
+  cell has no policy at all, which is default-deny). Edit with `brig policy set
+  <cell> --allow <domain>`.
 - `denied by rule: <pattern>` — explicit deny rule matched.
 - `host header mismatch` — the cell tried to set a Host header that
   disagrees with the URL it's connecting to (smuggling defense).
@@ -81,7 +83,7 @@ Common reasons:
 To test a domain without sending real traffic:
 
 ```bash
-brig policy test <domain> --path /api
+brig policy test <cell> <domain> --path /api
 ```
 
 ## Disk space
@@ -166,8 +168,10 @@ Inspect the file directly:
 
 ```bash
 brig cell exec <cell> -- cat /var/log/myapp.log
-brig cell read <cell> /var/log/myapp.log
 ```
+
+(`brig cell read` only reaches files under the cell's workspace mount, not
+arbitrary container paths like `/var/log` — use `exec ... cat` for those.)
 
 For long-running interactive cells, write app logs to stdout (most
 runtimes have a flag for this) so `brig cell logs -f <cell>` works.

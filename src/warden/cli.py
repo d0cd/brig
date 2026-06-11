@@ -37,15 +37,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_prune.add_argument("--days", type=int, default=7, help="Days to keep")
     p_prune.add_argument("--size", type=int, help="Max total size in MB")
 
-    p_policy = sub.add_parser("policy", help="Policy management")
-    p_policy_sub = p_policy.add_subparsers(dest="policy_command", required=True)
-    p_validate = p_policy_sub.add_parser("validate", help="Validate policy file")
-    p_validate.add_argument("file", nargs="?", help="Policy file path")
-    p_test = p_policy_sub.add_parser("test", help="Test a domain against policy")
-    p_test.add_argument("domain", help="Domain to test")
-    p_test.add_argument("--path", default="/", help="Path to test")
-    p_test.add_argument("--method", default="GET", help="HTTP method")
-
     return parser
 
 
@@ -57,8 +48,6 @@ def main() -> None:
     configure_logging(debug=args.debug, quiet=args.quiet)
 
     from warden import proxy, health
-    from brig.policy import policy as brig_policy
-
     dispatch = {
         "start": lambda: _cmd_start(proxy),
         "stop": lambda: (proxy.stop(), 0)[1],
@@ -69,9 +58,7 @@ def main() -> None:
         "health": lambda: _cmd_health(args, health),
     }
 
-    if args.command == "policy":
-        exit_code = _handle_policy(args, brig_policy)
-    elif args.command == "logs":
+    if args.command == "logs":
         exit_code = _handle_logs(args)
     elif args.command in dispatch:
         exit_code = dispatch[args.command]()
@@ -96,55 +83,6 @@ def _cmd_status(proxy_mod: object) -> int:
     else:
         print("Proxy: not running")
     return 0
-
-
-def _domain_matches_rule(domain: str, rule: str) -> bool:
-    """Check if a domain matches a policy rule. Thin wrapper around the
-    shared brig.policy.policy.domain_matches_rule so warden and brig CLI
-    share one implementation (C6 dedup from the 0.3 validation plan)."""
-    from brig.policy.policy import domain_matches_rule
-    return domain_matches_rule(rule, domain)
-
-
-def _handle_policy(args: object, policy_mod: object) -> int:
-    """Handle policy subcommands using brig.policy."""
-    from pathlib import Path
-    cmd = getattr(args, "policy_command", "")
-    if cmd == "validate":
-        file_path = getattr(args, "file", None)
-        policy_path = Path(file_path) if file_path else Path("/cells/network-policy.json")
-        try:
-            pol = policy_mod.load_policy_file(policy_path)  # type: ignore[attr-defined]
-        except (ValueError, FileNotFoundError) as e:
-            print(f"ERROR: {e}")
-            return 1
-        errors = policy_mod.validate_policy(pol)  # type: ignore[attr-defined]
-        if errors:
-            print("Validation FAILED:")
-            for e in errors:
-                print(f"  ERROR: {e}")
-            return 1
-        print("Validation OK")
-        return 0
-    elif cmd == "test":
-        try:
-            pol = policy_mod.load_policy_file(Path("/cells/network-policy.json"))  # type: ignore[attr-defined]
-        except (ValueError, FileNotFoundError) as e:
-            print(f"ERROR: {e}")
-            return 1
-        # Simple allow/deny check.
-        domain = getattr(args, "domain", "")
-        for rule in pol.get("deny", []):
-            if isinstance(rule, str) and _domain_matches_rule(domain, rule):
-                print(f"BLOCKED: Denied by rule: {rule}")
-                return 1
-        for rule in pol.get("allow", []):
-            if isinstance(rule, str) and _domain_matches_rule(domain, rule):
-                print(f"ALLOWED: Matched rule: {rule}")
-                return 0
-        print("BLOCKED: Not in allowlist")
-        return 1
-    return 1
 
 
 def _cmd_preflight() -> int:

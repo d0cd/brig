@@ -44,6 +44,29 @@ class TestValidateCellDefinition(unittest.TestCase):
         errors = validate_cell_definition({"image": ""})
         self.assertTrue(any("non-empty string" in e for e in errors))
 
+    def test_restart_valid(self):
+        for v in ("no", "always"):
+            errs = validate_cell_definition(
+                {"name": "test", "image": "alpine", "restart": v})
+            self.assertEqual(errs, [], v)
+
+    def test_restart_invalid(self):
+        errs = validate_cell_definition(
+            {"name": "test", "image": "alpine", "restart": "on-failure"})
+        self.assertTrue(any("restart" in e for e in errs), errs)
+
+    def test_user_valid(self):
+        for u in ("0", "0:0", "1000:1000", "hermes", "hermes:hermes"):
+            errs = validate_cell_definition(
+                {"name": "test", "image": "alpine", "user": u})
+            self.assertEqual(errs, [], u)
+
+    def test_user_invalid(self):
+        for u in ("", "0:0:0", "root user", "../x", "0;rm", 1000):
+            errs = validate_cell_definition(
+                {"name": "test", "image": "alpine", "user": u})
+            self.assertTrue(any("user" in e for e in errs), u)
+
     def test_command_string(self):
         errors = validate_cell_definition({"command": "echo hi"})
         self.assertEqual(errors, [])
@@ -224,6 +247,53 @@ class TestValidateCellDefinition(unittest.TestCase):
     def test_workspace_mount_root_rejected(self):
         errors = validate_cell_definition({"workspace_mount": "/"})
         self.assertTrue(any("shadows rootfs" in e for e in errors), errors)
+
+    def test_workspace_mount_doubled_slash_shadow_rejected(self):
+        # A doubled slash slips past a purely-lexical forbidden-prefix check
+        # while the kernel collapses it back to the protected path. Each of
+        # these normalizes onto a brig-internal mount root.
+        for shadow in ("/run//host", "/run//brig", "/run//secrets",
+                       "//etc", "/run/host//", "/proc/."):
+            errors = validate_cell_definition({"workspace_mount": shadow})
+            self.assertTrue(
+                errors,
+                f"expected rejection for non-normalized shadow {shadow}",
+            )
+
+    def test_workspace_mount_trailing_slash_rejected(self):
+        errors = validate_cell_definition({"workspace_mount": "/work/"})
+        self.assertTrue(any("normalized" in e for e in errors), errors)
+
+    def test_image_leading_dash_rejected(self):
+        # A leading '-' would be parsed by `podman run` as a flag
+        # (--runtime=runc downgrades gVisor, --privileged, -v /:/host).
+        for bad in ("--runtime=runc", "-v=/:/host", "--privileged"):
+            errors = validate_cell_definition({"name": "c", "image": bad})
+            self.assertTrue(
+                any("podman flag" in e for e in errors),
+                f"expected dash rejection for image {bad!r}, got: {errors}",
+            )
+
+    def test_image_normal_ref_allowed(self):
+        for good in ("alpine", "localhost/foo:latest",
+                     "ghcr.io/org/img@sha256:" + "a" * 64):
+            errors = validate_cell_definition({"name": "c", "image": good})
+            self.assertEqual(errors, [], f"{good} should validate")
+
+    def test_trailing_newline_rejected_in_name(self):
+        # `$` matches before a trailing newline; `\Z` does not. A name with an
+        # embedded/trailing newline must be refused.
+        errors = validate_cell_definition({"name": "ok\n", "image": "alpine"})
+        self.assertTrue(any("name" in e for e in errors), errors)
+
+    def test_trailing_newline_rejected_in_secret_and_domain(self):
+        errors = validate_cell_definition({
+            "name": "c", "image": "alpine",
+            "secrets": ["api\n"],
+            "policy": {"allow": ["example.com\n"]},
+        })
+        self.assertTrue(any("secret" in e.lower() for e in errors), errors)
+        self.assertTrue(any("domain" in e.lower() for e in errors), errors)
 
     def test_yaml_int_cpus_coerced_to_string(self):
         """`cpus: 4` in yaml (parses as int) used

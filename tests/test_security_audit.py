@@ -16,15 +16,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Mock mitmproxy before importing addons — it is not installed in the test
-# environment. The mock must be in sys.modules before any addon import.
-_mock_mitmproxy = MagicMock()
-sys.modules.setdefault("mitmproxy", _mock_mitmproxy)
-sys.modules.setdefault("mitmproxy.ctx", _mock_mitmproxy.ctx)
-sys.modules.setdefault("mitmproxy.http", _mock_mitmproxy.http)
+import pytest
+
+pytest.importorskip("mitmproxy", reason="install dev extras: uv pip install -e '.[dev]'")
+
+# Addons call `mitmproxy.ctx.log.info(...)`. `ctx` is populated by mitmproxy
+# at addon-load time; in unit-test context it's bare, so attach a no-op
+# logger shim before importing the addon modules.
+import mitmproxy.ctx  # noqa: E402
+if not hasattr(mitmproxy.ctx, "log"):
+    mitmproxy.ctx.log = MagicMock()
 
 # Add addons directory to sys.path so we can import enforce/logger directly.
-_addons_dir = str(Path(__file__).parent.parent / "src" / "addons")
+_addons_dir = str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons")
 if _addons_dir not in sys.path:
     sys.path.insert(0, _addons_dir)
 
@@ -288,21 +292,21 @@ class TestSeccompProfileValidation(unittest.TestCase):
     def test_unconfined_rejected(self, mock_vm_run):
         """seccomp_profile='unconfined' must be rejected."""
         spec = self._make_spec("unconfined")
-        with self.assertRaises(BrigError, msg="unconfined"):
+        with self.assertRaisesRegex(BrigError, "unconfined"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
     def test_unconfined_case_insensitive(self, mock_vm_run):
         """seccomp_profile='Unconfined' must also be rejected (case-insensitive)."""
         spec = self._make_spec("Unconfined")
-        with self.assertRaises(BrigError, msg="unconfined"):
+        with self.assertRaisesRegex(BrigError, "unconfined"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
     def test_path_with_slash_rejected(self, mock_vm_run):
         """seccomp_profile with '/' is rejected (must be filename only)."""
         spec = self._make_spec("/etc/seccomp.json")
-        with self.assertRaises(BrigError, msg="path"):
+        with self.assertRaisesRegex(BrigError, "path"):
             build_run_command(spec, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
@@ -310,7 +314,7 @@ class TestSeccompProfileValidation(unittest.TestCase):
         """seccomp_profile with '..' is rejected."""
         # URL-encoded ".." won't trigger the check, but literal ".." will.
         spec_literal = self._make_spec("../../../etc/seccomp.json")
-        with self.assertRaises(BrigError, msg="path"):
+        with self.assertRaisesRegex(BrigError, "path"):
             build_run_command(spec_literal, "10.60.1.1")
 
     @patch("brig.cell.reconciler.vm_run")
@@ -528,6 +532,13 @@ class TestResponseHeadersDnsRebinding(unittest.TestCase):
         self.enforcer.responseheaders(flow)
         self.assertTrue(flow.metadata.get("blocked"))
 
+    def test_unparseable_peer_ip_fails_closed(self):
+        """is_blocked_ip returns False for garbage; the explicit re-parse
+        must still block (can't prove the server isn't internal)."""
+        flow = self._make_flow("not-an-ip")
+        self.enforcer.responseheaders(flow)
+        self.assertTrue(flow.metadata.get("blocked"))
+
 
 class TestConnectMethodEnforcement(unittest.TestCase):
     """CONNECT tunnels must respect the same port and policy gates.
@@ -634,6 +645,47 @@ class TestAirgappedSpecValidation(unittest.TestCase):
         # secrets list must still be honored by the reconciler.
         self.assertTrue(spec.is_airgapped)
         self.assertEqual(spec.secrets, ["api-key"])
+
+
+class TestStrictPolicyLoadFailsClosed(unittest.TestCase):
+    """Startup uses _reload_policy(strict=True): a missing or malformed
+    /policy.json must RAISE so warden refuses to start rather than running
+    with an empty (default-deny but healthy-looking) policy."""
+
+    def _enforcer_with_policy_file(self, path):
+        import enforce as enforce_mod
+        enf = PolicyEnforcer()
+        old = enforce_mod.POLICY_FILE
+        enforce_mod.POLICY_FILE = path
+        self.addCleanup(setattr, enforce_mod, "POLICY_FILE", old)
+        return enf
+
+    def test_missing_policy_file_raises_under_strict(self):
+        missing = Path(tempfile.gettempdir()) / "brig-nonexistent-policy-xyz.json"
+        if missing.exists():
+            missing.unlink()
+        enf = self._enforcer_with_policy_file(missing)
+        with self.assertRaises(Exception):
+            enf._reload_policy(strict=True)
+
+    def test_malformed_policy_file_raises_under_strict(self):
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                         delete=False) as f:
+            f.write("{ this is not valid json ]")
+            f.flush()
+            enf = self._enforcer_with_policy_file(Path(f.name))
+            with self.assertRaises(Exception):
+                enf._reload_policy(strict=True)
+
+    def test_non_strict_reload_swallows_malformed(self):
+        # A bad edit during a running session must NOT crash the event loop;
+        # strict=False keeps the last-good policy in place.
+        with tempfile.NamedTemporaryFile(suffix=".json", mode="w",
+                                         delete=False) as f:
+            f.write("{ bad json ]")
+            f.flush()
+            enf = self._enforcer_with_policy_file(Path(f.name))
+            enf._reload_policy(strict=False)  # must not raise
 
 
 if __name__ == "__main__":

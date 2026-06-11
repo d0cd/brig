@@ -1,8 +1,6 @@
 """
-Merged operational addon for mitmproxy: metrics, rate limiting, and health.
-
-Combines the functionality of metrics.py, ratelimit.py, and health.py into
-a single addon with one configure() hook for coordinated state management.
+Merged operational addon for mitmproxy: metrics, rate limiting, and a health
+endpoint, behind one configure() hook for coordinated state management.
 
 This addon is loaded alongside enforce.py and logger.py.
 
@@ -22,6 +20,8 @@ from socketserver import ThreadingMixIn
 from typing import Any, Dict, Optional
 
 from mitmproxy import ctx, http
+
+from _common import stat_signature
 
 
 # --- Configuration ---
@@ -142,7 +142,7 @@ class OpsAddon:
         self.cell_rate_configs: Dict[str, RateLimitConfig] = {}
         self.buckets: collections.OrderedDict[str, TokenBucket] = collections.OrderedDict()
         self.buckets_lock = threading.Lock()
-        self.policy_mtime: float = 0.0
+        self.policy_mtime: tuple[int, int] = (0, 0)
 
         # Metrics.
         self.metrics: collections.OrderedDict[str, CellMetrics] = collections.OrderedDict()
@@ -170,8 +170,7 @@ class OpsAddon:
         """
         try:
             if POLICY_FILE.exists():
-                mtime = POLICY_FILE.stat().st_mtime
-                if mtime != self.policy_mtime:
+                if stat_signature(POLICY_FILE) != self.policy_mtime:
                     self._load_rate_config()
         except OSError:
             pass
@@ -268,7 +267,7 @@ class OpsAddon:
         try:
             if not POLICY_FILE.exists():
                 return
-            self.policy_mtime = POLICY_FILE.stat().st_mtime
+            sig = stat_signature(POLICY_FILE)
             with open(POLICY_FILE) as f:
                 policy = json.load(f)
             rate_limits = policy.get("rate_limits", {})
@@ -284,6 +283,10 @@ class OpsAddon:
                     rate=float(config.get("rate", self.default_rate_config.rate)),
                     burst=int(config.get("burst", self.default_rate_config.burst)),
                 )
+            # Advance the fingerprint only after a fully successful parse, so a
+            # bad edit is retried on the next configure() rather than skipped
+            # until the file changes again (matches enforce.py / notifier.py).
+            self.policy_mtime = sig
         except (json.JSONDecodeError, IOError, OSError, ValueError) as e:
             ctx.log.warn(f"OpsAddon: Failed to load rate config: {e}")
 

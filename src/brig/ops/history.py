@@ -6,7 +6,6 @@ All log entries are JSONL (one JSON object per line) with file locking.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import re
 import time
@@ -22,6 +21,7 @@ from brig.config import (
     POLICY_AUDIT_FILE,
     SENSITIVE_PATTERNS,
 )
+from brig.ops.locking import locked_file
 from brig.ops.logging import debug
 
 
@@ -62,8 +62,7 @@ def _append_jsonl(path: Path, entry: dict[str, Any]) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(path.suffix + ".lock")
-    with open(lock_path, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with locked_file(lock_path):
         _maybe_rotate(path)
         with open(path, "a") as f:
             f.write(json.dumps(entry) + "\n")

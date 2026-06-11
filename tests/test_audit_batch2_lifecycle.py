@@ -75,7 +75,7 @@ class TestH3BridgeRollbackOnApplyFailure(unittest.TestCase):
 
 
 class TestH2IngressTokenFailureRollsBackCell(unittest.TestCase):
-    """If _register_cell_ingress raises (missing token), the cell —
+    """If register_ingress_for raises (missing token), the cell —
     which is already running by that point — must be torn down. Leaving
     it running with no ingress = silent broken state."""
 
@@ -96,12 +96,12 @@ class TestH2IngressTokenFailureRollsBackCell(unittest.TestCase):
              patch("brig.cell.lifecycle.check_rate_limit", return_value=True), \
              patch("brig.cell.lifecycle.plan_run", return_value=[MagicMock()]), \
              patch("brig.cell.lifecycle.apply", return_value=good_apply), \
-             patch("brig.cell.lifecycle._register_cell_ingress",
+             patch("brig.cell.lifecycle.register_ingress_for",
                    side_effect=BrigError("no token")), \
              patch("brig.cell.lifecycle.rm_cell") as mock_rm:
             with self.assertRaises(BrigError):
                 run_cell(spec, proxy_check=lambda: True)
-        mock_rm.assert_called_once_with("alice", force=True)
+        mock_rm.assert_called_once_with("alice", force=True, keep_workspace=True)
 
 
 class TestH4BrigDownTearsDownAllBridges(unittest.TestCase):

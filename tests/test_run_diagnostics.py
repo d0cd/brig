@@ -27,28 +27,28 @@ def _args(**kw):
 
 class TestFlagAfterImageDetector(unittest.TestCase):
     def test_brig_flag_in_container_cmd_position_rejected(self):
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         from brig.errors import BrigError
         with self.assertRaises(BrigError) as ctx:
             cmd_run(_args(image="alpine", container_cmd=["--memory", "256m", "sh"]))
         self.assertIn("looks like a brig flag", str(ctx.exception))
 
     def test_brig_flag_after_double_dash_separator_rejected(self):
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         from brig.errors import BrigError
         with self.assertRaises(BrigError):
             cmd_run(_args(image="alpine", container_cmd=["--", "--detach"]))
 
     def test_legit_container_arg_starting_with_dash_allowed(self):
         # `ls -la` should not trigger — `-la` isn't a known brig flag.
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         from brig.errors import BrigError
         # We expect this to proceed past the flag-detector; downstream
         # mocks will short-circuit so it doesn't actually run.
-        with patch("brig.commands.lifecycle_cmd.run_cell") as mock_run:
+        with patch("brig.commands.lifecycle_run.run_cell") as mock_run:
             mock_run.return_value = MagicMock(success=True, container_id="abc")
             with patch("brig.ops.logging.Spinner"):
-                with patch("brig.commands.lifecycle_cmd._check_immediate_exit"):
+                with patch("brig.commands.lifecycle_run._check_immediate_exit"):
                     try:
                         cmd_run(_args(image="alpine", container_cmd=["ls", "-la"]))
                     except BrigError as e:
@@ -57,7 +57,7 @@ class TestFlagAfterImageDetector(unittest.TestCase):
 
 class TestDirAsImageRefDetector(unittest.TestCase):
     def test_directory_argument_suggests_build(self):
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         from brig.errors import BrigError
         with tempfile.TemporaryDirectory() as td:
             ctx_dir = Path(td) / "my-cell"
@@ -69,11 +69,11 @@ class TestDirAsImageRefDetector(unittest.TestCase):
 
     def test_localhost_image_ref_not_caught(self):
         # `localhost/foo:latest` contains '/' but shouldn't be flagged.
-        from brig.commands.lifecycle_cmd import cmd_run
-        with patch("brig.commands.lifecycle_cmd.run_cell") as mock_run:
+        from brig.commands.lifecycle_run import cmd_run
+        with patch("brig.commands.lifecycle_run.run_cell") as mock_run:
             mock_run.return_value = MagicMock(success=True, container_id="abc")
             with patch("brig.ops.logging.Spinner"):
-                with patch("brig.commands.lifecycle_cmd._check_immediate_exit"):
+                with patch("brig.commands.lifecycle_run._check_immediate_exit"):
                     cmd_run(_args(image="localhost/foo:latest"))
                     self.assertTrue(mock_run.called)
 
@@ -83,7 +83,7 @@ class TestDiagnoseExit(unittest.TestCase):
     common causes and suggests the fix."""
 
     def test_read_only_filesystem_suggests_writable_rootfs(self):
-        from brig.commands.lifecycle_cmd import _diagnose_exit
+        from brig.commands.lifecycle_run import _diagnose_exit
         hint = _diagnose_exit(
             "mkdir: cannot create directory '/var/log/app': Read-only file system"
         )
@@ -92,7 +92,7 @@ class TestDiagnoseExit(unittest.TestCase):
     def test_read_only_filesystem_lists_writable_paths(self):
         """Feedback #4: the writable paths should appear in the hint so
         users know HOME=/tmp/home is the lighter fix than writable_rootfs."""
-        from brig.commands.lifecycle_cmd import _diagnose_exit
+        from brig.commands.lifecycle_run import _diagnose_exit
         hint = _diagnose_exit(
             "mkdir: cannot create directory '/var/log/app': Read-only file system"
         )
@@ -101,19 +101,19 @@ class TestDiagnoseExit(unittest.TestCase):
         self.assertIn("HOME=/tmp/home", hint)
 
     def test_errno_30_also_matches(self):
-        from brig.commands.lifecycle_cmd import _diagnose_exit
+        from brig.commands.lifecycle_run import _diagnose_exit
         hint = _diagnose_exit("OSError: [Errno 30] Read-only file system: '/etc/foo'")
         self.assertIn("writable_rootfs", hint)
 
     def test_missing_bash_suggests_sh(self):
-        from brig.commands.lifecycle_cmd import _diagnose_exit
+        from brig.commands.lifecycle_run import _diagnose_exit
         hint = _diagnose_exit(
             "executable file not found in $PATH: \"bash\""
         )
         self.assertIn("sh", hint)
 
     def test_unknown_pattern_returns_empty(self):
-        from brig.commands.lifecycle_cmd import _diagnose_exit
+        from brig.commands.lifecycle_run import _diagnose_exit
         self.assertEqual(_diagnose_exit("something else exited 1"), "")
 
 

@@ -2,7 +2,10 @@
 Security invariant verification checks.
 
 Each check is a pure function returning CheckResult(passed, message, details).
-All 9 invariants from docs/design/security.md are covered.
+Covers the 6 of the 12 invariants that are verifiable at runtime via podman
+inspect: 1 (network isolation), 5 (gVisor), 6 (proxy-external membership),
+7 (cell-network members), 8 (single-homed), 9 (proxy running). The others are
+enforced at cell-definition parse / build time, not re-checked here.
 """
 
 from __future__ import annotations
@@ -29,19 +32,19 @@ def _run(cmd: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
     return vm_run(cmd, timeout=timeout)
 
 
-def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
-    """Shared query: list cell containers and their inspect data.
+def _get_cell_containers() -> list[dict] | None:
+    """Shared query: inspect data for all cell containers.
 
-    Returns (cell_names, container_infos) or None on failure. Uses the
-    module-local `_run` alias for both calls so tests can mock the
-    verify-side subprocess seam independently of list_cell_containers.
+    Returns the container info list ([] if none) or None on failure. Uses the
+    module-local `_run` alias for both calls so tests can mock the verify-side
+    subprocess seam independently of list_cell_containers.
     """
     result = _run([
         "podman", "ps", "-a", "--format", "json",
         "--filter", f"name=^{CONTAINER_PREFIX}",
     ])
     if not result.stdout.strip():
-        return [], []
+        return []
 
     try:
         containers = json.loads(result.stdout)
@@ -50,24 +53,26 @@ def _get_cell_containers() -> tuple[list[str], list[dict]] | None:
 
     def _name(c: dict) -> str:
         n = c.get("Names", "")
-        return n[0] if isinstance(n, list) else n
+        if isinstance(n, list):
+            return str(n[0]) if n else ""
+        return str(n)
 
     from brig.config import INFRA_CONTAINER_NAMES
     cell_names = [_name(c) for c in containers if _name(c) not in INFRA_CONTAINER_NAMES]
     if not cell_names:
-        return [], []
+        return []
 
     inspect = _run(["podman", "inspect", "--format", "json"] + cell_names)
     try:
-        return cell_names, json.loads(inspect.stdout)
+        return json.loads(inspect.stdout)  # type: ignore[no-any-return]
     except json.JSONDecodeError:
         return None
 
 
-def _get_cell_networks() -> tuple[list[str], list[dict]] | None:
-    """Shared query: list cell networks and their inspect data.
+def _get_cell_networks() -> list[dict] | None:
+    """Shared query: inspect data for all cell networks.
 
-    Returns (network_names, network_infos) or None on failure.
+    Returns the network info list ([] if none) or None on failure.
     """
     result = _run(["podman", "network", "ls", "--format", "{{.Name}}"])
     cell_networks = [
@@ -75,11 +80,11 @@ def _get_cell_networks() -> tuple[list[str], list[dict]] | None:
         if net.startswith(CONTAINER_PREFIX) and net != PROXY_EXTERNAL_NETWORK
     ]
     if not cell_networks:
-        return [], []
+        return []
 
     inspect = _run(["podman", "network", "inspect"] + cell_networks)
     try:
-        return cell_networks, json.loads(inspect.stdout)
+        return json.loads(inspect.stdout)  # type: ignore[no-any-return]
     except json.JSONDecodeError:
         return None
 
@@ -99,9 +104,36 @@ def verify_proxy_network() -> CheckResult:
         "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}",
     ])
     networks = result.stdout.strip().split()
-    if PROXY_EXTERNAL_NETWORK in networks:
-        return CheckResult(True, "Proxy attached to proxy-external")
-    return CheckResult(False, "Proxy not on proxy-external network")
+    if PROXY_EXTERNAL_NETWORK not in networks:
+        return CheckResult(False, "Proxy not on proxy-external network")
+
+    # Confirming warden is attached is not enough: a second container on
+    # proxy-external would share warden's egress-capable (non-internal)
+    # network and defeat the choke point. Enumerate the members and assert
+    # only infrastructure containers are attached.
+    from brig.config import INFRA_CONTAINER_NAMES
+    inspect = _run(["podman", "network", "inspect", PROXY_EXTERNAL_NETWORK])
+    try:
+        net_infos = json.loads(inspect.stdout)
+    except json.JSONDecodeError:
+        return CheckResult(False, "Could not inspect proxy-external network")
+
+    members: set[str] = set()
+    for net_info in net_infos:
+        containers = net_info.get("containers") or {}
+        for cid, m in containers.items():
+            if not isinstance(m, dict):
+                continue
+            # A member with no name still occupies the network and must be
+            # accounted for — fall back to the container ID so it can't slip
+            # past the enumeration (fail closed, not open).
+            members.add(m.get("name") or f"<unnamed:{cid}>")
+    unexpected = sorted(n for n in members if n not in INFRA_CONTAINER_NAMES)
+    if unexpected:
+        return CheckResult(
+            False, "Non-infrastructure containers on proxy-external", unexpected
+        )
+    return CheckResult(True, "Proxy-external has only infrastructure containers")
 
 
 def verify_gvisor_runtime(container_infos: list[dict] | None = None) -> CheckResult:
@@ -110,7 +142,7 @@ def verify_gvisor_runtime(container_infos: list[dict] | None = None) -> CheckRes
         data = _get_cell_containers()
         if data is None:
             return CheckResult(False, "Could not query containers")
-        _, container_infos = data
+        container_infos = data
     if not container_infos:
         return CheckResult(True, "No cells to check")
 
@@ -118,9 +150,15 @@ def verify_gvisor_runtime(container_infos: list[dict] | None = None) -> CheckRes
     for c_info in container_infos:
         name = c_info.get("Name", "").lstrip("/")
         cell = name[len(CONTAINER_PREFIX):] if name.startswith(CONTAINER_PREFIX) else name
-        oci_runtime = c_info.get("HostConfig", {}).get("Runtime", "")
-        if oci_runtime and oci_runtime != RUNTIME:
-            issues.append(f"{cell} uses {oci_runtime} instead of {RUNTIME}")
+        # podman reports the OCI *category* ("oci") in HostConfig.Runtime;
+        # the named runtime (runsc/crun) lives in the top-level OCIRuntime
+        # field. Reading HostConfig.Runtime cannot tell runsc from a crun
+        # downgrade.
+        oci_runtime = c_info.get("OCIRuntime", "")
+        if oci_runtime != RUNTIME:
+            issues.append(
+                f"{cell} uses {oci_runtime or '<unset>'} instead of {RUNTIME}"
+            )
 
     if issues:
         return CheckResult(False, "gVisor runtime violations", issues)
@@ -133,7 +171,7 @@ def verify_network_isolation(network_infos: list[dict] | None = None) -> CheckRe
         data = _get_cell_networks()
         if data is None:
             return CheckResult(False, "Could not query networks")
-        _, network_infos = data
+        network_infos = data
     if not network_infos:
         return CheckResult(True, "No cell networks to check")
 
@@ -154,7 +192,7 @@ def verify_single_homed(container_infos: list[dict] | None = None) -> CheckResul
         data = _get_cell_containers()
         if data is None:
             return CheckResult(False, "Could not query containers")
-        _, container_infos = data
+        container_infos = data
     if not container_infos:
         return CheckResult(True, "No cells to check")
 
@@ -162,7 +200,9 @@ def verify_single_homed(container_infos: list[dict] | None = None) -> CheckResul
     for c_info in container_infos:
         name = c_info.get("Name", "").lstrip("/")
         networks = list(c_info.get("NetworkSettings", {}).get("Networks", {}).keys())
-        if len(networks) != 1:
+        # Airgapped cells (--network none) legitimately have 0 networks and
+        # are strictly more isolated than single-homed; only >1 is a violation.
+        if len(networks) > 1:
             issues.append(f"{name} has {len(networks)} networks")
 
     if issues:
@@ -176,7 +216,7 @@ def verify_cell_network_members(network_infos: list[dict] | None = None) -> Chec
         data = _get_cell_networks()
         if data is None:
             return CheckResult(False, "Could not query networks")
-        _, network_infos = data
+        network_infos = data
     if not network_infos:
         return CheckResult(True, "No cell networks to check")
 
@@ -185,11 +225,12 @@ def verify_cell_network_members(network_infos: list[dict] | None = None) -> Chec
         net_name = net_info.get("name", "")
         containers = net_info.get("containers") or {}
         member_names = {
-            m.get("name", "") for m in containers.values()
+            (m.get("name") or f"<unnamed:{cid}>")
+            for cid, m in containers.items()
             if isinstance(m, dict)
         }
         expected = {PROXY_NAME, net_name}
-        unexpected = {n for n in member_names if n and n not in expected}
+        unexpected = {n for n in member_names if n not in expected}
         if unexpected:
             issues.append(
                 f"Network {net_name} has non-warden/non-cell containers: "
@@ -213,7 +254,7 @@ def verify_all() -> list[CheckResult]:
     if container_data is None:
         results.append(CheckResult(False, "Could not query containers"))
     else:
-        _, container_infos = container_data
+        container_infos = container_data
         results.append(verify_gvisor_runtime(container_infos))
         results.append(verify_single_homed(container_infos))
 
@@ -222,7 +263,7 @@ def verify_all() -> list[CheckResult]:
     if network_data is None:
         results.append(CheckResult(False, "Could not query networks"))
     else:
-        _, network_infos = network_data
+        network_infos = network_data
         results.append(verify_network_isolation(network_infos))
         results.append(verify_cell_network_members(network_infos))
 

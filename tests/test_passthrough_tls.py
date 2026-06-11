@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 
 def _addon_policy_class():
-    sys.path.insert(0, "src/addons")
+    sys.path.insert(0, "src/brig/warden_addons")
     try:
         from _policy import Policy
     finally:
@@ -154,7 +154,7 @@ class TestSyncCellPolicyPersistsPassthrough(unittest.TestCase):
 
     def test_passthrough_written_to_per_cell_policy(self):
         from brig.cell.spec import CellSpec
-        from brig.commands.lifecycle_cmd import _sync_cell_policy
+        from brig.commands.lifecycle_run import _sync_cell_policy
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             policy_dir = td / "policies"
@@ -166,7 +166,7 @@ class TestSyncCellPolicyPersistsPassthrough(unittest.TestCase):
             )
             with patch("brig.policy.policy.get_cell_policy_path",
                        side_effect=lambda name, *a, **kw: policy_dir / f"{name}.json"), \
-                 patch("brig.commands.lifecycle_cmd.info"):
+                 patch("brig.commands.lifecycle_run.info"):
                 _sync_cell_policy(spec)
             on_disk = json.loads((policy_dir / "codex.json").read_text())
             self.assertEqual(on_disk["tls_passthrough"], ["chatgpt.com"])
@@ -207,7 +207,7 @@ class TestTlsClientHelloFailsClosed(unittest.TestCase):
 
     def _enforcer(self):
         import sys
-        sys.path.insert(0, "src/addons")
+        sys.path.insert(0, "src/brig/warden_addons")
         try:
             from enforce import PolicyEnforcer
             from _policy import Policy
@@ -230,27 +230,48 @@ class TestTlsClientHelloFailsClosed(unittest.TestCase):
         client = MagicMock()
         client.peername = ("10.60.1.5", 54321)
         client.metadata = {}
-        client.tls_passthrough = False
         server = SimpleNamespace(
             address=(connect_host, 443) if connect_host else None,
         )
         context = SimpleNamespace(client=client, server=server)
         hello = SimpleNamespace(sni=sni)
+        # ClientHelloData exposes a settable `ignore_connection` — that IS the
+        # passthrough switch the TLS layer reads. Don't pre-set it; a flip is
+        # observed as the attribute becoming True.
         return SimpleNamespace(client_hello=hello, context=context), client
+
+    @staticmethod
+    def _passed_through(data) -> bool:
+        return getattr(data, "ignore_connection", False) is True
 
     def test_passthrough_flips_when_sni_matches_connect(self):
         enf = self._enforcer()
         data, client = self._make_data("chatgpt.com", "chatgpt.com")
-        enf.tls_clienthello(data)
-        self.assertTrue(client.tls_passthrough)
+        # SNI must resolve to a non-blocked address for passthrough to engage.
+        with patch("socket.getaddrinfo",
+                   return_value=[(2, 1, 6, "", ("104.18.0.1", 0))]):
+            enf.tls_clienthello(data)
+        self.assertTrue(self._passed_through(data),
+                        "ignore_connection must be set to engage passthrough")
         self.assertEqual(client.metadata.get("tls_mode"), "passthrough")
+
+    def test_passthrough_refused_when_sni_resolves_internal(self):
+        """SSRF/rebinding guard: a passthrough host that resolves into a
+        blocked range must NOT be tunneled raw — fall through to MITM."""
+        enf = self._enforcer()
+        data, client = self._make_data("chatgpt.com", "chatgpt.com")
+        with patch("socket.getaddrinfo",
+                   return_value=[(2, 1, 6, "", ("169.254.169.254", 0))]):
+            enf.tls_clienthello(data)
+        self.assertFalse(self._passed_through(data))
+        self.assertNotIn("tls_mode", client.metadata)
 
     def test_passthrough_not_flipped_when_connect_host_missing(self):
         """Fail closed: no CONNECT host = can't verify, don't flip."""
         enf = self._enforcer()
         data, client = self._make_data("chatgpt.com", None)
         enf.tls_clienthello(data)
-        self.assertFalse(client.tls_passthrough)
+        self.assertFalse(self._passed_through(data))
         self.assertNotIn("tls_mode", client.metadata)
 
     def test_passthrough_not_flipped_on_sni_connect_mismatch(self):
@@ -258,7 +279,7 @@ class TestTlsClientHelloFailsClosed(unittest.TestCase):
         # Cell CONNECTs to allowed host but ships SNI of disallowed host.
         data, client = self._make_data("attacker.com", "chatgpt.com")
         enf.tls_clienthello(data)
-        self.assertFalse(client.tls_passthrough)
+        self.assertFalse(self._passed_through(data))
 
 
 if __name__ == "__main__":

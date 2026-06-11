@@ -25,17 +25,17 @@ def _args(**kw):
 
 
 def _captured_spec(args):
-    from brig.commands import lifecycle_cmd
+    from brig.commands import lifecycle_run
     captured: dict = {}
     def fake_run_cell(spec):
         captured["spec"] = spec
         r = MagicMock(success=True, container_id="abc")
         return r
-    with patch.object(lifecycle_cmd, "run_cell", fake_run_cell), \
+    with patch.object(lifecycle_run, "run_cell", fake_run_cell), \
          patch("brig.ops.logging.Spinner"), \
-         patch.object(lifecycle_cmd, "_sync_cell_policy"), \
-         patch.object(lifecycle_cmd, "_check_immediate_exit"):
-        lifecycle_cmd.cmd_run(args)
+         patch.object(lifecycle_run, "_sync_cell_policy"), \
+         patch.object(lifecycle_run, "_check_immediate_exit"):
+        lifecycle_run.cmd_run(args)
     return captured["spec"]
 
 
@@ -81,7 +81,7 @@ class TestPolicyFromYaml(unittest.TestCase):
 class TestSyncCellPolicy(unittest.TestCase):
     def _run(self, *, policy_allow=None, policy_deny=None,
              host_services=None, prior=None):
-        from brig.commands.lifecycle_cmd import _sync_cell_policy
+        from brig.commands.lifecycle_run import _sync_cell_policy
         from brig.cell.spec import CellSpec
         spec = CellSpec(
             name="alice", image="alpine",

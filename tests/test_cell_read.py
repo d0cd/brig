@@ -32,7 +32,7 @@ def _patched_state(base: Path):
 class TestCellRead(unittest.TestCase):
 
     def _run(self, name: str, path: str) -> tuple[int, bytes]:
-        from brig.commands.lifecycle_cmd import cmd_read
+        from brig.commands.lifecycle_inspect import cmd_read
         # Capture stdout bytes (cmd_read writes to sys.stdout.buffer).
         captured = io.BytesIO()
         original_stdout = sys.stdout

@@ -41,6 +41,8 @@ from pathlib import Path
 
 from mitmproxy import ctx, http
 
+from _common import redact_path, stat_signature
+
 
 # Routes file (written by reconciler, watched by this addon).
 ROUTES_FILE = Path("/var/run/cells/ingress-routes.json")
@@ -61,7 +63,8 @@ AUTH_FAIL_MAX_IPS = 10000  # Max tracked IPs (LRU eviction beyond this).
 class IngressRoute:
     """A parsed ingress route."""
 
-    __slots__ = ("cell", "cell_ip", "name", "port", "path_prefix", "auth_secret_hash", "auth_salt")
+    __slots__ = ("cell", "cell_ip", "name", "port", "path_prefix", "auth",
+                 "auth_secret_hash", "auth_salt")
 
     def __init__(self, route: dict):
         self.cell = route["cell"]
@@ -69,6 +72,9 @@ class IngressRoute:
         self.name = route["name"]
         self.port = route["port"]
         self.path_prefix = route["path_prefix"]
+        # Default to "token" (fail-secure): a route missing `auth` is gated,
+        # never silently treated as open.
+        self.auth = route.get("auth", "token")
         self.auth_secret_hash = route.get("auth_secret_hash", "")
         self.auth_salt = route.get("auth_salt", "")
 
@@ -89,7 +95,9 @@ class IngressRouter:
 
     def __init__(self):
         self.routes: dict[str, list[IngressRoute]] = {}  # cell_name -> routes
-        self._routes_mtime = 0.0
+        # (st_mtime_ns, st_size); see _common.stat_signature for why a float
+        # mtime would miss a same-second route rewrite.
+        self._routes_sig: tuple[int, int] = (0, 0)
         self._reload_lock = threading.Lock()
         self._last_check_time = 0.0
         self._CHECK_INTERVAL = 1.0
@@ -116,8 +124,7 @@ class IngressRouter:
 
         try:
             if ROUTES_FILE.exists():
-                mtime = ROUTES_FILE.stat().st_mtime
-                if mtime != self._routes_mtime:
+                if stat_signature(ROUTES_FILE) != self._routes_sig:
                     with self._reload_lock:
                         self._reload_routes()
         except OSError:
@@ -132,11 +139,11 @@ class IngressRouter:
         try:
             if not ROUTES_FILE.exists():
                 self.routes = {}
-                self._routes_mtime = 0.0
+                self._routes_sig = (0, 0)
                 return
 
-            mtime = ROUTES_FILE.stat().st_mtime
-            if mtime == self._routes_mtime:
+            sig = stat_signature(ROUTES_FILE)
+            if sig == self._routes_sig:
                 return
 
             # Acquire shared lock to prevent reading a partially written file.
@@ -194,7 +201,7 @@ class IngressRouter:
                 new_routes[route.cell].append(route)
 
             self.routes = new_routes
-            self._routes_mtime = mtime
+            self._routes_sig = sig
 
             total = sum(len(v) for v in self.routes.values())
             ctx.log.info(
@@ -305,8 +312,9 @@ class IngressRouter:
         path = flow.request.path
         client_ip = flow.client_conn.peername[0] if flow.client_conn.peername else "unknown"
 
-        # Sanitize for logging (strip control characters).
-        safe_path = re.sub(r'[\x00-\x1f\x7f]', '', path)
+        # Sanitize for logging: strip control characters AND redact secrets in
+        # the path/query (ctx.log is captured as warden container stdout).
+        safe_path = redact_path(re.sub(r'[\x00-\x1f\x7f]', '', path))
 
         # Rate limit check — reject before any processing if IP is abusing auth.
         if self._is_rate_limited(client_ip):
@@ -322,36 +330,52 @@ class IngressRouter:
 
         if route is None:
             flow.response = http.Response.make(
-                404, "Not found", {"Content-Type": "text/plain"}
+                404, f"No ingress route registered for '{safe_path}'\n",
+                {"Content-Type": "text/plain"},
             )
             ctx.log.info(f"INGRESS MISS: {client_ip} {safe_path}")
             return
 
-        # Validate authentication.
-        if not self._validate_token(flow.request, route.auth_secret_hash, route.auth_salt):
-            self._record_auth_failure(client_ip)
-            flow.response = http.Response.make(
-                401,
-                "Unauthorized",
-                {
-                    "Content-Type": "text/plain",
-                    "WWW-Authenticate": "Bearer",
-                },
-            )
-            ctx.log.warn(
-                f"INGRESS AUTH FAIL: {client_ip} -> {route.cell}{safe_path}"
-            )
-            return
+        # Tag the flow with its route now (not just on the proxied path) so
+        # rejected attempts — auth failures, oversize bodies — also attribute
+        # to the cell and show up in `brig cell network <cell>` rather than
+        # vanishing into unknown.jsonl.
+        flow.metadata["ingress"] = True
+        flow.metadata["cell"] = route.cell
+        flow.metadata["ingress_cell"] = route.cell
+        flow.metadata["ingress_route"] = route.name
+        flow.metadata["ingress_client_ip"] = client_ip
+
+        # Validate authentication — unless the route opts out (auth: none),
+        # in which case brig is a transparent proxy and the cell's app is the
+        # gate. The untrusted profile can't declare auth: none (parse-time gate).
+        if route.auth != "none":
+            if not self._validate_token(flow.request, route.auth_secret_hash, route.auth_salt):
+                self._record_auth_failure(client_ip)
+                flow.response = http.Response.make(
+                    401,
+                    "Unauthorized",
+                    {
+                        "Content-Type": "text/plain",
+                        "WWW-Authenticate": "Bearer",
+                    },
+                )
+                ctx.log.warn(
+                    f"INGRESS AUTH FAIL: {client_ip} -> {route.cell}{safe_path}"
+                )
+                return
 
         # Check request body size.
         #
         # LIMITATION: mitmproxy has already buffered the body into memory by
         # the time this check runs, so this gate is post-allocation and
         # only protects the cell-side application (and downstream memory)
-        # from large payloads. Auth still gates this — an unauthenticated
-        # client can't make warden buffer a body, since 401 returns earlier.
-        # For a true wire-level cap, mitmproxy stream mode would have to be
-        # configured for the ingress listener; we don't do that today.
+        # from large payloads. For auth: token routes the 401 above returns
+        # first, so only authenticated clients can make warden buffer a body;
+        # an auth: none route has no brig gate (the operator opted out), so its
+        # cell app is reachable with bodies up to this cap. For a true
+        # wire-level cap, mitmproxy stream mode would have to be configured for
+        # the ingress listener; we don't do that today.
         if flow.request.content and len(flow.request.content) > MAX_INGRESS_BODY_SIZE:
             flow.response = http.Response.make(
                 413, "Request body too large", {"Content-Type": "text/plain"}
@@ -362,9 +386,11 @@ class IngressRouter:
             )
             return
 
-        # Strip Authorization header before forwarding to cell.
-        # The cell should not see the ingress token.
-        del flow.request.headers["Authorization"]
+        # Strip the Authorization header before forwarding so the cell never
+        # sees brig's ingress token. For auth: none, leave it intact — the
+        # request passes through transparently for the app to authenticate.
+        if route.auth != "none" and "Authorization" in flow.request.headers:
+            del flow.request.headers["Authorization"]
 
         # Rewrite request to target cell.
         flow.request.host = route.cell_ip
@@ -375,15 +401,6 @@ class IngressRouter:
         # Override Host header to prevent host-header confusion/poisoning
         # in the target cell application.
         flow.request.headers["Host"] = f"{route.cell_ip}:{route.port}"
-
-        # Tag for logging. `cell` is what the logger keys log files on,
-        # so setting it here makes ingress hits appear in
-        # `brig cell network <cell>` instead of going to unknown.jsonl.
-        flow.metadata["ingress"] = True
-        flow.metadata["cell"] = route.cell
-        flow.metadata["ingress_cell"] = route.cell
-        flow.metadata["ingress_route"] = route.name
-        flow.metadata["ingress_client_ip"] = client_ip
 
         ctx.log.info(
             f"INGRESS: {client_ip} -> {route.cell}:{route.port}"
@@ -408,9 +425,9 @@ class IngressRouter:
         come from cells we already trust on this listener and don't
         need body inspection.
 
-        Aitelier diagnosed this — SA's ACP bridge emits
-        `agent_message_chunk` notifications via SSE; without
-        passthrough the client never sees them before session close.
+        SSE-style streams (e.g. an agent emitting `agent_message_chunk`
+        notifications) need this: without passthrough the client never sees
+        chunks before session close.
         """
         if not flow.metadata.get("ingress_route"):
             return

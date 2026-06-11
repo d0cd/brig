@@ -29,7 +29,7 @@ src/
     security/
       secrets.py             # Secret path validation
       image.py               # Image signature verification
-      verify.py              # All 9 invariant verification checks
+      verify.py              # Security-invariant verification checks (verify_* fns)
 
     ops/
       logging.py             # Canonical logging (ONE copy)
@@ -44,8 +44,16 @@ src/
     workspace/
       workspace.py           # File copy with sanitization + quarantine
 
+    observability/
+      collector.py           # OTel collector container lifecycle (brig-otel)
+      collector_config.yaml  # Collector pipeline config
+      promql.py              # PromQL query helpers
+      stats.py               # Stats aggregation for `brig system stats`
+
     commands/
-      lifecycle_cmd.py       # run/stop/kill/rm/list/exec/shell/etc.
+      lifecycle_run.py       # brig run + its arg-parse/merge/diagnose helpers
+      lifecycle_inspect.py   # list/inspect/files/read/logs/cp/top/diff/stats/export/ingress/preflight
+      lifecycle_control.py   # stop/kill/rm/start/restart/pause/unpause/wait/rename/exec/shell/attach
       system_cmd.py          # init/verify/doctor/preflight/metrics/prune/history/stats
       policy_cmd.py          # policy show/set
       secrets_cmd.py         # secrets list/add/rm
@@ -57,21 +65,24 @@ src/
 
     sdk.py                   # Programmatic API (execute_sync for agents)
 
+    warden_addons/           # mitmproxy addons — brig package-data, flat-loaded
+      _common.py             # Shared: BLOCKED_NETWORKS, SubnetResolver, atomic_write_json
+      _policy.py             # Policy data structures (PolicyRule, DomainTrie, Policy)
+      _log_writer.py         # Batched JSONL log writer with rotation
+      _notifier_state.py     # Webhook URL SSRF resolution/state for notifier
+      enforce.py             # Policy enforcer addon (uses _policy)
+      logger.py              # Request logging (JSONL per cell)
+      ops.py                 # Merged: metrics + rate limiting + health endpoint
+      ingress.py             # Ingress reverse proxy (port 8443; auth: token|none)
+      notifier.py            # Webhook notifications
+      otel_export.py         # OpenTelemetry metrics + log records export
+
   warden/
     cli.py                   # Warden CLI entry point
     proxy.py                 # Container lifecycle (start/stop/status)
     reconcile.py             # Subnet state reconciliation
     health.py                # Health checks
     logs.py                  # Log management (prune)
-
-  addons/
-    _common.py               # Shared: BLOCKED_NETWORKS, SubnetResolver, atomic_write_json
-    _policy.py               # Policy data structures (PolicyRule, DomainTrie, Policy)
-    enforce.py               # Policy enforcer addon (uses _policy)
-    logger.py                # Request logging (JSONL per cell)
-    ops.py                   # Merged: metrics + rate limiting + health endpoint
-    ingress.py               # Authenticated reverse proxy (port 8443)
-    notifier.py              # Webhook notifications
 ```
 
 ## Declarative Reconciler
@@ -93,6 +104,7 @@ and the Lima VM.
 | File | Location | Purpose |
 |------|----------|---------|
 | `subnets.json` | `~/.brig/state/system/` | Subnet allocation |
-| `network-policy.json` | `~/.brig/cells/` | Global egress policy |
+| `network-policy.json` | `~/.brig/cells/` | Process-wide operational settings (rate limits, log filter, policy tracing) — no allow/deny |
+| `policies/<cell>.json` | `~/.brig/state/system/policies/` | Per-cell egress allow/deny |
 | `operations.jsonl` | `~/.brig/state/system/` | Command audit log |
 | `lifecycle.jsonl` | `~/.brig/state/system/` | Cell lifecycle events |

@@ -89,7 +89,7 @@ def test_bench_domain_normalization_idn(benchmark, policy_rule_class):
 def test_bench_subnet_lookup_200(benchmark, policy_enforcer_class, subnet_map_large):
     """Cell attribution from IP with 200 subnets — proves O(1) dict lookup.
 
-    Subnet logic was extracted into addons/_common.SubnetResolver during
+    Subnet logic was extracted into warden_addons/_common.SubnetResolver during
     the audit pass; we now poke the resolver directly on the enforcer.
     """
     enforcer = policy_enforcer_class()

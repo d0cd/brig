@@ -31,7 +31,8 @@ class TestBrigUpDelegatesToIsRunning(unittest.TestCase):
         mock_is_running.return_value = True
         from brig.commands.convenience_cmd import cmd_up
 
-        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home:
+        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home, \
+             patch("brig.ops.addon_deploy.sync_addons", return_value=False):
             mock_home.exists.return_value = True
             rc = cmd_up(_args())
 
@@ -49,7 +50,8 @@ class TestBrigUpDelegatesToIsRunning(unittest.TestCase):
         mock_is_running.return_value = False
         from brig.commands.convenience_cmd import cmd_up
 
-        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home:
+        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home, \
+             patch("brig.ops.addon_deploy.sync_addons", return_value=False):
             mock_home.exists.return_value = True
             rc = cmd_up(_args())
 
@@ -65,11 +67,37 @@ class TestBrigUpDelegatesToIsRunning(unittest.TestCase):
     ):
         from brig.commands.convenience_cmd import cmd_up
 
-        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home:
+        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home, \
+             patch("brig.ops.addon_deploy.sync_addons", return_value=False):
             mock_home.exists.return_value = True
             rc = cmd_up(_args())
 
         self.assertEqual(rc, 1)
+
+
+class TestBrigUpToleratesMountSyncFailure(unittest.TestCase):
+    """A bad/transient mount_root must not take the whole harness down — the
+    lima sync is best-effort, like the OTel collector start."""
+
+    @patch("brig.config.mount_roots", return_value=[])
+    @patch("warden.proxy.start", return_value=True)
+    @patch("warden.proxy.is_running", return_value=True)
+    @patch("brig.vm.shell.vm_exists", return_value=True)
+    @patch("brig.vm.shell.vm_running", return_value=True)
+    def test_sync_error_does_not_abort_up(self, *mocks):
+        from brig.errors import BrigError
+        from brig.commands.convenience_cmd import cmd_up
+
+        with (
+            patch("brig.vm.lima_mounts.sync_lima_mount_roots",
+                  side_effect=BrigError("bad root")),
+            patch("brig.ops.addon_deploy.sync_addons", return_value=False),
+            patch("brig.config.HostPaths.BRIG_HOME") as mock_home,
+        ):
+            mock_home.exists.return_value = True
+            rc = cmd_up(_args())
+
+        self.assertEqual(rc, 0)
 
 
 class TestBrigUpDoesNotLieAboutExitedContainer(unittest.TestCase):
@@ -87,7 +115,8 @@ class TestBrigUpDoesNotLieAboutExitedContainer(unittest.TestCase):
     ):
         from brig.commands.convenience_cmd import cmd_up
 
-        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home:
+        with patch("brig.config.HostPaths.BRIG_HOME") as mock_home, \
+             patch("brig.ops.addon_deploy.sync_addons", return_value=False):
             mock_home.exists.return_value = True
             rc = cmd_up(_args())
 

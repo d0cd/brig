@@ -20,7 +20,7 @@ def _spec(host_services=None):
 
 class TestMaybeRestartWardenForTcp(unittest.TestCase):
     def test_no_tcp_services_is_noop(self):
-        from brig.commands.lifecycle_cmd import _maybe_restart_warden_for_tcp
+        from brig.commands.lifecycle_run import _maybe_restart_warden_for_tcp
         with patch("warden.proxy.get_bound_tcp_ports") as mock_bound, \
              patch("warden.proxy.start") as mock_start, \
              patch("warden.proxy.stop") as mock_stop:
@@ -33,7 +33,7 @@ class TestMaybeRestartWardenForTcp(unittest.TestCase):
         mock_stop.assert_not_called()
 
     def test_already_bound_is_noop(self):
-        from brig.commands.lifecycle_cmd import _maybe_restart_warden_for_tcp
+        from brig.commands.lifecycle_run import _maybe_restart_warden_for_tcp
         with patch("warden.proxy.get_bound_tcp_ports", return_value=[5432]), \
              patch("warden.proxy.start") as mock_start, \
              patch("warden.proxy.stop") as mock_stop:
@@ -47,7 +47,7 @@ class TestMaybeRestartWardenForTcp(unittest.TestCase):
         mock_stop.assert_not_called()
 
     def test_missing_port_triggers_restart_when_yes(self):
-        from brig.commands.lifecycle_cmd import _maybe_restart_warden_for_tcp
+        from brig.commands.lifecycle_run import _maybe_restart_warden_for_tcp
         with patch("warden.proxy.get_bound_tcp_ports", return_value=[]), \
              patch("warden.proxy.start", return_value=True) as mock_start, \
              patch("warden.proxy.stop") as mock_stop:
@@ -63,11 +63,12 @@ class TestMaybeRestartWardenForTcp(unittest.TestCase):
     def test_missing_port_prompt_decline_raises(self):
         """Operator declining the prompt must abort with a clear
         suggestion, NOT silently start the cell into a broken state."""
-        from brig.commands.lifecycle_cmd import _maybe_restart_warden_for_tcp
+        from brig.commands.lifecycle_run import _maybe_restart_warden_for_tcp
         from brig.errors import BrigError
         with patch("warden.proxy.get_bound_tcp_ports", return_value=[]), \
              patch("warden.proxy.start") as mock_start, \
              patch("warden.proxy.stop") as mock_stop, \
+             patch("sys.stdin.isatty", return_value=True), \
              patch("builtins.input", return_value="n"):
             with self.assertRaises(BrigError) as ctx:
                 _maybe_restart_warden_for_tcp(
@@ -82,10 +83,11 @@ class TestMaybeRestartWardenForTcp(unittest.TestCase):
         self.assertIn("--yes", ctx.exception.suggestion or "")
 
     def test_missing_port_prompt_accept_restarts(self):
-        from brig.commands.lifecycle_cmd import _maybe_restart_warden_for_tcp
+        from brig.commands.lifecycle_run import _maybe_restart_warden_for_tcp
         with patch("warden.proxy.get_bound_tcp_ports", return_value=[]), \
              patch("warden.proxy.start", return_value=True) as mock_start, \
              patch("warden.proxy.stop") as mock_stop, \
+             patch("sys.stdin.isatty", return_value=True), \
              patch("builtins.input", return_value="y"):
             _maybe_restart_warden_for_tcp(
                 _spec(host_services=[
@@ -96,8 +98,28 @@ class TestMaybeRestartWardenForTcp(unittest.TestCase):
         mock_start.assert_called()
         mock_stop.assert_called()
 
+    def test_missing_port_non_tty_raises(self):
+        """A non-interactive caller (no TTY) without --yes must fail fast with an
+        actionable error, not block on a prompt / EOF-driven abort."""
+        from brig.commands.lifecycle_run import _maybe_restart_warden_for_tcp
+        from brig.errors import BrigError
+        with patch("warden.proxy.get_bound_tcp_ports", return_value=[]), \
+             patch("warden.proxy.start") as mock_start, \
+             patch("warden.proxy.stop") as mock_stop, \
+             patch("sys.stdin.isatty", return_value=False):
+            with self.assertRaises(BrigError) as ctx:
+                _maybe_restart_warden_for_tcp(
+                    _spec(host_services=[
+                        {"name": "db", "port": 5432, "protocol": "tcp"},
+                    ]),
+                    yes=False,
+                )
+        mock_start.assert_not_called()
+        mock_stop.assert_not_called()
+        self.assertIn("--yes", ctx.exception.suggestion or "")
+
     def test_warden_restart_failure_raises(self):
-        from brig.commands.lifecycle_cmd import _maybe_restart_warden_for_tcp
+        from brig.commands.lifecycle_run import _maybe_restart_warden_for_tcp
         from brig.errors import BrigError
         with patch("warden.proxy.get_bound_tcp_ports", return_value=[]), \
              patch("warden.proxy.start", return_value=False), \

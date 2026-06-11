@@ -109,7 +109,7 @@ class TestUseWardenRequiresWardenRunning(unittest.TestCase):
                 image_cmd.cmd_build(_args(use_warden=True))
         msg = str(ctx.exception)
         self.assertIn("Warden", msg)
-        self.assertIn("brig up", ctx.exception.suggestion or "")
+        self.assertIn("brig system up", ctx.exception.suggestion or "")
 
     def test_raises_brigerror_when_warden_ca_missing(self):
         """Pre-check that the CA file we're about to mount actually

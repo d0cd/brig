@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brig"
-version = "0.3.1"
+version = "0.4.0"
 description = "Secure workload harness for running untrusted code on macOS"
 readme = "README.md"
 license = {text = "MIT"}
@@ -43,7 +43,14 @@ dev = [
     # (enforce, ingress, logger, notifier, ops) are the most security-
     # critical code in the tree; mocking mitmproxy's API surface means
     # an upstream signature change only surfaces in E2E.
-    "mitmproxy>=10.0",
+    #
+    # PINNED to the 10.x major to match the warden image (mitmproxy 10.1.1,
+    # pinned by digest in src/warden/image/Dockerfile). Unbounded `>=10.0`
+    # floated to 12.x, where the addon API differs materially (no ctx.log, no
+    # tls_passthrough, ignore_connection semantics) — so CI was exercising the
+    # security-critical addons against semantics production never runs. Bump
+    # this in lockstep with the Dockerfile base.
+    "mitmproxy>=10.1.1,<11",
 ]
 
 [project.scripts]
@@ -60,14 +67,19 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-# addons/ is intentionally NOT installed as a Python package — those files
-# are mounted into the warden container via `make _copy-addons` and have
-# no __init__.py. They are sibling scripts, not a brig submodule.
+# brig/warden_addons/ is NOT an importable package (no __init__) — the addons
+# are flat-loaded by mitmproxy inside the warden container and import each other
+# as flat modules (`from _common import ...`). They ship as brig package-data
+# (below) so they're resolvable in any install (editable AND wheel) and synced
+# into the container by `brig system up`. Excluded from `find` for the same
+# reason (no __init__).
 include = ["brig*", "warden*"]
 
 [tool.setuptools.package-data]
 "brig.vm" = ["*.template"]
 "brig.observability" = ["*.yaml"]
+# The warden data plane — shipped as data, deployed flat into the container.
+"brig" = ["warden_addons/*.py"]
 
 [tool.ruff]
 line-length = 100
@@ -77,7 +89,7 @@ target-version = "py310"
 select = ["E", "F", "W"]
 # F401 is intentionally NOT in this global ignore — orphan imports
 # should be flagged. Re-exports opt in per-file via `# noqa: F401`
-# (see e.g. src/addons/enforce.py's re-exports for tests and external
+# (see e.g. src/brig/warden_addons/enforce.py's re-exports for tests and external
 # callers).
 ignore = ["E402", "E501", "F405"]
 
@@ -119,12 +131,20 @@ omit = [
 ]
 
 [tool.mypy]
+# Type-check brig/ and warden/. Addons run inside the warden container
+# with their own Python environment and depend on mitmproxy's stubs,
+# which use newer syntax than our `python_version` floor — they're
+# excluded here and covered by their unit tests instead.
 python_version = "3.10"
-warn_return_any = false
+# Resolve intra-repo `brig.*` / `warden.*` imports as packages. Without this,
+# ignore_missing_imports treats every cross-module call as Any and triggers
+# spurious warn_return_any errors at `return other_module_fn()` sites.
+mypy_path = "src"
+warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
-check_untyped_defs = false
-exclude = ["tests/"]
+check_untyped_defs = true
+exclude = ["tests/", "src/brig/warden_addons/"]
 
 [tool.coverage.report]
 exclude_lines = [

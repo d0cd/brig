@@ -37,7 +37,7 @@ class TestPlanRun(unittest.TestCase):
     def test_network_exists(self):
         """If network exists, skip allocate/create but still connect proxy and run."""
         spec = CellSpec(name="test", image="alpine")
-        actual = CellState(network_exists=True)
+        actual = CellState(network_exists=True, network_internal=True)
         actions = plan_run(spec, actual)
         types = [a.type for a in actions]
         self.assertNotIn(ActionType.ALLOCATE_SUBNET, types)
@@ -57,10 +57,21 @@ class TestPlanRun(unittest.TestCase):
     def test_proxy_already_connected(self):
         """If proxy is already connected, skip CONNECT_PROXY."""
         spec = CellSpec(name="test", image="alpine")
-        actual = CellState(network_exists=True, proxy_connected=True)
+        actual = CellState(network_exists=True, network_internal=True, proxy_connected=True)
         actions = plan_run(spec, actual)
         types = [a.type for a in actions]
         self.assertNotIn(ActionType.CONNECT_PROXY, types)
+
+    def test_non_internal_network_refused(self):
+        """Fail closed: a pre-existing same-named network that isn't --internal
+        must not be silently adopted — it would break east-west isolation and
+        bypass Warden (invariants 1 + 4: the VM network set is untrusted)."""
+        from brig.errors import BrigError
+        spec = CellSpec(name="test", image="alpine")
+        actual = CellState(network_exists=True, network_internal=False,
+                           network_name="brig-test")
+        with self.assertRaises(BrigError):
+            plan_run(spec, actual)
 
 
 class TestPlanDestroy(unittest.TestCase):
@@ -139,6 +150,17 @@ class TestBuildRunCommand(unittest.TestCase):
         self.assertIn("http_proxy=http://10.60.1.1:8080", cmd_str)
         self.assertIn("https_proxy=http://10.60.1.1:8080", cmd_str)
 
+    def test_user_emitted_when_set(self):
+        spec = CellSpec(name="test", image="alpine", user="0")
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertIn("--user", cmd)
+        self.assertEqual(cmd[cmd.index("--user") + 1], "0")
+
+    def test_user_omitted_by_default(self):
+        spec = CellSpec(name="test", image="alpine")
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertNotIn("--user", cmd)
+
     def test_airgapped_no_proxy(self):
         """Airgapped cells have --network none and no proxy env."""
         spec = CellSpec(name="test", image="alpine", network="none")
@@ -152,7 +174,7 @@ class TestBuildRunCommand(unittest.TestCase):
         """User cannot override proxy env vars."""
         from brig.errors import BrigError
         spec = CellSpec(name="test", image="alpine", env=["http_proxy=evil"])
-        with self.assertRaises(BrigError, msg="Cannot override proxy"):
+        with self.assertRaisesRegex(BrigError, "Cannot override proxy"):
             build_run_command(spec, "10.60.1.1")
 
     def test_all_proxy_env_names_rejected(self):
@@ -190,6 +212,16 @@ class TestBuildRunCommand(unittest.TestCase):
         self.assertIn("alpine", cmd)
         self.assertIn("echo", cmd)
         self.assertIn("hi", cmd)
+
+    def test_end_of_options_separator_precedes_image(self):
+        # `--` must immediately precede the image so a dash-leading positional
+        # can never be parsed by podman as a flag (defense in depth alongside
+        # the validator's leading-dash rejection).
+        spec = CellSpec(name="test", image="alpine", command=["echo", "hi"])
+        cmd = build_run_command(spec, "10.60.1.1")
+        sep = cmd.index("--")
+        self.assertEqual(cmd[sep + 1], "alpine")
+        self.assertEqual(cmd[sep + 2:], ["echo", "hi"])
 
     def test_workspace_mount(self):
         spec = CellSpec(name="test", image="alpine")

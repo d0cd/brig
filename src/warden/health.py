@@ -8,6 +8,7 @@ import socket
 from dataclasses import dataclass
 from pathlib import Path
 
+from brig.config import PROXY_PORT
 from brig.vm.shell import vm_run
 
 
@@ -32,7 +33,7 @@ def check_container_running(container_name: str = "warden") -> HealthCheck:
     )
 
 
-def check_mitmproxy_responsive(proxy_ip: str, port: int = 8080) -> HealthCheck:
+def check_mitmproxy_responsive(proxy_ip: str, port: int = PROXY_PORT) -> HealthCheck:
     """Check if mitmproxy is responding on its listen port."""
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

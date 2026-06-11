@@ -1,6 +1,6 @@
 #!/bin/bash
 # build-warden-image.sh — build the warden image inside the brig VM and
-# pin its sha256 in src/warden/proxy.py:IMAGE_DIGEST.
+# pin its sha256 in src/warden/proxy.py:WARDEN_IMAGE_DIGEST.
 #
 # Run this when WARDEN_IMAGE_TAG or the OTel SDK version changes.
 # Operator commits the resulting one-line digest update.

@@ -13,7 +13,7 @@ directly via `limactl shell brig -- warden <subcommand>`.
 | `warden stop` | Sends SIGTERM (10s grace), then removes the container. Idempotent. |
 | `warden restart` | `stop` then `start`. |
 | `warden status` | Prints `running` / `not running` and the list of cell networks the proxy is attached to. |
-| `warden reload` | Sends SIGHUP to mitmproxy. The `enforce` and `logger` addons hot-reload `network-policy.json`, `subnet-map.json`, and the per-cell policy directory on receipt. Quicker than a restart. |
+| `warden reload` | Sends SIGHUP to mitmproxy. `enforce` hot-reloads `network-policy.json`, the per-cell policy directory, and `subnet-map.json`; `logger` reloads its log filter (from `network-policy.json`) and `subnet-map.json`. Quicker than a restart. |
 | `warden preflight` | Reconciles the subnet allocator state file with podman's actual networks. Reports missing networks, orphaned subnets, and inconsistencies — without making any changes. Run this when warden won't start. |
 
 ## Health & logs
@@ -26,12 +26,9 @@ directly via `limactl shell brig -- warden <subcommand>`.
 
 ## Policy
 
-| Command | What it does |
-|---|---|
-| `warden policy validate [path]` | Loads a policy JSON/YAML file and reports parse errors and rule problems (invalid domains, suspicious patterns). Useful for linting per-cell policies before they're written. |
-| `warden policy test <path> <domain> [--path /...] [--method GET]` | Runs the proxy's allow/deny matcher against the policy at `<path>`. From the host the equivalent for a deployed cell is `brig policy test <cell> <domain>`. |
-
-For the host-side `brig` command, see [`brig-cli.md`](brig-cli.md).
+Network policy is enforced **per cell** — there is no global allow/deny list.
+Author and inspect a cell's policy from the host with `brig policy …` (see
+[`brig-cli.md`](brig-cli.md)); the warden CLI does not have policy subcommands.
 
 ## Common workflows
 
@@ -60,9 +57,6 @@ limactl shell brig -- warden restart
 ```bash
 # Preflight reports state inconsistencies without changing anything.
 limactl shell brig -- warden preflight
-
-# Check the policy file parses.
-limactl shell brig -- warden policy validate
 
 # Last resort: tail container logs while attempting to start.
 limactl shell brig -- warden logs &

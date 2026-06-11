@@ -169,6 +169,33 @@ class WardenHandle:
         return stop()
 
 
+def _require_tcp_listeners_bound(spec: CellSpec) -> None:
+    """Fail loudly if the cell declares a TCP host_service whose warden
+    `reverse:tcp` listener isn't bound yet.
+
+    mitmproxy can't hot-add reverse:tcp listeners, so a new TCP port needs a
+    warden restart. The CLI prompts the operator for that; the SDK has no
+    operator, so it raises rather than return a Cell whose `<name>.host.brig`
+    TCP connection would silently have no listener.
+    """
+    tcp_ports = sorted({
+        e["port"] for e in (spec.host_services or [])
+        if isinstance(e, dict) and e.get("protocol") == "tcp"
+        and isinstance(e.get("port"), int)
+    })
+    if not tcp_ports:
+        return
+    from warden.proxy import get_bound_tcp_ports
+    missing = [p for p in tcp_ports if p not in set(get_bound_tcp_ports())]
+    if missing:
+        raise BrigError(
+            f"Cell '{spec.name}' declares TCP host_services on port(s) {missing} "
+            f"that warden hasn't bound (mitmproxy can't hot-add reverse:tcp "
+            f"listeners).",
+            suggestion="brig system down && brig system up  # rebind, then re-run",
+        )
+
+
 class Brig:
     """Main SDK entry point for cell management."""
 
@@ -191,6 +218,21 @@ class Brig:
         timeout: str | None = None,
         labels: list[str] | None = None,
         host_sockets: list[dict[str, Any]] | None = None,
+        host_services: list[dict[str, Any]] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        ingress: list[dict[str, Any]] | None = None,
+        policy_allow: list[str] | None = None,
+        policy_deny: list[str] | None = None,
+        policy_passthrough_tls: list[str] | None = None,
+        image_digest: str | None = None,
+        trust_warden_ca: bool = True,
+        workdir: str | None = None,
+        workspace_quota: str | None = None,
+        workspace_mount: str = "/work",
+        writable_rootfs: bool = False,
+        seccomp_profile: str | None = None,
+        restart: str = "no",
+        user: str | None = None,
     ) -> Cell:
         """Run a new cell. Returns a Cell handle."""
         return await asyncio.to_thread(
@@ -200,6 +242,13 @@ class Brig:
             pids_limit=pids_limit, network=network, profile=profile,
             detach=detach, timeout=timeout, labels=labels,
             host_sockets=host_sockets,
+            host_services=host_services, mounts=mounts, ingress=ingress,
+            policy_allow=policy_allow, policy_deny=policy_deny,
+            policy_passthrough_tls=policy_passthrough_tls,
+            image_digest=image_digest, trust_warden_ca=trust_warden_ca,
+            workdir=workdir, workspace_quota=workspace_quota,
+            workspace_mount=workspace_mount, writable_rootfs=writable_rootfs,
+            seccomp_profile=seccomp_profile, restart=restart, user=user,
         )
 
     def run_sync(
@@ -218,12 +267,35 @@ class Brig:
         timeout: str | None = None,
         labels: list[str] | None = None,
         host_sockets: list[dict[str, Any]] | None = None,
+        host_services: list[dict[str, Any]] | None = None,
+        mounts: list[dict[str, Any]] | None = None,
+        ingress: list[dict[str, Any]] | None = None,
+        policy_allow: list[str] | None = None,
+        policy_deny: list[str] | None = None,
+        policy_passthrough_tls: list[str] | None = None,
+        image_digest: str | None = None,
+        trust_warden_ca: bool = True,
+        workdir: str | None = None,
+        workspace_quota: str | None = None,
+        workspace_mount: str = "/work",
+        writable_rootfs: bool = False,
+        seccomp_profile: str | None = None,
+        restart: str = "no",
+        user: str | None = None,
     ) -> Cell:
         """Synchronous version of run().
 
         host_sockets: list of dicts with keys {name, host_path, mount_point,
         mode?}. Same validation rules as the cell yaml (see
         docs/design/cell-definition.md). Bypasses Warden by design.
+
+        mounts: list of dicts {name, host_path, mount_point, mode?} —
+        bind-mount a host dir (under a configured mount_roots entry) into the
+        cell, ro default / rw opt-in. Rejected on the untrusted profile.
+
+        host_services / ingress / policy / image_digest etc accept the
+        same shapes as the cell yaml fields of the same name; see
+        docs/design/cell-definition.md for the full schema.
         """
         if not CELL_NAME_PATTERN.match(name):
             raise BrigError(f"Invalid cell name: {name}")
@@ -241,23 +313,44 @@ class Brig:
             "detach": detach,
             "labels": labels or [],
             "host_sockets": host_sockets or [],
+            "host_services": host_services or [],
+            "mounts": mounts or [],
+            "ingress": ingress or [],
+            "policy_allow": policy_allow or [],
+            "policy_deny": policy_deny or [],
+            "policy_passthrough_tls": policy_passthrough_tls or [],
+            "trust_warden_ca": trust_warden_ca,
+            "workspace_mount": workspace_mount,
+            "writable_rootfs": writable_rootfs,
         }
-
         if timeout:
             spec_kwargs["timeout"] = timeout
+        if image_digest:
+            spec_kwargs["image_digest"] = image_digest
+        if workdir:
+            spec_kwargs["workdir"] = workdir
+        if workspace_quota:
+            spec_kwargs["workspace_quota"] = workspace_quota
+        if seccomp_profile:
+            spec_kwargs["seccomp_profile"] = seccomp_profile
+        if restart and restart != "no":
+            spec_kwargs["restart"] = restart
+        if user:
+            spec_kwargs["user"] = user
 
         if profile:
             try:
                 prof = load_profile(profile)
                 spec_kwargs = apply_profile(spec_kwargs, prof)
+                spec_kwargs["profile"] = profile
             except ValueError as e:
                 raise ProfileError(str(e))
 
-        # CellSpec.__post_init__ only validates name + coerces numeric
-        # strings. The security boundary for host_sockets / ingress /
-        # policy lives in validate_cell_definition — without this call,
-        # an SDK caller bypasses the engine-socket denylist, path
-        # traversal checks, and the untrusted-profile rejection.
+        # validate_cell_definition accepts the SDK's flat policy_* form
+        # and the yaml's nested `policy: {...}` form via the same entry
+        # point, so the untrusted-profile guards and SSRF wildcard checks
+        # fire on SDK calls without the SDK needing to know the nested
+        # shape.
         from brig.cell.spec import validate_cell_definition
         validation_errors = validate_cell_definition(spec_kwargs)
         if validation_errors:
@@ -265,12 +358,12 @@ class Brig:
                 "Invalid cell spec:\n  " + "\n  ".join(validation_errors),
             )
 
-        # Filter to only CellSpec fields (profiles may add extra keys like 'runtime').
         import dataclasses
         valid_fields = {f.name for f in dataclasses.fields(CellSpec)}
         spec_kwargs = {k: v for k, v in spec_kwargs.items() if k in valid_fields}
 
         spec = CellSpec(**spec_kwargs)
+        _require_tcp_listeners_bound(spec)
         run_cell(spec)
         return Cell(name)
 
@@ -355,7 +448,7 @@ class Brig:
         return await asyncio.to_thread(self.list_sync)
 
     def list_sync(self) -> list[CellInfo]:
-        """Synchronous version of list()."""
+        """Synchronous version of list_cells()."""
         from brig.cell.lifecycle import list_cell_containers
         return [
             CellInfo(name=cell, status=c.get("State", ""), image=c.get("Image", ""))

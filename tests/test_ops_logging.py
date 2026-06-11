@@ -19,7 +19,6 @@ from brig.ops.logging import (
     is_quiet,
     log,
     output,
-    status_color,
     warn,
 )
 
@@ -80,41 +79,6 @@ class TestColorize(unittest.TestCase):
         _state["color"] = True
         result = colorize("hello", "neon")
         self.assertEqual(result, "hello")
-
-
-class TestStatusColor(unittest.TestCase):
-    """Test status_color() maps statuses to correct colors."""
-
-    def setUp(self):
-        self._orig = dict(_state)
-        _state["color"] = True
-
-    def tearDown(self):
-        _state.update(self._orig)
-
-    def test_running_green(self):
-        result = status_color("running")
-        self.assertIn("\033[32m", result)
-
-    def test_paused_yellow(self):
-        result = status_color("paused")
-        self.assertIn("\033[33m", result)
-
-    def test_exited_red(self):
-        result = status_color("exited")
-        self.assertIn("\033[31m", result)
-
-    def test_stopped_red(self):
-        result = status_color("stopped")
-        self.assertIn("\033[31m", result)
-
-    def test_created_blue(self):
-        result = status_color("created")
-        self.assertIn("\033[34m", result)
-
-    def test_unknown_passthrough(self):
-        result = status_color("unknown-state")
-        self.assertEqual(result, "unknown-state")
 
 
 class TestLog(unittest.TestCase):
@@ -195,10 +159,12 @@ class TestHelpers(unittest.TestCase):
             self.assertIn("hello", mock_out.getvalue())
 
     def test_output_quiet(self):
+        # --quiet suppresses advisory chatter (log()), NOT command results.
+        # output() is the command's actual stdout and always prints.
         _state["quiet"] = True
         with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
             output("hello")
-            self.assertEqual(mock_out.getvalue(), "")
+            self.assertIn("hello", mock_out.getvalue())
 
 
 class TestSpinner(unittest.TestCase):

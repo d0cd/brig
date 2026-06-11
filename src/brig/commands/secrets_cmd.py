@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any
+import argparse
 
 from brig.config import HostPaths
 from brig.errors import BrigError
@@ -44,11 +44,11 @@ def register_parser(sub) -> None:
 DISPATCH = {}  # Populated below after handlers are defined.
 
 
-def cmd_secrets_list(args: Any) -> int:
+def cmd_secrets_list(args: argparse.Namespace) -> int:
     """Handle `brig secrets list`."""
     secrets_dir = HostPaths.SECRETS_DIR
     if not secrets_dir.exists():
-        output("No secrets directory. Run: brig init")
+        output("No secrets directory. Run: brig system init")
         return 0
 
     secrets = sorted(f.name for f in secrets_dir.iterdir() if f.is_file())
@@ -72,7 +72,7 @@ def cmd_secrets_list(args: Any) -> int:
     return 0
 
 
-def cmd_secrets_add(args: Any) -> int:
+def cmd_secrets_add(args: argparse.Namespace) -> int:
     """Handle `brig secrets add <name>`.
 
     Reads value from:
@@ -179,13 +179,27 @@ def cmd_secrets_add(args: Any) -> int:
     return 0
 
 
-def cmd_secrets_rm(args: Any) -> int:
+def cmd_secrets_rm(args: argparse.Namespace) -> int:
     """Handle `brig secrets rm <name>`.
 
     Requires --yes for non-interactive use, or an interactive y/N confirmation,
     because secret deletion is irreversible and a typo at the prompt
     permanently destroys credentials.
     """
+    # Validate the name before building the path — `rm` must apply the same
+    # traversal/charset rules as `add`, otherwise `brig secrets rm ../../x`
+    # would unlink a file outside the secrets dir.
+    from brig.config import SECRET_NAME_PATTERN
+    name = args.name
+    if not name:
+        raise BrigError("Secret name must not be empty")
+    if "\x00" in name:
+        raise BrigError("Secret name must not contain null bytes")
+    if "/" in name or ".." in name:
+        raise BrigError("Secret name must not contain / or ..")
+    if not SECRET_NAME_PATTERN.match(name):
+        raise BrigError(f"Invalid secret name '{name}'")
+
     path = HostPaths.SECRETS_DIR / args.name
     if not path.exists():
         raise BrigError(f"Secret '{args.name}' not found")
