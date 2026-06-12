@@ -50,7 +50,7 @@ dev = [
     # tls_passthrough, ignore_connection semantics) — so CI was exercising the
     # security-critical addons against semantics production never runs. Bump
     # this in lockstep with the Dockerfile base.
-    "mitmproxy>=10.1.1,<11",
+    "mitmproxy>=11.0.2,<12",
 ]
 
 [project.scripts]
