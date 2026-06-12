@@ -275,7 +275,7 @@ class TestNovelHelpers(unittest.TestCase):
         self.assertEqual(nt("/static/app.js"), "/static/app.js")  # short segments stay
 
     def test_normalize_collapses_colon_joined_credential(self):
-        # A Telegram bot token rides IN the path; the colon must not let it leak.
+        # A colon-joined API token rides IN the path; the colon must not let it leak.
         from notifier import normalize_path_template as nt
         self.assertEqual(
             nt("/bot0000000000:FAKEfakeFAKEfakeFAKEfakeFAKEfake000/getUpdates"),
@@ -414,7 +414,7 @@ class TestNovelAllowed(unittest.TestCase):
 
 class TestUnifiedRedaction(unittest.TestCase):
     """All sinks share one classifier (_common), so a secret masked in one
-    channel can't leak in another — regression for the Telegram-token leak that
+    channel can't leak in another — regression for a secret-in-path leak that
     was redacted in novel_allowed but verbatim in the logger + OTel sinks."""
 
     TOKEN_PATH = "/bot0000000000:FAKEfakeFAKEfakeFAKEfakeFAKEfake000/getUpdates"

@@ -99,8 +99,8 @@ _UUID_SEG = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
 _NUM_SEG = re.compile(r"\A[0-9]+\Z")
 _HEX_SEG = re.compile(r"\A[0-9a-fA-F]{8,}\Z")
 _TOKEN_SEG = re.compile(r"\A[A-Za-z0-9_\-]{20,}\Z")          # base64url/JWT-ish.
-# Colon-joined credential, e.g. a Telegram bot token `bot<digits>:<base64>` in
-# the path — the colon breaks _TOKEN_SEG, so without this it leaks verbatim.
+# Colon-joined credential, e.g. an `<id>:<secret>`-shaped API token in the path —
+# the colon breaks _TOKEN_SEG, so without this it leaks verbatim.
 _COLON_TOKEN = re.compile(r"\A[A-Za-z0-9._\-]+:[A-Za-z0-9._\-]{8,}\Z")
 
 # Entropy fallback (detect-secrets-style recall net for unenumerated formats —
