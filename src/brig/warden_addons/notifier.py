@@ -37,6 +37,7 @@ Usage:
 import collections
 import json
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -45,7 +46,7 @@ from urllib.parse import urlparse
 
 from mitmproxy import ctx, http
 
-from _common import BLOCKED_NETWORKS, atomic_write_json  # noqa: F401  (re-exported for tests)
+from _common import BLOCKED_NETWORKS, atomic_write_json, stat_signature  # noqa: F401  (re-exported for tests)
 from _notifier_state import (
     DEFAULT_BASE_BACKOFF,
     DEFAULT_FAILURE_THRESHOLD,
@@ -60,10 +61,20 @@ from _notifier_state import (
     CircuitBreakerConfig,
     CircuitBreakerState,
     NotificationConfig,
+    NovelAllowedConfig,
     _redact_notification_path,
     _redact_url_for_logging,
     _resolve_webhook_url,
+    normalize_path_template,
+    query_exfil_signal,
 )
+
+# Per-cell network logs the logger addon writes — used to seed the novel_allowed
+# baseline so a warden restart doesn't replay every known path as "novel".
+NETWORK_LOG_DIR = Path("/var/log/brig/network")
+# Cap per-cell baseline templates; if a cell saturates it, novelty detection
+# goes quiet for that cell (logged once) rather than storming or growing unbounded.
+MAX_NOVEL_KEYS_PER_CELL = 5000
 
 # Try to use urllib3 for connection pooling, fall back to urllib.
 try:
@@ -84,7 +95,8 @@ class Notifier:
 
     def __init__(self):
         self.config = NotificationConfig()
-        self.policy_mtime = 0.0
+        self.policy_mtime: tuple[int, int] = (0, 0)
+        self._last_check_time = 0.0
         self.last_notification: collections.OrderedDict[str, float] = collections.OrderedDict()
         self._last_notification_lock = threading.Lock()
         self.notification_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
@@ -97,6 +109,12 @@ class Notifier:
         self._cb_lock = threading.Lock()
         self._http_pool: Optional[object] = None
         self._pool_lock = threading.Lock()
+        # novel_allowed baselines, per cell. Touched only from response()
+        # (mitmproxy runs hooks single-threaded), so no lock needed.
+        self._novel_seen: dict[str, set] = {}        # cell -> {host\npath_template}
+        self._novel_query_seen: dict[str, set] = {}  # cell -> {host\npath_template} (query-flagged)
+        self._novel_seeded: set[str] = set()         # cells whose baseline was seeded
+        self._novel_saturated: set[str] = set()      # cells whose baseline hit the cap
 
     def _get_http_pool(self):
         """Get or create HTTP connection pool for the webhook URL.
@@ -133,7 +151,7 @@ class Notifier:
     def load(self, loader):
         """Called when addon is loaded."""
         ctx.log.info("Notifier: Loading...")
-        self._reload_config()
+        self._reload_config(force=True)
         if self.config.enabled:
             self._start_worker()
 
@@ -145,14 +163,25 @@ class Notifier:
                 self._http_pool.clear()
                 self._http_pool = None
 
-    def _reload_config(self) -> None:
-        """Load notification configuration from policy file."""
+    _CHECK_INTERVAL: float = 1.0  # Seconds between mtime checks.
+
+    def _reload_config(self, *, force: bool = False) -> None:
+        """Load notification configuration from policy file.
+
+        Called from response() on every proxied flow, so throttle the stat
+        check to at most once per second (matching enforce.py) — `force=True`
+        from load() bypasses the throttle for the initial read.
+        """
+        now = time.monotonic()
+        if not force and now - self._last_check_time < self._CHECK_INTERVAL:
+            return
+        self._last_check_time = now
         try:
             if not POLICY_FILE.exists():
                 return
 
-            mtime = POLICY_FILE.stat().st_mtime
-            if mtime == self.policy_mtime:
+            sig = stat_signature(POLICY_FILE)
+            if sig == self.policy_mtime:
                 return  # No change.
 
             with open(POLICY_FILE, "r") as f:
@@ -178,6 +207,24 @@ class Notifier:
             filters = notifications.get("filters", {})
             cb_config = notifications.get("circuit_breaker", {})
 
+            na = notifications.get("novel_allowed", {})
+            novel_allowed = None
+            if isinstance(na, dict):
+                ignore_paths = []
+                for pat in (na.get("ignore_paths") or []):
+                    try:
+                        ignore_paths.append(re.compile(pat))
+                    except re.error as e:
+                        ctx.log.warn(f"Notifier: bad novel_allowed ignore_paths regex {pat!r}: {e}")
+                novel_allowed = NovelAllowedConfig(
+                    enabled=bool(na.get("enabled", False)),
+                    cells=na.get("cells"),
+                    ignore_hosts=tuple(na.get("ignore_hosts") or ()),
+                    ignore_paths=tuple(ignore_paths),
+                    dry_run=bool(na.get("dry_run", False)),
+                    max_query_len=int(na.get("max_query_len", 512)),
+                )
+
             self.config = NotificationConfig(
                 webhook_url=webhook_url,
                 block_reasons=filters.get("block_reasons"),
@@ -194,8 +241,9 @@ class Notifier:
                 resolved_ip=resolved_ip,
                 resolved_hostname=resolved_hostname,
                 resolved_port=resolved_port,
+                novel_allowed=novel_allowed,
             )
-            self.policy_mtime = mtime
+            self.policy_mtime = sig
 
             if self.config.enabled:
                 ctx.log.info(f"Notifier: Enabled - webhook {_redact_url_for_logging(self.config.webhook_url)}")
@@ -248,7 +296,9 @@ class Notifier:
     def _check_circuit_breaker(self) -> bool:
         """Check if circuit breaker allows requests. Returns True if allowed."""
         with self._cb_lock:
-            now = time.time()
+            # monotonic: this is a within-process elapsed timer; a wall-clock
+            # step backward (VM sleep/resume + NTP) must not wedge the breaker.
+            now = time.monotonic()
             if self.circuit_breaker.state == "closed":
                 return True
             if self.circuit_breaker.state == "open":
@@ -274,7 +324,7 @@ class Notifier:
         with self._cb_lock:
             self.circuit_breaker.consecutive_failures += 1
             self.circuit_breaker.total_failures += 1
-            self.circuit_breaker.last_failure_time = time.time()
+            self.circuit_breaker.last_failure_time = time.monotonic()
             if self.circuit_breaker.state == "half-open":
                 self.circuit_breaker.state = "open"
                 ctx.log.warn("Notifier: Circuit breaker re-opened after failed recovery")
@@ -427,20 +477,32 @@ class Notifier:
         if self.config.block_reasons is not None:
             if not any(p in block_reason for p in self.config.block_reasons):
                 return False
-        now = time.time()
+        # monotonic: per-cell throttle is a within-process elapsed timer.
+        now = time.monotonic()
         with self._last_notification_lock:
             last = self.last_notification.get(cell_name, 0)
         if now - last < self.config.min_interval_seconds:
             return False
         return True
 
+    def _enqueue(self, notification: dict) -> None:
+        """Hand a notification to the worker, or dead-letter it if the queue is full."""
+        try:
+            self.notification_queue.put_nowait(notification)
+        except queue.Full:
+            ctx.log.warn("Notifier: Queue full, adding to dead-letter queue")
+            self._add_to_dead_letter(notification, "queue_full")
+
     def response(self, flow: http.HTTPFlow) -> None:
-        """Check for blocked requests and queue notifications."""
+        """Alert on blocked requests (tried somewhere new) and — if enabled —
+        on first-seen allowed requests (used an allowed destination a new way)."""
         self._reload_config()
+        if flow.metadata.get("blocked", False):
+            self._handle_blocked(flow)
+        else:
+            self._handle_novel_allowed(flow)
 
-        if not flow.metadata.get("blocked", False):
-            return
-
+    def _handle_blocked(self, flow: http.HTTPFlow) -> None:
         cell_name = flow.metadata.get("cell", "unknown")
         block_reason = flow.metadata.get("block_reason", "unknown")
 
@@ -455,9 +517,9 @@ class Notifier:
                     self.last_notification.popitem(last=False)
             else:
                 self.last_notification.move_to_end(cell_name)
-            self.last_notification[cell_name] = time.time()
+            self.last_notification[cell_name] = time.monotonic()
 
-        notification = {
+        self._enqueue({
             "event": "request_blocked",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "cell": cell_name,
@@ -466,13 +528,99 @@ class Notifier:
             "method": flow.request.method,
             "block_reason": block_reason,
             "client_ip": flow.client_conn.peername[0] if flow.client_conn.peername else "unknown",
-        }
+        })
 
+    @staticmethod
+    def _host_ignored(host: str, ignore_hosts) -> bool:
+        return any(host == h or host.endswith("." + h) for h in ignore_hosts)
+
+    def _seed_novel_baseline(self, cell: str) -> None:
+        """Seed a cell's baseline from its existing network log so a warden
+        restart doesn't replay every known (host, path) as novel. The log is
+        the persistence layer — re-seeding from it on each load is idempotent."""
+        if cell in self._novel_seeded:
+            return
+        self._novel_seeded.add(cell)
+        seen = self._novel_seen.setdefault(cell, set())
         try:
-            self.notification_queue.put_nowait(notification)
-        except queue.Full:
-            ctx.log.warn("Notifier: Queue full, adding to dead-letter queue")
-            self._add_to_dead_letter(notification, "queue_full")
+            with open(NETWORK_LOG_DIR / f"{cell}.jsonl", "r") as f:
+                for line in f:
+                    if len(seen) >= MAX_NOVEL_KEYS_PER_CELL:
+                        break
+                    try:
+                        e = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if e.get("blocked"):
+                        continue
+                    host, path = e.get("host"), e.get("path")
+                    if host and path is not None:
+                        seen.add(f"{host}\n{normalize_path_template(path)}")
+        except OSError:
+            pass  # No prior log — baseline starts empty (all novel from here).
+
+    def _emit_novel(self, flow, cell, host, template, reason, na, query_length=None):
+        # Deliberately omit the raw path/query — for suspicious_query the query
+        # may BE the exfil payload, so we report its length, never its content.
+        notification = {
+            "event": "novel_allowed",
+            "reason": reason,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cell": cell,
+            "host": host,
+            "path_template": template,
+            "method": flow.request.method,
+        }
+        if query_length is not None:
+            notification["query_length"] = query_length
+        if na.dry_run:
+            ctx.log.info(
+                f"Notifier: [dry-run] novel_allowed {reason}: {cell} {host}{template}"
+            )
+            return
+        self._enqueue(notification)
+
+    def _handle_novel_allowed(self, flow: http.HTTPFlow) -> None:
+        na = self.config.novel_allowed
+        if not na or not na.enabled:
+            return
+        cell = flow.metadata.get("cell", "unknown")
+        if na.cells is not None and cell not in na.cells:
+            return
+        host = flow.request.host
+        if self._host_ignored(host, na.ignore_hosts):
+            return
+        template = normalize_path_template(flow.request.path)
+        if any(p.search(template) for p in na.ignore_paths):
+            return
+
+        self._seed_novel_baseline(cell)
+        if cell in self._novel_saturated:
+            return
+        seen = self._novel_seen.setdefault(cell, set())
+        key = f"{host}\n{template}"
+
+        if key not in seen:
+            if len(seen) >= MAX_NOVEL_KEYS_PER_CELL:
+                self._novel_saturated.add(cell)
+                ctx.log.warn(
+                    f"Notifier: novel_allowed baseline saturated for cell "
+                    f"'{cell}' ({MAX_NOVEL_KEYS_PER_CELL}); pausing novelty alerts"
+                )
+                return
+            seen.add(key)
+            self._emit_novel(flow, cell, host, template, "novel_path", na)
+            return
+
+        # Known shape — check the query channel path-novelty can't see (fires
+        # once per (host, template) so a chatty endpoint doesn't storm).
+        if query_exfil_signal(flow.request.path, na.max_query_len):
+            qseen = self._novel_query_seen.setdefault(cell, set())
+            if key not in qseen:
+                qseen.add(key)
+                qlen = len(flow.request.path.split("?", 1)[1])
+                self._emit_novel(flow, cell, host, template, "suspicious_query",
+                                 na, query_length=qlen)
 
 
 addons = [Notifier()]

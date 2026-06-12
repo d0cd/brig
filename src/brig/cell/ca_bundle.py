@@ -4,8 +4,7 @@ Warden's MITM cert out of the box.
 Without this, every cell-image author has to extract Warden's CA, mount
 it as a secret, append it onto /etc/ssl/certs, and export the assorted
 SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS
-env vars themselves. Aitelier flagged that as their #1 adoption ask —
-every consumer was rediscovering the workaround.
+env vars themselves. Staging it once here removes that per-image setup.
 
 Threat model:
 
@@ -40,10 +39,8 @@ from brig.vm.shell import vm_run
 
 # Warden's CA cert lives in a persistent bind-mounted dir inside the
 # VM (see src/warden/proxy.py VM_WARDEN_STATE_DIR). brig reads it from
-# the VM filesystem directly — no `podman exec`. The previous design
-# went through `podman exec warden cat ...` and hit three compounding
-# bugs aitelier diagnosed (sh -c skipping auto-sudo, lazy CA gen, root-
-# owned tmpfs). The current design eliminates all three by structure:
+# the VM filesystem directly — no `podman exec` — which avoids three
+# failure modes by structure:
 #   - direct filesystem read uses vm_run([cat, ...]) which is on the
 #     sudo whitelist
 #   - eager CA gen at `warden start` (proxy.py:_ensure_warden_ca_exists)
@@ -74,7 +71,7 @@ def stage_bundle(cell_name: str) -> None:
     never sees a torn write. Raises BrigError if warden's CA file is
     missing — that means `brig system up` hasn't run yet (or warden
     failed to generate its cert at start, which would have already
-    surfaced as a `brig up` failure).
+    surfaced as a `brig system up` failure).
     """
     bundle = vm_bundle_path(cell_name)
     tmp = bundle.with_suffix(".crt.tmp")
@@ -84,7 +81,7 @@ def stage_bundle(cell_name: str) -> None:
         raise BrigError(
             f"Warden CA cert is missing at {VM_WARDEN_CA_FILE}",
             suggestion=(
-                "Bring warden up first: brig up\n"
+                "Bring warden up first: brig system up\n"
                 f"  (Cell '{cell_name}' aborted before any state was created.)"
             ),
         )
@@ -106,7 +103,7 @@ def stage_bundle(cell_name: str) -> None:
         f"chmod 0644 {shlex.quote(str(tmp))}; "
         f"mv {shlex.quote(str(tmp))} {shlex.quote(str(bundle))}"
     )
-    result = vm_run(["sudo", "sh", "-c", script], timeout=15)
+    result = vm_run(["sh", "-c", script], timeout=15, sudo=True)
     if result.returncode != 0:
         # BrigError (not RuntimeError) so the operator gets the
         # standard suggestion-line affordance brig uses everywhere

@@ -26,8 +26,8 @@ class TestBuildMetadata(unittest.TestCase):
             m = build_metadata("test-cell", "/work")
 
         self.assertEqual(m["version"], SCHEMA_VERSION)
-        self.assertEqual(m["version"], 2,
-            "v2 schema (dropped workspace.host_path) — bump this when you "
+        self.assertEqual(m["version"], 3,
+            "v3 schema (added image_digest + ingress) — bump this when you "
             "intentionally change the wire shape, not when you change "
             "internals")
         self.assertEqual(m["name"], "test-cell")
@@ -65,14 +65,18 @@ class TestBuildMetadata(unittest.TestCase):
             m = build_metadata("c", "/work")
         self.assertEqual(sorted(m["policy"]["host_services"]), ["svcA", "svcB"])
 
-    def test_host_services_strips_non_string_entries(self):
-        """Defense against a hand-edited policy that mixes the global shape
-        (dicts with name+port) into per-cell."""
+    def test_host_services_projects_dicts_to_names(self):
+        """Per-cell policy stores `[{name, port, protocol}, ...]`; the
+        in-cell metadata view exposes names only, with no port leak."""
         from brig.cell.metadata import build_metadata
-        policy = {"host_services": ["ok", {"name": "wrong", "port": 80}, 42]}
+        policy = {"host_services": [
+            {"name": "db", "port": 5432, "protocol": "tcp"},
+            "legacy-string-form",
+            42,
+        ]}
         with patch("brig.cell.metadata.load_cell_policy", return_value=policy):
             m = build_metadata("c", "/work")
-        self.assertEqual(m["policy"]["host_services"], ["ok"])
+        self.assertEqual(m["policy"]["host_services"], ["db", "legacy-string-form"])
 
 
 class TestWriteMetadata(unittest.TestCase):
@@ -91,7 +95,7 @@ class TestWriteMetadata(unittest.TestCase):
         self.assertEqual(payload["name"], "test-cell")
         self.assertEqual(payload["workspace"]["mount_point"], "/work")
         self.assertIn("started_at", payload)
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
         self.assertNotIn("host_path", payload["workspace"])
 
     def test_metadata_file_is_world_readable_inside_cell(self):
@@ -231,6 +235,54 @@ class TestReconcilerBindMountsMetadata(unittest.TestCase):
             f"expected exactly one /run/brig/cell.json mount, got {v_pairs}")
         # Source path must include the cell name.
         self.assertIn("test-cell", match[0])
+
+
+class TestRestartSpecPersistence(unittest.TestCase):
+    """Persist/restore the full spec for `restart: always` cells."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._p = patch("brig.cell.metadata.HostPaths.STATE_DIR", self.tmp)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+
+    def _spec(self, name="c", restart="always"):
+        from brig.cell.spec import CellSpec
+        return CellSpec(name=name, image="alpine", restart=restart, env=["K=v"])
+
+    def test_always_persists_and_roundtrips(self):
+        from brig.cell.metadata import read_cell_spec, write_cell_spec
+        write_cell_spec(self._spec())
+        got = read_cell_spec("c")
+        self.assertIsNotNone(got)
+        self.assertEqual(got["restart"], "always")
+        self.assertEqual(got["name"], "c")
+        self.assertEqual(got["env"], ["K=v"])
+
+    def test_no_removes_stale_spec(self):
+        from brig.cell.metadata import read_cell_spec, write_cell_spec
+        write_cell_spec(self._spec(restart="always"))
+        write_cell_spec(self._spec(restart="no"))  # flipped — must drop the file
+        self.assertIsNone(read_cell_spec("c"))
+
+    def test_restorable_filters_to_always(self):
+        from brig.cell.metadata import restorable_cell_specs, write_cell_spec
+        write_cell_spec(self._spec(name="a", restart="always"))
+        write_cell_spec(self._spec(name="b", restart="no"))
+        self.assertEqual([s["name"] for s in restorable_cell_specs()], ["a"])
+
+    def test_remove_cell_spec_deletes_and_is_idempotent(self):
+        from brig.cell.metadata import (
+            read_cell_spec,
+            remove_cell_spec,
+            write_cell_spec,
+        )
+        write_cell_spec(self._spec())
+        remove_cell_spec("c")
+        self.assertIsNone(read_cell_spec("c"))
+        remove_cell_spec("c")  # idempotent — no error when already gone
 
 
 if __name__ == "__main__":

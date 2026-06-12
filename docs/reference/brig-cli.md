@@ -2,7 +2,7 @@
 
 A working reference for the `brig` command. Companion to
 [`warden-cli.md`](warden-cli.md) for the proxy lifecycle commands. For
-the SDK that wraps these, see [`sdk-spec.md`](../sdk-spec.md).
+the SDK that wraps these, see [`sdk.md`](sdk.md).
 
 `brig --version` prints the installed version. `brig --help` lists every
 subcommand. `--debug` adds verbose logs; `--quiet` suppresses info-level
@@ -13,8 +13,8 @@ output; `--no-color` disables ANSI colors.
 | Command | What it does |
 |---|---|
 | `brig run <image> [cmd...]` | Create + start a new cell. See [brig run flags](#brig-run-flags) for the full flag list. Flags must precede the image — `brig run` rejects flag-after-image with an explanatory error. |
-| `brig cell list [--format=table\|wide\|json]` | List cells. `wide` adds CREATED, NETWORK columns. |
-| `brig cell inspect <cell>` | Raw podman inspect JSON. |
+| `brig cell list [--format=table\|wide\|json]` | List cells. `wide` adds CREATED, NETWORK columns. Aliases: `brig cell ls`, top-level `brig ps`. |
+| `brig cell inspect <cell>` | Raw podman inspect JSON. Alias: `brig cell status <cell>`. |
 | `brig cell diagnose <cell>` | Per-cell state summary (status, runtime, networks). |
 | `brig cell stop <cell>` | SIGTERM with 10s grace. |
 | `brig cell kill <cell>` | SIGKILL. |
@@ -29,8 +29,8 @@ output; `--no-color` disables ANSI colors.
 | `brig cell shell <cell>` | Open `/bin/sh` inside the cell. |
 | `brig cell exec <cell> [-i] -- cmd...` | Run a one-off command inside the cell. |
 | `brig cell read <cell> <path>` | Stream a workspace file to stdout. Race-free; refuses symlinks. Safer than `brig cell cp` for plain reads. |
-| `brig cell trace <trace_id>` | Render a request trace from the OTel collector by trace_id (or prefix; first match wins). |
-| `brig cell export <cell>` | Print the cell's YAML definition (round-trips via `brig run --file -`). |
+| `brig cell export <cell>` | Print the cell's YAML definition. Round-trip with `brig cell export <cell> > cell.yaml && brig run --file cell.yaml` (no stdin: `--file` takes a path). |
+| `brig cell mount-scan <cell> [--quarantine]` | Scan a cell's host `mounts:` for symlinks whose realpath escapes the mounted dir (a cell can plant one pointing out of a shared rw mount). Reports them (exit 1 if any); `--quarantine` removes them. Run before a host process consumes cell-written files. |
 
 ### brig run flags
 
@@ -73,6 +73,7 @@ output; `--no-color` disables ANSI colors.
 |---|---|
 | `brig cell network <cell> [--tail N] [--blocked] [--otel]` | Warden's per-cell request log. `--blocked` filters to only the requests warden denied, with the block reason on the same line. `--otel` reads from the OTel collector's flow store instead of the per-cell JSONL file (needed when the collector has retention older than the JSONL rotation). |
 | `brig cell events [cell] [--tail N] [-f]` | Lifecycle events stream. `-f` follows; default is one-shot. |
+| `brig cell ingress <cell>` | Show the reachable ingress URL(s) for a cell, the token-secret name to use in the `Authorization: Bearer` header, and whether the cell currently has a registered route. |
 | `brig system history [--tail N] [--cell <name>]` | Operations history (every `brig` invocation with exit code + duration). |
 | `brig policy show <cell>` | Print the cell's policy. Cells with no policy file show the empty default (cell blocks all egress). |
 | `brig policy set <cell> --allow DOMAIN [...] --deny DOMAIN [...]` | Extend a cell's allow/deny lists. Use `--remove-allow` / `--remove-deny` to drop. To declare host_services, edit the cell yaml. |
@@ -84,7 +85,7 @@ output; `--no-color` disables ANSI colors.
 | Command | What it does |
 |---|---|
 | `brig secrets list` | List secrets + their mount paths and env var names. |
-| `brig secrets add <name> [--value V \| --from-file F]` | Add a secret. Falls back to interactive `getpass` prompt if stdin is a TTY, else pipes from stdin. |
+| `brig secrets add <name> [--value V \| --from-file F] [--force]` | Add a secret. Falls back to interactive `getpass` prompt if stdin is a TTY, else pipes from stdin. `--force` overwrites an existing secret (otherwise adding a name that exists is refused). |
 | `brig secrets rm <name> [-y\|--yes]` | Delete a secret. **Requires `--yes` for non-interactive use** (refuses to delete in scripts/CI without explicit confirmation); interactive shells get a `[y/N]` prompt. |
 
 ## Images
@@ -93,18 +94,18 @@ output; `--no-color` disables ANSI colors.
 |---|---|
 | `brig image build <dir> [--tag TAG] [--file PATH] [--build-arg K=V] [--use-warden]` | Build a container image from a directory inside the VM. Auto-derives tag from the dir basename if `--tag` omitted; auto-detects `Containerfile`/`Dockerfile` if `--file` omitted. `--use-warden` routes the build's HTTP(S) traffic through warden — injects `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` build args and mounts the warden CA at `/etc/ssl/certs/warden-ca.crt`. Same policy applies as runtime. |
 | `brig image pull <image>` | Pull + cache an image. |
-| `brig image warmup [--profile NAME]` | Pre-pull images for a profile. |
-| `brig image verify <image> [--key KEY \| --keyless]` | Verify a cosign signature. Cosign is a hard requirement (no `podman trust` fallback). |
+| `brig image warmup` | Pre-pull the pinned warden/mitmproxy base image into the VM cache. |
+| `brig image verify <image> [--key KEY \| --keyless]` | Verify a cosign signature. Cosign is a hard requirement (no `podman trust` fallback). Advisory only — `--keyless` without an identity/issuer constraint confirms the image is signed, not who signed it; run-time integrity comes from digest pinning. |
 
 ## System / lifecycle
 
 | Command | What it does |
 |---|---|
-| `brig system up` | Initialize `~/.brig` if needed, create Lima VM if missing, start it if stopped, start warden. The "make it work" command. |
+| `brig system up` | Initialize `~/.brig` if needed, create Lima VM if missing, start it if stopped, start warden, then re-launch any gone `restart: always` cells. The "make it work" command. |
 | `brig system down [--vm]` | Stop all cells + warden. `--vm` also stops the Lima VM. |
 | `brig system init` | Bootstrap `~/.brig`, set 0700 perms on `secrets`/`addons`/`state/system`, write default policy. Idempotent. |
 | `brig system profiles` | List trust profiles (`untrusted`, `supervised`, `dev`, `airgapped`, `honeypot`). |
-| `brig system doctor --quick [--format=table\|json]` | Lightweight health check: proxy running + VM reachable. |
+| `brig system doctor --quick` | Lightweight health check: proxy running + VM reachable. |
 | `brig system doctor` | Deep environment check: tooling on PATH, Lima VM state, addon presence, directory permissions, network policy parses, warden running. Prints a checklist with fix suggestions on each failure. Use this before filing a bug. |
 | `brig system verify` | Run security invariant checks (`verify_all` in `brig.security.verify`). |
 | `brig system preflight` | Reconcile subnet state with podman networks; report drift. |
@@ -119,6 +120,7 @@ output; `--no-color` disables ANSI colors.
 |---|---|
 | `brig config show [key]` | Print config. Dot paths supported (`brig config show operation_logging.level`). |
 | `brig config set <key> <value>` | Set a config value. Dot paths create intermediate dicts. Values are parsed as JSON if possible, else stored as a string. |
+| `brig config set mount_roots <dir[,dir...]>` | Declare the host trees that cells may bind-mount via `mounts:` (VM-level allowlist). Rejects `/`, `$HOME`, secret dirs, `~/.brig`, `/etc`, non-dirs, and slug collisions — comparing by real path + on-disk identity, so symlinks, realpath aliases (`/etc` → `/private/etc`), and case variants (`~/.SSH`) can't slip past. Accepts a JSON list or a comma-separated string. A lossless VM restart applies it (`brig system down --vm && brig system up`; images preserved). See `docs/design/host-mounts.md`. |
 | `brig config reset` | Restore defaults. |
 
 ## Common workflows
@@ -132,7 +134,7 @@ brig run alpine echo hello
 **Debugging blocked requests:**
 ```bash
 brig cell network <cell> --blocked
-brig policy test <domain>           # try a domain without sending real traffic
+brig policy test <cell> <domain>    # try a domain without sending real traffic
 ```
 
 **Recovering from a confused state:**

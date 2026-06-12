@@ -38,7 +38,7 @@ class TestRunThroughReconciler(unittest.TestCase):
     def test_stopped_cell_cleans_up_first(self):
         """A stopped container from a previous run gets removed before re-run."""
         spec = CellSpec(name="test", image="alpine")
-        actual = CellState(exists=True, running=False, network_exists=True, proxy_connected=True)
+        actual = CellState(exists=True, running=False, network_exists=True, network_internal=True, proxy_connected=True)
         actions = plan_run(spec, actual)
         types = [a.type for a in actions]
         self.assertEqual(types[0], ActionType.PODMAN_RM)

@@ -2,9 +2,8 @@
 
 Brig ships with an OpenTelemetry collector that runs as a sibling
 container to warden inside the Lima VM. Warden's `otel_export` addon
-pushes metrics, traces, and logs to it; the brig CLI reads them back
-out for `brig system stats`, `brig cell trace`, and
-`brig cell network --otel`.
+pushes metrics and logs to it; the brig CLI reads them back out for
+`brig system stats` and `brig cell network --otel`.
 
 ## The collector
 
@@ -36,18 +35,6 @@ brig system metrics        # raw Prometheus-format counters
 requests, and TLS-mode (mitm vs passthrough) totals per cell. It
 exits non-zero with a clear message if the collector isn't running.
 
-## Reading traces
-
-Warden's mitmproxy addon attaches OTel spans to each request flow.
-The CLI looks up a single trace by ID:
-
-```bash
-brig cell trace <trace_id>     # or a unique prefix; first match wins
-```
-
-The trace ID typically shows up in the warden log lines (`trace_id=...`)
-that `brig cell network` and `brig cell logs` already print.
-
 ## Reading flows
 
 `brig cell network <cell>` defaults to the per-cell JSONL file
@@ -65,19 +52,18 @@ The two sources agree on recent flows; the OTel side retains longer
 
 ## Where the raw data lives
 
-The collector writes traces and logs to rotated JSONL files inside
-the VM at `/var/lib/otel/`:
+The collector writes logs to a rotated JSONL file inside the VM at
+`/var/lib/otel/`:
 
 | Signal | Path | Rotation |
 |---|---|---|
-| Traces | `/var/lib/otel/traces.jsonl` | 100 MB × 3 backups, 7-day max-age |
 | Logs   | `/var/lib/otel/logs.jsonl`   | 100 MB × 5 backups, 7-day max-age |
 | Metrics | (in-memory; exposed at `:9464/metrics`) | n/a |
 
-To peek at the raw files from the host:
+To peek at the raw file from the host:
 
 ```bash
-limactl shell brig -- sudo cat /var/lib/otel/traces.jsonl | tail -50
+limactl shell brig -- sudo cat /var/lib/otel/logs.jsonl | tail -50
 ```
 
 The configuration template is at

@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Cell network is verified `--internal` before reuse.** `observe()` recorded only whether a `brig-<cell>` network existed, and `plan_run` skipped `CREATE_NETWORK` (the sole `--internal` site) on the reuse path — so a leftover/tampered/operator-made non-internal network of the same name was silently adopted, giving the cell off-segment routes (invariant 1) and a path around Warden. The state dir / VM network set is untrusted (invariant 4), so the reconciler now inspects the network and **fails closed** if it isn't internal.
+- **Blocked-request paths are redacted in the `ctx.log` sink too.** The `BLOCKED:` (enforce) and `INGRESS MISS:` (ingress) log lines went to warden's container stdout with only control-character stripping, so a secret in the path/query (`?api_key=…`) on a *blocked* request landed verbatim in `podman logs warden`. Both now run the path through the shared `redact_path` redactor, closing the one sink the redaction pipeline missed.
+- Query-value redaction broadened: the sensitive-param allowlist gains `session`/`sig`/`signature`/`code`/`refresh_token`/`id_token`/`sas`, and **any** query value that classifies as a secret segment (token-shaped / high-entropy) is now masked regardless of its parameter name.
+- `server_connect` re-checks the upstream port against the egress allowlist (80/443) as defense-in-depth, so the connect-time guard is self-sufficient even if a future flow type reaches it without the request-time port check (legitimate non-80/443 destinations — host_service rewrites, ingress, declared TCP host_services — stay exempt).
+- The proxy-env override guard now strips/normalizes the env key before comparison, and `_v_env` rejects keys that aren't valid POSIX environment names — so a whitespace-padded ` http_proxy` can't slip past the guard protecting the Warden choke point.
+- `mount_root_slug` is derived from the realpath everywhere (validation, lima.yaml render, reconciler bind), so two symlinked `mount_roots` can't collide at one `/mnt/host/<slug>` with no validation error (which would shadow one host tree with another).
+- `_v_workdir` rejects `..`/`.` segments and doubled slashes, matching the other in-cell path validators.
+- Path filters (`policy.allow` with `paths:`) match on the path **without** its query string, so an intended endpoint scope isn't affected by query content; the glob-over-path semantics are now documented.
+- `brig system down` self-heals orphaned subnet allocations (frees `/24`s whose podman network is gone, then sweeps their ingress routes) instead of leaking them until a manual `prune`; fails safe if the network list can't be read.
+- Connect-time destination-IP validation closes the SSRF / DNS-rebinding gap on the egress paths the response-only check missed. `enforce.server_connect` resolves the destination and refuses (`data.server.error`) any MITM flow that resolves into a blocked range *before* the request is forwarded; `enforce.tls_clienthello` resolves the SNI and refuses to flip TLS passthrough into a blocked range (a raw-TCP passthrough tunnel produces no HTTP response, so the old `responseheaders` re-check never covered it). Warden's own routing — host_service rewrites (→ host IP) and ingress reverse-proxy (→ cell IP) — is exempt.
+- `brig run --profile untrusted` now enforces the untrusted-profile guards on the CLI path. The profile name was not recorded where validation could see it, so a cell launched with `--profile untrusted -f cell.yaml` could declare `host_sockets`, `tls_passthrough`, or `host_services` unchecked. (The SDK path was already correct.)
+- Image references beginning with `-` are rejected on the cell-yaml `image:` and SDK `image=` paths, and `podman run` now gets a `--` end-of-options marker before the image. An `image:` value like `--runtime=runc` (silent gVisor downgrade), `--privileged`, or `-v /:/host` can no longer be parsed by podman as a flag.
+- `verify_gvisor_runtime` reads the named runtime (top-level `OCIRuntime`) instead of `HostConfig.Runtime` (the OCI category, always `"oci"`). `brig system verify` can now actually distinguish a `runsc` cell from a `crun` downgrade (invariant 5) instead of false-failing every cell.
+- `workspace_mount` rejects non-normalized paths (doubled/leading/trailing slashes, `.` segments). A value like `/run//host` previously slipped past the lexical forbidden-prefix check while the kernel collapsed it back onto a brig-internal mount root.
+- `BLOCKED_NETWORKS` adds the IPv4 6to4-relay anycast (`192.88.99.0/24`) and IETF protocol-assignment / NAT64 well-known (`192.0.0.0/24`) ranges, for parity with the existing IPv6 tunnel prefixes.
+- The `host_socket` bridge writes the realpath validated at check time into the launchd plist instead of re-resolving at write time, closing a validate→freeze TOCTOU window.
+- Per-cell policy read-modify-write is serialized under one exclusive lock (`mutate_cell_policy`), so a concurrent `brig policy set` racing `brig run`'s policy re-sync can no longer silently drop an update.
+- `image_digest` is matched at the exact per-algorithm hex length (sha256/384/512); cell-name / secret-name / domain / memory validators anchor with `\Z` so a trailing newline is rejected.
+
+### Changed
+
+- Version bumped to **0.4.0** (new invariants 11–13 + removed `brig cell trace`); `pyproject.toml` and `brig.config.VERSION` are now guarded against drift by a test.
+- The pinned mitmproxy base image has a single source of truth (`warden.proxy.BASE_IMAGE`), imported by `brig image warmup`; a test keeps the warden Dockerfile `FROM`/`LABEL` in lockstep, matching the gVisor/collector pin discipline.
+- Invariant 6 docs realigned with the code: `proxy-external` admits brig infrastructure (warden **and** the OTel collector `brig-otel`, per `INFRA_CONTAINER_NAMES`); no cell can reach that network.
+- **Fail-closed behavior changes** (operators take note): `brig cell start` now refuses to start a digest-pinned cell whose container reports an empty image digest (was: started unverified); a cell that declares `ingress` now fails and rolls back if its container can't be inspected or has no IP at start (was: started with the route silently unregistered); TLS passthrough is refused (falls through to MITM) when the host resolves into a blocked range.
+- `brig system verify` no longer reports airgapped (`--network none`) cells as single-homing violations, and now flags network members that lack a name instead of silently skipping them.
+- The warden addons moved from the loose top-level `src/addons/` into the brig package as shipped data (`src/brig/warden_addons/`). They now ship in the wheel (declared as `brig` package-data) and `brig.ops.addon_deploy` resolves them via `importlib.resources`, so the deployed data plane is resolvable in any install layout, not just an editable checkout. The addons stay flat-loaded by mitmproxy (no `__init__.py`); the deploy target (`~/.brig/cells/addons` → `/addons`) is unchanged.
+
+### Removed
+
+- `brig cell trace` and the OTel **traces** pipeline. No addon ever emitted a span (the tracer/exporter were initialized but unused), so the collector's traces lane and `traces.jsonl` were always empty and the command always returned no data. Removed the command, the unused `TracerProvider`/`OTLPSpanExporter` setup in `otel_export.py`, the `traces` pipeline + `file/traces` exporter in the collector config, `brig/observability/traces.py`, and the stale docs claim that spans are attached per request. Metrics and logs (the signals that actually flow) are unaffected.
+
+### Fixed
+
+- **Documentation accuracy (quality audit).** `docs/learning/concepts.md` claimed the `dev` profile disables gVisor (it can't — gVisor is mandatory, invariant 5) and documented a `--sanitize` / `--allow-scripts` / `--allow-office` flag family and blocklist that don't exist (export sanitization is unconditional; the real blocklist is `UNSAFE_EXTENSIONS`). Also corrected: `security.md` "proxy listens ONLY on 8080" (ingress adds 8443, TCP host_services add their ports) and the `tls_mode=mitm` scope (OTel records, not the JSONL flow log); `INVARIANTS.md` symbol `_register_cell_ingress` → `register_ingress_for`; `warden reload` addon credit; `secrets add --force` flag; `sdk.py` `list_sync` docstring.
+- More actionable errors: "Invalid cell name" now states the allowed format; `Could not parse …` raises suggest `brig system doctor`; the TCP-restart prompt fails fast with a `--yes` hint on non-interactive callers instead of an EOF-driven abort.
+- **TLS passthrough (invariant 11) now actually engages.** `tls_clienthello` set `client_conn.tls_passthrough = True`, an attribute the warden image's mitmproxy (10.1.1) does not read — so passthrough was a silent no-op: every host was MITM'd, and a host that refuses mitmproxy's relayed handshake simply failed. Warden now sets `data.ignore_connection = True`, the switch the TLS layer actually reads. Verified e2e (manual, against the pinned image): a host in `tls_passthrough` receives its real upstream certificate (warden tunnels raw, no decryption), while an allowlisted-but-not-passthrough host still receives warden's MITM cert. The gating is preserved (allow-coverage, SNI/CONNECT match, resolved-IP guard). NOTE: a true passthrough tunnel produces no mitmproxy flow, so the `warden_passthrough_*` otel counters and the `tcp_*` hooks do NOT fire for it — the only passthrough audit is the connection-level `PASSTHROUGH: cell=… sni=…` log line. See `docs/INVARIANTS.md` invariant 11.
+- `scripts/local-smoke-test.sh` updated to the 0.3.0 noun-verb CLI (`brig system up/verify`, `brig cell list/inspect/exec/stop/rm`); it had broken against the restructured surface.
+- Atomic file writes `fsync` the parent directory after rename, so a crash immediately after the rename can't lose the directory entry.
+
 ## [0.3.1] - 2026-05-26
 
 ### Fixed
@@ -75,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Authenticated ingress reverse proxy through Warden: external requests to `https://warden:8443/{cell}/{prefix}/...` route to a cell-internal port after Bearer-token auth. Salted SHA-256 token hashing, constant-time comparison, per-IP auth-failure rate limiting.
 - WebSocket passthrough through Warden (logged but not re-policy-checked once the upgrade has been allowed).
-- `brig doctor` — deep environment check (PATH, Lima VM state, addon presence, directory permissions, port collisions). Complements the lighter `brig health`.
+- `brig doctor` — deep environment check (PATH, Lima VM state, addon presence, directory permissions, port collisions). Complements the lighter `--quick` check.
 - `brig policy test <domain>` — host-side passthrough that runs the same allow/deny logic warden uses.
 - `brig events --follow` — block and tail new lifecycle events.
 - `brig network <cell> --blocked` — filter to only the requests warden blocked, with reason.
@@ -119,8 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `brig policy rm <cell>`: drops a cell's per-cell policy override (the cell falls back to the global policy on the next request). Wired up an existing-but-unreachable `delete_cell_policy()` function that already had tests.
-- `brig policy set <cell> --host-service <name>`: per-cell ACL grant. Previously `--host-service` only worked for the global policy (`name:port` form), so the H1 per-cell ACL field could only be set by hand-editing JSON. Now: global takes `name:port` (declares warden's forward target), per-cell takes a bare `name` (grants the cell access to a globally-declared service). The CLI rejects each form in the wrong context with a clear suggestion.
+- `brig policy rm <cell>`: drops a cell's per-cell policy; the cell then blocks all egress (default-deny) on the next request. Wired up an existing-but-unreachable `delete_cell_policy()` function that already had tests.
 - The `log_compaction` block in `docs/examples/network-policy.example.json` (no consumer).
 
 ### Moved

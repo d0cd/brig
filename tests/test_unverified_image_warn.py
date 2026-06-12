@@ -18,14 +18,14 @@ from unittest.mock import patch
 
 class TestUnverifiedImageWarn(unittest.TestCase):
     def _run_with_config(self, image: str, config: dict | None) -> list[str]:
-        from brig.commands.lifecycle_cmd import _warn_unverified_image
+        from brig.commands.lifecycle_run import _warn_unverified_image
         with tempfile.TemporaryDirectory() as td:
             cfg = Path(td) / "config.json"
             if config is not None:
                 cfg.write_text(json.dumps(config))
             with patch("brig.config.CONFIG_FILE", cfg):
                 msgs: list[str] = []
-                with patch("brig.commands.lifecycle_cmd.info",
+                with patch("brig.commands.lifecycle_run.info",
                            side_effect=msgs.append):
                     _warn_unverified_image(image)
                 return msgs
@@ -60,13 +60,13 @@ class TestUnverifiedImageWarn(unittest.TestCase):
         self.assertEqual(msgs, [])
 
     def test_malformed_config_treated_as_warn(self):
-        from brig.commands.lifecycle_cmd import _warn_unverified_image
+        from brig.commands.lifecycle_run import _warn_unverified_image
         with tempfile.TemporaryDirectory() as td:
             cfg = Path(td) / "config.json"
             cfg.write_text("{ not valid json")
             with patch("brig.config.CONFIG_FILE", cfg):
                 msgs: list[str] = []
-                with patch("brig.commands.lifecycle_cmd.info",
+                with patch("brig.commands.lifecycle_run.info",
                            side_effect=msgs.append):
                     _warn_unverified_image("alpine")
                 self.assertEqual(len(msgs), 1)

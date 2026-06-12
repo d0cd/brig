@@ -2,6 +2,11 @@
 
 Covers:
   - Webhook URL SSRF prevention (notifier.py)
+
+Imports the real mitmproxy (installed via the dev extras) so an API
+drift in mitmproxy surfaces as a unit-test failure instead of an E2E
+surprise. Tests skip if mitmproxy is unavailable — `uv pip install -e
+'.[dev]'` to enable.
 """
 
 import sys
@@ -9,19 +14,82 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-# Mock mitmproxy before importing addons — it is not installed in the test
-# environment. The mock must be in sys.modules before any addon import.
-_mock_mitmproxy = MagicMock()
-sys.modules.setdefault("mitmproxy", _mock_mitmproxy)
-sys.modules.setdefault("mitmproxy.ctx", _mock_mitmproxy.ctx)
-sys.modules.setdefault("mitmproxy.http", _mock_mitmproxy.http)
+import pytest
+
+pytest.importorskip("mitmproxy", reason="install dev extras: uv pip install -e '.[dev]'")
+
+# Addons call `mitmproxy.ctx.log.*`; `ctx` is populated by a running master, so
+# stub it for unit tests (mirrors test_security_audit.py).
+import mitmproxy.ctx  # noqa: E402
+if not hasattr(mitmproxy.ctx, "log"):
+    mitmproxy.ctx.log = MagicMock()
 
 # Add addons directory to sys.path so we can import directly.
-_addons_dir = str(Path(__file__).parent.parent / "src" / "addons")
+_addons_dir = str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons")
 if _addons_dir not in sys.path:
     sys.path.insert(0, _addons_dir)
 
 from notifier import _resolve_webhook_url, Notifier  # noqa: E402
+
+
+class TestOtelPathRedaction(unittest.TestCase):
+    """The OTel log sink must redact query-string secrets, matching the JSONL
+    sink — otherwise `?api_key=...` lands in the collector log in cleartext."""
+
+    def test_response_redacts_query_secret(self):
+        from types import SimpleNamespace
+        import otel_export
+        exporter = otel_export.OtelExporter()
+        # Wire just enough so response() runs and emits a log record.
+        for attr in ("requests_total", "request_duration_ms", "blocked_total",
+                     "bytes_in_total", "bytes_out_total"):
+            setattr(exporter, attr, MagicMock())
+        captured = {}
+        logger = MagicMock()
+        logger.emit = lambda rec: captured.update(
+            body=rec.body, attrs=dict(rec.attributes))
+        exporter.logger = logger
+
+        req = SimpleNamespace(method="GET", host="api.example.com",
+                              path="/v1/data?api_key=SECRET&x=1", content=b"")
+        resp = SimpleNamespace(status_code=200, content=b"ok")
+        flow = SimpleNamespace(request=req, response=resp,
+                               metadata={"cell": "codex"})
+        # LogRecord is only imported when the OTel SDK is installed; stub it so
+        # the test exercises redaction regardless of the dev env.
+        def _fake_logrecord(**kw):
+            return SimpleNamespace(**kw)
+        with patch.object(otel_export, "LogRecord", _fake_logrecord, create=True):
+            exporter.response(flow)
+
+        self.assertNotIn("SECRET", captured["body"])
+        self.assertNotIn("SECRET", captured["attrs"]["path"])
+        self.assertIn("REDACTED", captured["attrs"]["path"])
+
+    def test_log_record_has_zero_span_ids(self):
+        # Span-less records must carry int 0 ids, not None — else the OTLP
+        # encoder's _encode_span_id(None) throws and floods warden's log.
+        from types import SimpleNamespace
+        import otel_export
+        exporter = otel_export.OtelExporter()
+        for attr in ("requests_total", "request_duration_ms", "blocked_total",
+                     "bytes_in_total", "bytes_out_total"):
+            setattr(exporter, attr, MagicMock())
+        captured = {}
+        logger = MagicMock()
+        logger.emit = lambda rec: captured.update(
+            span_id=rec.span_id, trace_id=rec.trace_id, trace_flags=rec.trace_flags)
+        exporter.logger = logger
+        flow = SimpleNamespace(
+            request=SimpleNamespace(method="GET", host="api.x", path="/v1/x", content=b""),
+            response=SimpleNamespace(status_code=200, content=b"ok"),
+            metadata={"cell": "c"})
+        with patch.object(otel_export, "LogRecord",
+                          lambda **kw: SimpleNamespace(**kw), create=True):
+            exporter.response(flow)
+        self.assertEqual(captured["span_id"], 0)
+        self.assertEqual(captured["trace_id"], 0)
+        self.assertEqual(captured["trace_flags"], 0)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +177,43 @@ class TestResolveWebhookUrl(unittest.TestCase):
         safe, _, _, _ = _resolve_webhook_url("https://cgnat.example.com/webhook")
         self.assertFalse(safe)
 
+    @patch("_notifier_state._socket.getaddrinfo")
+    def test_rejects_ipv6_loopback(self, mock_getaddrinfo):
+        """URL resolving to ::1 is rejected (IPv6 sockaddr is 4-tuple)."""
+        mock_getaddrinfo.return_value = [
+            (10, 1, 6, "", ("::1", 443, 0, 0)),
+        ]
+        safe, _, _, _ = _resolve_webhook_url("https://v6.example.com/webhook")
+        self.assertFalse(safe)
+
+    @patch("_notifier_state._socket.getaddrinfo")
+    def test_rejects_ipv6_link_local(self, mock_getaddrinfo):
+        """URL resolving to fe80::/10 is rejected."""
+        mock_getaddrinfo.return_value = [
+            (10, 1, 6, "", ("fe80::1", 443, 0, 0)),
+        ]
+        safe, _, _, _ = _resolve_webhook_url("https://v6.example.com/webhook")
+        self.assertFalse(safe)
+
+    @patch("_notifier_state._socket.getaddrinfo")
+    def test_rejects_nat64_prefix(self, mock_getaddrinfo):
+        """URL resolving into the NAT64 well-known prefix is rejected."""
+        mock_getaddrinfo.return_value = [
+            (10, 1, 6, "", ("64:ff9b::7f00:1", 443, 0, 0)),
+        ]
+        safe, _, _, _ = _resolve_webhook_url("https://nat64.example.com/webhook")
+        self.assertFalse(safe)
+
+    @patch("_notifier_state._socket.getaddrinfo")
+    def test_rejects_when_any_resolved_address_is_internal(self, mock_getaddrinfo):
+        """A mixed answer set with one internal address is rejected outright."""
+        mock_getaddrinfo.return_value = [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+            (10, 1, 6, "", ("::1", 443, 0, 0)),
+        ]
+        safe, _, _, _ = _resolve_webhook_url("https://mixed.example.com/webhook")
+        self.assertFalse(safe)
+
     def test_rejects_file_scheme(self):
         """file:// URL is rejected (non-HTTP scheme)."""
         safe, _, _, _ = _resolve_webhook_url("file:///etc/passwd")
@@ -156,6 +261,226 @@ class TestSendHttpRequestSSRF(unittest.TestCase):
         self.assertIn("93.184.216.34", request_obj.full_url)
         self.assertNotIn("webhook.example.com", request_obj.full_url)
         self.assertEqual(request_obj.get_header("Host"), "webhook.example.com")
+
+
+class TestNovelHelpers(unittest.TestCase):
+    """Path templating + query-exfil heuristic (pure functions)."""
+
+    def test_normalize_collapses_high_cardinality_segments(self):
+        from notifier import normalize_path_template as nt
+        self.assertEqual(nt("/users/12345/posts/67"), "/users/{id}/posts/{id}")
+        self.assertEqual(nt("/v1/3fa85f64-5717-4562-b3fc-2c963f66afa6"), "/v1/{id}")
+        self.assertEqual(nt("/repos/deadbeefcafe1234"), "/repos/{id}")  # long hex
+        self.assertEqual(nt("/api/messages?api_key=secret"), "/api/messages")  # query stripped
+        self.assertEqual(nt("/static/app.js"), "/static/app.js")  # short segments stay
+
+    def test_normalize_collapses_colon_joined_credential(self):
+        # A colon-joined API token rides IN the path; the colon must not let it leak.
+        from notifier import normalize_path_template as nt
+        self.assertEqual(
+            nt("/bot0000000000:FAKEfakeFAKEfakeFAKEfakeFAKEfake000/getUpdates"),
+            "/{id}/getUpdates")
+
+    def test_entropy_helper_thresholds(self):
+        from _notifier_state import _high_entropy_segment as hi
+        self.assertTrue(hi("ABCDEFGHIJKLMNOPqrstuvwxyz012345"))  # 32 distinct -> 5.0 bits
+        self.assertFalse(hi("aZ3kP9xQ"))                         # 8 chars < len floor
+        self.assertFalse(hi("a" * 20))                           # long but 0 entropy
+
+    def test_entropy_fallback_collapses_unknown_token(self):
+        # The recall net: an unenumerated high-entropy token (e.g. base64 with
+        # +/= that the regexes miss) still collapses, so it can't leak.
+        from notifier import normalize_path_template as nt
+        self.assertEqual(nt("/d/ABCDEFGHIJKLMNOPqrstuvwxyz012345"), "/d/{id}")
+
+    def test_entropy_keeps_meaningful_segments(self):
+        # Tuned against brig's real logs — these must NOT collapse (false positive).
+        from notifier import normalize_path_template as nt
+        for p in ("/v1/models/model-catalog.json", "/repos/NousResearch",
+                  "/api/setMyCommands"):
+            self.assertEqual(nt(p), p, p)
+
+    def test_query_exfil_signal(self):
+        from notifier import query_exfil_signal as q
+        self.assertTrue(q("/x?dump=" + "a" * 100, 50))
+        self.assertFalse(q("/x?p=ab", 50))
+        self.assertFalse(q("/x", 50))  # no query
+
+
+class TestNovelAllowed(unittest.TestCase):
+    """First-seen detection on allow-listed hosts (the detection complement)."""
+
+    def _flow(self, host="api.anthropic.com", path="/v1/messages",
+              method="POST", blocked=False, cell="sa"):
+        flow = MagicMock()
+        flow.metadata = {"blocked": blocked, "cell": cell}
+        flow.request.host = host
+        flow.request.path = path
+        flow.request.method = method
+        flow.client_conn.peername = ("10.60.1.2", 1234)
+        return flow
+
+    def _notifier(self, **na_kw):
+        from _notifier_state import NotificationConfig, NovelAllowedConfig
+        n = Notifier()
+        n.config = NotificationConfig(
+            novel_allowed=NovelAllowedConfig(enabled=True, **na_kw))
+        return n
+
+    @patch("notifier.Notifier._reload_config")
+    def test_first_seen_path_is_novel(self, _):
+        n = self._notifier()
+        n.response(self._flow(path="/v1/messages"))
+        notif = n.notification_queue.get_nowait()
+        self.assertEqual(notif["event"], "novel_allowed")
+        self.assertEqual(notif["reason"], "novel_path")
+        self.assertEqual(notif["host"], "api.anthropic.com")
+
+    @patch("notifier.Notifier._reload_config")
+    def test_repeat_and_id_variants_are_not_novel(self, _):
+        n = self._notifier()
+        n.response(self._flow(host="api.x", path="/users/123"))
+        n.notification_queue.get_nowait()  # drain the first (novel) alert
+        n.response(self._flow(host="api.x", path="/users/123"))   # exact repeat
+        n.response(self._flow(host="api.x", path="/users/456"))   # same template
+        self.assertTrue(n.notification_queue.empty())
+
+    @patch("notifier.Notifier._reload_config")
+    def test_dry_run_does_not_enqueue(self, _):
+        n = self._notifier(dry_run=True)
+        n.response(self._flow())
+        self.assertTrue(n.notification_queue.empty())
+
+    @patch("notifier.Notifier._reload_config")
+    def test_ignore_host_suffix(self, _):
+        n = self._notifier(ignore_hosts=("anthropic.com",))
+        n.response(self._flow(host="api.anthropic.com"))
+        self.assertTrue(n.notification_queue.empty())
+
+    @patch("notifier.Notifier._reload_config")
+    def test_cells_filter_scopes_detection(self, _):
+        n = self._notifier(cells=["other-cell"])
+        n.response(self._flow(cell="sa"))
+        self.assertTrue(n.notification_queue.empty())
+
+    @patch("notifier.Notifier._reload_config")
+    def test_suspicious_query_on_known_path_without_leaking_payload(self, _):
+        import json as _json
+        n = self._notifier(max_query_len=10)
+        n.response(self._flow(path="/v1/messages"))          # novel_path
+        n.notification_queue.get_nowait()
+        n.response(self._flow(path="/v1/messages?leak=" + "x" * 50))
+        notif = n.notification_queue.get_nowait()
+        self.assertEqual(notif["reason"], "suspicious_query")
+        self.assertIn("query_length", notif)
+        self.assertNotIn("leak", _json.dumps(notif))  # payload never recorded
+
+    @patch("notifier.Notifier._reload_config")
+    def test_blocked_path_still_alerts_after_refactor(self, _):
+        n = self._notifier()
+        n.config.enabled = True
+        n.config.min_interval_seconds = 0
+        n.response(self._flow(blocked=True))
+        notif = n.notification_queue.get_nowait()
+        self.assertEqual(notif["event"], "request_blocked")
+
+    def test_reload_config_parses_novel_allowed_block(self):
+        # Exercises the real _reload_config parse path (compiles ignore_paths),
+        # which the _reload_config-patched tests above don't cover.
+        import json as _json
+        import os
+        import tempfile
+        from pathlib import Path
+        fd, name = tempfile.mkstemp(suffix=".json")
+        os.write(fd, _json.dumps({"notifications": {"novel_allowed": {
+            "enabled": True, "cells": ["sa"], "ignore_hosts": ["pypi.org"],
+            "ignore_paths": ["^/v1/acp/"], "dry_run": True, "max_query_len": 256,
+        }}}).encode())
+        os.close(fd)
+        try:
+            n = Notifier()
+            with patch("notifier.POLICY_FILE", Path(name)):
+                n._reload_config(force=True)
+            na = n.config.novel_allowed
+            self.assertIsNotNone(na)
+            self.assertTrue(na.enabled and na.dry_run)
+            self.assertEqual(na.cells, ["sa"])
+            self.assertEqual(na.max_query_len, 256)
+            self.assertEqual(na.ignore_hosts, ("pypi.org",))
+            self.assertTrue(any(p.search("/v1/acp/x") for p in na.ignore_paths))
+        finally:
+            os.unlink(name)
+
+
+class TestUnifiedRedaction(unittest.TestCase):
+    """All sinks share one classifier (_common), so a secret masked in one
+    channel can't leak in another — regression for a secret-in-path leak that
+    was redacted in novel_allowed but verbatim in the logger + OTel sinks."""
+
+    TOKEN_PATH = "/bot0000000000:FAKEfakeFAKEfakeFAKEfakeFAKEfake000/getUpdates"
+
+    def test_redact_path_masks_secret_keeps_id_scrubs_query(self):
+        from _common import redact_path
+        self.assertEqual(redact_path(self.TOKEN_PATH), "/[REDACTED]/getUpdates")
+        self.assertEqual(redact_path("/users/12345/posts"), "/users/12345/posts")  # id kept
+        self.assertEqual(redact_path("/v1/x?api_key=SECRET"), "/v1/x?api_key=REDACTED")
+
+    def test_all_sinks_close_the_token_leak(self):
+        import _log_writer
+        import _notifier_state as ns
+        for fn in (_log_writer._redact_path,           # logger + otel
+                   ns._redact_notification_path,       # notifier blocked alert
+                   ns.normalize_path_template):        # novel_allowed template
+            self.assertNotIn("FAKEfake", fn(self.TOKEN_PATH), fn.__name__)
+
+
+class TestQueryValueRedaction(unittest.TestCase):
+    """Query values are redacted both for known-sensitive names and for any
+    value that classifies as a secret segment (unenumerated param names)."""
+
+    def test_extra_named_params_redacted(self):
+        from _common import redact_path
+        self.assertIn("session=REDACTED", redact_path("/a?session=abcdef0123456789"))
+        self.assertIn("sig=REDACTED", redact_path("/a?sig=AAAAAAAAAAAAAAAA"))
+
+    def test_high_entropy_unlisted_param_redacted(self):
+        from _common import redact_path
+        out = redact_path("/a?nonce=AKIAIOSFODNN7EXAMPLE1234567890")
+        self.assertNotIn("AKIAIOSFODNN7EXAMPLE", out)
+
+    def test_short_benign_values_kept(self):
+        from _common import redact_path
+        self.assertEqual(redact_path("/a?page=2&size=10"), "/a?page=2&size=10")
+
+
+class TestPathFilterQueryStrip(unittest.TestCase):
+    """Path filters match on the path WITHOUT the query string."""
+
+    def test_query_stripped_before_match(self):
+        from _policy import PolicyRule
+        rule = PolicyRule({"domain": "api.example.com", "paths": ["/v1/x"]})
+        self.assertTrue(rule.matches_path("/v1/x?token=abc"))
+        self.assertTrue(rule.matches_path("/v1/x"))
+        self.assertFalse(rule.matches_path("/v2/x"))
+
+
+class TestBlockedLogRedaction(unittest.TestCase):
+    """The BLOCKED ctx.log line is captured as warden container stdout — the
+    same trust level as the structured sinks — so secrets in the path/query
+    must be redacted there too. Regression: ctx.log was the one sink the
+    redaction pipeline missed on the blocked branch."""
+
+    def test_block_log_redacts_secret_query(self):
+        import mitmproxy.ctx as ctx
+        from enforce import PolicyEnforcer
+        ctx.log = MagicMock()
+        enf = PolicyEnforcer()
+        flow = MagicMock()
+        flow.request.host = "evil.example.com"
+        flow.request.path = "/x?api_key=sk-SUPERSECRETVALUE0123456789"
+        enf._block(flow, "blocked for test")
+        logged = " ".join(str(c) for c in ctx.log.info.call_args_list)
+        self.assertNotIn("SUPERSECRETVALUE", logged)
 
 
 if __name__ == "__main__":

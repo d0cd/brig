@@ -33,11 +33,19 @@ egress filtered through the Warden proxy. The cell name is auto-generated.
 ## 3. Run a Named Cell
 
 ```bash
-brig run --name my-cell -d python:3.12 python -c "
-import urllib.request
+brig run --name my-cell --policy-allow pypi.org -d python:3.12 python -c "
+import time, urllib.request
 print(urllib.request.urlopen('https://pypi.org').status)
+while True: time.sleep(60)
 "
 ```
+
+Egress is **default-deny**: without `--policy-allow pypi.org` the request is
+blocked (403) and the cell crashes before it can sleep. The trailing
+`while True: time.sleep(60)` keeps the cell running so
+`brig cell exec / files / logs` work. Without it the cell exits
+within a second of the urlopen call and the inspection commands below
+fail with "cell not running."
 
 Check it:
 

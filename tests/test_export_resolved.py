@@ -28,7 +28,7 @@ class TestExportResolved(unittest.TestCase):
 
     def _captured_output(self, args, inspect_data, cell_policy=None,
                          ingress_routes=None, host_sockets=None):
-        from brig.commands.lifecycle_cmd import cmd_export
+        from brig.commands.lifecycle_inspect import cmd_export
         lines: list[str] = []
         result = MagicMock(returncode=0, stdout=json.dumps(inspect_data))
         with tempfile.TemporaryDirectory() as td:
@@ -43,8 +43,8 @@ class TestExportResolved(unittest.TestCase):
             policies_dir.mkdir()
             if cell_policy is not None:
                 (policies_dir / "alice.json").write_text(json.dumps(cell_policy))
-            with patch("brig.commands.lifecycle_cmd.vm_run", return_value=result), \
-                 patch("brig.commands.lifecycle_cmd.output",
+            with patch("brig.commands.lifecycle_inspect.vm_run", return_value=result), \
+                 patch("brig.commands.lifecycle_inspect.output",
                        side_effect=lines.append), \
                  patch("brig.config.HostPaths.INGRESS_ROUTES_FILE", routes_file), \
                  patch("brig.cell.metadata._host_metadata_path",
@@ -56,10 +56,9 @@ class TestExportResolved(unittest.TestCase):
 
     def test_minimal_emits_image_and_resources(self):
         text = self._captured_output(_args(), self._inspect())
-        # Strings are JSON-quoted in output for yaml-safety.
-        self.assertIn('name: "alice"', text)
-        self.assertIn('image: "alpine"', text)
-        self.assertIn('memory: "2g"', text)
+        self.assertIn("name: alice", text)
+        self.assertIn("image: alpine", text)
+        self.assertIn("memory: 2g", text)
 
     def test_includes_allow_and_deny(self):
         text = self._captured_output(_args(), self._inspect(), cell_policy={
@@ -75,7 +74,7 @@ class TestExportResolved(unittest.TestCase):
             "host_services": [{"name": "db", "port": 5432}],
         })
         self.assertIn("host_services:", text)
-        self.assertIn('"db"', text)
+        self.assertIn("name: db", text)
         self.assertIn("5432", text)
 
     def test_includes_ingress_routes(self):
@@ -87,7 +86,7 @@ class TestExportResolved(unittest.TestCase):
             ],
         )
         self.assertIn("ingress:", text)
-        self.assertIn('"api"', text)
+        self.assertIn("name: api", text)
         self.assertNotIn("port: 1\n", text)  # other cell's route not included
 
     def test_includes_host_sockets_without_host_path(self):
@@ -101,23 +100,42 @@ class TestExportResolved(unittest.TestCase):
         self.assertIn("/run/host/pg.sock", text)
         self.assertNotIn("SHOULD-NOT-LEAK", text)
 
+    def test_includes_user_when_set(self):
+        inspect = self._inspect()
+        inspect["Config"]["User"] = "0"
+        text = self._captured_output(_args(), inspect)
+        self.assertIn("user:", text)
+        self.assertIn("'0'", text)
+
+    def test_omits_user_when_unset(self):
+        text = self._captured_output(_args(), self._inspect())
+        self.assertNotIn("user:", text)
+
+    def test_includes_restart_always(self):
+        # restart isn't recoverable from podman inspect; read from persisted spec.
+        with patch("brig.cell.metadata.read_cell_spec",
+                   return_value={"restart": "always"}):
+            text = self._captured_output(_args(), self._inspect())
+        self.assertIn("restart: always", text)
+
+    def test_omits_restart_when_not_always(self):
+        with patch("brig.cell.metadata.read_cell_spec",
+                   return_value={"restart": "no"}):
+            text = self._captured_output(_args(), self._inspect())
+        self.assertNotIn("restart:", text)
+
     def test_export_wildcard_round_trips(self):
-        """Regression: bare `*.example.com` would emit unquoted and
-        pyyaml would parse it as an alias. JSON-quoted strings keep
-        round-trip working."""
+        """Regression: bare `*.example.com` would parse as a yaml alias.
+        yaml.safe_dump quotes it so the export round-trips."""
         text = self._captured_output(_args(), self._inspect(), cell_policy={
             "allow": ["*.example.com", "api.x"], "deny": [],
         })
-        # Each wildcard must be quoted in the output.
-        self.assertIn('"*.example.com"', text)
-        # And the resulting yaml block must parse cleanly.
-        try:
-            import yaml
-            yaml.safe_load(text)
-        except (ImportError, ModuleNotFoundError):
-            self.skipTest("pyyaml not installed")
-        except Exception as e:
-            self.fail(f"emitted yaml does not parse: {e}\n{text}")
+        # The wildcard must be quoted in the output.
+        self.assertIn("'*.example.com'", text)
+        # And the resulting yaml block must parse cleanly + preserve the value.
+        import yaml
+        parsed = yaml.safe_load(text)
+        self.assertIn("*.example.com", parsed["policy"]["allow"])
 
 
 if __name__ == "__main__":

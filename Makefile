@@ -1,4 +1,4 @@
-.PHONY: setup test check smoke clean reset help up down bench
+.PHONY: setup test check smoke redteam clean reset help up down bench
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -18,15 +18,17 @@ setup: .venv ## Install brig, create VM, start everything
 		limactl start brig; \
 	fi
 	./scripts/provision-vm.sh
-	uv run brig up
+	@echo "Building the warden image inside the VM (one-time, ~1-2 min)..."
+	./scripts/build-warden-image.sh
+	uv run brig system up
 	@echo ""
 	@echo "Ready. Try: uv run brig run alpine echo hello"
 
 up: ## Start VM + warden (if already set up)
-	uv run brig up
+	uv run brig system up
 
 down: ## Stop all cells + warden
-	uv run brig down
+	uv run brig system down
 
 # --- Testing ---
 
@@ -40,6 +42,9 @@ check: ## Run full CI checks locally
 
 smoke: ## Run end-to-end smoke test (requires VM)
 	./scripts/local-smoke-test.sh
+
+redteam: ## Run the containment red-team (Tier-1, requires VM up)
+	./tests/test_containment_e2e.sh
 
 bench: ## Run benchmarks
 	uv run pytest tests/benchmarks/ -m bench --benchmark-enable -q
@@ -72,14 +77,15 @@ pin-gvisor: ## Fetch + write gVisor sha512s into scripts/provision-vm.sh (run on
 _copy-addons:
 	@mkdir -p ~/.brig/cells/addons
 	@chmod 0700 ~/.brig/cells/addons
-	@# Copy every *.py in src/addons/ — simpler than maintaining a
+	@# Copy every *.py in src/brig/warden_addons/ — simpler than maintaining a
 	@# split between "required" and "optional" sets that drifts from
-	@# what warden actually loads (audit M7). cp without -r since the
-	@# dir is flat; explicit error if there's nothing to copy.
-	@if ! ls src/addons/*.py >/dev/null 2>&1; then \
-		echo "ERROR: no addon .py files in src/addons/"; exit 1; \
+	@# what warden actually loads. cp without -r since the dir is flat; explicit
+	@# error if there's nothing to copy. (Ongoing drift is handled by
+	@# `brig system up`; this stays for first-boot + seccomp staging.)
+	@if ! ls src/brig/warden_addons/*.py >/dev/null 2>&1; then \
+		echo "ERROR: no addon .py files in src/brig/warden_addons/"; exit 1; \
 	fi
-	@cp src/addons/*.py ~/.brig/cells/addons/
+	@cp src/brig/warden_addons/*.py ~/.brig/cells/addons/
 	@# Seccomp profiles are referenced by reconciler.build_run_command as
 	@# /cells/seccomp/<name>.json inside the VM (the host's ~/.brig/cells
 	@# is mounted at /cells). Without these, --seccomp-profile fails to

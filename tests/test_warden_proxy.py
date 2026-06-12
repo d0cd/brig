@@ -96,3 +96,21 @@ class TestGetStatus(unittest.TestCase):
         status = get_status()
         self.assertFalse(status["running"])
         self.assertFalse(status["exists"])
+
+
+class TestEnsureWardenCaExists(unittest.TestCase):
+    """Invariant 12 readiness gate: warden start waits for mitmproxy's CA to
+    exist (else cells get an empty CA bundle -> fail-closed self-DoS)."""
+
+    @patch("warden.proxy.vm_run")
+    def test_ca_present_returns_true_fast(self, mock_run):
+        from warden.proxy import _ensure_warden_ca_exists
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        self.assertTrue(_ensure_warden_ca_exists(timeout_s=5))
+
+    @patch("warden.proxy.time.sleep", lambda s: None)
+    @patch("warden.proxy.vm_run")
+    def test_ca_absent_times_out_false(self, mock_run):
+        from warden.proxy import _ensure_warden_ca_exists
+        mock_run.return_value = subprocess.CompletedProcess([], 1, "", "")
+        self.assertFalse(_ensure_warden_ca_exists(timeout_s=0.05))

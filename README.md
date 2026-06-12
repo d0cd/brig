@@ -105,22 +105,34 @@ Policy commands always operate against a named cell; the cell yaml is the source
 brig system up                       # start everything (VM + warden)
 brig system down                     # stop everything
 brig system down --vm                # also stop the VM
-brig system verify                   # check all 12 security invariants
+brig system verify                   # check the runtime-verifiable invariants (6 of 12)
 brig system doctor --quick                   # system health check
 brig cell diagnose mycell          # debug a specific cell
 ```
 
 ## Network Policy
 
-Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
+Egress allow/deny is **per-cell** and **default-deny**: a cell with no policy
+reaches nothing. Rules come from the cell's `policy:` block (or a trust
+profile) and can be edited live with `brig policy set <cell>`:
+
+```yaml
+# in a cell yaml
+policy:
+  allow:
+    - pypi.org
+    - "*.pythonhosted.org"
+    - github.com
+    - api.github.com
+  deny:
+    - "*.ngrok.io"
+```
+
+`~/.brig/cells/network-policy.json` carries only process-wide operational
+settings — it holds **no** allow/deny rules:
 
 ```json
 {
-  "allow": [
-    "pypi.org", "*.pythonhosted.org", "github.com",
-    "api.github.com", "*.githubusercontent.com", "registry.npmjs.org"
-  ],
-  "deny": [],
   "rate_limits": {"default": {"rate": 100, "burst": 500}}
 }
 ```
@@ -134,7 +146,10 @@ Default policy (`~/.brig/cells/network-policy.json`) allows pypi, github, npm:
 | Per-cell networks | No lateral movement between cells |
 | Warden proxy | Egress filtering, logging, rate limiting |
 
-12 security invariants, all tested. Run `brig system verify` to check.
+12 security invariants. 6 are runtime-verifiable via `brig system verify`; the
+rest have automated tests, except invariant 3 (secrets are observable, not
+preventable) which is a design property rather than a testable check. See
+`docs/INVARIANTS.md` for the full coverage ledger.
 
 ## Development
 
@@ -155,7 +170,7 @@ make bench                    # benchmarks
 - [Cell Definition Reference](docs/design/cell-definition.md)
 - [Architecture](docs/design/architecture.md)
 - [Security Design](docs/design/security.md) — and the [supply-chain notes](docs/design/supply-chain.md)
-- [SDK Specification](docs/sdk-spec.md)
+- [SDK Specification](docs/reference/sdk.md)
 - [Brig CLI Reference](docs/reference/brig-cli.md)
 - [Warden CLI Reference](docs/reference/warden-cli.md)
 - [Cell Metadata Reference](docs/reference/cell-metadata.md) — `/run/brig/cell.json` schema and workspace-passthrough security model

@@ -149,17 +149,19 @@ src/
 │   ├── ops/                # Logging, cache, rate limiting, history, atomic
 │   ├── workspace/          # Cell workspace file ops (cp in/out, sanitize)
 │   ├── vm/                 # Lima shell wrapper + VM config template
-│   └── commands/           # Thin CLI handlers (one file per command group)
-├── warden/                 # Proxy manager (lifecycle, policy, health, reconcile, logs)
-└── addons/                 # mitmproxy addons mounted into warden container:
-                            # _common (shared helpers), _policy (policy data
-                            # structures), enforce, logger, ops, ingress,
-                            # notifier
+│   ├── commands/           # Thin CLI handlers (one file per command group)
+│   └── warden_addons/      # mitmproxy addons (brig package-data, NOT a submodule):
+│                           # _common (shared helpers), _policy (policy data
+│                           # structures), enforce, logger, ops, ingress,
+│                           # notifier
+└── warden/                 # Proxy manager (lifecycle, policy, health, reconcile, logs)
 ```
 
-Addons run inside the warden container with their own Python env. They can
-import sibling addons (e.g. `from _common import ...`) but cannot import
-`brig.*`.
+Addons ship as brig package-data and are synced into the warden container by
+`brig system up`. They run inside the container with their own Python env,
+flat-loaded by mitmproxy: they import sibling addons (e.g. `from _common import
+...`) but cannot import `brig.*`. They are data, not an importable `brig`
+submodule (no `__init__.py`), which is what keeps the flat imports valid.
 
 ### Data (`~/.brig/`)
 
@@ -167,8 +169,10 @@ import sibling addons (e.g. `from _common import ...`) but cannot import
 ~/.brig/
 ├── lima.yaml           # VM config
 ├── cells/              # Cell definitions
-│   ├── network-policy.json  # Warden allowlist
-│   └── addons/        # Warden addons
+│   ├── network-policy.json  # Process-wide warden settings (rate limits, log
+│   │                        # filter, policy trace, notifications) — NOT egress
+│   │                        # allow/deny, which is per-cell
+│   └── addons/        # Warden addons (deployed copy of brig/warden_addons)
 ├── secrets/            # One file per secret
 └── state/              # Cell workspaces and logs
     └── system/        # Subnet allocator state (subnets.json)

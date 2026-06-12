@@ -14,7 +14,6 @@ from brig.network.subnet import (
     allocate,
     free,
     get,
-    get_subnet_map,
     index_to_subnet,
     list_all,
     validate_index,
@@ -54,10 +53,17 @@ class TestAllocateAndFree(unittest.TestCase):
         self.assertEqual(info1.index, 1)
         self.assertEqual(info2.index, 2)
 
-    def test_allocate_duplicate_raises(self):
-        allocate("cell-a", self.state_file, self.lock_file)
-        with self.assertRaises(ValueError, msg="already has subnet"):
-            allocate("cell-a", self.state_file, self.lock_file)
+    def test_allocate_duplicate_is_idempotent(self):
+        # Re-allocating a same-named cell returns its existing subnet instead
+        # of raising — lets `brig run` reclaim an orphan after a VM restart.
+        first = allocate("cell-a", self.state_file, self.lock_file)
+        second = allocate("cell-a", self.state_file, self.lock_file)
+        self.assertEqual(first.index, second.index)
+        self.assertEqual(first.subnet, second.subnet)
+        self.assertEqual(first.allocated_at, second.allocated_at)
+        # No second index was consumed.
+        info_b = allocate("cell-b", self.state_file, self.lock_file)
+        self.assertEqual(info_b.index, 2)
 
     def test_allocate_invalid_name_raises(self):
         with self.assertRaises(ValueError, msg="Invalid cell name"):
@@ -106,27 +112,12 @@ class TestAllocateAndFree(unittest.TestCase):
 
 
 class TestSubnetMap(unittest.TestCase):
-    """Test get_subnet_map() for enforce.py consumption."""
+    """Test that allocate()/free() keep subnet-map.json in sync on disk."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.state_file = Path(self.tmpdir) / "subnets.json"
         self.lock_file = Path(self.tmpdir) / "allocator.lock"
-
-    def test_map_basic(self):
-        allocate("cell-a", self.state_file, self.lock_file)
-        allocate("cell-b", self.state_file, self.lock_file)
-        mapping = get_subnet_map(self.state_file, self.lock_file)
-        self.assertEqual(mapping["10.60.1.0/24"], "cell-a")
-        self.assertEqual(mapping["10.60.2.0/24"], "cell-b")
-
-    def test_map_empty(self):
-        self.assertEqual(get_subnet_map(self.state_file, self.lock_file), {})
-
-    def test_map_after_free(self):
-        allocate("cell-a", self.state_file, self.lock_file)
-        free("cell-a", self.state_file, self.lock_file)
-        self.assertEqual(get_subnet_map(self.state_file, self.lock_file), {})
 
     def test_allocate_writes_map_alongside_state(self):
         """Regression: allocate() with a custom state_file must write
@@ -170,6 +161,48 @@ class TestMaxCapacity(unittest.TestCase):
         free("cell-100", self.state_file, self.lock_file)
         info = allocate("cell-new", self.state_file, self.lock_file)
         self.assertEqual(info.index, 100)
+
+
+class TestTamperedState(unittest.TestCase):
+    """subnets.json is untrusted (invariant 4): a crafted state file must not
+    cause two cells to share a /24 (invariants 1, 8)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.state_file = Path(self.tmpdir) / "subnets.json"
+        self.lock_file = Path(self.tmpdir) / "allocator.lock"
+
+    def _write(self, state: dict) -> None:
+        self.state_file.write_text(json.dumps(state))
+
+    def test_freed_index_colliding_with_allocated_not_reused(self):
+        # Index 1 is allocated to cell-a but also sits in freed. Allocating a
+        # new cell must NOT hand out index 1 again.
+        self._write({
+            "next_index": 2,
+            "allocated": {"cell-a": {"index": 1, "allocated_at": "x"}},
+            "freed": [1],
+        })
+        info = allocate("cell-b", self.state_file, self.lock_file)
+        self.assertNotEqual(info.index, 1)
+
+    def test_duplicate_freed_index_handed_out_once(self):
+        # freed has [1, 1]; two allocations must get distinct indices.
+        self._write({"next_index": 5, "allocated": {}, "freed": [1, 1]})
+        a = allocate("cell-a", self.state_file, self.lock_file)
+        b = allocate("cell-b", self.state_file, self.lock_file)
+        self.assertNotEqual(a.index, b.index)
+
+    def test_next_index_below_allocated_does_not_collide(self):
+        # next_index points at an already-allocated index; the next allocation
+        # must skip past it.
+        self._write({
+            "next_index": 3,
+            "allocated": {"cell-a": {"index": 3, "allocated_at": "x"}},
+            "freed": [],
+        })
+        info = allocate("cell-b", self.state_file, self.lock_file)
+        self.assertNotEqual(info.index, 3)
 
 
 class TestConcurrentAllocation(unittest.TestCase):

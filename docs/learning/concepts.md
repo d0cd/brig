@@ -1,6 +1,10 @@
 # Concepts
 
-Deep dives into how Brig works.
+User-facing explanations of *why* Brig is built the way it is — what
+each layer protects you from, what it doesn't, and what you should
+expect when you use it. For the component-level breakdown (how the
+pieces wire together, network topology, deployment), see
+[`design/architecture.md`](../design/architecture.md).
 
 ## Lima VM as Security Boundary
 
@@ -75,13 +79,11 @@ Some programs don't work with gVisor:
 - Some network tools
 - Programs with specific kernel dependencies
 
-If you must run without gVisor (not recommended), use the `dev` profile,
-which keeps gVisor off by default but applies the same network/policy
-gating:
-
-```bash
-brig run --name test --profile dev your-image -- your-command
-```
+gVisor is **mandatory** for cells — no flag, profile, or yaml field disables it
+(invariant 5: gVisor must be active, no silent downgrade). The `dev` profile only
+raises resource limits (memory / cpus / pids); it does not change the runtime. If
+a workload genuinely can't run under gVisor's syscall surface, it can't run as a
+brig cell — that's the security boundary, not a setting to turn off.
 
 ---
 
@@ -155,20 +157,26 @@ Even if a cell ignores `HTTP_PROXY` environment variables, it still can't reach 
 
 ### Policy Enforcement
 
-```yaml
-# network-policy.json
-allow:
-  - pypi.org
-  - "*.pythonhosted.org"
-  - github.com
-  - api.openai.com
+Egress allow/deny is **per-cell** and **default-deny** — a cell with no policy
+reaches nothing. Rules live in the cell's `policy:` block (or a trust profile)
+and can be edited live with `brig policy set <cell>`:
 
-deny:
-  - pastebin.com
-  - "*.ngrok.io"
+```yaml
+# in a cell yaml
+policy:
+  allow:
+    - pypi.org
+    - "*.pythonhosted.org"
+    - github.com
+    - api.openai.com
+  deny:
+    - pastebin.com
+    - "*.ngrok.io"
 ```
 
-Requests to non-allowed domains return 403.
+Requests to non-allowed domains return 403. The process-wide
+`~/.brig/cells/network-policy.json` holds only operational settings (rate
+limits, log filtering, policy tracing) — no allow/deny rules.
 
 ### Hot Reload
 
@@ -308,19 +316,23 @@ The `~/.brig/state/` directory contains untrusted output from cells.
    brig cell files my-cell
    ```
 
-2. Export with sanitization:
+2. Export safely — sanitization is automatic on every `cell cp` out of a cell;
+   there is no flag to enable or disable it:
    ```bash
-   brig cell cp --sanitize my-cell:/work/report.html ./report.html
+   brig cell cp my-cell:/work/report.html ./report.html
    ```
 
-3. Never run from state directory directly
+3. Never run files directly from the state directory
 
-### What Gets Blocked by `--sanitize`
+### What export sanitization does
 
-| Type | Examples | Action |
-|------|----------|--------|
-| Executables | `.app`, `.command`, `.exe` | Blocked |
-| Scripts | `.sh`, `.py`, `.js` | Blocked unless `--allow-scripts` |
-| Office docs | `.docx`, `.pdf` | Blocked unless `--allow-office` |
-| Data files | `.json`, `.csv`, `.txt` | Allowed |
-| Images | `.png`, `.jpg` | Allowed |
+Every file copied out of a cell gets a macOS **quarantine xattr** (Gatekeeper
+treats it as downloaded from an untrusted source). Files whose extension is in
+the unsafe-executable set additionally have their **execute bits stripped**.
+Nothing is dropped — you always get the file; brig just makes cell-written files
+non-executable and marks them untrusted.
+
+| Type | Examples | On export |
+|------|----------|-----------|
+| Unsafe executables | `.app`, `.command`, `.scpt`, `.dmg`, `.pkg`, `.webloc`, `.jar`, `.exe`, `.bat`, `.cmd`, `.msi`, `.vbs`, `.ps1` | quarantined + execute bits removed |
+| Everything else | `.py`, `.sh`, `.pdf`, `.docx`, `.json`, `.csv`, `.png` | quarantined (copied as-is) |

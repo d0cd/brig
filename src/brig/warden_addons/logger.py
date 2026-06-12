@@ -42,7 +42,7 @@ from typing import Optional
 
 from mitmproxy import ctx, http
 
-from _common import SubnetResolver
+from _common import SubnetResolver, stat_signature
 from _log_writer import (
     AsyncLogWriter,
     DEFAULT_MAX_LOG_SIZE,
@@ -66,7 +66,7 @@ class RequestLogger:
     def __init__(self):
         self.subnets = SubnetResolver(SUBNET_MAP_FILE)
         self.log_filter = LogFilter()
-        self.policy_mtime = 0.0
+        self.policy_mtime: tuple[int, int] = (0, 0)
         self.max_log_size = DEFAULT_MAX_LOG_SIZE
         self.async_writer = AsyncLogWriter(max_log_size=self.max_log_size)
         self._reload_pending = False  # Deferred reload flag for signal safety.
@@ -86,8 +86,8 @@ class RequestLogger:
     def _do_reload(self):
         """Perform the actual reload outside of signal context."""
         ctx.log.info("RequestLogger: Reloading config...")
-        self.subnets._mtime = 0.0
-        self.policy_mtime = 0.0
+        self.subnets._sig = (0, 0)
+        self.policy_mtime: tuple[int, int] = (0, 0)
         self.subnets.reload()
         self._reload_log_filter()
 
@@ -102,8 +102,8 @@ class RequestLogger:
             if not POLICY_FILE.exists():
                 return
 
-            mtime = POLICY_FILE.stat().st_mtime
-            if mtime == self.policy_mtime:
+            sig = stat_signature(POLICY_FILE)
+            if sig == self.policy_mtime:
                 return  # No change.
 
             with open(POLICY_FILE, "r") as f:
@@ -118,7 +118,7 @@ class RequestLogger:
             self.max_log_size = max_size_mb * 1024 * 1024
             self.async_writer.max_log_size = self.max_log_size
 
-            self.policy_mtime = mtime
+            self.policy_mtime = sig
 
             ctx.log.info(
                 f"RequestLogger: Loaded config (filter enabled, "

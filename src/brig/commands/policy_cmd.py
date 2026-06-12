@@ -8,13 +8,13 @@ trust profile in the cell yaml.
 
 from __future__ import annotations
 
+import argparse
 import json
-from typing import Any
 
 from brig.errors import BrigError
 from brig.ops.history import log_policy_change
 from brig.ops.logging import info, output
-from brig.policy.policy import delete_cell_policy, load_cell_policy, save_cell_policy
+from brig.policy.policy import delete_cell_policy, load_cell_policy, mutate_cell_policy
 
 
 def register_parser(sub) -> None:
@@ -41,7 +41,7 @@ def register_parser(sub) -> None:
     p_rm.add_argument("name", help="Cell name")
 
 
-def cmd_policy_show(args: Any) -> int:
+def cmd_policy_show(args: argparse.Namespace) -> int:
     policy = load_cell_policy(args.name)
     if policy is None:
         # No per-cell policy file = default deny. Don't error — show
@@ -55,7 +55,7 @@ def cmd_policy_show(args: Any) -> int:
     return 0
 
 
-def cmd_policy_test(args: Any) -> int:
+def cmd_policy_test(args: argparse.Namespace) -> int:
     """Simulate a request against a cell's policy."""
     policy = load_cell_policy(args.name)
     if policy is None:
@@ -98,13 +98,23 @@ def cmd_policy_test(args: Any) -> int:
     return 1
 
 
-def cmd_policy_set(args: Any) -> int:
-    policy = load_cell_policy(args.name) or {"allow": [], "deny": []}
-    old_policy = dict(policy)
-    changes = _apply_policy_changes(args, policy)
+def cmd_policy_set(args: argparse.Namespace) -> int:
+    # Read-modify-write under one exclusive lock so a concurrent `brig run`
+    # re-sync or parallel `brig policy set` can't drop this update.
+    captured: dict = {}
 
-    save_cell_policy(args.name, policy)
-    log_policy_change(args.name, "update", changes, old_policy, policy)
+    def _mutate(policy: dict | None) -> dict:
+        import copy
+        policy = policy or {"allow": [], "deny": []}
+        # Deep copy: _apply_policy_changes mutates the inner allow/deny lists
+        # in place, so a shallow dict() copy would make the "old" snapshot
+        # alias the post-mutation lists and log old == new.
+        captured["old"] = copy.deepcopy(policy)
+        captured["changes"] = _apply_policy_changes(args, policy)
+        return policy
+
+    new_policy = mutate_cell_policy(args.name, _mutate)
+    log_policy_change(args.name, "update", captured["changes"], captured["old"], new_policy)
     from brig.cell.metadata import refresh_metadata_if_present
     refresh_metadata_if_present(args.name)
     info(f"Updated policy for cell '{args.name}'")
@@ -124,7 +134,7 @@ def _validate_domains(domains: list[str]) -> None:
             raise BrigError(f"Rejected: {suspicious}")
 
 
-def _apply_policy_changes(args: Any, policy: dict) -> dict:
+def _apply_policy_changes(args: argparse.Namespace, policy: dict) -> dict:
     changes: dict[str, list[str]] = {}
 
     if getattr(args, "allow", None):
@@ -139,32 +149,31 @@ def _apply_policy_changes(args: Any, policy: dict) -> dict:
 
     if getattr(args, "remove_allow", None):
         allow_list = policy.get("allow", [])
-        for domain in args.remove_allow:
-            if domain in allow_list:
-                allow_list.remove(domain)
-        changes["remove_allow"] = args.remove_allow
+        removed = [d for d in args.remove_allow if d in allow_list]
+        for domain in removed:
+            allow_list.remove(domain)
+        # Record only what was actually removed, so the audit summary doesn't
+        # claim a removal that never happened for an absent domain.
+        changes["remove_allow"] = removed
 
     if getattr(args, "remove_deny", None):
         deny_list = policy.get("deny", [])
-        for domain in args.remove_deny:
-            if domain in deny_list:
-                deny_list.remove(domain)
-        changes["remove_deny"] = args.remove_deny
+        removed = [d for d in args.remove_deny if d in deny_list]
+        for domain in removed:
+            deny_list.remove(domain)
+        changes["remove_deny"] = removed
 
     return changes
 
 
-def cmd_policy_rm(args: Any) -> int:
+def cmd_policy_rm(args: argparse.Namespace) -> int:
     if delete_cell_policy(args.name):
         log_policy_change(args.name, "delete", changes={})
         from brig.cell.metadata import refresh_metadata_if_present
         refresh_metadata_if_present(args.name)
+        # Warden auto-reloads per-cell policies on file-change (mtime poll),
+        # same as `brig policy set` — no explicit reload needed.
         info(f"Deleted policy for '{args.name}' (cell will block all egress)")
-        try:
-            from warden.proxy import reload_policy
-            reload_policy()
-        except Exception:
-            info("Note: run 'warden reload' to apply changes")
         return 0
     raise BrigError(f"No policy for '{args.name}'")
 

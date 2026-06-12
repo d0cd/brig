@@ -2,15 +2,19 @@
 Policy enforcement addon for mitmproxy.
 
 Enforces network policy on egress traffic:
-    - Allowlist/denylist with wildcard support
-    - Per-cell policies override global policy
+    - Per-cell allowlist/denylist with wildcard support
     - Path and method-based filtering
     - Block internal IP ranges (RFC1918, localhost, CGNAT, etc.)
     - Block literal IP addresses
     - Block non-HTTP/HTTPS ports
-    - Default-deny on errors (fail closed)
+    - Default-deny on errors and for cells without a policy (fail closed)
 
-Policy format (JSON):
+Egress is evaluated solely against the requesting cell's own policy file in
+/var/run/cells/policies/<cell>.json; a cell with no per-cell policy is blocked.
+The global /policy.json is read only for the `policy_trace` settings — it
+carries no allow/deny rules.
+
+Per-cell policy file (JSON):
     {
         "allow": [
             "example.com",
@@ -18,12 +22,8 @@ Policy format (JSON):
             {"domain": "api.example.com", "paths": ["/v1/*"], "methods": ["GET", "POST"]}
         ],
         "deny": ["evil.com"],
-        "cells": {
-            "my-cell": {
-                "allow": ["extra.com"],
-                "deny": ["blocked.com"]
-            }
-        }
+        "tls_passthrough": ["example.com"],
+        "host_services": [{"name": "db", "port": 5432, "protocol": "tcp"}]
     }
 
 Usage:
@@ -41,7 +41,7 @@ from typing import Optional
 
 from mitmproxy import ctx, http
 
-from _common import BLOCKED_NETWORKS, SubnetResolver, is_blocked_ip  # noqa: F401 (BLOCKED_NETWORKS re-exported for the constant-mirror test)
+from _common import BLOCKED_NETWORKS, SubnetResolver, canonical_ip, is_blocked_ip, redact_path, stat_signature  # noqa: F401 (BLOCKED_NETWORKS re-exported for the constant-mirror test)
 # Re-exported for tests and any external addons that import policy types
 # from `enforce` for historical reasons. Implementation lives in _policy.
 from _policy import (  # noqa: F401
@@ -58,6 +58,11 @@ POLICY_FILE = Path("/policy.json")
 # Host service virtual domain suffix. Cells request <name>.host.brig;
 # Warden rewrites to the macOS host IP + declared port.
 HOST_SERVICE_SUFFIX = ".host.brig"
+
+# Upstream host that warden's TCP host_service reverse listeners dial.
+# Mirrors warden.proxy.TCP_UPSTREAM_HOST — a raw-TCP host_service flow's
+# server.address[0] is this literal string (not the resolved host IP).
+TCP_UPSTREAM_HOST = "host.lima.internal"
 
 # Subnet map for cell identification.
 SUBNET_MAP_FILE = Path("/var/run/cells/subnet-map.json")
@@ -77,16 +82,6 @@ MAX_CACHED_CELL_POLICIES = 1000
 # loading a multi-gigabyte JSON. 1 MiB is well above any realistic
 # policy (1000 rules ≈ ~100 KiB at the verbose end).
 MAX_POLICY_FILE_BYTES = 1024 * 1024
-
-
-def _stat_signature(path: Path) -> tuple[int, int]:
-    """Return (st_mtime_ns, st_size) — a fingerprint resilient to coarse
-    filesystem mtime resolution. Same-second policy rewrites can collide
-    on float-precision mtime but rarely on size, so the tuple catches
-    edits that a `!=` on `st_mtime` would silently drop.
-    """
-    st = path.stat()
-    return (st.st_mtime_ns, st.st_size)
 
 
 class PolicyEnforcer:
@@ -182,15 +177,17 @@ class PolicyEnforcer:
         try:
             policy_changed = (
                 POLICY_FILE.exists() and
-                _stat_signature(POLICY_FILE) != self.policy_mtime
+                stat_signature(POLICY_FILE) != self.policy_mtime
             )
             subnet_changed = (
                 SUBNET_MAP_FILE.exists() and
-                SUBNET_MAP_FILE.stat().st_mtime != self.subnets._mtime
+                stat_signature(SUBNET_MAP_FILE) != self.subnets._sig
             )
             policy_dir_changed = False
             if CELL_POLICY_DIR.exists():
-                # Detect adds / removes / edits to per-cell policies via dir mtime.
+                # Dir mtime bumps on add / remove / rename of a policy file
+                # (in-place edits are caught per-file by mtime+size in
+                # _reload_cell_policies); any bump triggers a rescan.
                 dir_mtime_ns = CELL_POLICY_DIR.stat().st_mtime_ns
                 if not hasattr(self, "_cell_policy_dir_mtime"):
                     self._cell_policy_dir_mtime = 0
@@ -228,7 +225,7 @@ class PolicyEnforcer:
                 ctx.log.warn(f"PolicyEnforcer: Policy file not found: {POLICY_FILE}")
                 return
 
-            sig = _stat_signature(POLICY_FILE)
+            sig = stat_signature(POLICY_FILE)
             if sig == self.policy_mtime:
                 return
 
@@ -257,8 +254,10 @@ class PolicyEnforcer:
             if not CELL_POLICY_DIR.exists():
                 return
 
+            present: set[str] = set()
             for policy_file in CELL_POLICY_DIR.glob("*.json"):
                 cell_name = policy_file.stem
+                present.add(cell_name)
                 stat = policy_file.stat()
                 sig = (stat.st_mtime_ns, stat.st_size)
 
@@ -302,6 +301,16 @@ class PolicyEnforcer:
                     except (json.JSONDecodeError, IOError) as e:
                         ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
 
+            # Evict cached policies whose file was deleted (`brig policy rm`).
+            # Teardown already default-denies a removed cell via subnet-map,
+            # but dropping the cache keeps it from lingering and re-applying if
+            # the cell name (and subnet) is later reused.
+            with self._cell_policy_lock:
+                for stale in [c for c in self.cell_policies if c not in present]:
+                    del self.cell_policies[stale]
+                    self.cell_policy_mtimes.pop(stale, None)
+                    ctx.log.info(f"PolicyEnforcer: Dropped deleted policy for '{stale}'")
+
         except OSError as e:
             ctx.log.error(f"PolicyEnforcer: Failed to scan cell policies: {e}")
 
@@ -315,13 +324,13 @@ class PolicyEnforcer:
         return is_blocked_ip(host)
 
     def _is_literal_ip(self, host: str) -> bool:
-        """Check if host is a literal IP address (not a domain)."""
-        try:
-            addr = host[1:-1] if host.startswith("[") and host.endswith("]") else host
-            ipaddress.ip_address(addr)
-            return True
-        except ValueError:
-            return False
+        """Check if host is a literal IP address (not a domain).
+
+        Delegates to _common.canonical_ip so alternate IPv4 encodings
+        (integer/hex/octal/short-dotted) are recognized as literals rather
+        than slipping through as domain names.
+        """
+        return canonical_ip(host) is not None
 
     @staticmethod
     def _normalize_hostspec(hostspec: str) -> str:
@@ -505,6 +514,19 @@ class PolicyEnforcer:
             return
         service_port = cell_policy.host_services_map.get(service_name)
         if service_port is None:
+            tcp_map = cell_policy.tcp_host_services_map or {}
+            if service_name in tcp_map:
+                # Reached as HTTP but declared TCP. Block with a clearer
+                # message; sending HTTP framing to a raw TCP listener
+                # would only produce garbage on both ends, but a precise
+                # error helps the cell author debug their config.
+                self._block(
+                    flow,
+                    f"host service '{safe_name}': declared as TCP, "
+                    f"connect via raw TCP to '{safe_name}.host.brig:"
+                    f"{tcp_map[service_name]}' instead",
+                )
+                return
             self._block(
                 flow,
                 f"host service '{safe_name}': not declared in cell "
@@ -538,7 +560,9 @@ class PolicyEnforcer:
             {"Content-Type": "text/plain"}
         )
         safe_host = re.sub(r'[\x00-\x1f\x7f]', '', flow.request.host)
-        safe_path = re.sub(r'[\x00-\x1f\x7f]', '', flow.request.path)
+        # Redact secrets in the path/query — ctx.log is captured as warden
+        # container stdout, the same trust level as the structured sinks.
+        safe_path = redact_path(re.sub(r'[\x00-\x1f\x7f]', '', flow.request.path))
         safe_reason = re.sub(r'[\x00-\x1f\x7f]', '', reason)
         ctx.log.info(f"BLOCKED: {safe_host}{safe_path} - {safe_reason}")
 
@@ -686,20 +710,45 @@ class PolicyEnforcer:
                 return
 
             if cell_policy.is_passthrough(sni):
-                # Flip mitmproxy's passthrough switch — connection is
-                # tunneled raw after this point. Tag context so audit
-                # log lines (server_connected, response*) can mark
-                # tls_mode=passthrough.
-                if client_conn is not None:
-                    setattr(client_conn, "tls_passthrough", True)
-                # Persist for later hooks. Use a dict on data.context if
-                # mitmproxy exposes one; otherwise set an attribute on
-                # the client connection.
+                # Connect-time SSRF / DNS-rebinding guard for passthrough.
+                # A passthrough tunnel is raw TCP: warden never sees an HTTP
+                # response, so the responseheaders IP re-check never fires for
+                # it. Resolve the SNI here and REFUSE to flip passthrough if it
+                # points into a blocked range — fall through to MITM instead,
+                # which fails closed (the cell hits a cert error, or the MITM
+                # server_connect / responseheaders guard blocks the internal
+                # IP). This is the passthrough counterpart to server_connect.
+                if self._resolve_safe(sni) is None:
+                    ctx.log.warn(
+                        f"PASSTHROUGH refused: cell={cell_name} sni={sni} "
+                        f"resolves to an internal/reserved address"
+                    )
+                    return
+                # Engage mitmproxy passthrough: setting ignore_connection on
+                # the ClientHelloData makes mitmproxy tunnel the TLS bytes raw
+                # after the CONNECT (no MITM), routed to the already-resolved
+                # CONNECT target. This is THE passthrough switch the TLS layer
+                # reads (`if tls_clienthello.ignore_connection`). Setting an
+                # attribute on the client connection does nothing — mitmproxy
+                # never reads it.
+                #
+                # A raw-tunneled (ignored) connection produces no TCPFlow, so
+                # tcp_start/tcp_message/tcp_end do NOT fire and there are no
+                # per-byte passthrough metrics — that is inherent to true
+                # passthrough (warden never decrypts). The connection-level
+                # audit is the PASSTHROUGH log line below (cell + SNI); the
+                # connection is still gated by the CONNECT allowlist check, the
+                # SNI/CONNECT match above, the resolved-IP guard, and
+                # server_connect. The client-connection metadata tags below are
+                # best-effort context for any hook that does observe the
+                # connection.
+                data.ignore_connection = True
                 if client_conn is not None:
                     metadata = getattr(client_conn, "metadata", None)
                     if isinstance(metadata, dict):
                         metadata["tls_mode"] = "passthrough"
                         metadata["passthrough_sni"] = sni
+                        metadata["cell"] = cell_name or "unknown"
                 ctx.log.info(
                     f"PASSTHROUGH: cell={cell_name} sni={sni} (no MITM, SNI-routed)"
                 )
@@ -710,14 +759,112 @@ class PolicyEnforcer:
             # silently leaking through.
             ctx.log.warn(f"tls_clienthello error, defaulting to MITM: {e}")
 
-    # DNS-rebinding check lives in responseheaders() only. The earlier
-    # server_connected variant depended on a latent mitmproxy-API bug
-    # (`data.server.close()` no longer exists on >= 10, AttributeError
-    # masked the would-be block), and `data.flow` was None at that hook
-    # for warden-routed flows so the host_service / ingress exemptions
-    # were a no-op too. responseheaders fires after request() and
-    # http_connect() populate metadata, so the exemptions actually
-    # gate correctly. Aitelier diagnosed this; see INVARIANTS doc.
+    def _resolve_safe(self, host: str) -> Optional[str]:
+        """Resolve `host` and return an IP only if NO resolved address is in
+        a blocked range. Returns None if the host is unresolvable or any
+        answer is internal/blocked (fail closed, rebinding-resistant — a
+        split-horizon answer set with one internal IP is refused outright).
+
+        A literal-IP host is validated directly. Domain names are resolved
+        via getaddrinfo; warden runs in the same VM netns mitmproxy connects
+        from, so this resolver sees the same answers.
+        """
+        if canonical_ip(host) is not None:
+            return None if is_blocked_ip(host) else host
+        import socket
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except (socket.gaierror, UnicodeError, OSError):
+            return None
+        candidate: Optional[str] = None
+        for info in infos:
+            ip = info[4][0]
+            if is_blocked_ip(ip):
+                return None
+            if candidate is None:
+                candidate = ip
+        return candidate
+
+    def server_connect(self, data) -> None:
+        """Connect-time destination-IP guard (SSRF / DNS rebinding).
+
+        The request-time checks (request/http_connect) validate the
+        cell-supplied host *name*, not the resolved upstream IP. The
+        responseheaders re-check sees the resolved IP but only AFTER the
+        request is forwarded. This hook resolves the destination before the
+        connection is used and refuses it — via the same `data.server.error`
+        mechanism mitmproxy's own proxyserver uses — if it resolves into a
+        blocked range, closing the request-before-block gap on the MITM path.
+        Passthrough tunnels are guarded separately at tls_clienthello (the
+        raw-TCP relay may not reach this hook). Fails closed on any error.
+
+        Warden's own internal routing is exempt: host_service flows are
+        rewritten to the macOS host IP, and ingress flows (reverse proxy on
+        :8443) connect warden to a managed cell IP. Both are warden's
+        decisions, not cell-controlled egress.
+        """
+        try:
+            server = getattr(data, "server", None)
+            address = getattr(server, "address", None) if server else None
+            if not address:
+                return
+            host = address[0]
+
+            # host_service rewrite target — a deliberate, policy-gated
+            # internal destination.
+            if self._host_ip and host == self._host_ip:
+                return
+            # Ingress (reverse-proxy) flows arrive on the :8443 listener;
+            # warden→cell connections there are expected.
+            client = getattr(data, "client", None)
+            sockname = getattr(client, "sockname", None) if client else None
+            if sockname and len(sockname) >= 2 and sockname[1] == 8443:
+                return
+
+            # TCP host_service flows: warden's `reverse:tcp` listener dials
+            # TCP_UPSTREAM_HOST (host.lima.internal), which resolves to the
+            # internal Lima host IP. Exempt these, but ONLY for a port the
+            # REQUESTING cell actually declared as a TCP host_service — mirrors
+            # tcp_start's per-cell ACL, so a cell can't reach the host by
+            # allowlisting the hostname directly.
+            port = address[1] if len(address) >= 2 else None
+            if host == TCP_UPSTREAM_HOST and isinstance(port, int):
+                peer = getattr(client, "peername", None) if client else None
+                client_ip = peer[0] if peer else None
+                cell_name = self.subnets.get_cell_name(client_ip) if client_ip else None
+                cell_policy = self._lookup_cell_policy(cell_name)
+                tcp_map = (getattr(cell_policy, "tcp_host_services_map", None) or {}) if cell_policy else {}
+                if port in set(tcp_map.values()):
+                    return
+
+            # Defense-in-depth: re-check the upstream port against the egress
+            # allowlist. Every flow normally passes the request-time port check
+            # first; this makes the connect-time guard self-sufficient if a
+            # future flow type ever reaches it without that earlier check. The
+            # legitimate non-80/443 destinations (host_service rewrites, ingress,
+            # declared TCP host_services) are already exempted above.
+            if isinstance(port, int) and port not in ALLOWED_PORTS:
+                server.error = f"blocked: port {port} not allowed for egress"
+                ctx.log.warn(f"BLOCKED connect: {host}:{port} (port not in egress allowlist)")
+                return
+
+            if self._resolve_safe(host) is None:
+                server.error = (
+                    f"blocked: {host} resolves to a disallowed "
+                    f"(internal/reserved) address"
+                )
+                ctx.log.warn(f"BLOCKED connect: {host} (internal/reserved resolution)")
+        except Exception as e:
+            ctx.log.warn(f"server_connect guard error, failing closed: {e}")
+            try:
+                data.server.error = "blocked: connect-time validation error"
+            except Exception:
+                pass
+
+    # Resolved-IP guards by flow type: tls_clienthello refuses passthrough to
+    # an internal-resolving SNI; server_connect (above) blocks MITM flows at
+    # connect time; responseheaders keeps a post-connect re-check for MITM as
+    # defence in depth.
 
     def tcp_start(self, flow) -> None:
         """Per-cell access control for TCP host_service flows.
@@ -740,11 +887,12 @@ class PolicyEnforcer:
              distinguishes TCP-host-service from TLS-passthrough flows.
 
         Cells that wouldn't have policy (system flows, unknown peer)
-        are killed fail-closed. The TLS passthrough flow uses
-        tls_clienthello to flip `client_conn.tls_passthrough` BEFORE
-        tcp_start fires; this hook still runs for those flows, but
-        the existing passthrough metadata tells us to skip the
-        host_service check.
+        are killed fail-closed. TLS-passthrough flows engage via
+        tls_clienthello's `data.ignore_connection`, which makes mitmproxy
+        build an ignored TCPLayer (no flow) — so tcp_start does NOT fire for
+        them. The passthrough-metadata early-return below is therefore
+        defensive only (it would matter for a future flow-bearing relay);
+        this hook in practice handles TCP host_service flows.
         """
         try:
             client = getattr(flow, "client_conn", None)

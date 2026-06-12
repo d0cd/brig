@@ -136,7 +136,7 @@ fi
 if limactl shell --workdir / brig -- sudo test -x /usr/local/bin/runsc; then
     pass "gVisor (runsc) installed in VM"
 else
-    fail "gVisor not found in VM (provision VM with: limactl delete brig && make vm)"
+    fail "gVisor not found in VM (re-provision with: limactl delete brig && make setup)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -149,9 +149,9 @@ WARDEN_STATUS=$(limactl shell --workdir / brig -- sudo podman inspect warden --f
 if [ "$WARDEN_STATUS" = "running" ]; then
     pass "Warden proxy is running"
 else
-    echo "  Warden not running, attempting start via brig up..."
-    if $BRIG up 2>/dev/null; then
-        pass "Warden started (via brig up)"
+    echo "  Warden not running, attempting start via brig system up..."
+    if $BRIG system up 2>/dev/null; then
+        pass "Warden started (via brig system up)"
     else
         fail "Warden failed to start — run: make up"
     fi
@@ -172,17 +172,17 @@ else
     fail "brig run"
 fi
 
-# Test 2: brig list.
-LIST_OUT=$($BRIG list 2>/dev/null)
+# Test 2: brig cell list.
+LIST_OUT=$($BRIG cell list 2>/dev/null)
 if echo "$LIST_OUT" | grep -q "$CELL_NAME"; then
-    pass "brig list shows cell"
+    pass "brig cell list shows cell"
 else
-    fail "brig list does not show cell (output: $LIST_OUT)"
+    fail "brig cell list does not show cell (output: $LIST_OUT)"
 fi
 
-# Test 3: brig inspect.
-if $BRIG inspect "$CELL_NAME" >/dev/null 2>&1; then
-    pass "brig inspect"
+# Test 3: brig cell inspect.
+if $BRIG cell inspect "$CELL_NAME" >/dev/null 2>&1; then
+    pass "brig cell inspect"
 else
     fail "brig inspect"
 fi
@@ -220,30 +220,30 @@ else
     fail "proxy env vars not set: $HTTP_PROXY"
 fi
 
-# Test 7: brig exec.
-EXEC_OUT=$($BRIG exec "$CELL_NAME" echo "hello from cell" 2>/dev/null)
+# Test 7: brig cell exec.
+EXEC_OUT=$($BRIG cell exec "$CELL_NAME" echo "hello from cell" 2>/dev/null)
 if echo "$EXEC_OUT" | grep -q "hello from cell"; then
-    pass "brig exec"
+    pass "brig cell exec"
 else
-    fail "brig exec output: $EXEC_OUT"
+    fail "brig cell exec output: $EXEC_OUT"
 fi
 
-# Test 8: brig stop.
-if $BRIG stop "$CELL_NAME" 2>/dev/null; then
-    pass "brig stop"
+# Test 8: brig cell stop.
+if $BRIG cell stop "$CELL_NAME" 2>/dev/null; then
+    pass "brig cell stop"
 else
-    fail "brig stop"
+    fail "brig cell stop"
 fi
 
-# Test 9: brig rm.
-if $BRIG rm "$CELL_NAME" 2>/dev/null; then
-    pass "brig rm"
+# Test 9: brig cell rm.
+if $BRIG cell rm "$CELL_NAME" 2>/dev/null; then
+    pass "brig cell rm"
 else
-    fail "brig rm"
+    fail "brig cell rm"
 fi
 
 # Test 10: Verify cleanup.
-if ! $BRIG list 2>/dev/null | grep -q "$CELL_NAME"; then
+if ! $BRIG cell list 2>/dev/null | grep -q "$CELL_NAME"; then
     pass "cell removed from list"
 else
     fail "cell still in list after rm"
@@ -251,11 +251,11 @@ fi
 
 # ---------------------------------------------------------------------------
 info ""
-info "Phase 6: brig verify (security invariants)"
+info "Phase 6: brig system verify (security invariants)"
 # ---------------------------------------------------------------------------
 
-if $BRIG verify 2>&1; then
-    pass "brig verify — all invariants"
+if $BRIG system verify 2>&1; then
+    pass "brig system verify — all invariants"
 else
     fail "brig verify reported issues"
 fi
@@ -272,7 +272,7 @@ if $BRIG run --name "$AIR_NAME" --network none alpine echo "isolated" 2>&1; then
 else
     fail "airgapped cell failed"
 fi
-$BRIG rm -f "$AIR_NAME" 2>/dev/null
+$BRIG cell rm -f "$AIR_NAME" 2>/dev/null
 
 # ---------------------------------------------------------------------------
 info ""
@@ -289,7 +289,7 @@ if $BRIG run --name "$PROF_NAME" --profile untrusted -d alpine sleep 10 2>&1; th
     else
         fail "memory limit: $MEM (expected 536870912 for 512m)"
     fi
-    $BRIG rm -f "$PROF_NAME" 2>/dev/null
+    $BRIG cell rm -f "$PROF_NAME" 2>/dev/null
 else
     fail "profile-based run"
 fi
@@ -323,7 +323,7 @@ if $BRIG run --name "$POLICY_NAME" -d alpine sleep 30 2>&1; then
         fail "proxy blocked allowed domain github.com"
     fi
 
-    $BRIG rm -f "$POLICY_NAME" 2>/dev/null
+    $BRIG cell rm -f "$POLICY_NAME" 2>/dev/null
 else
     fail "policy test cell failed to start"
 fi

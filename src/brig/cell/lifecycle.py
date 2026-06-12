@@ -9,7 +9,7 @@ making it testable without mocking subprocess.
 from __future__ import annotations
 
 import re
-from typing import Callable
+from typing import Any, Callable
 
 from brig.cell.reconciler import (
     Action,
@@ -25,17 +25,8 @@ from brig.cell.spec import CellSpec
 from brig.errors import BrigError
 from brig.ops.history import log_lifecycle, log_operation, log_policy_change
 from brig.ops.logging import debug, info
-from brig.ops.ratelimit import check_rate_limit
+from brig.ops.ratelimit import check_rate_limit, record_rate_limit
 from brig.vm.shell import vm_run
-
-
-def _register_cell_ingress(spec: CellSpec, result: ReconcileResult) -> None:
-    """Register ingress routes for a newly started cell.
-
-    Reads the cell's IP from podman inspect, reads the auth token from
-    the mounted ingress-token secret, and registers routes.
-    """
-    register_ingress_for(spec.name, spec.ingress)
 
 
 def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
@@ -46,11 +37,42 @@ def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
     Raises BrigError if ingress is declared but the auth token is missing
     or empty — registering would-be-rejected routes is worse than failing
     loudly.
+
+    The replay path reads `ingress_spec` from `cell-metadata.json`, which
+    invariant 4 names as untrusted. Each entry is re-run through the
+    same per-entry validator that gates cell yaml at parse time before
+    any persistence happens.
     """
     if not ingress_spec:
         return
 
-    from brig.config import HostPaths
+    from brig.cell.validators import _v_ingress_entry
+    from brig.config import MAX_INGRESS_PER_CELL
+    errors: list[str] = []
+    # The replay path (cell start) reads ingress from untrusted
+    # cell-metadata.json (invariant 4); apply the same count cap that
+    # _v_ingress enforces at parse time, not just the per-entry shape check.
+    if len(ingress_spec) > MAX_INGRESS_PER_CELL:
+        errors.append(
+            f"too many ingress entries ({len(ingress_spec)}), "
+            f"max {MAX_INGRESS_PER_CELL}"
+        )
+    seen_names: set = set()
+    seen_prefixes: set = set()
+    for i, entry in enumerate(ingress_spec):
+        errors.extend(_v_ingress_entry(i, entry, seen_names, seen_prefixes, ""))
+    if errors:
+        raise BrigError(
+            f"Refusing to register ingress for '{cell_name}': "
+            f"invalid entry shape — " + "; ".join(errors),
+            suggestion=(
+                f"~/.brig/state/{cell_name}/cell-metadata.json may have been "
+                f"hand-edited or corrupted. Re-create the cell from yaml: "
+                f"brig cell rm {cell_name} && brig run --file <yaml>"
+            ),
+        )
+
+    from brig.config import HostPaths, INGRESS_TOKEN_MIN_LEN
     from brig.network.ingress import register_ingress
     from brig.security.secrets import validate_secret_path
 
@@ -58,8 +80,12 @@ def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
     from brig.cell.reconciler import _podman_inspect_json
     container_info = _podman_inspect_json(cn)
     if not container_info:
-        debug(f"Could not inspect {cn} for ingress registration")
-        return
+        raise BrigError(
+            f"Cannot register ingress for '{cell_name}': container {cn} "
+            f"is not inspectable. Declared ingress routes would be silently "
+            f"unregistered.",
+            suggestion=f"brig cell logs {cell_name}  # check why the cell isn't up",
+        )
     cell_ip = (
         container_info.get("NetworkSettings", {})
         .get("Networks", {})
@@ -67,38 +93,48 @@ def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
         .get("IPAddress", "")
     )
     if not cell_ip:
-        debug("Could not determine cell IP for ingress registration")
-        return
-
-    token_name = f"{cell_name}-ingress-token"
-    try:
-        token_path = validate_secret_path(token_name, HostPaths.SECRETS_DIR)
-    except (ValueError, FileNotFoundError):
-        try:
-            token_path = validate_secret_path("ingress-token", HostPaths.SECRETS_DIR)
-        except (ValueError, FileNotFoundError):
-            raise BrigError(
-                f"Cell '{cell_name}' declares ingress with auth: token "
-                f"but no token secret exists. Ingress would register "
-                f"routes that reject every request.",
-                suggestion=(
-                    f"Create the token (32+ random chars), then re-run:\n"
-                    f"  openssl rand -hex 32 | brig secrets add {token_name} -\n"
-                    f"  brig cell rm {cell_name} && brig run --file <yaml>"
-                ),
-            )
-
-    auth_token = token_path.read_text().strip()
-    if not auth_token:
         raise BrigError(
-            f"Ingress token for '{cell_name}' is empty",
-            suggestion=f"openssl rand -hex 32 | brig secrets add {token_name} -",
+            f"Cannot register ingress for '{cell_name}': cell IP could not "
+            f"be determined. Declared ingress routes would be silently "
+            f"unregistered.",
+            suggestion=f"brig cell logs {cell_name}",
         )
-    if len(auth_token) < 32:
-        info(
-            f"WARNING: Ingress token for '{cell_name}' is short. "
-            f"Use at least 32 characters."
-        )
+
+    # A token is needed only if at least one route is auth: token. An
+    # all-`auth: none` cell (transparent pass-through) requires no secret.
+    needs_token = any(e.get("auth") == "token" for e in ingress_spec)
+    auth_token: str | None = None
+    if needs_token:
+        token_name = f"{cell_name}-ingress-token"
+        try:
+            token_path = validate_secret_path(token_name, HostPaths.SECRETS_DIR)
+        except (ValueError, FileNotFoundError):
+            try:
+                token_path = validate_secret_path("ingress-token", HostPaths.SECRETS_DIR)
+            except (ValueError, FileNotFoundError):
+                raise BrigError(
+                    f"Cell '{cell_name}' declares ingress with auth: token "
+                    f"but no token secret exists. Ingress would register "
+                    f"routes that reject every request.",
+                    suggestion=(
+                        f"Create the token (32+ random chars), then re-run:\n"
+                        f"  openssl rand -hex 32 | brig secrets add {token_name} -\n"
+                        f"  brig cell rm {cell_name} && brig run --file <yaml>"
+                    ),
+                )
+
+        auth_token = token_path.read_text().strip()
+        if not auth_token:
+            raise BrigError(
+                f"Ingress token for '{cell_name}' is empty",
+                suggestion=f"openssl rand -hex 32 | brig secrets add {token_name} -",
+            )
+        if len(auth_token) < INGRESS_TOKEN_MIN_LEN:
+            raise BrigError(
+                f"Ingress token for '{cell_name}' is too short "
+                f"({len(auth_token)} chars); minimum is {INGRESS_TOKEN_MIN_LEN}",
+                suggestion=f"openssl rand -hex 32 | brig secrets add {token_name} -",
+            )
 
     register_ingress(cell_name, cell_ip, ingress_spec, auth_token)
 
@@ -118,8 +154,8 @@ def _container_name_from_entry(entry: dict) -> str:
     """
     names = entry.get("Names", "")
     if isinstance(names, list):
-        return names[0] if names else ""
-    return names
+        return str(names[0]) if names else ""
+    return str(names)
 
 
 def list_cell_containers(*, include_stopped: bool = True) -> list[tuple[str, dict]]:
@@ -162,7 +198,11 @@ def list_cell_containers(*, include_stopped: bool = True) -> list[tuple[str, dic
     return out
 
 
-_DIGEST_PATTERN = re.compile(r"^sha(?:256|384|512):[0-9a-fA-F]{64,}$")
+# Exact hex length per algorithm — an open-ended {64,} would accept an
+# over-long sha256 or a wrong-length sha384/sha512 as well-formed.
+_DIGEST_PATTERN = re.compile(
+    r"^sha(?:256:[0-9a-fA-F]{64}|384:[0-9a-fA-F]{96}|512:[0-9a-fA-F]{128})\Z"
+)
 
 
 def _apply_image_digest_pin(spec: CellSpec) -> None:
@@ -197,9 +237,59 @@ def _apply_image_digest_pin(spec: CellSpec) -> None:
     spec.image = f"{spec.image}@{digest}"
 
 
+def sync_cell_policy(spec: CellSpec) -> None:
+    """Write the cell's allow / deny / host_services / tls_passthrough to its
+    per-cell policy file (`<cell>.json`). Replace semantics — the spec is the
+    source of truth. Skips the write when the on-disk policy already matches
+    so idempotent re-runs don't churn mtime (which would trigger a warden
+    reload). Called by run_cell so BOTH the CLI and the SDK persist policy —
+    without this, a cell launched via the SDK has no per-cell policy file and
+    warden default-denies all its egress.
+    """
+    from brig.policy.policy import mutate_cell_policy
+
+    desired = {
+        "allow": list(spec.policy_allow or []),
+        "deny": list(spec.policy_deny or []),
+        "host_services": list(spec.host_services or []),
+        "tls_passthrough": list(spec.policy_passthrough_tls or []),
+    }
+    current_holder: dict[str, Any] = {}
+
+    def _mutate(existing: dict[str, Any] | None) -> dict[str, Any] | None:
+        existing = existing or {}
+        current = {
+            "allow": existing.get("allow", []),
+            "deny": existing.get("deny", []),
+            "host_services": existing.get("host_services", []),
+            "tls_passthrough": existing.get("tls_passthrough", []),
+        }
+        current_holder.update(current)
+        if desired == current:
+            return None  # No change — skip the write.
+        merged = dict(existing)
+        merged.update(desired)
+        return merged
+
+    written = mutate_cell_policy(spec.name, _mutate)
+    if written is None:
+        return
+    current = current_holder
+
+    def _names(items: Any) -> set[str]:
+        return {e["name"] for e in items if isinstance(e, dict) and "name" in e}
+    added = _names(desired["host_services"]) - _names(current["host_services"])
+    removed = _names(current["host_services"]) - _names(desired["host_services"])
+    for n in sorted(added):
+        info(f"host_service granted: {spec.name} → {n} (from cell yaml)")
+    for n in sorted(removed):
+        info(f"host_service revoked: {spec.name} → {n} (no longer in cell yaml)")
+
+
 def run_cell(
     spec: CellSpec,
     proxy_check: Callable[[], bool] = _default_proxy_check,
+    count_against_rate_limit: bool = True,
 ) -> ReconcileResult:
     """Run a new cell.
 
@@ -207,6 +297,9 @@ def run_cell(
         spec: Cell specification.
         proxy_check: Callable returning True if proxy is running.
             Injected for testability; defaults to the real proxy_running().
+        count_against_rate_limit: when False, skip the creation rate limiter.
+            Set by restore (replaying already-authorized restart:always cells),
+            which would otherwise throttle past the limit and strand the rest.
 
     Enforces:
       - Invariant 9: proxy must be running (unless airgapped)
@@ -219,14 +312,23 @@ def run_cell(
     if not spec.is_airgapped and not proxy_check():
         raise BrigError(
             "Warden proxy is not running",
-            suggestion="Start with: brig up",
+            suggestion="Start with: brig system up",
         )
 
-    if not check_rate_limit():
+    if count_against_rate_limit and not check_rate_limit():
         raise BrigError(
             "Rate limit exceeded: too many cells created recently",
             suggestion="Wait a moment and try again, or increase the rate limit",
         )
+
+    # Persist the cell's per-cell policy before it starts so warden enforces
+    # the intended allow/deny (not default-deny). Done here, not in the CLI,
+    # so SDK-launched cells get it too. Track whether a policy already existed
+    # so a failed reconcile can clean up a file THIS run created without
+    # deleting a legitimate policy on an idempotent re-run of a live cell.
+    from brig.policy.policy import load_cell_policy
+    policy_preexisted = load_cell_policy(spec.name) is not None
+    sync_cell_policy(spec)
 
     actual = observe(spec.name)
     if actual.exists and actual.running:
@@ -256,24 +358,25 @@ def run_cell(
         from brig.cell.host_sockets_bridge import start_cell_bridges
         start_cell_bridges(spec.name, spec.host_sockets)
 
+    def _rollback_reconcile_side_effects() -> None:
+        # apply() rolls back its own network/subnet/podman actions, but bridges
+        # and the pre-written policy file are ours to clean up.
+        if spec.host_sockets:
+            from brig.cell.host_sockets_bridge import stop_cell_bridges
+            stop_cell_bridges(spec.name)
+        if not policy_preexisted:
+            from brig.policy.policy import delete_cell_policy
+            delete_cell_policy(spec.name)
+
     debug(f"Reconciliation plan: {[a.type.name for a in actions]}")
     try:
         result = apply(actions)
     except Exception:
-        # apply() rolled back its own actions, but it doesn't know about
-        # bridges. Tear them down so we don't leak a socat process for
-        # a cell that never started.
-        if spec.host_sockets:
-            from brig.cell.host_sockets_bridge import stop_cell_bridges
-            stop_cell_bridges(spec.name)
+        _rollback_reconcile_side_effects()
         raise
 
     if not result.success:
-        # Same rollback as the exception path: apply()'s _rollback handles
-        # network/subnet/podman actions, but bridges are ours to clean up.
-        if spec.host_sockets:
-            from brig.cell.host_sockets_bridge import stop_cell_bridges
-            stop_cell_bridges(spec.name)
+        _rollback_reconcile_side_effects()
         failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
         raise BrigError(f"Failed to start cell '{spec.name}': {failed[1]}")
 
@@ -292,7 +395,22 @@ def run_cell(
             )
         # Register ingress routes if the cell has ingress endpoints.
         if spec.ingress:
-            _register_cell_ingress(spec, result)
+            register_ingress_for(spec.name, spec.ingress)
+            # An auth: none route removes brig's perimeter gate — the cell's
+            # app is the authenticator. Surface it loudly (audit + operator
+            # NOTE), the way mounts/host_sockets announce their bypasses.
+            open_routes = [e for e in spec.ingress if e.get("auth") == "none"]
+            for e in open_routes:
+                log_lifecycle(
+                    "ingress_unauthenticated", spec.name,
+                    details={"route": e.get("name"), "path_prefix": e.get("path_prefix")},
+                )
+            if open_routes:
+                info(
+                    f"NOTE: cell '{spec.name}' has {len(open_routes)} ingress "
+                    f"route(s) with auth: none — brig does NOT authenticate "
+                    f"these; the cell's app must be the gate."
+                )
         # Audit any host_sockets that were mounted. The bytes flowing
         # over these sockets bypass Warden, so the attach event is the
         # only thing we can record — make sure it's loud.
@@ -308,18 +426,89 @@ def run_cell(
                 f"NOTE: cell '{spec.name}' has {len(spec.host_sockets)} "
                 f"host_sockets — Warden does not see traffic over these."
             )
+        # Audit host-directory mounts. The cell reads/writes these host files
+        # directly (Warden not in the path); a rw mount lets it modify files a
+        # host process later consumes — surface it loudly.
+        if spec.mounts:
+            for entry in spec.mounts:
+                log_lifecycle(
+                    "mount_attach", spec.name,
+                    details={"mount": entry["name"],
+                             "host_path": entry["host_path"],
+                             "mount_point": entry["mount_point"],
+                             "mode": entry.get("mode", "ro")},
+                )
+            rw = [m for m in spec.mounts if m.get("mode") == "rw"]
+            info(
+                f"NOTE: cell '{spec.name}' has {len(spec.mounts)} host mount(s) "
+                f"({len(rw)} rw) — Warden does not see these bytes. Treat files "
+                f"the cell writes as untrusted; scan with: brig cell mount-scan "
+                f"{spec.name}"
+            )
         info(f"Cell '{spec.name}' started")
     except BrigError:
         # Roll the cell back — container is running, but post-start
-        # config failed. Better to fail clean than ship a half-cell.
+        # config failed. Preserve the workspace: a post-start failure
+        # is brig's fault, not the user's, and if the cell name was
+        # reused for an already-populated workspace (the
+        # exists-but-stopped recovery path), wiping it would destroy
+        # the user's data.
         info(f"post-start failure for '{spec.name}'; rolling back cell")
         try:
-            rm_cell(spec.name, force=True)
+            rm_cell(spec.name, force=True, keep_workspace=True)
         except Exception as cleanup_err:
             debug(f"rollback rm_cell failed: {cleanup_err}")
         raise
 
+    # Persist the spec for restart:always cells so `brig system up` can
+    # re-launch them after a VM restart. Best-effort — a persistence failure
+    # must not fail an otherwise-healthy cell.
+    try:
+        from brig.cell.metadata import write_cell_spec
+        write_cell_spec(spec)
+    except Exception as e:
+        debug(f"failed to persist restart spec for '{spec.name}': {e}")
+
+    # The cell is fully up and configured — count it against the creation
+    # quota now, so no-ops (already running, empty plan), rolled-back
+    # reconciles, AND rolled-back post-start failures never burned a slot.
+    if count_against_rate_limit:
+        record_rate_limit()
     return result
+
+
+def restore_persisted_cells() -> None:
+    """Re-launch `restart: always` cells whose container is gone, on
+    `brig system up` (once warden is up).
+
+    A cell is restored only when its container no longer exists. An *exited*
+    cell (still present — e.g. an explicit `brig cell stop`) is left alone.
+    Note a VM restart drops every container, so a stopped restart:always cell
+    DOES relaunch on the next up; use `brig cell rm` to keep one down for good.
+
+    The persisted spec is re-validated before launch (the state dir is
+    untrusted, invariant 4) and replayed without counting against the creation
+    rate limit (these cells were already authorized).
+    """
+    import dataclasses
+    from brig.cell.metadata import restorable_cell_specs
+    from brig.cell.spec import validate_cell_definition
+
+    valid = {f.name for f in dataclasses.fields(CellSpec)}
+    for raw in restorable_cell_specs():
+        name = raw.get("name")
+        if not name or observe(name).exists:
+            continue
+        errs = validate_cell_definition(raw)
+        if errs:
+            info(f"  (warn) skipping restore of '{name}': invalid persisted spec: {errs[0]}")
+            continue
+        info(f"Restoring cell '{name}' (restart: always)...")
+        try:
+            spec = CellSpec(**{k: v for k, v in raw.items() if k in valid})
+            run_cell(spec, count_against_rate_limit=False)
+        except Exception as e:
+            info(f"  (warn) could not restore cell '{name}': {e}")
 
 
 def stop_cell(cell_name: str) -> None:
@@ -328,12 +517,12 @@ def stop_cell(cell_name: str) -> None:
     if not actual.exists:
         raise BrigError(
             f"Cell '{cell_name}' does not exist",
-            suggestion="Use 'brig list' to see available cells",
+            suggestion="Use 'brig cell list' to see available cells",
         )
     if not actual.running:
         raise BrigError(
             f"Cell '{cell_name}' is not running",
-            suggestion=f"Use 'brig start {cell_name}' to start it",
+            suggestion=f"Use 'brig cell start {cell_name}' to start it",
         )
 
     # Deregister ingress routes before stopping (prevents stale routes
@@ -364,7 +553,7 @@ def kill_cell(cell_name: str) -> None:
     if not actual.exists:
         raise BrigError(
             f"Cell '{cell_name}' does not exist",
-            suggestion="Use 'brig list' to see available cells",
+            suggestion="Use 'brig cell list' to see available cells",
         )
 
     # Deregister ingress routes before killing.
@@ -375,7 +564,16 @@ def kill_cell(cell_name: str) -> None:
     from brig.cell.host_sockets_bridge import stop_cell_bridges
     stop_cell_bridges(cell_name)
 
-    actions = [Action(ActionType.PODMAN_KILL, cell_name)] if actual.running else []
+    # observe() reports a paused container as running=False, so gate on the
+    # actual status too — otherwise killing a paused cell would no-op, log a
+    # false "kill" success, and leave it up with its egress wiring stripped.
+    # podman refuses to SIGKILL a paused container, so unpause it first.
+    should_kill = actual.running or actual.status == "paused"
+    if should_kill and actual.status == "paused":
+        from brig.config import container_name
+        vm_run(["podman", "unpause", container_name(cell_name)])
+
+    actions = [Action(ActionType.PODMAN_KILL, cell_name)] if should_kill else []
     result = apply(actions)
 
     if result.success:
@@ -395,23 +593,29 @@ def rm_cell(
     callers that want to extract files first should `brig cell cp` them
     out before calling rm.
 
-    Why default-delete (was leave-on-disk in earlier versions): the
-    workspace can contain cell-controlled content including symlinks
-    pointing at host files. If a new cell takes the same name later, it
-    inherits the prior cell's planted bait. Cleaning by default closes
-    that re-use foot-gun; users who need the data ask for it.
+    Why default-delete: the workspace can contain cell-controlled content
+    including symlinks pointing at host files. If a new cell takes the same
+    name later, it inherits the prior cell's planted bait. Cleaning by
+    default closes that re-use foot-gun; users who need the data ask for it.
     """
+    # Validate before any path construction: rm_cell does a destructive
+    # rmtree of ~/.brig/state/<cell>/, so gate on the name pattern (forbids
+    # '/' and '..') rather than relying on a downstream existence check.
+    from brig.config import CELL_NAME_PATTERN
+    if not CELL_NAME_PATTERN.match(cell_name):
+        raise BrigError(f"Invalid cell name: '{cell_name}'")
+
     actual = observe(cell_name)
     if not actual.exists and not actual.network_exists:
         raise BrigError(
             f"Cell '{cell_name}' does not exist",
-            suggestion="Use 'brig list' to see available cells",
+            suggestion="Use 'brig cell list' to see available cells",
         )
 
     if actual.running and not force:
         raise BrigError(
             f"Cell '{cell_name}' is running. Stop it first or use --force.",
-            suggestion=f"brig stop {cell_name}  OR  brig rm -f {cell_name}",
+            suggestion=f"brig cell stop {cell_name}  OR  brig cell rm -f {cell_name}",
         )
 
     # Deregister ingress routes before destroying the cell.
@@ -428,6 +632,18 @@ def rm_cell(
     if not result.success:
         failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
         raise BrigError(f"Failed to remove cell '{cell_name}': {failed[1]}")
+
+    # Delete the per-cell policy file so a future cell reusing this name
+    # doesn't inherit the removed cell's allow/deny (the workspace + subnet
+    # are freed by plan_destroy; the policy file lives separately).
+    from brig.policy.policy import delete_cell_policy
+    delete_cell_policy(cell_name)
+
+    # Drop the persisted restart spec unconditionally — even with
+    # keep_workspace — so a removed cell can't be resurrected by restart:always
+    # on the next `brig system up` (the spec is a sibling of the workspace).
+    from brig.cell.metadata import remove_cell_spec
+    remove_cell_spec(cell_name)
 
     # Clean up host-side per-cell state (workspace + metadata file).
     # Deletion is destructive but matches the principle that `rm` should

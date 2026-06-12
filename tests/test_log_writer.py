@@ -6,17 +6,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
 
-# Stub mitmproxy.
-_mock = MagicMock()
-sys.modules.setdefault("mitmproxy", _mock)
-sys.modules.setdefault("mitmproxy.ctx", _mock.ctx)
-sys.modules.setdefault("mitmproxy.http", _mock.http)
+pytest.importorskip("mitmproxy", reason="install dev extras: uv pip install -e '.[dev]'")
 
-_ADDONS_DIR = str(Path(__file__).parent.parent / "src" / "addons")
+_ADDONS_DIR = str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons")
 if _ADDONS_DIR not in sys.path:
     sys.path.insert(0, _ADDONS_DIR)
 

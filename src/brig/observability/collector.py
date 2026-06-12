@@ -2,8 +2,8 @@
 
 Runs as a sibling container to warden inside the Lima VM. Receives
 OTLP from warden, exposes a Prometheus endpoint for the brig CLI to
-read, and writes traces/logs to rotated files. Started before warden
-on `brig system up` so warden has an emit target from cold start.
+read, and writes log records to a rotated file. Started before warden
+on `brig system up` (by cmd_up) so warden has an emit target from cold start.
 
 Failure-closed: refuses to start if the image digest is not pinned in
 brig.config.COLLECTOR_IMAGE_DIGEST (run scripts/pin-collector-image.sh

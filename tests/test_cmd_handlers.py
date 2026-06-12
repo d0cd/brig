@@ -23,14 +23,14 @@ class TestCmdStartReplayIngress(unittest.TestCase):
     """
 
     def test_start_with_ingress_in_metadata_replays_registration(self):
-        from brig.commands.lifecycle_cmd import cmd_start
+        from brig.commands.lifecycle_control import cmd_start
         ingress_entries = [
             {"name": "api", "port": 8000,
              "path_prefix": "/api", "auth": "token"},
         ]
         with patch("brig.network.proxy.proxy_running", return_value=True), \
-             patch("brig.commands.lifecycle_cmd._refresh_metadata_for_start"), \
-             patch("brig.commands.lifecycle_cmd.vm_run") as mock_vm, \
+             patch("brig.commands.lifecycle_control._refresh_metadata_for_start"), \
+             patch("brig.commands.lifecycle_control.vm_run") as mock_vm, \
              patch("brig.cell.metadata.read_ingress",
                    return_value=ingress_entries) as mock_read, \
              patch("brig.cell.lifecycle.register_ingress_for") as mock_reg:
@@ -42,10 +42,10 @@ class TestCmdStartReplayIngress(unittest.TestCase):
         mock_reg.assert_called_once_with("cell-with-ingress", ingress_entries)
 
     def test_start_without_ingress_in_metadata_skips_registration(self):
-        from brig.commands.lifecycle_cmd import cmd_start
+        from brig.commands.lifecycle_control import cmd_start
         with patch("brig.network.proxy.proxy_running", return_value=True), \
-             patch("brig.commands.lifecycle_cmd._refresh_metadata_for_start"), \
-             patch("brig.commands.lifecycle_cmd.vm_run") as mock_vm, \
+             patch("brig.commands.lifecycle_control._refresh_metadata_for_start"), \
+             patch("brig.commands.lifecycle_control.vm_run") as mock_vm, \
              patch("brig.cell.metadata.read_ingress", return_value=[]), \
              patch("brig.cell.lifecycle.register_ingress_for") as mock_reg:
             import subprocess
@@ -69,11 +69,11 @@ class TestCmdRunProfileMerge(unittest.TestCase):
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
 
-    @patch("brig.commands.lifecycle_cmd.run_cell")
+    @patch("brig.commands.lifecycle_run.run_cell")
     def test_untrusted_profile_sets_memory(self, mock_run):
         mock_run.return_value = ReconcileResult(success=True, container_id="abc")
 
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         args = self._make_args(profile="untrusted")
         cmd_run(args)
 
@@ -82,18 +82,18 @@ class TestCmdRunProfileMerge(unittest.TestCase):
         self.assertEqual(spec.cpus, "1")
         self.assertEqual(spec.pids_limit, 256)
 
-    @patch("brig.commands.lifecycle_cmd.run_cell")
+    @patch("brig.commands.lifecycle_run.run_cell")
     def test_cli_flags_override_profile(self, mock_run):
         mock_run.return_value = ReconcileResult(success=True, container_id="abc")
 
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         args = self._make_args(profile="untrusted", memory="4g")
         cmd_run(args)
 
         spec = mock_run.call_args[0][0]
         self.assertEqual(spec.memory, "4g")  # CLI wins over profile.
 
-    @patch("brig.commands.lifecycle_cmd.run_cell")
+    @patch("brig.commands.lifecycle_run.run_cell")
     def test_cell_def_file_merged(self, mock_run):
         mock_run.return_value = ReconcileResult(success=True, container_id="abc")
 
@@ -102,7 +102,7 @@ class TestCmdRunProfileMerge(unittest.TestCase):
                        "env": {"FROM_FILE": "yes"}}, f)
             f.flush()
 
-            from brig.commands.lifecycle_cmd import cmd_run
+            from brig.commands.lifecycle_run import cmd_run
             args = self._make_args(name=None, image=None, file=f.name)
             cmd_run(args)
 
@@ -110,11 +110,11 @@ class TestCmdRunProfileMerge(unittest.TestCase):
         self.assertEqual(spec.image, "python:3.12")
         self.assertTrue(any("FROM_FILE=yes" in e for e in spec.env))
 
-    @patch("brig.commands.lifecycle_cmd.run_cell")
+    @patch("brig.commands.lifecycle_run.run_cell")
     def test_auto_generated_name(self, mock_run):
         mock_run.return_value = ReconcileResult(success=True, container_id="abc")
 
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         args = self._make_args(name=None)
         cmd_run(args)
 
@@ -122,11 +122,11 @@ class TestCmdRunProfileMerge(unittest.TestCase):
         self.assertIsNotNone(spec.name)
         self.assertRegex(spec.name, r'^[a-z]+-[a-z]+-\d+$')
 
-    @patch("brig.commands.lifecycle_cmd.run_cell")
+    @patch("brig.commands.lifecycle_run.run_cell")
     def test_airgapped_network(self, mock_run):
         mock_run.return_value = ReconcileResult(success=True, container_id="abc")
 
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         args = self._make_args(network="none")
         cmd_run(args)
 
@@ -150,13 +150,13 @@ class TestCmdRunValidation(unittest.TestCase):
         return types.SimpleNamespace(**defaults)
 
     def test_invalid_cell_name_rejected(self):
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         args = self._make_args(name="../../../etc")
         with self.assertRaises((BrigError, ValueError)):
             cmd_run(args)
 
     def test_invalid_cell_def_file_rejected(self):
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         with tempfile.NamedTemporaryFile(suffix=".json", mode="w", delete=False) as f:
             json.dump({"network": "proxy-external"}, f)
             f.flush()
@@ -165,7 +165,7 @@ class TestCmdRunValidation(unittest.TestCase):
                 cmd_run(args)
 
     def test_no_image_and_no_file_rejected(self):
-        from brig.commands.lifecycle_cmd import cmd_run
+        from brig.commands.lifecycle_run import cmd_run
         args = self._make_args(image=None, file=None)
         with self.assertRaises(BrigError):
             cmd_run(args)

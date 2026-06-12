@@ -111,6 +111,35 @@ class TestVmRunRouting(unittest.TestCase):
         called_cmd = mock_run.call_args[0][0]
         self.assertEqual(called_cmd[:6], ["limactl", "shell", "--workdir", "/", "brig", "--"])
 
+    @patch("brig.vm.shell.subprocess.run")
+    def test_vm_run_sudo_true_forces_sudo_on_non_autosudo_cmd(self, mock_run):
+        """`sudo=True` lets callers run root-only commands whose basename
+        isn't in the auto-sudo set (e.g. `sh -c <script>` writing to a
+        root-owned dir) without prefixing 'sudo' themselves."""
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        from brig.vm.shell import vm_run
+        vm_run(["cat", "/var/log/root-owned.log"], sudo=True)
+        called_cmd = mock_run.call_args[0][0]
+        self.assertEqual(called_cmd[6:], ["sudo", "cat", "/var/log/root-owned.log"])
+
+    @patch("brig.vm.shell.subprocess.run")
+    def test_vm_run_sudo_false_suppresses_auto_sudo(self, mock_run):
+        """`sudo=False` defeats the auto-sudo for cmd[0]. Lets callers
+        run a normally-auto-sudo basename as the lima user when that's
+        what they want."""
+        mock_run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        from brig.vm.shell import vm_run
+        vm_run(["podman", "info"], sudo=False)
+        called_cmd = mock_run.call_args[0][0]
+        self.assertEqual(called_cmd[6:], ["podman", "info"])
+
+    def test_vm_run_rejects_explicit_sudo_prefix(self):
+        """Bare `["sudo", ...]` is rejected so sudo decisions stay in one
+        place (the helper) and double-sudo bugs can't slip in."""
+        from brig.vm.shell import vm_run
+        with self.assertRaises(ValueError):
+            vm_run(["sudo", "podman", "ps"])
+
 
 class TestReconcilerPlanToApply(unittest.TestCase):
     """Test the full reconciler path: observe state → plan → action sequence."""
@@ -133,7 +162,7 @@ class TestReconcilerPlanToApply(unittest.TestCase):
     def test_partial_recovery_network_exists(self):
         """If interrupted after network creation, plan skips to proxy connect."""
         spec = CellSpec(name="test", image="alpine")
-        actual = CellState(network_exists=True)
+        actual = CellState(network_exists=True, network_internal=True)
 
         actions = plan_run(spec, actual)
         types = [a.type for a in actions]
@@ -146,7 +175,7 @@ class TestReconcilerPlanToApply(unittest.TestCase):
     def test_stopped_container_gets_cleaned_up(self):
         """A stopped container from a previous run is removed before re-run."""
         spec = CellSpec(name="test", image="alpine")
-        actual = CellState(exists=True, running=False, network_exists=True, proxy_connected=True)
+        actual = CellState(exists=True, running=False, network_exists=True, network_internal=True, proxy_connected=True)
 
         actions = plan_run(spec, actual)
         types = [a.type for a in actions]

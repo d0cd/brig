@@ -4,8 +4,14 @@ Warden's behavior is composed from mitmproxy addons mounted into the warden
 container. This page lists each addon, what it does, whether it's required,
 and how to configure it.
 
-Addons live in `src/addons/` (host) and are copied to `~/.brig/cells/addons/`
-by `make _copy-addons`. They run inside the warden container at `/addons/`.
+Addons live in `src/brig/warden_addons/`, shipped with brig as package-data (so
+they're present in any install, editable or wheel). `brig system up` syncs them
+into `~/.brig/cells/addons/` — and bounces warden if any changed — so the
+deployed copy can't silently drift from the installed package; `make _copy-addons`
+does the same one-shot staging at first setup. They run inside the warden
+container at `/addons/`, flat-loaded by mitmproxy (each addon imports its
+siblings as flat modules, e.g. `from _common import ...`), which is why they are
+data rather than an importable `brig` submodule.
 
 ## Required addons
 
@@ -62,20 +68,22 @@ A `tcp_start` hook gates per-cell access for raw TCP `host_services`
   - Skips TLS-passthrough flows (different mechanism).
   - Fail-closed on any unexpected mitmproxy API shape.
 
-OTel passthrough metrics emitted via `otel_export.py` `tcp_start` /
-`tcp_message` / `tcp_end` hooks:
-
-| Metric | Cardinality |
-|---|---|
-| `warden_passthrough_connections_total{cell,host}` | one counter per (cell, SNI) |
-| `warden_passthrough_bytes_total{cell,host,direction}` | direction ∈ {in, out} |
-| `warden_passthrough_duration_ms{cell,host}` | histogram |
+**NOTE — passthrough emits no per-byte/connection metrics.** TLS passthrough
+engages via `data.ignore_connection`, which makes mitmproxy build an *ignored*
+TCP layer with no flow object — so `otel_export.py`'s `tcp_start` /
+`tcp_message` / `tcp_end` hooks never fire for passthrough, and the
+`warden_passthrough_*` counters they define are not produced. The only
+passthrough audit is the connection-level `PASSTHROUGH: cell=… sni=…` log line
+emitted by `enforce.py:tls_clienthello`. (The hooks remain for a possible
+future flow-bearing relay; see `docs/INVARIANTS.md` invariant 11.)
 
 These surface in `brig system stats` as `PT/CONN` / `PT/IN` / `PT/OUT`
 columns (the `PT/*` callout appears when any cell had passthrough
 connections).
 
-Configured via `~/.brig/cells/network-policy.json`:
+Allow/deny and `host_services` are **per-cell** — each cell's policy lives in
+`~/.brig/state/system/policies/<cell>.json` (managed via `brig policy set
+<cell>`). A cell with no policy file is blocked (default deny):
 
 ```json
 {
@@ -85,8 +93,8 @@ Configured via `~/.brig/cells/network-policy.json`:
 }
 ```
 
-Per-cell overrides go in `~/.brig/state/system/policies/<cell>.json` (managed
-via `brig policy set <cell>`).
+The process-wide `~/.brig/cells/network-policy.json` carries no allow/deny —
+the enforce addon reads only its `policy_trace` block from there.
 
 ### `logger.py`
 
@@ -125,16 +133,18 @@ Loaded only if the file exists in `~/.brig/cells/addons/`.
 
 ### `ingress.py`
 
-Authenticated reverse proxy on port 8443. Routes external requests to a
-cell-internal port:
+Reverse proxy on port 8443. Routes external requests to a cell-internal port:
 
 ```
 GET https://warden:8443/{cell}/{prefix}/...
   → http://{cell_ip}:{cell_port}/...
 ```
 
-Auth: salted SHA-256 token compared with `hmac.compare_digest`. Per-IP auth
-failure rate limit (10 failures per minute, LRU-evicted at 10k tracked IPs).
+Auth is per-route: `auth: token` (default) compares a salted SHA-256 Bearer
+token with `hmac.compare_digest` (per-IP failure rate limit: 10/min, LRU-evicted
+at 10k tracked IPs); `auth: none` is transparent pass-through — no token check,
+`Authorization` forwarded untouched for the cell's app to authenticate. A route
+missing `auth` is treated as `token` (fail-secure).
 
 Routes are written by `brig run` based on the cell's `ingress` field; tokens
 are read from `~/.brig/secrets/<cell>-ingress-token` (or generic
@@ -150,6 +160,37 @@ a CA bundle. The urllib fallback path explicitly disables HTTP redirects.
 
 Circuit breaker (configurable failure threshold / recovery timeout) +
 exponential backoff retries + dead-letter queue for failed notifications.
+
+**`novel_allowed` — first-seen detection on allow-listed hosts.** Blocked-alerting
+catches "tried somewhere new"; this catches "used an allowed destination a new
+way" — where telemetry/exfil hide, since they ride a host you *had* to allow and
+are never blocked. On each allowed response it keys `(cell, host,
+path-template)` (high-cardinality segments — ids/hashes/uuids/tokens — collapse
+to `{id}`; query stripped) and alerts the first time a key is seen. A separate
+`suspicious_query` signal flags an over-long query string on an already-known
+path (the exfil channel path-novelty can't see); it reports the query *length*,
+never its content. The baseline is seeded from the cell's existing
+`/var/log/brig/network/<cell>.jsonl` on load, so a warden restart doesn't replay
+known paths as novel. Default off; opt in per cell and **run `dry_run` first** to
+confirm the baseline + ignore-lists are tight before enabling delivery:
+
+```json
+"notifications": {
+  "webhook_url": "https://example.com/webhook",
+  "novel_allowed": {
+    "enabled": true,
+    "cells": ["sandbox-agent", "hermes"],
+    "ignore_hosts": ["pypi.org"],
+    "ignore_paths": ["^/v1/acp/"],
+    "dry_run": false,
+    "max_query_len": 512
+  }
+}
+```
+
+Limits: `tls_passthrough` hosts expose SNI only (no path), so novelty there is
+host-level (== the allowlist); and data smuggled in a POST *body* on a known path
+is out of scope (path-template + query-length don't see it).
 
 ## How addons load
 

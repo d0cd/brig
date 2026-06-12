@@ -53,6 +53,17 @@ class TestIngressTaggedInNetworkOutput(unittest.TestCase):
         self.assertIn("OUT:", text)
         self.assertIn("INGRESS:", text)
 
+    def test_control_chars_stripped_from_rendered_fields(self):
+        """A cell injecting ESC/CR into host/path must not reach the terminal
+        verbatim (ANSI/log-line forgery defense)."""
+        text = self._run([_entry(
+            host="evil\x1b[2K.com", path="/\rFAKE-[BLOCKED]",
+        )])
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\r", text)
+        # The non-control text survives.
+        self.assertIn("evil[2K.com", text)
+
 
 if __name__ == "__main__":
     unittest.main()

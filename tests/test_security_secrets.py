@@ -4,10 +4,31 @@ Tests invariant 4: macOS state directory is untrusted.
 """
 
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from brig.security.secrets import validate_secret_path
+
+
+class TestSecretsRmValidatesName(unittest.TestCase):
+    """`brig secrets rm` must reject traversal/charset like `add` does, so it
+    can't unlink a file outside the secrets dir."""
+
+    def _args(self, name):
+        return types.SimpleNamespace(name=name, yes=True)
+
+    def test_traversal_name_rejected_before_unlink(self):
+        from brig.commands.secrets_cmd import cmd_secrets_rm
+        from brig.errors import BrigError
+        for bad in ("../../etc/passwd", "a/b", "..", "bad name", "UPPER"):
+            with patch("brig.commands.secrets_cmd.HostPaths") as hp:
+                # If validation is skipped, unlink would be attempted; make the
+                # path's unlink explode so a regression is loud.
+                hp.SECRETS_DIR = Path("/nonexistent-secrets-dir")
+                with self.assertRaises(BrigError, msg=f"{bad!r} should be rejected"):
+                    cmd_secrets_rm(self._args(bad))
 
 
 class TestValidateSecretPath(unittest.TestCase):

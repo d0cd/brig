@@ -75,21 +75,6 @@ def colorize(text: str, color: str) -> str:
     return text
 
 
-def status_color(status: str) -> str:
-    """Get colorized status string."""
-    status_lower = status.lower()
-    if status_lower == "running":
-        return colorize(status, "green")
-    elif status_lower == "paused":
-        return colorize(status, "yellow")
-    elif status_lower in ("exited", "stopped", "dead"):
-        return colorize(status, "red")
-    elif status_lower == "created":
-        return colorize(status, "blue")
-    else:
-        return status
-
-
 def log(level: int, msg: str, level_name: str | None = None) -> None:
     """Log a message at the specified level."""
     if level < _state["log_level"]:
@@ -129,9 +114,14 @@ def info(msg: str) -> None:
 
 
 def output(msg: str) -> None:
-    """Print output message (respects quiet mode)."""
-    if not _state["quiet"]:
-        print(msg)
+    """Print primary command output to stdout.
+
+    Always prints — `--quiet` suppresses advisory chatter (the [INFO]/[DEBUG]
+    stderr lines via log()), NOT the command's actual results. Suppressing
+    results would break scripting (`brig cell list --quiet`, `--format json`,
+    inspect/export/read all produce their data through this path).
+    """
+    print(msg)
 
 
 def warn(msg: str) -> None:

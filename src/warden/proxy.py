@@ -16,6 +16,7 @@ from brig.config import (
     INGRESS_PORT,
     PROXY_EXTERNAL_NETWORK,
     PROXY_NAME,
+    PROXY_PORT,
     VMPaths,
 )
 from brig.ops.logging import debug, info
@@ -27,7 +28,10 @@ from brig.vm.shell import vm_run
 # Until the digest is populated, warden falls back to the bare
 # mitmproxy image — no OTel exports, but proxy still works.
 WARDEN_IMAGE_TAG = "0.4.0-otel-1.27"
-WARDEN_IMAGE_DIGEST = "sha256:d6e66f7c196e7d89a92858da2fc62e4c92fe725d605ef5daa99432d19cf9cb38"
+WARDEN_IMAGE_DIGEST = "sha256:76d1c84842a0cc885d6e8f59e91ca949e05c11f86ffc9c6198b2181f4c1ffd96"
+# Single source of truth for the pinned mitmproxy base. Imported by
+# brig.commands.image_cmd (warmup) and kept in lockstep with the warden image
+# Dockerfile FROM/LABEL by tests/test_warden_base_image_pin.py.
 BASE_IMAGE = "docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268"
 
 
@@ -94,7 +98,7 @@ VM_ADDONS_DIR = VMPaths.ADDONS_DIR
 #     filesystem, no `podman exec` needed (eliminates the auto-sudo
 #     trap where vm_run only sudo's for cmd[0] in a small whitelist —
 #     `sh -c '...podman exec...'` falls through and silently runs
-#     unprivileged, which aitelier hit hard on fresh installs)
+#     unprivileged)
 VM_WARDEN_STATE_DIR = Path("/var/lib/warden/mitmproxy-state")
 # Path inside the VM to warden's CA cert. brig.cell.ca_bundle reads from
 # here directly via `cat` (no `podman exec`) — see VM_WARDEN_STATE_DIR
@@ -109,11 +113,12 @@ VM_WARDEN_CA_FILE = VM_WARDEN_STATE_DIR / "mitmproxy-ca-cert.pem"
 WARDEN_RUNTIME_FILE = HostPaths.SYSTEM_DIR / "warden-runtime.json"
 
 # Ports we won't bind as TCP host_services listeners — they collide with
-# warden's own HTTP forward proxy or ingress reverse proxy, or with
-# privileged-only ranges that the mitmproxy user can't bind. Cells that
-# declare these for a TCP host_service get a clear validation error in
-# the schema, and warden also refuses to bind here as defense in depth.
-WARDEN_RESERVED_PORTS = frozenset({8080, INGRESS_PORT})
+# warden's own HTTP forward proxy or ingress reverse proxy. Privileged
+# ports (<1024), which the non-root mitmproxy user can't bind, are rejected
+# separately by the schema (cell.validators._v_host_service_entry). Cells
+# that declare a reserved port for a TCP host_service get a clear validation
+# error, and warden also refuses to bind here as defense in depth.
+WARDEN_RESERVED_PORTS = frozenset({PROXY_PORT, INGRESS_PORT})
 
 # TCP host_service listeners forward through `host.lima.internal`, which
 # every Lima-provisioned VM resolves to the macOS host. mitmproxy
@@ -162,13 +167,18 @@ def container_exists() -> bool:
 def stop(timeout: int = 10) -> bool:
     """Stop the proxy container gracefully. Idempotent."""
     vm_run(["podman", "stop", "-t", str(timeout), PROXY_NAME])
-    # Clean up stopped container regardless.
-    vm_run(
-        ["podman", "rm", PROXY_NAME],
-    )
-    # Lifecycle event — pairs with the warden_start event so operators
-    # can grep `brig events` for the exact window when live TCP
-    # connections would have been dropped.
+    vm_run(["podman", "rm", PROXY_NAME])
+    # Drop the runtime fingerprint so get_bound_tcp_ports() doesn't
+    # report stale listener state to the next `brig run` (the lifecycle
+    # code uses bound_tcp_ports to decide whether warden needs to
+    # restart for a new host_service port).
+    try:
+        WARDEN_RUNTIME_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    # Lifecycle event — pairs with warden_start so operators can grep
+    # `brig cell events` for the exact window when live TCP connections
+    # would have been dropped.
     try:
         from brig.ops.history import log_lifecycle
         log_lifecycle("warden_stop", PROXY_NAME)
@@ -212,7 +222,7 @@ def start() -> bool:
 
     if not HostPaths.NETWORK_POLICY.exists():
         debug(f"Policy file missing: {HostPaths.NETWORK_POLICY}")
-        info("Run: brig init")
+        info("Run: brig system init")
         return False
 
     try:
@@ -318,7 +328,7 @@ def start() -> bool:
         # ingress.py MUST load before enforce.py so it can authenticate
         # and tag requests before enforce.py checks the ingress flag.
         cmd.extend([
-            "--mode", "regular@8080",
+            "--mode", f"regular@{PROXY_PORT}",
             "--mode", f"regular@{INGRESS_PORT}",
             *tcp_mode_args,
             "--set", "block_global=false",
@@ -329,7 +339,7 @@ def start() -> bool:
     else:
         cmd.extend([
             "--listen-host", "0.0.0.0",
-            "--listen-port", "8080",
+            "--listen-port", str(PROXY_PORT),
             *tcp_mode_args,
             "--set", "block_global=false",
             "-s", "/addons/enforce.py",
@@ -353,6 +363,11 @@ def start() -> bool:
         time.sleep(0.5)
     else:
         debug("Proxy did not become healthy in 5 seconds")
+        # Don't leave a half-up container behind: a later `brig system up`
+        # only auto-removes a *stopped* container, so a container that came
+        # up just after this window would otherwise linger while we report
+        # failure. stop() is idempotent (podman stop + rm).
+        stop()
         return False
 
     # Eager CA generation. mitmproxy creates its CA on first traffic, not
@@ -365,15 +380,17 @@ def start() -> bool:
     # persisted state dir), this is a no-op fast-path.
     if not _ensure_warden_ca_exists():
         debug("Warden CA generation failed — cells will not trust warden")
+        # Tear down the running-but-unusable container so the next start is
+        # a clean create, not a confusing "already running but no CA" state.
+        stop()
         return False
 
     # Reconnect to existing cell networks.
     _reconnect_cell_networks()
     # Lifecycle event so operators can correlate cell-side TCP/HTTP
-    # connection failures with warden restarts. Aitelier-driven —
-    # any restart drops every live TCP host_service connection (cells
-    # need reconnect logic), and `brig events` is where they'd look
-    # to confirm "yeah, warden was restarted at T".
+    # connection failures with warden restarts: any restart drops every
+    # live TCP host_service connection (cells need reconnect logic), and
+    # `brig cell events` is where they'd look to confirm warden restarted at T.
     try:
         from brig.ops.history import log_lifecycle
         log_lifecycle("warden_start", PROXY_NAME)
@@ -443,7 +460,11 @@ def _collect_tcp_host_service_ports() -> list[int]:
             if entry.get("protocol") != "tcp":
                 continue
             port = entry.get("port")
-            if isinstance(port, int) and 1 <= port <= 65535 \
+            # Mirror the parse-time validator: privileged ports (<1024) can't
+            # be bound by the non-root mitmproxy user under --cap-drop ALL and
+            # would crash mitmdump for ALL cells. Drop them here too, since
+            # this reads untrusted on-disk policy (invariant 4).
+            if isinstance(port, int) and 1024 <= port <= 65535 \
                     and port not in WARDEN_RESERVED_PORTS:
                 ports.add(port)
     return sorted(ports)

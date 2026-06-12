@@ -8,11 +8,12 @@ import json
 import time
 from brig.vm.shell import vm_run
 from pathlib import Path
-from typing import Any
+import argparse
 
 from brig.config import BRIG_HOME, CONTAINER_PREFIX, STATE_DIR, container_name
 from brig.errors import BrigError
 from brig.ops.atomic import atomic_write_json
+from brig.ops.locking import locked_file
 from brig.ops.logging import debug, output
 from brig.security.verify import verify_all
 
@@ -26,58 +27,67 @@ _DEFAULT_POLICY = {
 }
 
 
-def cmd_init(args: Any) -> int:
-    """Handle `brig init`."""
+def cmd_init(args: argparse.Namespace) -> int:
+    """Handle `brig system init`.
+
+    Serialized under fcntl on $BRIG_HOME/.init.lock so two concurrent
+    invocations can't race on the lima.yaml template copy (one would
+    win and overwrite a locally-edited file).
+    """
     import shutil
 
-    dirs = [
-        BRIG_HOME / "cells" / "addons",
-        BRIG_HOME / "secrets",
-        BRIG_HOME / "state" / "system",
-        BRIG_HOME / "state" / "system" / "policies",
-        BRIG_HOME / "profiles",
-    ]
-    for d in dirs:
-        d.mkdir(parents=True, exist_ok=True)
+    BRIG_HOME.mkdir(parents=True, exist_ok=True)
+    with locked_file(BRIG_HOME / ".init.lock"):
+        dirs = [
+            BRIG_HOME / "cells" / "addons",
+            BRIG_HOME / "secrets",
+            BRIG_HOME / "state" / "system",
+            BRIG_HOME / "state" / "system" / "policies",
+            BRIG_HOME / "profiles",
+        ]
+        for d in dirs:
+            d.mkdir(parents=True, exist_ok=True)
 
-    # Sensitive dirs must not be readable/writable by other users on the host.
-    # secrets: holds API keys, tokens.
-    # cells/addons: an attacker who can write here can replace enforce.py.
-    # state/system: holds subnet allocator state and operation history.
-    for sensitive in (BRIG_HOME / "secrets",
-                      BRIG_HOME / "cells" / "addons",
-                      BRIG_HOME / "state" / "system"):
-        sensitive.chmod(0o700)
+        # secrets: API keys / tokens. addons: an attacker who writes
+        # here replaces enforce.py. state/system: allocator + audit.
+        for sensitive in (BRIG_HOME / "secrets",
+                          BRIG_HOME / "cells" / "addons",
+                          BRIG_HOME / "state" / "system"):
+            sensitive.chmod(0o700)
 
-    # Default network policy.
-    policy_file = BRIG_HOME / "cells" / "network-policy.json"
-    if not policy_file.exists():
-        atomic_write_json(policy_file, _DEFAULT_POLICY)
-        output(f"  Created default policy: {policy_file}")
+        policy_file = BRIG_HOME / "cells" / "network-policy.json"
+        if not policy_file.exists():
+            atomic_write_json(policy_file, _DEFAULT_POLICY)
+            output(f"  Created default policy: {policy_file}")
 
-    # Lima VM template.
-    lima_yaml = BRIG_HOME / "lima.yaml"
-    if not lima_yaml.exists():
-        template = Path(__file__).parent.parent / "vm" / "lima.yaml.template"
-        if not template.exists():
-            raise BrigError(
-                f"Lima VM template missing at {template}. "
-                f"This is a packaging bug — the wheel should ship "
-                f"src/brig/vm/lima.yaml.template; the editable install "
-                f"should expose the source tree directly."
-            )
-        shutil.copy2(template, lima_yaml)
-        output(f"  Created VM config: {lima_yaml}")
+        lima_yaml = BRIG_HOME / "lima.yaml"
+        if not lima_yaml.exists():
+            template = Path(__file__).parent.parent / "vm" / "lima.yaml.template"
+            if not template.exists():
+                raise BrigError(
+                    f"Lima VM template missing at {template}. "
+                    f"This is a packaging bug — the wheel should ship "
+                    f"src/brig/vm/lima.yaml.template; the editable install "
+                    f"should expose the source tree directly."
+                )
+            shutil.copy2(template, lima_yaml)
+            output(f"  Created VM config: {lima_yaml}")
 
-    output(f"Initialized brig at {BRIG_HOME}")
-    output("")
-    output("Next steps:")
-    output("  brig up                 # create VM, start VM, start warden")
-    output("  brig run alpine echo hi # run your first cell")
+        # Apply any configured mount_roots into the VM config's managed
+        # block (no-op when unset). Picked up on VM create.
+        from brig.vm.lima_mounts import sync_lima_mount_roots
+        if sync_lima_mount_roots(lima_yaml):
+            output("  Applied mount_roots to VM config")
+
+        output(f"Initialized brig at {BRIG_HOME}")
+        output("")
+        output("Next steps:")
+        output("  brig system up                 # create VM, start VM, start warden")
+        output("  brig run alpine echo hi # run your first cell")
     return 0
 
 
-def cmd_verify(args: Any) -> int:
+def cmd_verify(args: argparse.Namespace) -> int:
     """Handle `brig verify`."""
     output("Verifying security invariants...")
     output("=" * 50)
@@ -102,15 +112,15 @@ def cmd_verify(args: Any) -> int:
         return 0
 
 
-def cmd_doctor(args: Any) -> int:
-    """Handle `brig doctor` — deep environment + system check.
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Handle `brig system doctor` — deep environment + system check.
 
-    Goes beyond `brig health`: verifies tooling on PATH, Lima version, gVisor
-    presence inside the VM, addons installed, port collisions, and disk
-    space. Prints a checklist with actionable suggestions on each failure.
+    Verifies tooling on PATH, Lima version, gVisor presence inside the VM,
+    addons installed, port collisions, and disk space. Prints a checklist
+    with actionable suggestions on each failure.
 
-    --quick: only the two essentials (proxy + VM). Equivalent to the
-    deprecated `brig health` and meant for scripting / readiness probes.
+    --quick: only the two essentials (proxy + VM) — a fast readiness probe
+    for scripting.
     """
     if getattr(args, "quick", False):
         return _cmd_doctor_quick()
@@ -119,7 +129,7 @@ def cmd_doctor(args: Any) -> int:
     from brig.network.proxy import proxy_running
 
     failures = []
-    output("Running brig doctor...")
+    output("Running brig system doctor...")
     output("=" * 50)
 
     def _check(label: str, ok: bool, detail: str = "", suggestion: str = ""):
@@ -173,7 +183,7 @@ def cmd_doctor(args: Any) -> int:
                    detail=f"mode: {oct(actual_mode)}",
                    suggestion=f"chmod 0700 {dir_path}")
         else:
-            _check(f"{dir_path} exists", False, suggestion="brig init")
+            _check(f"{dir_path} exists", False, suggestion="brig system init")
 
     # 4. Required addons present.
     for addon in ["enforce.py", "logger.py", "_common.py"]:
@@ -190,13 +200,19 @@ def cmd_doctor(args: Any) -> int:
         except json.JSONDecodeError as e:
             _check(f"policy: {policy_path.name}", False,
                    detail=str(e),
-                   suggestion=f"Fix {policy_path} or re-seed: brig init")
+                   suggestion=f"Fix {policy_path} or re-seed: brig system init")
     else:
-        _check(f"policy: {policy_path.name}", False, suggestion="brig init")
+        _check(f"policy: {policy_path.name}", False, suggestion="brig system init")
 
     # 6. Warden running.
     _check("warden proxy running", proxy_running(),
-           suggestion="brig up")
+           suggestion="brig system up")
+
+    # 6b. OTel collector running — `brig system stats` and
+    # `brig cell network --otel` read from it; warden always emits to it.
+    from brig.observability import collector
+    _check("otel collector running", collector.is_running(),
+           suggestion="brig system down && brig system up")
 
     # 7. host_socket bridges — if any plists exist under LaunchAgents,
     # the corresponding bridge sockets must be present. Missing bridge
@@ -204,7 +220,7 @@ def cmd_doctor(args: Any) -> int:
     # also checked since the bridges require it.
     _check_host_socket_bridges(_check)
 
-    # 8. Warden CA staleness — aitelier hit a silent-TLS-hang foot-gun:
+    # 8. Warden CA staleness — a silent-TLS-hang foot-gun:
     # a cell entrypoint that ALSO sets SSL_CERT_FILE clobbers brig's
     # auto-mounted bundle. On the next warden restart, mitmproxy
     # regenerates its CA, brig re-stages bundles, but the cell's
@@ -242,7 +258,10 @@ def _check_warden_ca_consistency(check) -> None:
     from brig.config import HostPaths
 
     ca_path = "/var/lib/warden/mitmproxy-state/mitmproxy-ca-cert.pem"
-    result = vm_run(["sudo", "cat", ca_path], timeout=5)
+    # Bind-mounted dir is uid-1000 owned (matches the lima user); no sudo
+    # needed. vm_run's auto-sudo whitelist intentionally doesn't cover
+    # `cat`, and a literal `sudo cat` here would diverge from that pattern.
+    result = vm_run(["cat", ca_path], timeout=5)
     if result.returncode != 0:
         # Warden hasn't run yet, or CA missing — separate check (#6
         # "warden proxy running") handles that case loudly.
@@ -276,7 +295,7 @@ def _check_warden_ca_consistency(check) -> None:
             suggestion=f"brig cell restart {entry.name}",
         )
 
-        # Foot-gun catch (aitelier-flagged): a cell's image may set
+        # Foot-gun catch: a cell's image may set
         # SSL_CERT_FILE in its Config.Env, pointing at a path that
         # ISN'T brig's auto-mounted bundle. The TLS handshake against
         # warden's MITM cert then succeeds on the client side (whatever
@@ -288,9 +307,8 @@ def _check_warden_ca_consistency(check) -> None:
 
 def _check_entrypoint_ssl_cert_override(check, cell_name: str) -> None:
     """Warn if a cell's effective env sets SSL_CERT_FILE differently
-    from brig's auto-mount target. Foot-gun aitelier diagnosed —
-    silent TLS hangs result when warden's CA rotates and the cell
-    trusts whatever the entrypoint pointed at.
+    from brig's auto-mount target. Silent TLS hangs result when warden's
+    CA rotates and the cell trusts whatever the entrypoint pointed at.
 
     Inspects the live container's env via `podman inspect`. No-op if
     the cell isn't running (the bundle mtime check above already
@@ -377,9 +395,8 @@ def _check_host_socket_bridges(check) -> None:
         )
 
 
-def _cmd_doctor_quick(fmt: str = "table") -> int:
-    """The "quick" two-essentials check, shared by `brig doctor --quick`
-    and the deprecated `brig health`."""
+def _cmd_doctor_quick() -> int:
+    """The "quick" two-essentials check behind `brig system doctor --quick`."""
     from brig.network.proxy import proxy_running
 
     checks = [("Proxy running", proxy_running())]
@@ -392,10 +409,6 @@ def _cmd_doctor_quick(fmt: str = "table") -> int:
     )
     checks.append(("VM reachable", vm_result.returncode == 0))
 
-    if fmt == "json":
-        output(json.dumps([{"check": n, "passed": p} for n, p in checks], indent=2))
-        return 0 if all(p for _, p in checks) else 1
-
     all_ok = True
     for name, passed in checks:
         status = "[OK]" if passed else "[FAIL]"
@@ -407,7 +420,7 @@ def _cmd_doctor_quick(fmt: str = "table") -> int:
 
 
 
-def cmd_diagnose(args: Any) -> int:
+def cmd_diagnose(args: argparse.Namespace) -> int:
     """Handle `brig diagnose` — run diagnostic checks for a cell."""
     cn = container_name(args.name)
 
@@ -423,7 +436,10 @@ def cmd_diagnose(args: Any) -> int:
         if isinstance(data, list):
             data = data[0]
     except json.JSONDecodeError:
-        raise BrigError("Could not parse container info")
+        raise BrigError(
+            "Could not parse container info",
+            suggestion="Check podman / VM health: brig system doctor",
+        )
 
     state = data.get("State", {})
     output(f"Cell: {args.name}")
@@ -438,7 +454,7 @@ def cmd_diagnose(args: Any) -> int:
     return 0
 
 
-def cmd_preflight(args: Any) -> int:
+def cmd_preflight(args: argparse.Namespace) -> int:
     """Handle `brig preflight` — run pre-start checks."""
     from warden.reconcile import reconcile_subnet_state
 
@@ -454,7 +470,7 @@ def cmd_preflight(args: Any) -> int:
     return 0
 
 
-def cmd_metrics(args: Any) -> int:
+def cmd_metrics(args: argparse.Namespace) -> int:
     """Handle `brig metrics` — output Prometheus-style metrics."""
     from brig.network.subnet import list_all
 
@@ -475,7 +491,7 @@ def cmd_metrics(args: Any) -> int:
     return 0
 
 
-def cmd_prune(args: Any) -> int:
+def cmd_prune(args: argparse.Namespace) -> int:
     """Handle `brig prune` — clean up stopped cells, old logs, orphan subnets.
 
     With --dry-run, prints what would be removed without taking action.
@@ -498,8 +514,8 @@ def cmd_prune(args: Any) -> int:
     freed_subnets = 0
 
     # 1. Stopped cells AND orphan workspace dirs (state dirs with no
-    # container, left by `brig rm` versions before the workspace
-    # cleanup landed, or by externally-killed containers).
+    # container, left behind by externally-killed containers or an
+    # interrupted cell rm).
     if do_cells:
         from brig.cell.lifecycle import list_cell_containers
         live_cells: set[str] = set()
@@ -566,6 +582,17 @@ def cmd_prune(args: Any) -> int:
                         pass
                 freed_subnets += 1
 
+        # Drop ingress routes for cells whose subnet allocation is gone, so a
+        # reused /24 index can't inherit a stale route (old cell_ip + auth
+        # token). Keyed by the cells that still hold an allocation.
+        if not dry_run:
+            from brig.network.ingress import sweep_orphan_routes
+            swept = sweep_orphan_routes(
+                live_cells={info.cell_name for info in list_all()}
+            )
+            if swept:
+                output(f"  swept {swept} orphan ingress route(s)")
+
     output("")
     output(f"Pruned: {removed_cells} cells, {removed_logs} log files, {freed_subnets} subnets")
     if dry_run:
@@ -573,7 +600,7 @@ def cmd_prune(args: Any) -> int:
     return 0
 
 
-def cmd_history(args: Any) -> int:
+def cmd_history(args: argparse.Namespace) -> int:
     """Handle `brig history` — show operation history."""
     history_file = STATE_DIR / "system" / "operations.jsonl"
     if not history_file.exists():

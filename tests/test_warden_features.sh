@@ -14,7 +14,7 @@
 #
 # Prerequisites:
 #   - Lima VM running: limactl start cell
-#   - Addons installed: ./src/install-addons.sh
+#   - Addons deployed: make _copy-addons (or `brig system up`, which syncs them)
 #   - Warden running: warden start
 #
 # Exit codes:
@@ -97,76 +97,6 @@ if ! run_in_vm test -f /usr/local/bin/warden; then
 fi
 echo "Warden installed"
 echo
-
-# ============================================
-# Policy Validation Tests
-# ============================================
-echo "--- Policy Validation Tests ---"
-
-# Test 1: Valid policy passes validation.
-echo
-echo "Test 1: Valid policy passes validation"
-if run_in_vm sudo warden policy validate /cells/network-policy.json 2>/dev/null; then
-    log_pass "Valid policy validation"
-else
-    log_fail "Valid policy should pass validation"
-fi
-
-# Test 2: Invalid JSON fails validation.
-echo
-echo "Test 2: Invalid JSON fails validation"
-run_in_vm bash -c 'echo "not json" > /tmp/bad-policy.json'
-if run_in_vm sudo warden policy validate /tmp/bad-policy.json 2>/dev/null; then
-    log_fail "Invalid JSON should fail validation"
-else
-    log_pass "Invalid JSON rejected"
-fi
-run_in_vm rm -f /tmp/bad-policy.json
-
-# Test 3: Policy with invalid rule type fails.
-echo
-echo "Test 3: Invalid rule type fails validation"
-run_in_vm bash -c 'echo "{\"allow\": [123]}" > /tmp/bad-policy.json'
-if run_in_vm sudo warden policy validate /tmp/bad-policy.json 2>/dev/null; then
-    log_fail "Invalid rule type should fail"
-else
-    log_pass "Invalid rule type rejected"
-fi
-run_in_vm rm -f /tmp/bad-policy.json
-
-# ============================================
-# Policy Test Command
-# ============================================
-echo
-echo "--- Policy Test Command ---"
-
-# Test 4: Allowlisted domain passes test.
-echo
-echo "Test 4: Allowlisted domain passes test"
-if run_in_vm_capture sudo warden policy test example.com | grep -q "ALLOWED"; then
-    log_pass "Allowlisted domain allowed"
-else
-    log_fail "Allowlisted domain should be allowed"
-fi
-
-# Test 5: Non-allowlisted domain blocked.
-echo
-echo "Test 5: Non-allowlisted domain blocked"
-if run_in_vm_capture sudo warden policy test evil-domain-xyz.com | grep -q "BLOCKED"; then
-    log_pass "Non-allowlisted domain blocked"
-else
-    log_fail "Non-allowlisted domain should be blocked"
-fi
-
-# Test 6: Wildcard matching works.
-echo
-echo "Test 6: Wildcard matching works"
-# Assuming *.example.com is in allowlist.
-if run_in_vm_capture sudo warden policy test sub.example.com | grep -q "ALLOWED"; then
-    log_pass "Wildcard subdomain allowed"
-else
-    log_skip "Wildcard test (depends on policy content)"
-fi
 
 # ============================================
 # Health Check Tests

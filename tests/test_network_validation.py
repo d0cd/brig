@@ -47,3 +47,16 @@ class TestIsSuspiciousDomain(unittest.TestCase):
     def test_bare_tld_wildcard(self):
         """Wildcard on bare TLD like *.xyz (one dot) is suspicious."""
         self.assertTrue(is_suspicious_domain("*.xyz"))
+
+    def test_canonical_ip_literal_rejected(self):
+        """A literal IP is not a domain — egress targets must be names."""
+        for host in ("127.0.0.1", "192.168.0.1", "8.8.8.8", "::1"):
+            self.assertTrue(is_suspicious_domain(host), f"{host} should be flagged")
+
+    def test_alternate_encoded_ip_literal_rejected(self):
+        """Integer/hex/octal/short-dotted IPv4 forms are IP literals in disguise."""
+        for host in ("2130706433", "0x7f000001", "0177.0.0.1", "127.1"):
+            self.assertTrue(is_suspicious_domain(host), f"{host} should be flagged")
+
+    def test_real_domain_not_flagged_as_ip(self):
+        self.assertEqual(is_suspicious_domain("api.github.com"), "")

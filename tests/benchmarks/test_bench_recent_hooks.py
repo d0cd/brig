@@ -22,17 +22,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# Mock mitmproxy globally so addons import cleanly inside the bench
-# subprocess.
-for _mod in (
-    "mitmproxy", "mitmproxy.http", "mitmproxy.ctx", "mitmproxy.connection",
-):
-    sys.modules.setdefault(_mod, MagicMock())
+# Real mitmproxy is imported by the benchmarks conftest (importorskip), so the
+# addons import cleanly against it. We deliberately do NOT install a module-level
+# mitmproxy mock here — that previously leaked a non-package mock into the shared
+# session. MagicMock below is only used to build fake per-flow objects.
 
 
 @pytest.fixture(scope="module")
 def ingress_router():
-    sys.path.insert(0, "src/addons")
+    sys.path.insert(0, "src/brig/warden_addons")
     try:
         from ingress import IngressRouter
     finally:
@@ -42,7 +40,7 @@ def ingress_router():
 
 @pytest.fixture(scope="module")
 def policy_enforcer():
-    sys.path.insert(0, "src/addons")
+    sys.path.insert(0, "src/brig/warden_addons")
     try:
         from enforce import PolicyEnforcer
         from _policy import Policy
@@ -157,7 +155,7 @@ def test_bench_tcp_start_deny(benchmark, policy_enforcer):
 def test_bench_policy_is_passthrough_match(benchmark):
     """Invariant 11 defense-in-depth check. Runs at every
     tls_clienthello and gates the passthrough flip — must be µs."""
-    sys.path.insert(0, "src/addons")
+    sys.path.insert(0, "src/brig/warden_addons")
     try:
         from _policy import Policy
     finally:
@@ -174,7 +172,7 @@ def test_bench_policy_is_passthrough_match(benchmark):
 def test_bench_policy_is_passthrough_no_match(benchmark):
     """Negative path — host not in passthrough list. Hot for every
     TLS connection that ISN'T passthrough (the majority)."""
-    sys.path.insert(0, "src/addons")
+    sys.path.insert(0, "src/brig/warden_addons")
     try:
         from _policy import Policy
     finally:

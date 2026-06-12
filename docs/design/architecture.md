@@ -1,5 +1,10 @@
 # Brig Architecture
 
+Component-level breakdown for contributors: how the pieces wire
+together, network topology, deployment shape. For a user-facing
+explanation of *why* each layer exists and what it protects you
+from, see [`learning/concepts.md`](../learning/concepts.md).
+
 ## Overview
 
 **Brig** is a secure, observable harness for running untrusted code on macOS. It provides VM-isolated containers (hardware boundary at the Lima VM) with controlled network egress and full observability.
@@ -156,7 +161,7 @@ If you need true air-gap isolation, disable all network egress or use a dedicate
 
 **Key points:**
 - Each cell gets its own `--internal` network (created by `brig run`)
-- Proxy joins each cell's network (so DNS name `proxy` resolves)
+- Proxy joins each cell's network; `brig run` injects the proxy's per-cell IP into the cell's `HTTP(S)_PROXY` environment
 - No shared network = no east-west traffic by topology
 - No iptables rules needed = no chain ordering bugs
 - IPv6 disabled = simpler security model
@@ -268,7 +273,7 @@ Runs inside Lima. Routes and logs all cell traffic.
 Cell containers are attached only to a per-cell **internal** Podman network (created with `--internal`). These networks have **no route/NAT to the VM's egress interface**.
 
 The only component with internet access is the **proxy**, which is the **only** container attached to:
-- each `cell-*` internal network (to accept proxied requests), and
+- each `brig-<cell>` internal network (to accept proxied requests), and
 - the `proxy-external` network (for outbound access).
 
 Additionally, the Lima VM applies a **fail-closed** firewall on traffic forwarded from the `proxy-external` CIDR to the VM egress interface.
@@ -278,5 +283,5 @@ Additionally, the Lima VM applies a **fail-closed** firewall on traffic forwarde
 ## DNS Model
 
 - Cells do not perform external DNS lookups directly. External name resolution happens inside the proxy as part of egress.
-- Cells only need internal DNS to resolve the proxy hostname (`proxy`) on their private network. Podman's internal DNS handles this automatically.
+- Cells reach the proxy via the per-cell IP injected into `HTTP(S)_PROXY` at run time (the proxy container is named `warden`); no internal DNS name for the proxy is created or required.
 - **DNS over HTTPS (DoH):** If a cell attempts DoH to an allowed domain (e.g., `cloudflare-dns.com`), the request will succeed but is **visible in proxy logs** as HTTPS traffic to that domain.

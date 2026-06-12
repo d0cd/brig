@@ -1,7 +1,7 @@
 # Warden image — mitmproxy + OpenTelemetry SDK.
 # Built inside the brig VM (`./scripts/build-warden-image.sh`) so
 # Python wheels match the runtime architecture, then pinned by
-# sha256 in src/warden/proxy.py:IMAGE_DIGEST.
+# sha256 in src/warden/proxy.py:WARDEN_IMAGE_DIGEST.
 
 FROM docker.io/mitmproxy/mitmproxy@sha256:39ef4ec493d10bf07c71189961c7797b24c445e640ee133efba87fea80d19268
 

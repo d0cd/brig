@@ -43,9 +43,17 @@ class TestVerifyProxyRunning(unittest.TestCase):
 class TestVerifyProxyNetwork(unittest.TestCase):
     """Invariant 6: Only infrastructure containers on proxy-external."""
 
+    @staticmethod
+    def _members_json(*names):
+        containers = {f"id{i}": {"name": n} for i, n in enumerate(names)}
+        return json.dumps([{"name": "proxy-external", "containers": containers}])
+
     @patch("brig.security.verify._run")
-    def test_on_proxy_external(self, mock_run):
-        mock_run.return_value = subprocess.CompletedProcess([], 0, "proxy-external brig-cell1 ", "")
+    def test_on_proxy_external_only_infra(self, mock_run):
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 0, "proxy-external brig-cell1 ", ""),
+            subprocess.CompletedProcess([], 0, self._members_json("warden", "brig-otel"), ""),
+        ]
         result = verify_proxy_network()
         self.assertTrue(result.passed)
 
@@ -54,6 +62,16 @@ class TestVerifyProxyNetwork(unittest.TestCase):
         mock_run.return_value = subprocess.CompletedProcess([], 0, "brig-cell1 ", "")
         result = verify_proxy_network()
         self.assertFalse(result.passed)
+
+    @patch("brig.security.verify._run")
+    def test_rogue_container_on_proxy_external_fails(self, mock_run):
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 0, "proxy-external ", ""),
+            subprocess.CompletedProcess([], 0, self._members_json("warden", "brig-evil"), ""),
+        ]
+        result = verify_proxy_network()
+        self.assertFalse(result.passed)
+        self.assertIn("brig-evil", " ".join(result.details or []))
 
 
 class TestVerifyGvisorRuntime(unittest.TestCase):
@@ -67,8 +85,12 @@ class TestVerifyGvisorRuntime(unittest.TestCase):
 
     @patch("brig.security.verify._run")
     def test_all_gvisor(self, mock_run):
+        # podman exposes the named runtime in the top-level OCIRuntime field;
+        # HostConfig.Runtime is the category ("oci") and cannot distinguish
+        # runsc from a crun downgrade.
         containers = [{"Names": ["brig-cell1"]}]
-        inspect = [{"Name": "brig-cell1", "HostConfig": {"Runtime": "runsc"}}]
+        inspect = [{"Name": "brig-cell1", "OCIRuntime": "runsc",
+                    "HostConfig": {"Runtime": "oci"}}]
         mock_run.side_effect = [
             subprocess.CompletedProcess([], 0, json.dumps(containers), ""),
             subprocess.CompletedProcess([], 0, json.dumps(inspect), ""),
@@ -79,7 +101,8 @@ class TestVerifyGvisorRuntime(unittest.TestCase):
     @patch("brig.security.verify._run")
     def test_runtime_downgrade(self, mock_run):
         containers = [{"Names": ["brig-cell1"]}]
-        inspect = [{"Name": "brig-cell1", "HostConfig": {"Runtime": "crun"}}]
+        inspect = [{"Name": "brig-cell1", "OCIRuntime": "crun",
+                    "HostConfig": {"Runtime": "oci"}}]
         mock_run.side_effect = [
             subprocess.CompletedProcess([], 0, json.dumps(containers), ""),
             subprocess.CompletedProcess([], 0, json.dumps(inspect), ""),
@@ -87,6 +110,37 @@ class TestVerifyGvisorRuntime(unittest.TestCase):
         result = verify_gvisor_runtime()
         self.assertFalse(result.passed)
         self.assertTrue(any("crun" in d for d in result.details))
+
+    @patch("brig.security.verify._run")
+    def test_empty_runtime_is_violation(self, mock_run):
+        """An empty/absent runtime field must not pass — that would let a
+        silent gVisor downgrade report as compliant (invariant 5)."""
+        containers = [{"Names": ["brig-cell1"]}]
+        inspect = [{"Name": "brig-cell1", "OCIRuntime": ""}]
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 0, json.dumps(containers), ""),
+            subprocess.CompletedProcess([], 0, json.dumps(inspect), ""),
+        ]
+        result = verify_gvisor_runtime()
+        self.assertFalse(result.passed)
+
+    def test_real_podman_inspect_shape(self):
+        """Drive the check with a real `podman inspect` fixture so the field
+        name can't silently regress: real podman reports OCIRuntime, not
+        HostConfig.Runtime (which is always 'oci')."""
+        import pathlib
+        fixture = json.loads(
+            (pathlib.Path(__file__).parent
+             / "fixtures/podman/4.9/inspect_warden.json").read_text()
+        )
+        info = fixture[0] if isinstance(fixture, list) else fixture
+        self.assertEqual(info.get("HostConfig", {}).get("Runtime"), "oci")
+        # This fixture ran under crun — reading the real field must flag it.
+        crun_info = dict(info, Name="brig-cell1")
+        self.assertFalse(verify_gvisor_runtime([crun_info]).passed)
+        # Same shape under runsc must pass.
+        runsc_info = dict(info, Name="brig-cell1", OCIRuntime="runsc")
+        self.assertTrue(verify_gvisor_runtime([runsc_info]).passed)
 
 
 class TestVerifyNetworkIsolation(unittest.TestCase):
@@ -144,6 +198,19 @@ class TestVerifySingleHomed(unittest.TestCase):
         result = verify_single_homed()
         self.assertFalse(result.passed)
 
+    @patch("brig.security.verify._run")
+    def test_airgapped_zero_networks_compliant(self, mock_run):
+        # --network none cells have 0 networks and are strictly more isolated
+        # than single-homed; they must not be flagged as a violation.
+        containers = [{"Names": ["brig-air"]}]
+        inspect = [{"Name": "brig-air", "NetworkSettings": {"Networks": {}}}]
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 0, json.dumps(containers), ""),
+            subprocess.CompletedProcess([], 0, json.dumps(inspect), ""),
+        ]
+        result = verify_single_homed()
+        self.assertTrue(result.passed)
+
 
 class TestVerifyCellNetworkMembers(unittest.TestCase):
     """Invariant 7: No privileged services on cell networks."""
@@ -187,3 +254,43 @@ class TestVerifyCellNetworkMembers(unittest.TestCase):
         mock_run.return_value = subprocess.CompletedProcess([], 0, "podman\nproxy-external\n", "")
         result = verify_cell_network_members()
         self.assertTrue(result.passed)
+
+    @patch("brig.security.verify._run")
+    def test_nameless_member_flagged(self, mock_run):
+        # A member dict with no name still occupies the cell network and must
+        # be flagged (fail closed) rather than dropped from the enumeration.
+        networks = [{
+            "name": "brig-cell1",
+            "containers": {
+                "abc": {"name": "warden"},
+                "def": {"name": "brig-cell1"},
+                "ghi": {},
+            },
+        }]
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 0, "brig-cell1\n", ""),
+            subprocess.CompletedProcess([], 0, json.dumps(networks), ""),
+        ]
+        result = verify_cell_network_members()
+        self.assertFalse(result.passed)
+        self.assertTrue(any("ghi" in d for d in result.details))
+
+
+class TestVerifyProxyNetworkNameless(unittest.TestCase):
+    """Invariant 6: a nameless member on proxy-external must not slip past."""
+
+    @patch("brig.security.verify._run")
+    def test_nameless_member_on_proxy_external_flagged(self, mock_run):
+        members = json.dumps([{
+            "name": "proxy-external",
+            "containers": {
+                "id0": {"name": "warden"},
+                "id1": {},
+            },
+        }])
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 0, "proxy-external ", ""),
+            subprocess.CompletedProcess([], 0, members, ""),
+        ]
+        result = verify_proxy_network()
+        self.assertFalse(result.passed)

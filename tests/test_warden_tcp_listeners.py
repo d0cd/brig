@@ -141,7 +141,7 @@ def _enforcer():
         "mitmproxy.connection",
     ):
         sys.modules.setdefault(_mod, MagicMock())
-    sys.path.insert(0, "src/addons")
+    sys.path.insert(0, "src/brig/warden_addons")
     try:
         from enforce import PolicyEnforcer
         from _policy import Policy
