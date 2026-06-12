@@ -32,7 +32,7 @@ dependencies = ["pyyaml>=6.0.3"]
 dev = [
     "pytest>=9.0.3",
     "pytest-benchmark>=5.2.3",
-    "pytest-cov>=4.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.15.17",
     "mypy>=2.1.0",
     # types-PyYAML so `mypy src/brig/` is clean locally without CI
