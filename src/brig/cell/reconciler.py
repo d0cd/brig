@@ -262,20 +262,30 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.is_airgapped:
         cmd.extend(["--network", "none"])
     else:
+        # `proxy_ip` (warden's IP on this cell's network) is required not to bake
+        # into the env — we point the cell at warden by NAME below — but as proof
+        # that warden is actually connected to this network. A cell with no warden
+        # on its net can't egress regardless, so refuse to start it (fail closed).
         if not proxy_ip:
             raise BrigError(
-                "proxy_ip is required for non-airgapped cells",
-                suggestion=(
-                    "Warden's per-cell IP could not be determined. "
-                    "Try: brig system doctor"
-                ),
+                "Warden is not connected to this cell's network",
+                suggestion="Try: brig system up (ensures warden is running and connected)",
             )
         cmd.extend([
             "--network", name,
-            "-e", f"http_proxy=http://{proxy_ip}:{PROXY_PORT}",
-            "-e", f"https_proxy=http://{proxy_ip}:{PROXY_PORT}",
-            "-e", f"HTTP_PROXY=http://{proxy_ip}:{PROXY_PORT}",
-            "-e", f"HTTPS_PROXY=http://{proxy_ip}:{PROXY_PORT}",
+            # Point the cell at warden by its DNS NAME, not its literal IP. Warden's
+            # per-cell-network IP is NOT stable across warden restarts (VM reboot,
+            # resume-from-sleep, addon reload, `system down/up`); a baked IP goes
+            # stale and the cell silently loses all egress (HTTP 000, no error). The
+            # name re-resolves warden's current IP on every connection via the cell
+            # network's DNS (aardvark — enabled by default; CREATE_NETWORK does not
+            # pass --disable-dns), so egress survives every warden restart with no
+            # cell recreate. PROXY_NAME is the same constant the warden container is
+            # named with, so the name and the resolver target can't drift.
+            "-e", f"http_proxy=http://{PROXY_NAME}:{PROXY_PORT}",
+            "-e", f"https_proxy=http://{PROXY_NAME}:{PROXY_PORT}",
+            "-e", f"HTTP_PROXY=http://{PROXY_NAME}:{PROXY_PORT}",
+            "-e", f"HTTPS_PROXY=http://{PROXY_NAME}:{PROXY_PORT}",
             "-e", "no_proxy=localhost,127.0.0.1",
         ])
 

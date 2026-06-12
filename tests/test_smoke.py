@@ -66,10 +66,10 @@ class TestFullRunCommandChain(unittest.TestCase):
 
         # Proxy env vars.
         cmd_str = " ".join(cmd)
-        self.assertIn("http_proxy=http://10.60.42.1:8080", cmd_str)
-        self.assertIn("https_proxy=http://10.60.42.1:8080", cmd_str)
-        self.assertIn("HTTP_PROXY=http://10.60.42.1:8080", cmd_str)
-        self.assertIn("HTTPS_PROXY=http://10.60.42.1:8080", cmd_str)
+        self.assertIn("http_proxy=http://warden:8080", cmd_str)
+        self.assertIn("https_proxy=http://warden:8080", cmd_str)
+        self.assertIn("HTTP_PROXY=http://warden:8080", cmd_str)
+        self.assertIn("HTTPS_PROXY=http://warden:8080", cmd_str)
         self.assertIn("no_proxy=localhost,127.0.0.1", cmd_str)
 
         # User env var passed through.

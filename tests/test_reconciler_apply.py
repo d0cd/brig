@@ -83,7 +83,7 @@ class TestApplyFiresCorrectCommands(unittest.TestCase):
         self.assertIn("--runtime runsc", run_cmd)
         self.assertIn("--cap-drop ALL", run_cmd)
         self.assertIn("no-new-privileges", run_cmd)
-        self.assertIn("http_proxy=http://10.60.42.1:8080", run_cmd)
+        self.assertIn("http_proxy=http://warden:8080", run_cmd)
 
 
 class TestApplyRollbackOnFailure(unittest.TestCase):

@@ -306,16 +306,6 @@ could fail). A brig-provided small per-cell writable HOME tmpfs *outside* `/tmp`
 mount. **Trigger:** a cell's CLI hard-fails on a `/tmp` HOME. **Effort:** Low
 (one more tmpfs mount + a default HOME).
 
-### `brig system doctor`: stale cell `HTTP_PROXY` check (consumer feedback: hermes)
-**Status:** Deferred — edge; the `restart: always` recreate path already avoids it.
-
-A cell's `HTTP_PROXY` is baked at creation to warden's then-current per-cell-net
-IP; if that IP churns (a full `system down/up`), an already-created cell keeps
-the stale address and `brig cell start` reuses it (only `rm --keep-workspace` +
-`run` recovers). Have `doctor` flag "cell HTTP_PROXY ≠ current warden IP" with
-the recreate fix. **Trigger:** warden IP churn strands a started cell.
-**Effort:** Low (one doctor check).
-
 ### Cross-source audit query (consumer feedback: hermes)
 **Status:** Deferred — needs a correlation-id contract.
 

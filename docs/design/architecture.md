@@ -161,7 +161,7 @@ If you need true air-gap isolation, disable all network egress or use a dedicate
 
 **Key points:**
 - Each cell gets its own `--internal` network (created by `brig run`)
-- Proxy joins each cell's network; `brig run` injects the proxy's per-cell IP into the cell's `HTTP(S)_PROXY` environment
+- Proxy joins each cell's network; `brig run` injects the proxy's DNS name (`warden`) into the cell's `HTTP(S)_PROXY` environment (re-resolved per connection, so egress survives warden IP changes)
 - No shared network = no east-west traffic by topology
 - No iptables rules needed = no chain ordering bugs
 - IPv6 disabled = simpler security model
@@ -283,5 +283,5 @@ Additionally, the Lima VM applies a **fail-closed** firewall on traffic forwarde
 ## DNS Model
 
 - Cells do not perform external DNS lookups directly. External name resolution happens inside the proxy as part of egress.
-- Cells reach the proxy via the per-cell IP injected into `HTTP(S)_PROXY` at run time (the proxy container is named `warden`); no internal DNS name for the proxy is created or required.
+- Cells reach the proxy via its DNS name `warden` injected into `HTTP(S)_PROXY` at run time; the cell network's DNS (aardvark) re-resolves warden's current per-cell IP on each connection, so egress survives warden restarts that change that IP. The name is the same `config.PROXY_NAME` constant the warden container is named with, so it can't drift from the resolver target.
 - **DNS over HTTPS (DoH):** If a cell attempts DoH to an allowed domain (e.g., `cloudflare-dns.com`), the request will succeed but is **visible in proxy logs** as HTTPS traffic to that domain.

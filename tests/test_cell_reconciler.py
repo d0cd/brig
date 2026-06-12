@@ -142,13 +142,26 @@ class TestBuildRunCommand(unittest.TestCase):
         idx = cmd.index("--runtime")
         self.assertEqual(cmd[idx + 1], "runsc")
 
-    def test_proxy_env_set(self):
-        """Proxy env vars are injected for non-airgapped cells."""
+    def test_proxy_env_uses_warden_dns_name_not_ip(self):
+        """Proxy env points the cell at warden by DNS NAME (stable across warden
+        restarts), not the literal per-cell IP (which goes stale → silent egress
+        loss). proxy_ip is still passed as proof warden is connected, but must not
+        be baked into the env."""
         spec = CellSpec(name="test", image="alpine")
         cmd = build_run_command(spec, "10.60.1.1")
         cmd_str = " ".join(cmd)
-        self.assertIn("http_proxy=http://10.60.1.1:8080", cmd_str)
-        self.assertIn("https_proxy=http://10.60.1.1:8080", cmd_str)
+        self.assertIn("http_proxy=http://warden:8080", cmd_str)
+        self.assertIn("https_proxy=http://warden:8080", cmd_str)
+        self.assertIn("HTTP_PROXY=http://warden:8080", cmd_str)
+        self.assertNotIn("10.60.1.1", cmd_str)  # the connectivity-proof IP is never baked
+
+    def test_non_airgapped_without_warden_connection_refused(self):
+        """Fail closed: a non-airgapped cell won't start if warden isn't connected
+        to its network (no proxy_ip = no proof of connectivity)."""
+        from brig.errors import BrigError
+        spec = CellSpec(name="test", image="alpine")
+        with self.assertRaises(BrigError):
+            build_run_command(spec, None)
 
     def test_user_emitted_when_set(self):
         spec = CellSpec(name="test", image="alpine", user="0")

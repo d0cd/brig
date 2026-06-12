@@ -60,8 +60,8 @@ class TestRunThroughReconciler(unittest.TestCase):
 
         # Proxy env.
         cmd_str = " ".join(cmd)
-        self.assertIn("http_proxy=http://10.60.1.1:8080", cmd_str)
-        self.assertIn("https_proxy=http://10.60.1.1:8080", cmd_str)
+        self.assertIn("http_proxy=http://warden:8080", cmd_str)
+        self.assertIn("https_proxy=http://warden:8080", cmd_str)
 
         # Resource limits.
         self.assertIn("--memory", cmd)
