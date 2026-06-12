@@ -33,7 +33,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-benchmark>=4.0",
     "pytest-cov>=4.0",
-    "ruff>=0.15.15",
+    "ruff>=0.15.17",
     "mypy>=2.1.0",
     # types-PyYAML so `mypy src/brig/` is clean locally without CI
     # having to install it inline.
