@@ -70,9 +70,9 @@ class TestVerifyAgainstRealPodman(unittest.TestCase):
         template_output = " ".join(networks)
         # Second call enumerates proxy-external members; only warden (infra)
         # is attached in a healthy system.
-        members_output = json.dumps([
-            {"name": "proxy-external", "containers": {"abc": {"name": "warden"}}}
-        ])
+        # Members are enumerated via `podman ps` (newline-separated names),
+        # since the network-inspect container list is unpopulated under netavark.
+        members_output = "warden\n"
         with patch("brig.security.verify.vm_run") as mock_vm:
             mock_vm.side_effect = [
                 _completed(template_output),

@@ -189,8 +189,12 @@ def stop(timeout: int = 10) -> bool:
 
 def reload_policy() -> bool:
     """Reload proxy policy by sending SIGHUP to mitmproxy (PID 1 in container)."""
+    # Signal via `podman kill --signal`, not `exec ... kill`: the mitmproxy
+    # image has no standalone `kill` binary (only the shell builtin), so
+    # `podman exec warden kill -HUP 1` fails with 127. `podman kill` delivers
+    # SIGHUP to PID 1 directly — mitmproxy reloads in place, container stays up.
     result = vm_run(
-        ["podman", "exec", PROXY_NAME, "kill", "-HUP", "1"],
+        ["podman", "kill", "--signal", "HUP", PROXY_NAME],
     )
     return result.returncode == 0
 

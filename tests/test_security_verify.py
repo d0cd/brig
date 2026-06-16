@@ -43,16 +43,14 @@ class TestVerifyProxyRunning(unittest.TestCase):
 class TestVerifyProxyNetwork(unittest.TestCase):
     """Invariant 6: Only infrastructure containers on proxy-external."""
 
-    @staticmethod
-    def _members_json(*names):
-        containers = {f"id{i}": {"name": n} for i, n in enumerate(names)}
-        return json.dumps([{"name": "proxy-external", "containers": containers}])
-
+    # Members are read from `podman ps --filter network` (newline-separated
+    # names), not the network-inspect `.containers` map (unpopulated under
+    # netavark). The second mocked _run is that ps output.
     @patch("brig.security.verify._run")
     def test_on_proxy_external_only_infra(self, mock_run):
         mock_run.side_effect = [
             subprocess.CompletedProcess([], 0, "proxy-external brig-cell1 ", ""),
-            subprocess.CompletedProcess([], 0, self._members_json("warden", "brig-otel"), ""),
+            subprocess.CompletedProcess([], 0, "warden\nbrig-otel\n", ""),
         ]
         result = verify_proxy_network()
         self.assertTrue(result.passed)
@@ -67,11 +65,22 @@ class TestVerifyProxyNetwork(unittest.TestCase):
     def test_rogue_container_on_proxy_external_fails(self, mock_run):
         mock_run.side_effect = [
             subprocess.CompletedProcess([], 0, "proxy-external ", ""),
-            subprocess.CompletedProcess([], 0, self._members_json("warden", "brig-evil"), ""),
+            subprocess.CompletedProcess([], 0, "warden\nbrig-evil\n", ""),
         ]
         result = verify_proxy_network()
         self.assertFalse(result.passed)
         self.assertIn("brig-evil", " ".join(result.details or []))
+
+    @patch("brig.security.verify._run")
+    def test_member_query_failure_fails_closed(self, mock_run):
+        # If `podman ps` can't enumerate members, the check must fail (closed),
+        # never vacuously pass.
+        mock_run.side_effect = [
+            subprocess.CompletedProcess([], 0, "proxy-external ", ""),
+            subprocess.CompletedProcess([], 1, "", "boom"),
+        ]
+        result = verify_proxy_network()
+        self.assertFalse(result.passed)
 
 
 class TestVerifyGvisorRuntime(unittest.TestCase):
@@ -215,35 +224,24 @@ class TestVerifySingleHomed(unittest.TestCase):
 class TestVerifyCellNetworkMembers(unittest.TestCase):
     """Invariant 7: No privileged services on cell networks."""
 
+    # _get_cell_networks runs `network ls` then `network inspect` (for names);
+    # membership then comes from a `podman ps --filter network` call per net.
     @patch("brig.security.verify._run")
     def test_only_warden_and_cell(self, mock_run):
-        networks = [{
-            "name": "brig-cell1",
-            "containers": {
-                "abc": {"name": "warden"},
-                "def": {"name": "brig-cell1"},
-            },
-        }]
         mock_run.side_effect = [
             subprocess.CompletedProcess([], 0, "brig-cell1\n", ""),
-            subprocess.CompletedProcess([], 0, json.dumps(networks), ""),
+            subprocess.CompletedProcess([], 0, json.dumps([{"name": "brig-cell1"}]), ""),
+            subprocess.CompletedProcess([], 0, "warden\nbrig-cell1\n", ""),
         ]
         result = verify_cell_network_members()
         self.assertTrue(result.passed)
 
     @patch("brig.security.verify._run")
     def test_foreign_container(self, mock_run):
-        networks = [{
-            "name": "brig-cell1",
-            "containers": {
-                "abc": {"name": "warden"},
-                "def": {"name": "brig-cell1"},
-                "ghi": {"name": "postgres"},
-            },
-        }]
         mock_run.side_effect = [
             subprocess.CompletedProcess([], 0, "brig-cell1\n", ""),
-            subprocess.CompletedProcess([], 0, json.dumps(networks), ""),
+            subprocess.CompletedProcess([], 0, json.dumps([{"name": "brig-cell1"}]), ""),
+            subprocess.CompletedProcess([], 0, "warden\nbrig-cell1\npostgres\n", ""),
         ]
         result = verify_cell_network_members()
         self.assertFalse(result.passed)
@@ -256,41 +254,14 @@ class TestVerifyCellNetworkMembers(unittest.TestCase):
         self.assertTrue(result.passed)
 
     @patch("brig.security.verify._run")
-    def test_nameless_member_flagged(self, mock_run):
-        # A member dict with no name still occupies the cell network and must
-        # be flagged (fail closed) rather than dropped from the enumeration.
-        networks = [{
-            "name": "brig-cell1",
-            "containers": {
-                "abc": {"name": "warden"},
-                "def": {"name": "brig-cell1"},
-                "ghi": {},
-            },
-        }]
+    def test_member_query_failure_fails_closed(self, mock_run):
+        # If `podman ps` can't enumerate a cell network's members, the check
+        # must fail (closed), not vacuously pass.
         mock_run.side_effect = [
             subprocess.CompletedProcess([], 0, "brig-cell1\n", ""),
-            subprocess.CompletedProcess([], 0, json.dumps(networks), ""),
+            subprocess.CompletedProcess([], 0, json.dumps([{"name": "brig-cell1"}]), ""),
+            subprocess.CompletedProcess([], 1, "", "boom"),
         ]
         result = verify_cell_network_members()
         self.assertFalse(result.passed)
-        self.assertTrue(any("ghi" in d for d in result.details))
-
-
-class TestVerifyProxyNetworkNameless(unittest.TestCase):
-    """Invariant 6: a nameless member on proxy-external must not slip past."""
-
-    @patch("brig.security.verify._run")
-    def test_nameless_member_on_proxy_external_flagged(self, mock_run):
-        members = json.dumps([{
-            "name": "proxy-external",
-            "containers": {
-                "id0": {"name": "warden"},
-                "id1": {},
-            },
-        }])
-        mock_run.side_effect = [
-            subprocess.CompletedProcess([], 0, "proxy-external ", ""),
-            subprocess.CompletedProcess([], 0, members, ""),
-        ]
-        result = verify_proxy_network()
-        self.assertFalse(result.passed)
+        self.assertTrue(any("enumerate" in d for d in result.details))

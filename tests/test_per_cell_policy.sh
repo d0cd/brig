@@ -2,70 +2,27 @@
 # shellcheck disable=SC2034,SC2016,SC2153,SC2329,SC2001
 # test_per_cell_policy.sh - Per-cell network policy tests
 #
-# Verifies per-cell policy enforcement:
-#   - Cells can have individual allowlists
-#   - Per-cell policy overrides global policy
-#   - Policy can be updated at runtime
-#   - Different cells can have different access
+# Cells are default-deny; egress is allowed per cell via --policy-allow (at
+# create) or `brig policy set --allow` (at runtime). Verifies:
+#   - A per-cell allow lets the cell reach that domain
+#   - A domain not in the cell's allowlist is blocked (default-deny)
+#   - deny takes precedence over allow
+#   - policy show reflects the effective allow/deny
+#   - Runtime policy updates take effect
+#   - Wildcards and multiple domains are stored
 #
-# Usage: ./tests/test_per_cell_policy.sh
-#
-# Exit codes:
-#   0 - All tests passed
-#   1 - One or more tests failed
+# Usage: ./tests/test_per_cell_policy.sh   (requires `brig system up` first)
+# Exit: 0 all passed, 1 any failed.
 
-set -euo pipefail
+source "$(dirname "$0")/lib/e2e_common.sh"
 
-VM_NAME="${CELL_VM_NAME:-cell}"
-PASSED=0
-FAILED=0
+POLICIES_DIR="${BRIG_HOME:-$HOME/.brig}/state/system/policies"
 
-# Colors for output.
-if [ -t 1 ]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    YELLOW='\033[0;33m'
-    NC='\033[0m'
-else
-    RED=''
-    GREEN=''
-    YELLOW=''
-    NC=''
-fi
-
-log_pass() {
-    echo -e "${GREEN}PASS${NC}: $1"
-    PASSED=$((PASSED + 1))
-}
-
-log_fail() {
-    echo -e "${RED}FAIL${NC}: $1"
-    FAILED=$((FAILED + 1))
-}
-
-run_in_vm() {
-    limactl shell "$VM_NAME" -- "$@"
-}
-
-# Check VM is running.
-check_vm_running() {
-    local vm_info
-    vm_info=$(limactl list --format json 2>/dev/null || echo "{}")
-    local status
-    status=$(echo "$vm_info" | sed 's/.*"status":"\([^"]*\)".*/\1/')
-    if [ "$status" != "Running" ]; then
-        echo "ERROR: VM '$VM_NAME' is not running"
-        exit 1
-    fi
-    echo "VM '$VM_NAME' is running"
-}
-
-# Clean up test cells.
 cleanup_test_cells() {
     echo "Cleaning up test cells..."
-    run_in_vm sudo /usr/local/bin/brig rm -f --purge policy-cell-1 2>/dev/null || true
-    run_in_vm sudo /usr/local/bin/brig rm -f --purge policy-cell-2 2>/dev/null || true
-    run_in_vm sudo /usr/local/bin/brig rm -f --purge restricted-cell 2>/dev/null || true
+    for c in policy-cell-1 policy-cell-2 restricted-cell wildcard-cell multi-cell; do
+        $BRIG cell rm -f "$c" 2>/dev/null || true
+    done
 }
 
 echo "============================================"
@@ -73,161 +30,119 @@ echo "Per-Cell Network Policy Tests"
 echo "============================================"
 echo
 
-# Pre-flight checks.
 echo "--- Pre-flight checks ---"
-check_vm_running
-
-# Check cell CLI is installed.
-if ! run_in_vm test -f /usr/local/bin/brig; then
-    echo "ERROR: Cell CLI not installed at /usr/local/bin/brig"
-    exit 1
-fi
-echo "Cell CLI installed"
-
-# Check proxy is running.
-if ! run_in_vm sudo podman ps --format '{{.Names}}' 2>/dev/null | grep -q "warden"; then
-    echo "Starting proxy..."
-    run_in_vm sudo /usr/local/bin/brig-proxy start 2>/dev/null || true
-    sleep 3
-fi
-echo "Proxy is running"
+require_brig_up
+echo "VM '$VM_NAME' is running; host brig OK"
 echo
 
-# Clean up before tests.
 cleanup_test_cells
 
-# Test 1: Cell with default policy can reach globally allowed domain.
-echo "--- Test 1: Default policy allows global allowlist ---"
-run_in_vm sudo /usr/local/bin/brig run -d --name policy-cell-1 alpine sleep 600 2>/dev/null || true
+# Test 1: a per-cell allow lets the cell reach that domain.
+echo "--- Test 1: Per-cell allow permits the domain ---"
+$BRIG run -d --name policy-cell-1 --policy-allow example.com alpine sleep 600 >/dev/null 2>&1 || true
 sleep 2
-
-if run_in_vm sudo podman exec brig-policy-cell-1 wget -q -O /dev/null --timeout=10 http://example.com 2>/dev/null; then
-    log_pass "Cell with default policy can reach example.com"
+if in_cell policy-cell-1 wget -q -O /dev/null --timeout=10 http://example.com 2>/dev/null; then
+    log_pass "Cell can reach allowed example.com"
 else
-    log_fail "Cell with default policy cannot reach example.com"
+    log_fail "Cell cannot reach allowed example.com"
 fi
 
-# Test 2: Cell with custom policy can reach additional domain.
+# Test 2: a different cell with its own allow reaches its domain.
 echo
-echo "--- Test 2: Custom policy adds allowed domain ---"
-run_in_vm sudo /usr/local/bin/brig run -d --name policy-cell-2 \
-    --policy-allow "httpbin.org" \
-    alpine sleep 600 2>/dev/null || true
+echo "--- Test 2: Custom allow permits httpbin.org ---"
+$BRIG run -d --name policy-cell-2 --policy-allow httpbin.org alpine sleep 600 >/dev/null 2>&1 || true
 sleep 2
-
-if run_in_vm sudo podman exec brig-policy-cell-2 wget -q -O /dev/null --timeout=10 http://httpbin.org/get 2>/dev/null; then
-    log_pass "Cell with custom policy can reach httpbin.org"
+if in_cell policy-cell-2 wget -q -O /dev/null --timeout=10 http://httpbin.org/get 2>/dev/null; then
+    log_pass "Cell with custom allow can reach httpbin.org"
 else
-    log_fail "Cell with custom policy cannot reach httpbin.org"
+    log_fail "Cell with custom allow cannot reach httpbin.org"
 fi
 
-# Test 3: Cell without custom policy cannot reach httpbin.org.
+# Test 3: a domain not in the cell's allowlist is blocked (default-deny).
 echo
-echo "--- Test 3: Default policy blocks non-global domain ---"
-if run_in_vm sudo podman exec brig-policy-cell-1 wget -q -O /dev/null --timeout=5 http://httpbin.org/get 2>/dev/null; then
-    log_fail "Default policy should block httpbin.org"
+echo "--- Test 3: Default-deny blocks non-allowed domain ---"
+if in_cell policy-cell-1 wget -q -O /dev/null --timeout=5 http://httpbin.org/get 2>/dev/null; then
+    log_fail "Cell reached httpbin.org despite not allowing it"
 else
-    log_pass "Default policy correctly blocks httpbin.org"
+    log_pass "Default-deny correctly blocks httpbin.org"
 fi
 
-# Test 4: Cell policy can be viewed.
+# Test 4: policy show reflects the cell's allowlist.
 echo
-echo "--- Test 4: cell policy show displays effective policy ---"
-POLICY_OUTPUT=$(run_in_vm sudo /usr/local/bin/brig policy show policy-cell-2 2>/dev/null || echo "")
+echo "--- Test 4: brig policy show displays the allowlist ---"
+POLICY_OUTPUT=$($BRIG policy show policy-cell-2 2>/dev/null || echo "")
 if echo "$POLICY_OUTPUT" | grep -q "httpbin.org"; then
     log_pass "brig policy show displays custom allowlist"
 else
     log_fail "brig policy show missing custom domain"
 fi
 
-# Test 5: Cell policy can be updated at runtime.
+# Test 5: a runtime policy update takes effect.
 echo
-echo "--- Test 5: cell policy set updates policy at runtime ---"
-run_in_vm sudo /usr/local/bin/brig policy set policy-cell-1 --allow "httpbin.org" 2>/dev/null || true
+echo "--- Test 5: brig policy set updates policy at runtime ---"
+$BRIG policy set policy-cell-1 --allow httpbin.org >/dev/null 2>&1 || true
 sleep 2
-
-if run_in_vm sudo podman exec brig-policy-cell-1 wget -q -O /dev/null --timeout=10 http://httpbin.org/get 2>/dev/null; then
-    log_pass "Runtime policy update allows new domain"
+if in_cell policy-cell-1 wget -q -O /dev/null --timeout=10 http://httpbin.org/get 2>/dev/null; then
+    log_pass "Runtime policy update allows the new domain"
 else
     log_fail "Runtime policy update not working"
 fi
 
-# Test 6: Restricted cell with deny-only policy.
+# Test 6: deny takes precedence over allow.
 echo
-echo "--- Test 6: Restricted cell can deny globally allowed domain ---"
-run_in_vm sudo /usr/local/bin/brig run -d --name restricted-cell \
-    --policy-deny "example.com" \
-    alpine sleep 600 2>/dev/null || true
+echo "--- Test 6: deny overrides allow ---"
+$BRIG run -d --name restricted-cell --policy-allow example.com --policy-deny example.com alpine sleep 600 >/dev/null 2>&1 || true
 sleep 2
-
-if run_in_vm sudo podman exec brig-restricted-cell wget -q -O /dev/null --timeout=5 http://example.com 2>/dev/null; then
-    log_fail "Restricted cell should not reach denied domain"
+if in_cell restricted-cell wget -q -O /dev/null --timeout=5 http://example.com 2>/dev/null; then
+    log_fail "deny did not override allow"
 else
-    log_pass "Restricted cell correctly blocked from denied domain"
+    log_pass "deny correctly overrides allow"
 fi
 
-# Test 7: Policy file exists for cell with custom policy.
+# Test 7: per-cell policy file exists.
 echo
 echo "--- Test 7: Per-cell policy file created ---"
-if run_in_vm test -f /var/run/brig/policies/policy-cell-2.json 2>/dev/null; then
+if [ -f "$POLICIES_DIR/policy-cell-2.json" ]; then
     log_pass "Per-cell policy file exists"
 else
-    log_fail "Per-cell policy file not created"
+    log_fail "Per-cell policy file not created at $POLICIES_DIR/policy-cell-2.json"
 fi
 
-# Test 8: Policy removed when cell is removed.
+# Test 8: policy file removed when the cell is removed.
 echo
 echo "--- Test 8: Policy cleaned up on cell removal ---"
-run_in_vm sudo /usr/local/bin/brig rm -f policy-cell-2 2>/dev/null || true
-if run_in_vm test -f /var/run/brig/policies/policy-cell-2.json 2>/dev/null; then
-    log_fail "Policy file not cleaned up"
+$BRIG cell rm -f policy-cell-2 >/dev/null 2>&1 || true
+if [ -f "$POLICIES_DIR/policy-cell-2.json" ]; then
+    log_fail "Policy file not cleaned up on rm"
 else
     log_pass "Policy file cleaned up on cell removal"
 fi
 
-# Test 9: Wildcard domain in per-cell policy.
+# Test 9: wildcard domains are stored in the per-cell policy.
 echo
-echo "--- Test 9: Wildcard domains work in per-cell policy ---"
-run_in_vm sudo /usr/local/bin/brig run -d --name policy-cell-2 \
-    --policy-allow "*.github.com" \
-    alpine sleep 600 2>/dev/null || true
-sleep 2
-
-if run_in_vm sudo podman exec brig-policy-cell-2 wget -q -O /dev/null --timeout=10 http://raw.github.com 2>/dev/null; then
-    log_pass "Wildcard domain works in per-cell policy"
+echo "--- Test 9: Wildcard domains stored in per-cell policy ---"
+$BRIG run -d --name wildcard-cell --policy-allow "*.github.com" alpine sleep 600 >/dev/null 2>&1 || true
+sleep 1
+if $BRIG policy show wildcard-cell 2>/dev/null | grep -q '\*.github.com'; then
+    log_pass "Wildcard domain stored in per-cell policy"
 else
-    # May fail due to HTTPS redirect, check if it was policy-blocked.
-    log_pass "Wildcard domain parsed correctly"
+    log_fail "Wildcard domain not stored"
 fi
 
-# Test 10: Multiple domains in per-cell policy.
+# Test 10: multiple domains can be allowed on one cell.
 echo
 echo "--- Test 10: Multiple domains can be allowed ---"
-POLICY_OUTPUT=$(run_in_vm sudo /usr/local/bin/brig policy show policy-cell-2 2>/dev/null || echo "")
-if echo "$POLICY_OUTPUT" | grep -q "github.com"; then
+$BRIG run -d --name multi-cell --policy-allow example.com --policy-allow github.com alpine sleep 600 >/dev/null 2>&1 || true
+sleep 1
+MULTI_OUTPUT=$($BRIG policy show multi-cell 2>/dev/null || echo "")
+if echo "$MULTI_OUTPUT" | grep -q "example.com" && echo "$MULTI_OUTPUT" | grep -q "github.com"; then
     log_pass "Multiple domains supported in policy"
 else
-    log_fail "Multiple domains not in policy output"
+    log_fail "Multiple domains not in policy output: $MULTI_OUTPUT"
 fi
 
-# Cleanup.
 echo
 echo "--- Cleanup ---"
 cleanup_test_cells
 
-# Summary.
-echo
-echo "============================================"
-echo "Summary"
-echo "============================================"
-echo -e "Passed: ${GREEN}$PASSED${NC}"
-echo -e "Failed: ${RED}$FAILED${NC}"
-echo
-
-if [ "$FAILED" -eq 0 ]; then
-    echo -e "${GREEN}All tests passed!${NC}"
-    exit 0
-else
-    echo -e "${RED}Some tests failed. Review output above.${NC}"
-    exit 1
-fi
+finish
