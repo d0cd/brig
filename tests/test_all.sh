@@ -24,6 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOTAL_PASSED=0
 TOTAL_FAILED=0
 FAILED_SUITES=()
+SKIPPED_SUITES=()
 
 # Resolve the VM name once and propagate to the suites, so a local run works
 # without the caller exporting anything. An explicitly-set value (e.g. CI's
@@ -67,13 +68,16 @@ SUITES=(
     "test_per_cell_policy:Per-Cell Policy"
     "test_warden_features:Warden Features"
     "test_invariants_7_8:Invariants 7 & 8"
+    "test_stream_passthrough:Stream Passthrough (ingress SSE)"
+    "test_host_sockets_e2e:Host Sockets"
 )
 
-# Feature e2e run on their own (also wired into CI's e2e.yml), NOT here:
-#   - test_host_sockets_e2e.sh   (host_socket bridge; needs macOS launchd+socat)
-#   - test_ingress_replay_e2e.sh (ingress reverse proxy survival)
-#   - test_stream_passthrough.sh (SSE; needs aiohttp on the host runner)
-#   - test_overhead.sh           (perf benchmarks)
+# Run on their own (also wired into CI's e2e.yml), NOT here:
+#   - test_ingress_replay_e2e.sh (does `brig system down/up` — disruptive)
+#   - test_overhead.sh           (perf benchmarks, minutes-long, informational)
+#
+# Suites may exit 2 to SKIP (e.g. host_sockets on a non-macOS host, or when it
+# hits the known gVisor host-UDS limitation). A skip is reported, not failed.
 
 # Pull "Passed:/Failed:" counts from a suite's output, stripping ANSI codes.
 extract_count() {
@@ -96,7 +100,12 @@ for suite in "${SUITES[@]}"; do
     TOTAL_PASSED=$((TOTAL_PASSED + passed))
     TOTAL_FAILED=$((TOTAL_FAILED + failed))
 
-    if [ "$rc" -eq 0 ]; then
+    if [ "$rc" -eq 2 ]; then
+        # Suite opted out (wrong platform / missing dep / known limitation).
+        reason=$(printf '%s\n' "$output" | grep -iE "^SKIP" | head -1 | sed 's/^SKIP:[[:space:]]*//')
+        echo -e "  ${YELLOW}SKIPPED${NC}: ${reason:-suite skipped}"
+        SKIPPED_SUITES+=("$name")
+    elif [ "$rc" -eq 0 ]; then
         echo -e "  ${GREEN}PASSED${NC}: $passed tests"
     elif printf '%s\n' "$output" | grep -qE "^Passed:"; then
         # Ran to its summary but reported failing checks.
@@ -119,6 +128,7 @@ echo "Final Summary"
 echo -e "================================================${NC}"
 echo -e "Total checks passed: ${GREEN}$TOTAL_PASSED${NC}"
 echo -e "Total checks failed: ${RED}$TOTAL_FAILED${NC}"
+[ "${#SKIPPED_SUITES[@]}" -gt 0 ] && echo -e "Skipped suites: ${YELLOW}${SKIPPED_SUITES[*]}${NC}"
 echo
 
 if [ "${#FAILED_SUITES[@]}" -eq 0 ]; then

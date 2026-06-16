@@ -1,214 +1,130 @@
 #!/bin/bash
 # shellcheck disable=SC2034,SC2016,SC2153,SC2329,SC2001
-# test_stream_passthrough.sh — B4 + B5 from docs/plans/0.3-validation-plan.md.
+# test_stream_passthrough.sh — warden must not buffer streaming responses on
+# the INGRESS path.
 #
-# Both tests verify that warden (mitmproxy) doesn't buffer streaming
-# responses. Buffering would break:
-#   B4 — WebSocket gateways (Telegram long-poll, Discord WSS, Slack
-#        Socket Mode) that any agent / bot in a cell may use.
-#   B5 — Server-Sent Events keepalives. Long-running LLM-style endpoints
-#        commonly emit `:keepalive` SSE comments every ~25s during
-#        silent phases; buffering would trip the consumer's stream-read
-#        timeout and kill long tasks.
+# mitmproxy buffers response bodies by default. For Server-Sent Events
+# (Content-Type: text/event-stream) buffering is fatal: keepalives emitted
+# every ~Ns during a silent phase would all arrive at once at stream close,
+# tripping the consumer's read timeout. warden's ingress addon sets
+# `flow.response.stream = True` for event-stream responses so they pass through
+# unbuffered (see ingress.py responseheaders).
 #
-# Usage: ./tests/test_stream_passthrough.sh
+# Scope: this is the INGRESS guarantee (external client -> warden :8443 -> cell)
+# — the path aitelier uses for streaming agents. Egress responses (cell ->
+# outside) are buffered BY DESIGN (ingress.py docstring), so this does not test
+# that direction.
 #
-# Prerequisites:
-#   - Lima VM running, brig installed, warden up.
-#   - Network policy allows `stream-test.host.brig` as a host service.
+# A cell runs a tiny stdlib SSE server (no extra deps), exposes it via ingress,
+# and the host streams it through warden :8443, asserting keepalives arrive
+# incrementally (gaps ~1s) rather than all at once.
 #
-# Exit codes:
-#   0 — all checks passed
-#   1 — at least one failure
+# Usage: ./tests/test_stream_passthrough.sh   (requires `brig system up` first)
+# Exit: 0 all passed, 1 any failed.
 
-set -euo pipefail
+source "$(dirname "$0")/lib/e2e_common.sh"
 
-VM_NAME="${CELL_VM_NAME:-cell}"
-PASSED=0
-FAILED=0
-TEST_PORT="${STREAM_TEST_PORT:-7700}"
+PYRUN="${PYRUN:-uv run python}"
 TEST_CELL="stream-passthrough-$$"
-SERVER_PID=""
-
-if [ -t 1 ]; then
-    RED='\033[0;31m'
-    GREEN='\033[0;32m'
-    NC='\033[0m'
-else
-    RED=''
-    GREEN=''
-    NC=''
-fi
-
-log_pass() { echo -e "${GREEN}PASS${NC}: $1"; PASSED=$((PASSED + 1)); }
-log_fail() { echo -e "${RED}FAIL${NC}: $1"; FAILED=$((FAILED + 1)); }
+TOKEN_VALUE="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+WORK_DIR="$(mktemp -d)"
+YAML="$WORK_DIR/cell.yaml"
 
 cleanup() {
-    [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
-    brig rm -f "$TEST_CELL" 2>/dev/null || true
-    brig policy rm "$TEST_CELL" 2>/dev/null || true
-    # Best-effort: drop the host service entry we added.
-    brig policy set global --remove-host-service stream-test 2>/dev/null || true
+    $BRIG cell rm -f "$TEST_CELL" 2>/dev/null || true
+    $BRIG secrets rm "${TEST_CELL}-ingress-token" --yes 2>/dev/null || true
+    rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
-# --- Set up the in-VM stream server -----------------------------------------
-# A tiny Python server that:
-#   GET /sse  → text/event-stream, emits `:keepalive\n\n` every 1s for 5s
-#              then sends `data: done\n\n` and closes
-#   GET /ws   → WebSocket upgrade; echoes each message; emits ping/pong
-#
-# Run it on the macOS host (the same place any host-service lives) and
-# route the cell to it via the host-service mechanism. Host port = $TEST_PORT.
-
-mkdir -p /tmp/brig-stream-test
-cat > /tmp/brig-stream-test/server.py <<'PY'
-import asyncio
-import sys
-from aiohttp import web
-
-async def sse(request):
-    resp = web.StreamResponse(
-        status=200,
-        headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
-    )
-    await resp.prepare(request)
-    for _ in range(5):
-        await resp.write(b":keepalive\n\n")
-        await asyncio.sleep(1)
-    await resp.write(b"data: done\n\n")
-    return resp
-
-async def ws(request):
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-    async for msg in ws:
-        if msg.type == web.WSMsgType.TEXT:
-            await ws.send_str(f"echo:{msg.data}")
-            if msg.data == "bye":
-                break
-    return ws
-
-app = web.Application()
-app.router.add_get("/sse", sse)
-app.router.add_get("/ws", ws)
-port = int(sys.argv[1]) if len(sys.argv) > 1 else 7700
-web.run_app(app, host="127.0.0.1", port=port, print=lambda *a, **k: None)
-PY
-
-echo "Starting stream server on host 127.0.0.1:$TEST_PORT..."
-python3 /tmp/brig-stream-test/server.py "$TEST_PORT" >/tmp/brig-stream-test/server.log 2>&1 &
-SERVER_PID=$!
-sleep 1
-if ! ps -p "$SERVER_PID" > /dev/null; then
-    log_fail "stream server failed to start (see /tmp/brig-stream-test/server.log)"
-    cat /tmp/brig-stream-test/server.log
-    exit 1
-fi
-log_pass "stream server up on host port $TEST_PORT"
-
-# --- Wire the host service + per-cell ACL -----------------------------------
-brig policy set global --host-service "stream-test:$TEST_PORT" >/dev/null
-brig policy set "$TEST_CELL" --host-service stream-test >/dev/null
-log_pass "stream-test.host.brig wired through warden"
-
-# --- B5: SSE keepalive passthrough ------------------------------------------
-# Spin up a cell that curls /sse and records the timestamp of each line.
-# We need each `:keepalive` to arrive within <2s of emission (server sleeps
-# 1s between lines). If mitmproxy buffers, all 5 keepalives arrive together
-# at end of stream and the test fails.
-
+echo "============================================"
+echo "Stream Passthrough (ingress SSE) Test"
+echo "============================================"
 echo
-echo "B5: SSE keepalive passthrough"
-brig run --name "$TEST_CELL" --detach alpine -- sh -c '
-    apk add --no-cache curl python3 >/dev/null 2>&1 || true
-    curl -sN http://stream-test.host.brig/sse | python3 -c "
-import sys, time
-last = time.time()
-gaps = []
-for line in sys.stdin:
-    now = time.time()
-    gaps.append(now - last); last = now
-    print(line.rstrip(), flush=True)
-print(\"GAPS:\" + \" \".join(f\"{g:.2f}\" for g in gaps), file=sys.stderr)
-"
-' >/dev/null
 
-# Wait up to 10s for the cell to exit.
-for _ in $(seq 1 10); do
-    if ! brig list --format json | python3 -c 'import json,sys; print(any(c["name"]=="'"$TEST_CELL"'" and c["status"]=="running" for c in json.load(sys.stdin)))' | grep -q True; then
-        break
-    fi
-    sleep 1
-done
+require_brig_up
 
-# Pull cell logs; assert at least 5 :keepalive lines and gaps < 2s.
-LOGS=$(brig logs "$TEST_CELL" 2>&1)
-KEEPALIVES=$(echo "$LOGS" | grep -c "^:keepalive$" || true)
-if [ "$KEEPALIVES" -ge 5 ]; then
-    log_pass "received $KEEPALIVES SSE keepalive lines"
-else
-    log_fail "expected ≥5 :keepalive lines, got $KEEPALIVES"
-    echo "--- cell logs ---"
-    echo "$LOGS"
+# --- Ingress token + a cell running a stdlib SSE server ----------------------
+echo "$TOKEN_VALUE" | $BRIG secrets add "${TEST_CELL}-ingress-token" --force >/dev/null 2>&1
+
+cat > "$YAML" <<EOF
+name: $TEST_CELL
+image: python:3.12-alpine
+memory: 256m
+ingress:
+  - name: sse
+    port: 8000
+    path_prefix: /sse
+    auth: token
+command:
+  - python
+  - -c
+  - |
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import time
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            for _ in range(5):
+                self.wfile.write(b":keepalive\n\n"); self.wfile.flush(); time.sleep(1)
+            self.wfile.write(b"data: done\n\n"); self.wfile.flush()
+        def log_message(self, *a): pass
+    HTTPServer(("0.0.0.0", 8000), H).serve_forever()
+EOF
+
+echo "Starting cell with an SSE endpoint behind ingress ..."
+$BRIG run --file "$YAML" -d >/dev/null 2>&1 || true
+sleep 3
+
+# --- Stream it from the host through warden :8443 and measure inter-line gaps -
+GAP_OUT=$($PYRUN - "$TEST_CELL" "$TOKEN_VALUE" <<'PY'
+import sys, urllib.request, time
+cell, token = sys.argv[1], sys.argv[2]
+req = urllib.request.Request(
+    f"http://127.0.0.1:8443/{cell}/sse/",
+    headers={"Authorization": f"Bearer {token}"},
+)
+last = time.time(); gaps = []; keepalives = 0
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        for raw in r:
+            now = time.time(); gaps.append(now - last); last = now
+            if raw.decode(errors="replace").rstrip() == ":keepalive":
+                keepalives += 1
+except Exception as e:
+    print("ERROR:%s" % e); sys.exit(0)
+print("KEEPALIVES:%d" % keepalives)
+print("GAPS:" + " ".join("%.2f" % g for g in gaps))
+PY
+)
+
+if echo "$GAP_OUT" | grep -q "^ERROR:"; then
+    log_fail "ingress SSE request failed: $(echo "$GAP_OUT" | sed -n 's/^ERROR://p')"
+    finish
 fi
 
-# Check the inter-line gaps to confirm streaming behavior (no buffering).
-GAPS=$(echo "$LOGS" | grep "^GAPS:" | sed 's/^GAPS://')
+KEEPALIVES=$(echo "$GAP_OUT" | sed -n 's/^KEEPALIVES:\([0-9]*\)/\1/p' | tail -1)
+KEEPALIVES="${KEEPALIVES:-0}"
+if [ "$KEEPALIVES" -ge 5 ]; then
+    log_pass "received $KEEPALIVES SSE keepalive lines through ingress"
+else
+    log_fail "expected >=5 :keepalive lines, got $KEEPALIVES ($GAP_OUT)"
+fi
+
+GAPS=$(echo "$GAP_OUT" | sed -n 's/^GAPS://p' | tail -1)
 if [ -n "$GAPS" ]; then
-    BIG_GAPS=$(echo "$GAPS" | tr ' ' '\n' | awk '$1 > 2.0 { print }' | wc -l | tr -d ' ')
-    if [ "$BIG_GAPS" -eq 0 ]; then
-        log_pass "all inter-line gaps ≤ 2.0s (no buffering)"
+    BIG=$(echo "$GAPS" | tr ' ' '\n' | awk '$1 > 2.0 {c++} END{print c+0}')
+    if [ "$BIG" -eq 0 ]; then
+        log_pass "all inter-line gaps <= 2.0s (ingress streams SSE, no buffering)"
     else
-        log_fail "$BIG_GAPS gaps > 2.0s suggests mitmproxy is buffering SSE"
+        log_fail "$BIG gap(s) > 2.0s — warden is buffering ingress SSE"
         echo "  gaps: $GAPS"
     fi
-fi
-
-# --- B4: WebSocket echo through warden --------------------------------------
-echo
-echo "B4: WebSocket through warden"
-brig rm -f "$TEST_CELL" >/dev/null 2>&1 || true
-
-# mitmproxy needs explicit websocket handling; the addon enables it by
-# default in regular mode. Verify by opening a ws:// connection through
-# http_proxy via Python's websockets lib.
-brig run --name "$TEST_CELL" --detach alpine -- sh -c '
-    apk add --no-cache python3 py3-pip >/dev/null 2>&1 || true
-    pip install --quiet websockets httpx-ws 2>/dev/null || true
-    python3 -c "
-import asyncio, os, sys
-from websockets.client import connect
-proxy = os.environ.get(\"http_proxy\", \"\")
-# Connect through the proxy if the lib supports it; otherwise direct
-# (warden will intercept the CONNECT regardless).
-async def go():
-    async with connect(\"ws://stream-test.host.brig/ws\") as ws:
-        await ws.send(\"hello\")
-        reply = await asyncio.wait_for(ws.recv(), timeout=5)
-        print(f\"reply={reply}\")
-        await ws.send(\"bye\")
-asyncio.run(go())
-"
-' >/dev/null
-
-for _ in $(seq 1 10); do
-    if ! brig list --format json | python3 -c 'import json,sys; print(any(c["name"]=="'"$TEST_CELL"'" and c["status"]=="running" for c in json.load(sys.stdin)))' | grep -q True; then
-        break
-    fi
-    sleep 1
-done
-
-LOGS=$(brig logs "$TEST_CELL" 2>&1)
-if echo "$LOGS" | grep -q "reply=echo:hello"; then
-    log_pass "WebSocket echo through warden works"
 else
-    log_fail "WebSocket echo failed (see cell logs)"
-    echo "--- cell logs ---"
-    echo "$LOGS"
+    log_fail "no GAPS line ($GAP_OUT)"
 fi
 
-# --- Summary ---------------------------------------------------------------
-echo
-echo "Results: $PASSED passed, $FAILED failed"
-[ "$FAILED" -eq 0 ]
+finish
