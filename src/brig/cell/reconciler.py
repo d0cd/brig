@@ -301,8 +301,17 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if not spec.writable_rootfs:
         cmd.extend([
             "--read-only",
+            # tmpfs flags follow "strictest that doesn't break a real workload":
+            # nosuid (no setuid escalation) + nodev on every tmpfs. noexec is
+            # weak, bypassable defense-in-depth (memfd; /work is exec-capable
+            # anyway) — NOT a brig boundary, which is the VM/gVisor/Warden choke
+            # point plus cap-drop ALL + read-only rootfs. So noexec is kept on
+            # /tmp, where no known workload needs to exec (zero cost), but
+            # dropped on /run because s6-overlay and other init systems exec
+            # their supervisor from /run/s6 — keeping it there breaks every
+            # s6-based image for no real security gain.
             "--tmpfs", "/tmp:rw,size=64m,noexec,nosuid,nodev",
-            "--tmpfs", "/run:rw,size=16m,noexec,nosuid,nodev",
+            "--tmpfs", "/run:rw,size=16m,nosuid,nodev",
         ])
 
     cmd.extend([

@@ -259,16 +259,22 @@ class TestBuildRunCommand(unittest.TestCase):
             f"expected /run tmpfs, got --tmpfs values {tmpfs_pairs}")
 
     def test_readonly_tmpfs_has_security_options(self):
-        """Sized tmpfs is necessary but not sufficient — also need
-        noexec/nosuid/nodev so the cell can't drop a SUID binary in /tmp
-        and exec something privileged from there."""
+        """Tmpfs flags follow "strictest that doesn't break a real workload".
+        Every tmpfs carries nosuid (no setuid escalation) + nodev. noexec is
+        weak, bypassable DiD (not a boundary — that's the VM/gVisor/Warden +
+        cap-drop + read-only rootfs), so it's kept on /tmp (nothing needs to
+        exec there) but dropped on /run, where s6-overlay/init systems exec
+        their supervisor from /run/s6 and noexec breaks every s6-based image."""
         spec = CellSpec(name="test", image="alpine")
         cmd = build_run_command(spec, "10.60.1.1")
-        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
-        for t in tmpfs_pairs:
-            self.assertIn("noexec", t, f"{t} missing noexec")
-            self.assertIn("nosuid", t, f"{t} missing nosuid")
-            self.assertIn("nodev", t, f"{t} missing nodev")
+        tmpfs = {t.split(":", 1)[0]: t for t in
+                 (cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs")}
+        for path in ("/tmp", "/run"):
+            self.assertIn("nosuid", tmpfs[path], f"{tmpfs[path]} missing nosuid")
+            self.assertIn("nodev", tmpfs[path], f"{tmpfs[path]} missing nodev")
+        self.assertIn("noexec", tmpfs["/tmp"], f"{tmpfs['/tmp']} missing noexec")
+        self.assertNotIn("noexec", tmpfs["/run"],
+            "/run must be exec-capable so s6-overlay/init-system images can run")
 
     def test_writable_rootfs_opt_out_omits_readonly(self):
         """For cells whose images legitimately need a writable rootfs

@@ -96,7 +96,9 @@ workspace_mount: /work           # Mount point for the cell's writable workspace
 
 # Cell rootfs writability. Default false (safe). When false, brig runs the
 # cell with --read-only rootfs + sized tmpfs at /tmp (64m) and /run (16m).
-# The cell can still write to /work (its workspace).
+# The cell can still write to /work (its workspace). Both tmpfs carry
+# nosuid+nodev; /tmp is noexec, but /run is exec-capable so s6-overlay and
+# other init systems (which exec their supervisor from /run/s6) can run.
 #
 # Set to true for images whose entrypoint needs to write outside /work,
 # /tmp, /run — e.g. legacy daemons that write to /var/log, dev images
