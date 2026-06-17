@@ -9,7 +9,12 @@ from typing import Any
 
 from brig.cell.lifecycle import run_cell
 from brig.cell.profiles import apply_profile, load_profile
-from brig.cell.spec import CellSpec, load_cell_definition, validate_cell_definition
+from brig.cell.spec import (
+    CellSpec,
+    load_cell_definition,
+    validate_cell_definition,
+    warn_unknown_cell_keys,
+)
 from brig.config import container_name
 from brig.errors import BrigError
 from brig.ops.logging import info, output
@@ -145,6 +150,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     cell_def: dict = {}
     if args.file:
         cell_def = load_cell_definition(args.file)
+        warn_unknown_cell_keys(cell_def, args.file)
         # The CLI --profile flag is authoritative over the yaml (CLI > yaml),
         # so inject it for validation; otherwise an untrusted-profile run could
         # declare host_services / tls_passthrough in the yaml unchecked.

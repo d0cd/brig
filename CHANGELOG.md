@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Unknown cell-yaml keys now warn instead of silently no-op-ing.** brig builds the spec by filtering to known `CellSpec` fields, so a typo'd or stale key (e.g. a leftover `host_sockets:`) was dropped without a word. `brig run --file` and `brig cell preflight` now print a warning naming the unrecognized key(s); the cell still runs (warn, not reject). The known set is derived from `CellSpec` fields (+ the nested `policy:` alias) so it can't drift.
 - Version bumped to **0.4.0** (new invariants 11–13 + removed `brig cell trace`); `pyproject.toml` and `brig.config.VERSION` are now guarded against drift by a test.
 - The pinned mitmproxy base image has a single source of truth (`warden.proxy.BASE_IMAGE`), imported by `brig image warmup`; a test keeps the warden Dockerfile `FROM`/`LABEL` in lockstep, matching the gVisor/collector pin discipline.
 - Invariant 6 docs realigned with the code: `proxy-external` admits brig infrastructure (warden **and** the OTel collector `brig-otel`, per `INFRA_CONTAINER_NAMES`); no cell can reach that network.

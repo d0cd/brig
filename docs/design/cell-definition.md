@@ -3,6 +3,10 @@
 A cell definition is a YAML or JSON file that describes a cell's configuration.
 Use with `brig run --file mycell.yaml`.
 
+Unrecognized top-level keys (a typo, or a removed field such as `host_sockets`)
+are **ignored**, but `brig run --file` and `brig cell preflight` print a warning
+naming them — so a stray key never silently does nothing.
+
 ## Full Schema
 
 ```yaml

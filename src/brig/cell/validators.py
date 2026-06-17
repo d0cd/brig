@@ -766,6 +766,37 @@ _SIMPLE_VALIDATORS = {
 }
 
 
+def unknown_cell_keys(cell_def: dict[str, Any]) -> list[str]:
+    """Return the cell-yaml top-level keys brig doesn't recognize, sorted.
+
+    Known keys are the `CellSpec` fields (derived dynamically, so the set can't
+    drift as fields are added/removed) plus the nested `policy:` yaml alias,
+    which folds into `policy_allow`/`policy_deny`/`policy_passthrough_tls`.
+
+    brig builds the spec by filtering cell_def to known fields, so an unknown
+    key (a typo, or a stale/removed field like `host_sockets:`) is otherwise
+    silently dropped. This powers a warning so the operator finds out.
+    """
+    import dataclasses
+
+    from brig.cell.spec import CellSpec  # lazy: spec imports this module.
+    known = {f.name for f in dataclasses.fields(CellSpec)} | {"policy"}
+    return sorted(k for k in cell_def if k not in known)
+
+
+def warn_unknown_cell_keys(cell_def: dict[str, Any], file_path: str = "") -> None:
+    """Warn (don't fail) about unrecognized cell-yaml keys — they're ignored
+    at build time, so an unflagged typo silently does nothing."""
+    unknown = unknown_cell_keys(cell_def)
+    if unknown:
+        from brig.ops.logging import warn
+        where = f" in {file_path}" if file_path else ""
+        warn(
+            f"ignoring unknown cell key(s){where}: {', '.join(unknown)} "
+            f"(typo, or a removed field — see docs/design/cell-definition.md)"
+        )
+
+
 def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> list[str]:
     """Validate a cell definition dict and return list of errors.
 

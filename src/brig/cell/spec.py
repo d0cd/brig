@@ -171,7 +171,10 @@ class CellSpec:
 
 # Re-export the validator entry point so existing imports
 # `from brig.cell.spec import validate_cell_definition` keep working.
-from brig.cell.validators import validate_cell_definition  # noqa: E402,F401
+from brig.cell.validators import (  # noqa: E402,F401
+    validate_cell_definition,
+    warn_unknown_cell_keys,
+)
 
 
 def load_cell_definition(path: str) -> dict[str, Any]:

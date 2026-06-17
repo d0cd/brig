@@ -84,10 +84,15 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     re-run" loop with a single diff. No mutations; safe to run
     anytime.
     """
-    from brig.cell.spec import load_cell_definition, validate_cell_definition
+    from brig.cell.spec import (
+        load_cell_definition,
+        validate_cell_definition,
+        warn_unknown_cell_keys,
+    )
     from brig.config import HostPaths
 
     cell_def = load_cell_definition(args.file)
+    warn_unknown_cell_keys(cell_def, args.file)
     errors = validate_cell_definition(cell_def, args.file)
     fail_count = 0
 
