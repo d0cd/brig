@@ -11,7 +11,6 @@ the aitelier-reported pytest-clobbers-subnet-map bug.
 import atexit
 import os
 import shutil
-import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -33,23 +32,3 @@ if src_dir not in sys.path:
 addons_dir = str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons")
 if addons_dir not in sys.path:
     sys.path.insert(0, addons_dir)
-
-
-def make_unix_socket(td, name: str = "svc.sock") -> Path:
-    """Create a bound AF_UNIX listener at td/name and return its path.
-
-    Skips the calling test if the runtime can't bind AF_UNIX sockets — some
-    sandboxes (e.g. macOS seatbelt profiles used by certain CI lanes and
-    desktop agent runtimes) block AF_UNIX bind even in writable tmpdirs,
-    and the cell-yaml validation tests that require a real socket are
-    legitimately untestable there. CI without those restrictions runs them.
-    """
-    import pytest
-    p = Path(td) / name
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.bind(str(p))
-    except OSError as e:
-        pytest.skip(f"AF_UNIX bind unavailable in this environment: {e}")
-    s.close()
-    return p

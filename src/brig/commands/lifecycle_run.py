@@ -137,9 +137,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         profile = load_profile(args.profile)
         merged = apply_profile(spec_kwargs, profile)
         spec_kwargs.update(merged)
-        # Record the profile name so the untrusted-profile guards (host_sockets,
-        # host_services, tls_passthrough) fire during validation below. Without
-        # this, --profile untrusted on the CLI silently voids those guards.
+        # Record the profile name so the untrusted-profile guards (host_services,
+        # tls_passthrough) fire during validation below. Without this,
+        # --profile untrusted on the CLI silently voids those guards.
         spec_kwargs["profile"] = args.profile
 
     cell_def: dict = {}
@@ -147,7 +147,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         cell_def = load_cell_definition(args.file)
         # The CLI --profile flag is authoritative over the yaml (CLI > yaml),
         # so inject it for validation; otherwise an untrusted-profile run could
-        # declare host_sockets / tls_passthrough in the yaml unchecked.
+        # declare host_services / tls_passthrough in the yaml unchecked.
         if args.profile:
             cell_def["profile"] = args.profile
         errors = validate_cell_definition(cell_def, args.file)

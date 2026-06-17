@@ -46,8 +46,8 @@ class TestProtocolFieldAccepted(unittest.TestCase):
 
 
 class TestUntrustedProfileRejectsTcp(unittest.TestCase):
-    """Same threat-model rationale as host_sockets: untrusted cells
-    don't get TCP side channels. host_services overall is already
+    """Untrusted cells don't get TCP side channels. host_services overall
+    is already
     rejected for the untrusted profile, but this test pins the
     behavior so a future relaxation of HTTP host_services for
     untrusted doesn't accidentally also unlock TCP."""

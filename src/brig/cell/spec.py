@@ -109,12 +109,6 @@ class CellSpec:
     image_digest: str | None = None
     profile: str | None = None
     ingress: list[dict[str, Any]] = field(default_factory=list)
-    # host_sockets — bind-mount macOS-side unix sockets into the cell.
-    # Each entry: {name, host_path, mount_point, mode?}. See
-    # cell.validators._v_host_sockets for validation; bypasses Warden by
-    # design, so the validators there are the entire security boundary
-    # on the cell-yaml → host-file path.
-    host_sockets: list[dict[str, Any]] = field(default_factory=list)
     # host_services — HTTP-only forwarding from cell to a macOS host
     # port, through Warden. Each entry: {name, port}. Cell reaches
     # <name>.host.brig and Warden rewrites to (host_ip, port).

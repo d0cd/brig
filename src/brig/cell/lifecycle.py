@@ -351,19 +351,9 @@ def run_cell(
             ),
         )
 
-    # Bring up host_socket bridges BEFORE reconcile — the reconciler's
-    # runtime check needs the bridge sockets to exist. start_cell_bridges
-    # is idempotent and a no-op if spec.host_sockets is empty.
-    if spec.host_sockets:
-        from brig.cell.host_sockets_bridge import start_cell_bridges
-        start_cell_bridges(spec.name, spec.host_sockets)
-
     def _rollback_reconcile_side_effects() -> None:
-        # apply() rolls back its own network/subnet/podman actions, but bridges
-        # and the pre-written policy file are ours to clean up.
-        if spec.host_sockets:
-            from brig.cell.host_sockets_bridge import stop_cell_bridges
-            stop_cell_bridges(spec.name)
+        # apply() rolls back its own network/subnet/podman actions, but the
+        # pre-written policy file is ours to clean up.
         if not policy_preexisted:
             from brig.policy.policy import delete_cell_policy
             delete_cell_policy(spec.name)
@@ -398,7 +388,7 @@ def run_cell(
             register_ingress_for(spec.name, spec.ingress)
             # An auth: none route removes brig's perimeter gate — the cell's
             # app is the authenticator. Surface it loudly (audit + operator
-            # NOTE), the way mounts/host_sockets announce their bypasses.
+            # NOTE), the way mounts announce their bypass.
             open_routes = [e for e in spec.ingress if e.get("auth") == "none"]
             for e in open_routes:
                 log_lifecycle(
@@ -411,21 +401,6 @@ def run_cell(
                     f"route(s) with auth: none — brig does NOT authenticate "
                     f"these; the cell's app must be the gate."
                 )
-        # Audit any host_sockets that were mounted. The bytes flowing
-        # over these sockets bypass Warden, so the attach event is the
-        # only thing we can record — make sure it's loud.
-        if spec.host_sockets:
-            for entry in spec.host_sockets:
-                log_lifecycle(
-                    "host_socket_attach", spec.name,
-                    details={"socket": entry["name"],
-                             "mount_point": entry["mount_point"],
-                             "mode": entry.get("mode", "ro")},
-                )
-            info(
-                f"NOTE: cell '{spec.name}' has {len(spec.host_sockets)} "
-                f"host_sockets — Warden does not see traffic over these."
-            )
         # Audit host-directory mounts. The cell reads/writes these host files
         # directly (Warden not in the path); a rw mount lets it modify files a
         # host process later consumes — surface it loudly.
@@ -530,12 +505,6 @@ def stop_cell(cell_name: str) -> None:
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
-    # Tear down any host_socket bridges (idempotent — no-op if there
-    # are none). Done before the podman stop so launchd doesn't keep
-    # trying to forward to a dead cell.
-    from brig.cell.host_sockets_bridge import stop_cell_bridges
-    stop_cell_bridges(cell_name)
-
     actions = plan_stop(cell_name, actual)
     result = apply(actions)
 
@@ -560,9 +529,6 @@ def kill_cell(cell_name: str) -> None:
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
-    # Tear down host_socket bridges (idempotent).
-    from brig.cell.host_sockets_bridge import stop_cell_bridges
-    stop_cell_bridges(cell_name)
 
     # observe() reports a paused container as running=False, so gate on the
     # actual status too — otherwise killing a paused cell would no-op, log a
@@ -622,9 +588,6 @@ def rm_cell(
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
-    # Tear down host_socket bridges (idempotent).
-    from brig.cell.host_sockets_bridge import stop_cell_bridges
-    stop_cell_bridges(cell_name)
 
     actions = plan_destroy(cell_name, actual)
     result = apply(actions)

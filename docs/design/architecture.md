@@ -34,12 +34,12 @@ from, see [`learning/concepts.md`](../learning/concepts.md).
 
 **This is containment, not air-gapped isolation.** Brig provides:
 - Strong host protection (Lima VM boundary)
-- Observable network egress — proxy logs every flow by default. Two
-  intentional carve-outs reduce visibility on opt-in paths:
-  `host_sockets` bypass Warden entirely (invariant 10), and
+- Observable network egress — proxy logs every flow by default. The
+  intentional carve-out that reduces visibility on an opt-in path:
   `policy.tls_passthrough` hosts are tunneled raw with only SNI +
-  bytes audited (invariant 11). Both require explicit cell-yaml
-  declaration — silent egress is impossible.
+  bytes audited (invariant 11). It requires explicit cell-yaml
+  declaration — silent egress is impossible. (Scoped `mounts:` also
+  bypass Warden for host *files* — invariant 13.)
 - Reduced blast radius (cells can't attack each other)
 
 Brig does **not** provide:

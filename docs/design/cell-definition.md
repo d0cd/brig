@@ -184,15 +184,6 @@ host_services:
   - {name: db, port: 5432, protocol: tcp}                # TCP — Postgres
   - {name: redis, port: 6379, protocol: tcp}             # TCP — Redis
 
-# Host sockets — bind-mount macOS unix sockets into the cell for
-# non-HTTP protocols (Postgres, Redis, ssh-agent). Bytes flow
-# kernel-direct; Warden is not in the path.
-host_sockets:
-  - name: postgres
-    host_path: /tmp/postgres.sock
-    mount_point: /run/host/postgres.sock
-    mode: rw
-
 # Host mounts — bind-mount a host directory into the cell, bounded by the
 # VM-level `mount_roots` allowlist. ro by default; rw needs `user: "0"` (above).
 # Warden does not mediate these bytes. supervised/dev only; untrusted rejects.
@@ -271,61 +262,6 @@ The env var name is derived from the filename:
 Application reads the file at runtime — secret values never appear in env vars,
 process listings, or container inspect output.
 
-## Host Sockets
-
-Bind-mount macOS-side unix sockets into the cell at a path under
-`/run/host/`. Bytes flow directly between the cell and the host
-service through the kernel; Warden is not in the path. This is the
-mechanism for non-HTTP services (Postgres, Redis, MySQL, ssh-agent)
-that cannot traverse an HTTP proxy.
-
-```yaml
-host_sockets:
-  - name: postgres                       # alphanumeric+hyphens, max 31 chars
-    host_path: /tmp/postgres.sock        # absolute, must be a real unix socket
-    mount_point: /run/host/postgres.sock # must start with /run/host/
-    mode: rw                             # ro (default) or rw
-```
-
-Then from inside the cell:
-
-```python
-import psycopg
-psycopg.connect("host=/run/host/postgres.sock dbname=app")
-```
-
-Requirements:
-
-- `host_path` must exist on the macOS host and be a real unix socket
-  (not a symlink, not a regular file)
-- `socat` must be installed (`brew install socat`) — used by the
-  launchd bridge
-- Maximum 8 host_sockets per cell
-- The `untrusted` profile rejects `host_sockets` at parse time:
-  bypassing Warden via a kernel side channel is incompatible with
-  the profile's threat model.
-
-Security properties:
-
-- Opt-in per cell yaml (no default access)
-- Engine sockets (`docker.sock`, `podman.sock`, `containerd.sock`,
-  `crio.sock`, `firecracker.sock`, `limactl.sock`) are denied
-- Bridge sockets are real unix sockets — symlinks rejected at runtime
-- Per-cell namespacing: two cells declaring the same physical service
-  each get their own bridge instance
-- Every attach is logged (`brig system history` or
-  `~/.brig/state/system/lifecycle.jsonl`)
-- Cell startup prints a NOTE that Warden does not see this traffic
-
-Limitations:
-
-- No per-request observability. Warden's HTTP audit does not apply
-  to raw TCP or binary protocols.
-- No automatic detection: every socket is declared in the cell yaml.
-- Cannot expose services that lack a unix-socket transport. See
-  [Raw TCP host services (via `protocol: tcp`)](#raw-tcp-host-services-via-protocol-tcp)
-  below for affected protocols and workarounds.
-
 ## Host Services
 
 Cells cannot reach the macOS host by default; private IPs are blocked
@@ -368,21 +304,19 @@ Security properties:
   gated on `flow.metadata["host_service"]`, not on the destination
   tuple, so a poisoned DNS response cannot reuse the exemption.
 
-### Choosing between host_services and host_sockets
+### Choosing HTTP vs TCP host_services
 
-| | host_services | host_sockets |
+| | `host_services` (HTTP, default) | `host_services` (`protocol: tcp`) |
 |---|---|---|
-| Protocol | HTTP/HTTPS only | Anything (TCP via unix socket) |
-| Audit | Per-request through Warden | Connect/disconnect only |
-| Address from cell | `<name>.host.brig` (DNS) | `/run/host/<name>.sock` (filesystem) |
-| Setup | `host_services: [{name, port}]` | `host_sockets: [{name, host_path, mount_point}]` + socat |
-| Use for | API gateways, model serving, anything HTTP | Postgres, Redis, MongoDB, MySQL, ssh-agent, anything with a unix socket |
+| Protocol | HTTP/HTTPS | Any TCP wire protocol |
+| Audit | Per-request through Warden (URL+method) | Connection-level (cell, service, bytes) |
+| Address from cell | `<name>.host.brig` (any path) | `<name>.host.brig:<port>` |
+| Use for | API gateways, model serving, anything HTTP | Postgres, Redis, MongoDB, MySQL, gRPC — anything TCP |
 
-Most database and RPC clients in active development support unix
-sockets — Postgres, MySQL, Redis, MongoDB, and gRPC across most
-languages. Combined with HTTP via `host_services` (egress) and
-`ingress` (inbound), the unix-socket path via `host_sockets` covers
-the common cell-to-host access patterns.
+Both keep Warden in the path. HTTP host_services get full per-request
+audit; TCP host_services trade that for raw-byte forwarding (the only
+option for binary DB wire protocols). Combined with `ingress` (inbound),
+these cover the cell-to-host access patterns.
 
 ### Raw TCP host services (via `protocol: tcp`)
 
@@ -420,8 +354,7 @@ Operational notes:
   inspection. Audit shape is connection-level (cell, service, bytes,
   duration) via `tcp_start`.
 
-Patterns where TCP host_services or `host_sockets` (unix-socket
-variant) is the right answer:
+Patterns where TCP host_services are the right answer:
 
 - Database protocols (Postgres, MySQL, MongoDB, Redis, Cassandra)
 - SSH from cell to a host bastion
@@ -429,10 +362,7 @@ variant) is the right answer:
 - Replica-set / service discovery that probes by DNS
 - Legacy TCP-only drivers (Oracle JDBC, MSSQL TDS)
 
-`host_sockets` is still preferred when the upstream already speaks
-unix sockets — bypass-of-warden is total there (see invariant 10).
-TCP host_services preserve warden in the path for audit + connection
-limits.
+TCP host_services keep warden in the path for audit + connection limits.
 
 ## Host Mounts
 
@@ -463,7 +393,7 @@ Rules:
   workspace mount (`/work`).
 - Maximum 8 mounts per cell.
 - The `untrusted` profile rejects `mounts:` at parse time.
-- **Warden does not see these bytes** (like `host_sockets`). The cell can't
+- **Warden does not see these bytes** (a deliberate bypass). The cell can't
   symlink-escape the subtree (mount-namespace isolation), but it *can* plant a
   symlink a host consumer might follow — scan with `brig cell mount-scan <cell>`
   before consuming cell-written files, and treat them as untrusted.

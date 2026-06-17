@@ -49,7 +49,7 @@ class TestExportClassified(unittest.TestCase):
     # Emitted by cmd_export (reconstructed from `podman inspect`).
     _EXPORTED = {
         "name", "image", "command", "env", "memory", "cpus", "pids_limit",
-        "ingress", "host_services", "host_sockets", "mounts", "restart", "user",
+        "ingress", "host_services", "mounts", "restart", "user",
         "policy_allow", "policy_deny", "policy_passthrough_tls",
     }
     # Intentionally not exported.

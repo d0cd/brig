@@ -1,7 +1,6 @@
 """`brig cell export` emits a self-contained yaml: spec from podman
-inspect plus per-cell policy (allow/deny/host_services), ingress
-routes, and host_sockets. `brig run --file <output>` reproduces the
-cell.
+inspect plus per-cell policy (allow/deny/host_services) and ingress
+routes. `brig run --file <output>` reproduces the cell.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ class TestExportResolved(unittest.TestCase):
         }
 
     def _captured_output(self, args, inspect_data, cell_policy=None,
-                         ingress_routes=None, host_sockets=None):
+                         ingress_routes=None):
         from brig.commands.lifecycle_inspect import cmd_export
         lines: list[str] = []
         result = MagicMock(returncode=0, stdout=json.dumps(inspect_data))
@@ -36,9 +35,6 @@ class TestExportResolved(unittest.TestCase):
             routes_file = td / "routes.json"
             if ingress_routes is not None:
                 routes_file.write_text(json.dumps({"routes": ingress_routes}))
-            meta_file = td / "alice-meta.json"
-            if host_sockets is not None:
-                meta_file.write_text(json.dumps({"host_sockets": host_sockets}))
             policies_dir = td / "policies"
             policies_dir.mkdir()
             if cell_policy is not None:
@@ -47,8 +43,6 @@ class TestExportResolved(unittest.TestCase):
                  patch("brig.commands.lifecycle_inspect.output",
                        side_effect=lines.append), \
                  patch("brig.config.HostPaths.INGRESS_ROUTES_FILE", routes_file), \
-                 patch("brig.cell.metadata._host_metadata_path",
-                       return_value=meta_file), \
                  patch("brig.policy.policy.get_cell_policy_path",
                        side_effect=lambda n, *a, **kw: policies_dir / f"{n}.json"):
                 cmd_export(args)
@@ -88,17 +82,6 @@ class TestExportResolved(unittest.TestCase):
         self.assertIn("ingress:", text)
         self.assertIn("name: api", text)
         self.assertNotIn("port: 1\n", text)  # other cell's route not included
-
-    def test_includes_host_sockets_without_host_path(self):
-        text = self._captured_output(_args(), self._inspect(),
-            host_sockets=[
-                {"name": "pg", "mount_point": "/run/host/pg.sock",
-                 "host_path": "/tmp/SHOULD-NOT-LEAK.sock"},
-            ],
-        )
-        self.assertIn("host_sockets:", text)
-        self.assertIn("/run/host/pg.sock", text)
-        self.assertNotIn("SHOULD-NOT-LEAK", text)
 
     def test_includes_user_when_set(self):
         inspect = self._inspect()

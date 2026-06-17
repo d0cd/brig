@@ -69,15 +69,14 @@ SUITES=(
     "test_warden_features:Warden Features"
     "test_invariants_7_8:Invariants 7 & 8"
     "test_stream_passthrough:Stream Passthrough (ingress SSE)"
-    "test_host_sockets_e2e:Host Sockets"
 )
 
 # Run on their own (also wired into CI's e2e.yml), NOT here:
 #   - test_ingress_replay_e2e.sh (does `brig system down/up` — disruptive)
 #   - test_overhead.sh           (perf benchmarks, minutes-long, informational)
 #
-# Suites may exit 2 to SKIP (e.g. host_sockets on a non-macOS host, or when it
-# hits the known gVisor host-UDS limitation). A skip is reported, not failed.
+# A suite may exit 2 to SKIP (e.g. wrong platform / missing dep); a skip is
+# reported, not failed.
 
 # Pull "Passed:/Failed:" counts from a suite's output, stripping ANSI codes.
 extract_count() {

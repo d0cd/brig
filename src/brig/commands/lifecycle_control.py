@@ -123,19 +123,6 @@ def cmd_start(args: argparse.Namespace) -> int:
             from brig.ops.logging import debug
             debug(f"CA bundle re-stage on start failed: {e}")
 
-        # host_sockets bridges are torn down on stop and are NOT recreated
-        # here: re-bridging needs the host_path, which is deliberately absent
-        # from the cell-readable metadata (it must not leak to the cell). Warn
-        # so the operator doesn't get a silently-dead mount.
-        from brig.cell.metadata import read_host_sockets
-        if read_host_sockets(args.name):
-            from brig.ops.logging import warn
-            warn(
-                f"Cell '{args.name}' declares host_sockets, but launchd bridges "
-                f"are not recreated on start. Re-run from yaml for working "
-                f"host_sockets: brig run --file <yaml>"
-            )
-
         from brig.cell.lifecycle import register_ingress_for
         from brig.cell.metadata import read_ingress
         ingress_entries = read_ingress(args.name)
@@ -221,9 +208,9 @@ def _verify_proxy_connected_after_start(cell_name: str) -> None:
 def _refresh_metadata_for_start(cell_name: str) -> None:
     """Rewrite /run/brig/cell.json on restart with a fresh `started_at`.
 
-    Preserves the original workspace_mount, host_sockets, and ingress —
-    bind mounts and ingress configuration are fixed at create time, so
-    these come from the prior metadata write rather than being re-derived.
+    Preserves the original workspace_mount and ingress — these are fixed at
+    create time, so they come from the prior metadata write rather than
+    being re-derived.
     If the file is missing or unreadable (cell predates cell.json), write
     a default-mount fallback.
     """

@@ -17,15 +17,10 @@ from brig.config import (
     CELL_NAME_PATTERN,
     DOMAIN_PATTERN,
     HOST_SERVICE_NAME_PATTERN,
-    HOST_SOCKET_ENGINE_DENYLIST,
-    HOST_SOCKET_MODES,
-    HOST_SOCKET_MOUNT_PREFIX,
-    HOST_SOCKET_NAME_PATTERN,
     INGRESS_AUTH_METHODS,
     INGRESS_NAME_PATTERN,
     INGRESS_PATH_PREFIX_PATTERN,
     MAX_HOST_SERVICES_PER_CELL,
-    MAX_HOST_SOCKETS_PER_CELL,
     MAX_INGRESS_PER_CELL,
     MAX_MOUNTS_PER_CELL,
     MEMORY_PATTERN,
@@ -302,8 +297,8 @@ def _v_workspace_mount(value: Any, context: str) -> list[str]:
         return [f"'workspace_mount' must not be '/' (shadows rootfs){context}"]
     forbidden_prefixes = (
         "/proc", "/sys", "/dev", "/run/secrets", "/etc",
-        # /run/host and /run/brig are the bind-mount roots for
-        # host_sockets and the downward-API metadata / CA bundle.
+        # /run/brig is the bind-mount root for the downward-API metadata
+        # and CA bundle; /run/host stays reserved (off-limits to cell mounts).
         "/run/host", "/run/brig",
     )
     for p in forbidden_prefixes:
@@ -400,135 +395,6 @@ def _v_image_digest(value: Any, context: str) -> list[str]:
             f"(or sha384/sha512){context}"
         ]
     return []
-
-
-def _v_host_socket_entry(
-    i: int, entry: Any, seen_names: set, seen_mounts: set, context: str,
-) -> list[str]:
-    """Validate one host_socket entry. Mutates seen_* to track duplicates.
-
-    Static checks only — the runtime check happens in the reconciler at
-    cell start, where TOCTOU is unavoidable anyway.
-    """
-    if not isinstance(entry, dict):
-        return [f"'host_sockets[{i}]' must be a dict{context}"]
-
-    errors: list[str] = []
-
-    name = entry.get("name")
-    if not name or not isinstance(name, str):
-        errors.append(
-            f"'host_sockets[{i}].name' is required and must be a string{context}"
-        )
-    elif not HOST_SOCKET_NAME_PATTERN.match(name):
-        errors.append(
-            f"'host_sockets[{i}].name' must be lowercase alphanumeric "
-            f"with hyphens, max 31 chars{context}"
-        )
-    elif name in seen_names:
-        errors.append(f"Duplicate host_sockets name '{name}'{context}")
-    else:
-        seen_names.add(name)
-
-    host_path = entry.get("host_path")
-    if not host_path or not isinstance(host_path, str):
-        errors.append(
-            f"'host_sockets[{i}].host_path' is required and must be a string{context}"
-        )
-    elif not host_path.startswith("/"):
-        errors.append(
-            f"'host_sockets[{i}].host_path' must be absolute{context}"
-        )
-    elif ".." in host_path.split("/"):
-        errors.append(
-            f"'host_sockets[{i}].host_path' must not contain '..' (path traversal){context}"
-        )
-    else:
-        # Engine-socket denylist: granting these is root-equivalent on
-        # the host.
-        basename = host_path.rsplit("/", 1)[-1]
-        if basename in HOST_SOCKET_ENGINE_DENYLIST:
-            errors.append(
-                f"'host_sockets[{i}].host_path' points at engine socket "
-                f"'{basename}' — granting this is root-equivalent on the "
-                f"host and is denied{context}"
-            )
-
-    mount_point = entry.get("mount_point")
-    if not mount_point or not isinstance(mount_point, str):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' is required and must be a string{context}"
-        )
-    elif ".." in mount_point.split("/"):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' must not contain '..' (path traversal){context}"
-        )
-    elif not mount_point.startswith(HOST_SOCKET_MOUNT_PREFIX):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' must start with "
-            f"'{HOST_SOCKET_MOUNT_PREFIX}'{context}"
-        )
-    elif mount_point.rstrip("/") == HOST_SOCKET_MOUNT_PREFIX.rstrip("/"):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' must be a file path under "
-            f"'{HOST_SOCKET_MOUNT_PREFIX}', not the directory itself{context}"
-        )
-    else:
-        import os.path as _ospath
-        normalized = _ospath.normpath(mount_point)
-        if normalized in seen_mounts:
-            errors.append(
-                f"Duplicate host_sockets mount_point '{mount_point}' "
-                f"(normalizes to '{normalized}'){context}"
-            )
-        else:
-            seen_mounts.add(normalized)
-
-    mode = entry.get("mode", "ro")
-    if not isinstance(mode, str) or mode not in HOST_SOCKET_MODES:
-        errors.append(
-            f"'host_sockets[{i}].mode' must be one of: "
-            f"{', '.join(sorted(HOST_SOCKET_MODES))}{context}"
-        )
-
-    return errors
-
-
-def _v_host_sockets(value: Any, cell_def: dict, context: str) -> list[str]:
-    """Validate the cell's host_sockets list as a whole."""
-    if not isinstance(value, list):
-        return [f"'host_sockets' must be a list{context}"]
-
-    errors: list[str] = []
-    if len(value) > MAX_HOST_SOCKETS_PER_CELL:
-        errors.append(
-            f"Too many host_sockets entries ({len(value)}), "
-            f"max {MAX_HOST_SOCKETS_PER_CELL}{context}"
-        )
-
-    if value and _profile_is_untrusted(cell_def.get("profile")):
-        errors.append(
-            f"'host_sockets' is not allowed with the untrusted profile — "
-            f"untrusted cells must not have side channels to host services"
-            f"{context}"
-        )
-
-    # Cell name with dots breaks launchd label parsing.
-    cell_name = cell_def.get("name", "")
-    if value and isinstance(cell_name, str) and "." in cell_name:
-        errors.append(
-            f"cell names with '.' may not declare host_sockets "
-            f"(launchd label ambiguity){context}"
-        )
-
-    seen_names: set = set()
-    seen_mounts: set = set()
-    for i, entry in enumerate(value):
-        errors.extend(
-            _v_host_socket_entry(i, entry, seen_names, seen_mounts, context)
-        )
-
-    return errors
 
 
 def _profile_is_untrusted(profile_name: Any) -> bool:
@@ -689,7 +555,7 @@ def _v_cell_mount_point(value: Any, field: str, workspace_mount: str,
 def _v_mount_entry(i: int, entry: Any, seen_names: set, seen_mounts: set,
                    roots: list[str], workspace_mount: str,
                    context: str) -> list[str]:
-    """Validate one `mounts:` entry. Mirrors `_v_host_socket_entry`.
+    """Validate one `mounts:` entry.
 
     `roots` are the realpath-canonicalized, configured mount_roots; a
     host_path whose realpath isn't under one of them is refused (the
@@ -864,7 +730,7 @@ def _v_ingress(value: Any, cell_def: dict, context: str) -> list[str]:
         errors.append(f"'ingress' cannot be used with network='none' (airgapped){context}")
 
     # auth: none removes brig's perimeter gate — an untrusted cell must not be
-    # openly reachable without it (consistent with host_sockets / tls_passthrough).
+    # openly reachable without it (consistent with tls_passthrough).
     if _profile_is_untrusted(cell_def.get("profile")):
         for i, entry in enumerate(value):
             if isinstance(entry, dict) and entry.get("auth") == "none":
@@ -929,9 +795,6 @@ def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> l
 
     if "ingress" in cell_def:
         errors.extend(_v_ingress(cell_def["ingress"], cell_def, context))
-
-    if "host_sockets" in cell_def:
-        errors.extend(_v_host_sockets(cell_def["host_sockets"], cell_def, context))
 
     if "host_services" in cell_def:
         errors.extend(_v_host_services(cell_def["host_services"], cell_def, context))

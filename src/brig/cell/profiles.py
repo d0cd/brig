@@ -69,8 +69,8 @@ def load_profile(name: str, profiles_dir: Path = PROFILES_DIR) -> dict[str, Any]
     builtin. This is load-bearing for `untrusted`, where the untrusted
     cell's adversarial-code guarantees come from the profile NAME being
     `untrusted`; if a user-defined file at ~/.brig/profiles/untrusted.yaml
-    were loaded instead, the operator could remove the host_sockets /
-    host_services / tls_passthrough rejections by editing one file.
+    were loaded instead, the operator could remove the host_services /
+    tls_passthrough rejections by editing one file.
 
     Raises ValueError if not found or if a user file shadows a builtin.
     """

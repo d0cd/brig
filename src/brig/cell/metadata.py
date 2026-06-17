@@ -18,7 +18,6 @@ Schema (v3):
       "workspace": {
         "mount_point": "/work"
       },
-      "host_sockets": [{"name": ..., "mount_point": ...}, ...],
       "ingress":      [{"name": ..., "port": int,
                         "path_prefix": ..., "auth": "token"}, ...],
       "image_digest": "sha256:..."  // optional; only when pinned
@@ -131,22 +130,10 @@ def build_metadata(
     cell_name: str,
     workspace_mount: str,
     started_at: datetime | None = None,
-    host_sockets: list[dict[str, Any]] | None = None,
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
 ) -> dict[str, Any]:
     """Compose the cell metadata payload. Pure function for testability.
-
-    host_sockets entries are projected to {name, mount_point} only —
-    host_path stays out of the downward-API surface for the same
-    reason workspace.host_path was dropped in v2 (no host paths
-    leak through `/run/brig/cell.json`).
-
-    The projection only reads `name` and `mount_point`, so callers may
-    pass either full entries (from CellSpec.host_sockets, with
-    host_path/mode set) or pre-projected ones — both work. Don't add
-    fabricated values (the old `host_path: ""` placeholder was a lie
-    waiting to break if the projection ever extended).
 
     ingress entries are stored in full ({name, port, path_prefix, auth})
     so `brig cell start` can replay registration without the original
@@ -154,11 +141,6 @@ def build_metadata(
     dir and is re-read at registration time.
     """
     ts = started_at or datetime.now(timezone.utc)
-    sockets_published = [
-        {"name": entry["name"], "mount_point": entry["mount_point"]}
-        for entry in (host_sockets or [])
-        if isinstance(entry, dict) and "name" in entry and "mount_point" in entry
-    ]
     ingress_published = [
         {
             "name": entry["name"],
@@ -177,7 +159,6 @@ def build_metadata(
         "workspace": {
             "mount_point": workspace_mount,
         },
-        "host_sockets": sockets_published,
         "ingress": ingress_published,
         "policy": {
             "host_services": _per_cell_host_services(cell_name),
@@ -228,18 +209,12 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
     workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
-    # Preserve host_sockets and ingress across refresh — bind mounts and
-    # ingress configuration are fixed at cell-create time, so these lists
-    # can't change without a `brig run`. build_metadata projects each
-    # entry to its public-facing fields.
-    prior_sockets = [
-        s for s in prior.get("host_sockets", [])
-        if isinstance(s, dict) and "name" in s and "mount_point" in s
-    ]
+    # Preserve ingress across refresh — ingress configuration is fixed at
+    # cell-create time, so it can't change without a `brig run`.
     prior_ingress = read_ingress(cell_name)
     return write_metadata(
         cell_name, workspace_mount,
-        host_sockets=prior_sockets, ingress=prior_ingress,
+        ingress=prior_ingress,
         image_digest=read_image_digest(cell_name),
     )
 
@@ -264,22 +239,6 @@ def read_ingress(cell_name: str) -> list[dict[str, Any]]:
     ]
 
 
-def read_host_sockets(cell_name: str) -> list[dict[str, Any]]:
-    """Return the cell's stored host_sockets entries from cell-metadata.json.
-
-    Only the cell-visible projection (name, mount_point) is stored — host_path
-    is deliberately omitted (the file is mounted into the untrusted cell), so
-    bridges cannot be reconstructed from this alone. Used to detect that a
-    cell declares host_sockets, not to recreate them.
-    """
-    import json as _json
-    try:
-        payload = _json.loads(_host_metadata_path(cell_name).read_text())
-    except (FileNotFoundError, _json.JSONDecodeError, OSError):
-        return []
-    return [e for e in (payload.get("host_sockets", []) or []) if isinstance(e, dict)]
-
-
 def read_image_digest(cell_name: str) -> str | None:
     """Return the cell's stored image_digest from cell-metadata.json.
 
@@ -298,7 +257,6 @@ def read_image_digest(cell_name: str) -> str | None:
 def write_metadata(
     cell_name: str,
     workspace_mount: str,
-    host_sockets: list[dict[str, Any]] | None = None,
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
 ) -> Path:
@@ -314,7 +272,7 @@ def write_metadata(
     """
     payload = build_metadata(
         cell_name, workspace_mount,
-        host_sockets=host_sockets, ingress=ingress,
+        ingress=ingress,
         image_digest=image_digest,
     )
     target = _host_metadata_path(cell_name)

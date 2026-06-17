@@ -396,7 +396,6 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.workdir:
         cmd.extend(["--workdir", spec.workdir])
 
-    _attach_host_sockets(spec, cmd)
     _attach_mounts(spec, cmd)
 
     # End-of-options marker so an image reference (or command token) that
@@ -406,85 +405,6 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     cmd.extend(spec.command)
 
     return cmd
-
-
-def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
-    """Append `--volume` args for each declared host_socket, after
-    re-checking that the bridge socket is actually present and is a
-    real unix socket file (not a symlink, not a regular file).
-
-    This is the runtime TOCTOU defense — the static checks at yaml
-    parse time can't see the bridge directory, and the bridge is
-    populated by the macOS-side launchd unit (Phase 4). If the bridge
-    is missing, refuse cell start with a clear error rather than
-    letting podman create an empty dir at the source path.
-    """
-    if not spec.host_sockets:
-        return
-
-    from brig.config import VMPaths
-    # Per-cell bridge dir so two cells declaring the same physical host
-    # service (e.g. both want /tmp/postgres.sock) each get their own
-    # bridge socket. No reference counting; bridges live with the cell.
-    #
-    # CRITICAL: this code runs in the HOST (macOS) process, but the `-v`
-    # mount source must be the VM-namespace path (podman runs inside the VM
-    # and sees the bridge dir at /state/..., not ~/.brig/...). So validate the
-    # HOST path (the same inode, shared into the VM via virtio-fs) and emit the
-    # VM path as the mount source. Validating the VM path here would lstat a
-    # nonexistent /state on macOS — breaking the feature and leaving the real
-    # bridge socket unchecked.
-    host_bridge_dir = HostPaths.HOST_SOCKETS_DIR / spec.name
-    vm_bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR)) / spec.name
-    for entry in spec.host_sockets:
-        name = entry["name"]
-        mount_point = entry["mount_point"]
-        mode = entry.get("mode", "ro")
-        source = host_bridge_dir / f"{name}.sock"
-
-        # lstat (NOT stat) so symlinks don't get followed silently.
-        # Symlinks AT the bridge path OR anywhere in its ancestor
-        # chain could redirect the bind-mount to attacker-controlled
-        # storage. We require:
-        #   - source exists, is a real socket, not a symlink
-        #   - every ancestor directory is also not a symlink
-        #   - realpath of source still lives under bridge_dir
-        import os as _os
-        import stat as _stat
-        try:
-            st = source.lstat()
-        except FileNotFoundError:
-            raise BrigError(
-                f"host_socket '{name}': bridge socket not found at {source}",
-                suggestion="Is the launchd bridge running? Try: brig system up",
-            )
-        if _stat.S_ISLNK(st.st_mode):
-            raise BrigError(
-                f"host_socket '{name}': bridge path {source} is a symlink. "
-                f"Refusing to mount — bridge sockets must be real files."
-            )
-        if not _stat.S_ISSOCK(st.st_mode):
-            raise BrigError(
-                f"host_socket '{name}': bridge path {source} is not a "
-                f"unix socket (mode={oct(st.st_mode)})."
-            )
-        # Realpath canonicalizes the entire ancestor chain in one
-        # call — any symlinked parent dir (e.g. someone replaced the
-        # per-cell bridge dir with a link elsewhere) gets resolved
-        # here, defeating a post-lstat parent-dir swap. Then require
-        # the canonical path to live under the canonical bridge_dir
-        # (resolve both sides; macOS /tmp → /private/tmp makes a raw
-        # comparison falsely flag every real path as escaping).
-        real_source = _os.path.realpath(str(source))
-        real_root = _os.path.realpath(str(host_bridge_dir))
-        if not real_source.startswith(real_root + "/"):
-            raise BrigError(
-                f"host_socket '{name}': bridge socket realpath {real_source} "
-                f"escapes bridge dir {real_root}"
-            )
-
-        # Validation passed against the host path; mount the VM-namespace path.
-        cmd.extend(["-v", f"{vm_bridge_dir / f'{name}.sock'}:{mount_point}:{mode}"])
 
 
 def _resolved_mount_roots() -> list[tuple[str, str]]:
@@ -508,8 +428,7 @@ def _verify_mount_sources_for_run(spec: CellSpec) -> None:
 
     mount_roots changed without a VM recreate => /mnt/host/<slug> is absent;
     podman -v would auto-create an empty dir and the cell would silently mount
-    VM-local storage instead of the host files. Fail closed (mirrors the
-    host_socket bridge guard).
+    VM-local storage instead of the host files. Fail closed.
     """
     if not spec.mounts:
         return
@@ -644,7 +563,6 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # Write the cell metadata file (downward API) so it's in place when
         # podman creates the read-only bind mount at /run/brig/cell.json.
         write_metadata(spec.name, spec.workspace_mount,
-                       host_sockets=spec.host_sockets,
                        ingress=spec.ingress,
                        image_digest=spec.image_digest)
         # Stage the combined CA bundle inside the VM so HTTPS clients in

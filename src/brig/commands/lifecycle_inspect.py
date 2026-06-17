@@ -76,10 +76,9 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     """Handle `brig cell preflight <yaml>`.
 
     Dry-run check: parses the yaml and verifies every host-side
-    requirement it implies (declared secrets exist, declared
-    host_socket targets exist, declared ingress entries have a
-    token secret, image exists or is buildable). Prints a checklist
-    with a one-line fix for each gap.
+    requirement it implies (declared secrets exist, declared ingress
+    entries have a token secret, image exists or is buildable). Prints
+    a checklist with a one-line fix for each gap.
 
     Replaces the iterative "brig run → error → fix one thing →
     re-run" loop with a single diff. No mutations; safe to run
@@ -134,31 +133,6 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             fix=f"openssl rand -hex 32 | brig secrets add {primary.name} -",
         )
 
-    import os as _os
-    import stat as _stat
-    for entry in cell_def.get("host_sockets") or []:
-        if not isinstance(entry, dict):
-            continue
-        host_path = entry.get("host_path", "")
-        name = entry.get("name", "?")
-        try:
-            st = _os.lstat(host_path)
-            is_sock = _stat.S_ISSOCK(st.st_mode) and not _stat.S_ISLNK(st.st_mode)
-        except (FileNotFoundError, OSError):
-            is_sock = False
-        _check(
-            f"host_socket target: {name} → {host_path}", is_sock,
-            fix="Start the service that provides this socket, or "
-                "correct host_path.",
-        )
-
-    if cell_def.get("host_sockets"):
-        import shutil as _shutil
-        _check(
-            "socat installed (host_sockets bridge dependency)",
-            bool(_shutil.which("socat")),
-            fix="brew install socat",
-        )
 
     output("=" * 60)
     if fail_count:
@@ -449,13 +423,6 @@ def cmd_export(args: argparse.Namespace) -> int:
     if ingress:
         cell_def["ingress"] = ingress
 
-    # Only {name, mount_point} are persisted (host_path stays off the
-    # downward-API surface). Reproducing the cell from the exported yaml
-    # requires re-supplying the host_path.
-    sockets = _host_sockets_from_metadata(args.name)
-    if sockets:
-        cell_def["host_sockets"] = sockets
-
     # Reconstruct `mounts:` from the live binds under /mnt/host/<slug> (host_path
     # mapped back via the configured mount_roots; mode from the bind's RW flag).
     # The original `name` isn't persisted, so it's re-derived from the mount
@@ -488,14 +455,10 @@ def cmd_export(args: argparse.Namespace) -> int:
         cell_def["restart"] = "always"
 
     output(f"# Cell definition exported from '{args.name}'")
-    if sockets:
-        output("# NOTE: host_sockets entries lack `host_path` — re-add the host")
-        output("# socket paths before `brig run --file`; they are intentionally")
-        output("# not stored in cell metadata.")
     if mounts:
         output("# NOTE: `mounts:` requires the same mount_roots configured on the")
         output("# target host (brig config set mount_roots ...) for host_path to resolve.")
-    if not sockets and not mounts:
+    else:
         output("# Self-contained: brig run --file <this-file> reproduces the cell.")
     output("")
     output(yaml.safe_dump(cell_def, default_flow_style=False, sort_keys=False).rstrip())
@@ -515,20 +478,6 @@ def _ingress_for_cell(cell_name: str, routes_file) -> list:
          "auth": "token"}
         for r in routes
         if isinstance(r, dict) and r.get("cell") == cell_name
-    ]
-
-
-def _host_sockets_from_metadata(cell_name: str) -> list:
-    from brig.cell.metadata import _host_metadata_path
-    try:
-        meta = json.loads(_host_metadata_path(cell_name).read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return []
-    entries = meta.get("host_sockets") or []
-    return [
-        {"name": e["name"], "mount_point": e["mount_point"]}
-        for e in entries
-        if isinstance(e, dict) and "name" in e and "mount_point" in e
     ]
 
 

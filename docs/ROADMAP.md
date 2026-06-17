@@ -70,9 +70,9 @@ of the network choke point and the invariant ledger.
 **Status:** Deferred — defense-in-depth for the untrusted-state-dir boundary.
 
 Confine brig's *macOS-side* processes with seatbelt (App Sandbox /
-`sandbox-exec` profiles): the host_socket bridges, `brig cell mount-scan`, and
-any host tooling that touches cell-influenced files (invariant 4 — the state dir
-is untrusted). A profile limiting each helper's filesystem reach and denying
+`sandbox-exec` profiles): `brig cell mount-scan` and any host tooling that
+touches cell-influenced files (invariant 4 — the state dir is untrusted). A
+profile limiting each helper's filesystem reach and denying
 unexpected network/exec shrinks the blast radius if a cell plants content a
 host-side helper later consumes (the confused-deputy boundary `mount-scan`
 already guards). Pairs with — does not replace — the VM boundary.

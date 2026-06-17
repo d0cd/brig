@@ -91,7 +91,6 @@ def run_sync(
     detach: bool = True,
     timeout: str | None = None,
     labels: list[str] | None = None,
-    host_sockets: list[dict] | None = None,
     host_services: list[dict] | None = None,
     mounts: list[dict] | None = None,   # {name, host_path, mount_point, mode?} — bounded by mount_roots
     ingress: list[dict] | None = None,
@@ -114,8 +113,8 @@ Creates and starts a new cell. Returns a `Cell` handle.
 
 Field semantics match the cell yaml — see
 [`docs/design/cell-definition.md`](../design/cell-definition.md) for
-the full schema (validation rules, expected shapes for `host_sockets`,
-`host_services`, `ingress`, `policy_*`). `validate_cell_definition`
+the full schema (validation rules, expected shapes for `host_services`,
+`ingress`, `policy_*`). `validate_cell_definition`
 runs against the SDK args before the cell starts, so the same
 untrusted-profile guards and SSRF wildcard checks that apply to
 `brig run --file` apply here.
@@ -150,7 +149,7 @@ cell is always removed in `finally:` so a wait timeout doesn't leak it.
 `podman logs` does not separate streams.
 
 `execute_sync` is intentionally a narrower surface than `run_sync` —
-the long list of advanced fields (host_sockets, ingress, policy_*) is
+the long list of advanced fields (host_services, ingress, policy_*) is
 not exposed because the typical agent use case doesn't need them. Drop
 to `run_sync` when you do.
 

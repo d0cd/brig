@@ -2,8 +2,8 @@
 
 The CLI run path validates the cell definition; if the --profile flag's name
 isn't recorded where the validator can see it, the untrusted guards
-(host_sockets, host_services, tls_passthrough) are silently skipped and a cell
-the operator believes is locked down can declare those side channels.
+(host_services, tls_passthrough) are silently skipped and a cell the operator
+believes is locked down can declare those side channels.
 """
 
 from __future__ import annotations
@@ -49,16 +49,6 @@ class TestUntrustedProfileCliEnforcement(unittest.TestCase):
             # Must reject at validation, before reconciliation.
             run_cell.assert_not_called()
             return str(ctx.exception)
-
-    def test_cli_untrusted_blocks_host_sockets(self):
-        msg = self._run_expecting_error(
-            name="u", image="alpine",
-            host_sockets=[{
-                "name": "db", "host_path": "/tmp/db.sock",
-                "mount_point": "/run/host/db.sock",
-            }],
-        )
-        self.assertIn("untrusted profile", msg)
 
     def test_cli_untrusted_blocks_tls_passthrough(self):
         msg = self._run_expecting_error(

@@ -20,7 +20,6 @@ it read-only into the cell. The cell can read but cannot modify it.
   "workspace": {
     "mount_point": "/work"
   },
-  "host_sockets": [],
   "ingress": [
     {"name": "api", "port": 8000, "path_prefix": "/api", "auth": "token"}
   ],
@@ -38,7 +37,6 @@ it read-only into the cell. The cell can read but cannot modify it.
 | `started_at` | string | RFC 3339 UTC timestamp of cell creation. |
 | `workspace.mount_point` | string | Path inside the cell, default `/work`, overridable via `workspace_mount` in the cell spec. |
 | `policy.host_services` | string[] | Per-cell host-service ACL — the names of host services this cell may reach. Ports live in the per-cell policy file on disk; metadata exposes names only. |
-| `host_sockets[]` | `[{name, mount_point}]` | Unix sockets bind-mounted into the cell from the host (host_path is intentionally omitted). |
 | `ingress[]` | `[{name, port, path_prefix, auth}]` | Ingress endpoints the cell publishes through warden's `:8443` reverse proxy. `auth` is `token` (default; the bearer token is never stored here — it lives in `~/.brig/secrets/<cell>-ingress-token`) or `none` (transparent pass-through, no token). `brig cell start` uses this list to replay route registration with a freshly-inspected cell IP after a `brig system down` / `up` cycle. |
 | `image_digest` | string? | Optional. Set when the cell was created with a pinned digest. `brig cell start` re-verifies the container's current image digest against this value before letting the cell start. |
 

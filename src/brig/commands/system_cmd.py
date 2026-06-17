@@ -214,13 +214,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     _check("otel collector running", collector.is_running(),
            suggestion="brig system down && brig system up")
 
-    # 7. host_socket bridges — if any plists exist under LaunchAgents,
-    # the corresponding bridge sockets must be present. Missing bridge
-    # = cell using that socket will fail to start. socat presence is
-    # also checked since the bridges require it.
-    _check_host_socket_bridges(_check)
-
-    # 8. Warden CA staleness — a silent-TLS-hang foot-gun:
+    # 7. Warden CA staleness — a silent-TLS-hang foot-gun:
     # a cell entrypoint that ALSO sets SSL_CERT_FILE clobbers brig's
     # auto-mounted bundle. On the next warden restart, mitmproxy
     # regenerates its CA, brig re-stages bundles, but the cell's
@@ -354,45 +348,6 @@ def _check_entrypoint_ssl_cert_override(check, cell_name: str) -> None:
         f"cell '{cell_name}' SSL_CERT_FILE matches brig auto-mount",
         True,
     )
-
-
-def _check_host_socket_bridges(check) -> None:
-    """Enumerate launchd host_socket plists and verify each bridge
-    socket file is present. Surfaces partial-up states (plist loaded
-    but socat crashed and didn't restart) before they manifest as
-    confusing cell-start failures.
-    """
-    import shutil as _shutil
-    from brig.cell.host_sockets_bridge import LABEL_PREFIX, PLIST_DIR
-    from brig.config import HostPaths
-
-    if not PLIST_DIR.exists():
-        return  # No bridges ever registered; nothing to check.
-    plists = [p for p in PLIST_DIR.iterdir()
-              if p.name.startswith(LABEL_PREFIX) and p.name.endswith(".plist")]
-    if not plists:
-        return
-
-    # If any plist exists, socat must too.
-    check("socat installed (host_socket bridges)",
-          bool(_shutil.which("socat")),
-          suggestion="brew install socat")
-
-    for plist in plists:
-        label = plist.stem
-        rest = label[len(LABEL_PREFIX):]
-        if "." not in rest:
-            continue
-        cell_name, sock_name = rest.split(".", 1)
-        bridge = HostPaths.HOST_SOCKETS_DIR / cell_name / f"{sock_name}.sock"
-        check(
-            f"bridge socket: {cell_name}/{sock_name}", bridge.exists(),
-            detail=str(bridge),
-            suggestion=(
-                f"Bridge process crashed. Tail /tmp/{label}.err.log "
-                f"then: brig cell rm {cell_name} && brig run --file <yaml>"
-            ),
-        )
 
 
 def _cmd_doctor_quick() -> int:

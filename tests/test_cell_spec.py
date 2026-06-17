@@ -217,8 +217,8 @@ class TestValidateCellDefinition(unittest.TestCase):
     def test_workspace_mount_shadowing_run_secrets_rejected(self):
         # The crown jewel: a cell that sets workspace_mount: /run/secrets
         # would hide its own secrets dir behind the workspace mount. Reject.
-        # /run/host and /run/brig also covered: host_sockets + downward
-        # API + CA bundle mount roots, shadowed = silent breakage.
+        # /run/host and /run/brig also covered: downward-API + CA bundle
+        # mount roots (and /run/host reserved), shadowed = silent breakage.
         for shadow in ("/run/secrets", "/run/secrets/foo",
                        "/run/host", "/run/host/foo.sock",
                        "/run/brig", "/run/brig/cell.json",

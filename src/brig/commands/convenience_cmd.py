@@ -141,11 +141,11 @@ def cmd_down(args: argparse.Namespace) -> int:
     """Handle `brig system down` — stop everything.
 
     Steps:
-      1. Stop all running cells (via stop_cell so ingress / host_socket
-         bridges are torn down consistently per-cell).
-      2. Sweep orphan host_socket bridges and ingress routes whose cell
-         already exited (subnet reuse would otherwise let a future cell
-         inherit the prior cell's hashed auth token).
+      1. Stop all running cells (via stop_cell so ingress is torn down
+         consistently per-cell).
+      2. Sweep orphan ingress routes whose cell already exited (subnet reuse
+         would otherwise let a future cell inherit the prior cell's hashed
+         auth token).
       3. Stop warden.
       4. Optionally stop VM (--vm flag).
 
@@ -165,8 +165,6 @@ def cmd_down(args: argparse.Namespace) -> int:
         except BrigError as e:
             output(f"  ERROR: {e}")
             failures += 1
-
-    _bootout_all_host_socket_bridges()
 
     # Self-heal subnet allocations whose podman network is gone (raw-podman
     # kills, crashes mid-rm), then sweep ingress routes against what's left —
@@ -203,34 +201,6 @@ def cmd_down(args: argparse.Namespace) -> int:
         return 1
     info("Brig stopped")
     return 0
-
-
-def _bootout_all_host_socket_bridges() -> None:
-    """Enumerate every loaded host_socket bridge plist and bootout it,
-    regardless of which cell it belongs to. Used by `brig system down` so we
-    don't leak orphan bridges across system restarts.
-    """
-    from brig.cell.host_sockets_bridge import (
-        LABEL_PREFIX, PLIST_DIR, stop_cell_bridges,
-    )
-    if not PLIST_DIR.exists():
-        return
-    cells_with_bridges: set[str] = set()
-    for plist in PLIST_DIR.iterdir():
-        name = plist.name
-        if not name.startswith(LABEL_PREFIX) or not name.endswith(".plist"):
-            continue
-        rest = name[len(LABEL_PREFIX):-len(".plist")]
-        if "." not in rest:
-            continue
-        cell_name = rest.split(".", 1)[0]
-        cells_with_bridges.add(cell_name)
-    for cell_name in cells_with_bridges:
-        info(f"Tearing down host_socket bridges for {cell_name}...")
-        try:
-            stop_cell_bridges(cell_name)
-        except Exception as e:
-            output(f"  (warn) failed to bootout bridges for {cell_name}: {e}")
 
 
 def cmd_profiles(args: argparse.Namespace) -> int:

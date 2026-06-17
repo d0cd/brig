@@ -1,7 +1,8 @@
 # Brig Security Invariants — Living Ledger
 
-The 13 invariants from [docs/design/security.md](design/security.md) are the
-thing this project exists to uphold. This document is the single source of
+The invariants from [docs/design/security.md](design/security.md) are the
+thing this project exists to uphold (numbered 1–13; #10 is retired). This
+document is the single source of
 truth for **which tests prove them** and **which CI lane runs those tests**.
 
 If you break a test named here, you're breaking an invariant. If you add a
@@ -126,40 +127,17 @@ proxy logs, not prevention.
 | E2E test | `tests/test_cell_lifecycle.sh` |
 | CI | Unit (the E2E `.sh` lane is gated on nested-virt and does NOT run on GitHub-hosted CI — manual/dispatch only) |
 
-### 10. host_sockets Bypass Warden by Design
+### 10. (retired) host_sockets
 
-The prior nine invariants imply "Warden sees all cell traffic." That is
-not literally true once host_sockets are declared. The bytes flowing
-over a bind-mounted unix socket move through the kernel directly between
-the cell and the host service — no proxy interposition possible. This
-is the trade-off for supporting non-HTTP services (Postgres, Redis,
-ssh-agent) that cannot meaningfully traverse an HTTP proxy.
+The unix `host_sockets` feature — a launchd bridge that mounted a macOS host
+service's unix socket into a cell — was **removed** (see CHANGELOG). It never
+worked under brig's mandatory gVisor runtime (a cell could not `connect()` to a
+bind-mounted host unix socket), no consumer used it, and it deliberately
+bypassed Warden. Cell→host access goes through **TCP/HTTP `host_services`**
+(Warden stays in the path) or scoped **`mounts`** (invariant 13).
 
-The invariant we DO uphold:
-
-  - host_sockets are opt-in per cell yaml (no default access)
-  - The `untrusted` profile cannot declare them at all (parse-time reject)
-  - Engine sockets (docker.sock, podman.sock, etc.) are denylisted at
-    parse time AND at bridge start (defense in depth)
-  - Bridge sockets are real unix sockets, never symlinks (lstat check)
-  - Per-cell namespacing — cell A's bridge cannot be reused by cell B
-  - Every attach is audited (`log_lifecycle("host_socket_attach", ...)`)
-  - The cell startup banner explicitly says Warden does not see the
-    traffic, so operators internalize the trade-off
-
-| Surface | Location |
-|---|---|
-| Parse-time guards | `src/brig/cell/validators.py:_v_host_socket_entry`, `_v_host_sockets` |
-| Engine denylist | `src/brig/config.py:HOST_SOCKET_ENGINE_DENYLIST` |
-| Runtime TOCTOU | `src/brig/cell/reconciler.py:_attach_host_sockets` (lstat, S_ISSOCK) |
-| Bridge defense | `src/brig/cell/host_sockets_bridge.py:_validate_target` |
-| Audit | `src/brig/cell/lifecycle.py:run_cell` emits `host_socket_attach` |
-| Banner | `src/brig/cell/lifecycle.py:run_cell` prints NOTE on cells with sockets |
-| Unit tests | `tests/test_host_sockets_spec.py` (19 cases) |
-| Unit tests | `tests/test_reconciler_host_sockets.py` (7 cases) |
-| Unit tests | `tests/test_host_sockets_bridge.py` (12 cases) |
-| Unit tests | `tests/test_metadata_host_sockets.py` (3 cases) |
-| CI | Unit |
+This number is retired rather than reused so invariants 11–13 keep stable
+references. See removed-feature design notes in GitHub issue #21.
 
 ### 11. TLS Passthrough Is an Explicit, Opt-In TLS-Handling Override
 
@@ -290,7 +268,7 @@ The invariants we DO uphold:
 A `supervised`/`dev` cell may bind-mount an operator-chosen host directory into
 itself via `mounts:` (ro default / rw opt-in), bounded by the VM-level
 `mount_roots` allowlist. The bytes flow between the cell and the host files
-directly — Warden does not mediate them (same trade-off as host_sockets).
+directly — Warden does not mediate them (an explicit Warden-bypass trade-off).
 
 The invariants we DO uphold:
 

@@ -191,7 +191,7 @@ The cell's PID 1 exited. Common causes:
   `--read-only`. See "Cell can't write to /workspace/..." above.
 
 - **Required env var or secret missing.** `brig cell preflight <yaml>`
-  validates secrets + host_services + host_sockets before starting.
+  validates secrets + host_services + ingress before starting.
 
 ## Warden blocks well-known telemetry endpoints (non-fatal)
 
