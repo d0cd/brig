@@ -88,7 +88,7 @@ brig policy test <cell> <domain> --path /api
 
 ## Disk space
 
-`~/.brig/state/system/<cell>/workspace/` accumulates per-cell. The Lima VM
+`~/.brig/state/<cell>/workspace/` accumulates per-cell. The Lima VM
 has its own disk allocation (default 100 GiB) for the container layer. If
 you're running out:
 
@@ -145,7 +145,7 @@ If your in-cell app expects to write to `/workspace/...`, either:
 1. **Change the cell yaml** to align with the app's expectation:
    ```yaml
    workspace_mount: /workspace        # default is /work
-   workspace_quota: "20g"             # bound the writable area
+   workspace_quota: "20g"             # soft cap: enforced on `brig cp` + by `brig system watchdog`
    ```
    Then `brig cell rm <name> -f && brig run --file <yaml>`. Bind
    mounts are fixed at container-create time; restart alone won't

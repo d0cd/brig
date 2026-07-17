@@ -130,6 +130,25 @@ class TestValidateCellDefinition(unittest.TestCase):
         errors = validate_cell_definition({"pids_limit": -1})
         self.assertTrue(any("positive integer" in e for e in errors))
 
+    def test_pids_limit_bool_rejected(self):
+        # bool is an int subclass; True must not slip through as --pids-limit True.
+        for bad in (True, False):
+            errors = validate_cell_definition({"pids_limit": bad})
+            self.assertTrue(any("positive integer" in e for e in errors), bad)
+
+    def test_workspace_mount_colon_rejected(self):
+        # ':' is the podman -v field separator; it must not reach the bind arg.
+        errors = validate_cell_definition({"workspace_mount": "/work:x"})
+        self.assertTrue(any("must not contain ':'" in e for e in errors), errors)
+
+    def test_workspace_quota_non_positive_rejected(self):
+        for bad in ("0", "0m", "-5g"):
+            errors = validate_cell_definition({"workspace_quota": bad})
+            self.assertTrue(any("positive size" in e for e in errors), (bad, errors))
+
+    def test_workspace_quota_positive_ok(self):
+        self.assertEqual(validate_cell_definition({"workspace_quota": "500m"}), [])
+
     # --- Security Invariant 1/6: network=proxy-external rejected ---
     def test_network_proxy_external_rejected(self):
         errors = validate_cell_definition({"network": "proxy-external"})

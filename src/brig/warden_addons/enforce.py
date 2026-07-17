@@ -624,7 +624,12 @@ class PolicyEnforcer:
                 f"cell '{cell_name or 'unknown'}' has no per-cell policy",
             )
             return
-        allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
+        # CONNECT only sets up the tunnel; path and method are encrypted inside
+        # it. Gate on the host alone here — per-request path/method rules are
+        # enforced in request() after MITM. Using the full is_allowed() with a
+        # placeholder "/"+"CONNECT" would wrongly block HTTPS to any host whose
+        # allow rule is path- or method-scoped.
+        allowed, reason = cell_policy.is_host_allowed(host)
         if not allowed:
             self._block(flow, f"cell policy: {reason}")
 

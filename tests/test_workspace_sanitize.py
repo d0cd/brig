@@ -4,6 +4,7 @@ These run host-side with no VM dependency. They cover the parts of
 brig.workspace.workspace that weren't exercised by test_workspace.py.
 """
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from brig.workspace.workspace import (
     _get_path_size,
     _sanitize_file,
     _sanitize_tree,
+    copy_out,
 )
 from brig.errors import BrigError
 
@@ -100,6 +102,94 @@ class TestApplyQuarantine(unittest.TestCase):
             args = mock_run.call_args[0][0]
             self.assertEqual(args[0], "xattr")
             self.assertIn("com.apple.quarantine", args)
+            self.assertNotIn("-r", args)  # single file: no recursion
+
+    def test_directory_quarantine_is_recursive(self):
+        # A copied-out tree must be marked recursively, or the payload files
+        # inside a quarantined top dir stay unquarantined (Gatekeeper checks
+        # the file being opened).
+        d = Path(tempfile.mkdtemp())
+        with patch("subprocess.run") as mock_run:
+            _apply_quarantine(d)
+            args = mock_run.call_args[0][0]
+            self.assertIn("-r", args)
+            self.assertIn("com.apple.quarantine", args)
+
+
+class TestCopyOutSanitizeFailure(unittest.TestCase):
+    """On a sanitize failure, copy_out must delete only what THIS copy created:
+    a pre-existing destination (containing the user's own files) must survive."""
+
+    def _ok(self, *a, **k):
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    def test_preexisting_dst_not_removed_on_failure(self):
+        dst = Path(tempfile.mkdtemp())
+        (dst / "keep.txt").write_text("user data")
+        (dst / "evil.command").write_text("x")  # unsafe → sanitize raises
+        with patch("brig.workspace.workspace.vm_run", side_effect=self._ok):
+            with self.assertRaises(BrigError):
+                copy_out("cell", "src", str(dst), sanitize=True)
+        self.assertTrue(dst.exists())
+        self.assertTrue((dst / "keep.txt").exists())
+
+    def test_new_dst_removed_on_failure(self):
+        base = Path(tempfile.mkdtemp())
+        dst = base / "fresh"  # does NOT pre-exist
+
+        def fake_cp(cmd, *a, **k):
+            dst.mkdir()
+            (dst / "evil.command").write_text("x")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with patch("brig.workspace.workspace.vm_run", side_effect=fake_cp):
+            with self.assertRaises(BrigError):
+                copy_out("cell", "src", str(dst), sanitize=True)
+        self.assertFalse(dst.exists())  # we created it, so we clean it up
+
+
+class TestCopyInQuota(unittest.TestCase):
+    """Preventive host->cell quota gate in copy_in()."""
+
+    def _sizes(self, current, src):
+        return (
+            patch("brig.workspace.workspace._get_workspace_size", return_value=current),
+            patch("brig.workspace.workspace._get_path_size", return_value=src),
+        )
+
+    def test_over_quota_rejected_before_copy(self):
+        from brig.workspace.workspace import copy_in
+        cur, srcp = self._sizes(400 * 1024 * 1024, 200 * 1024 * 1024)
+        with cur, srcp, patch("brig.workspace.workspace.vm_run") as vm:
+            with self.assertRaises(BrigError) as ctx:
+                copy_in("c", "/tmp/src", "/work/dst", quota="500m")
+        self.assertIn("quota exceeded", str(ctx.exception).lower())
+        vm.assert_not_called()
+
+    def test_under_quota_allowed(self):
+        from brig.workspace.workspace import copy_in
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        cur, srcp = self._sizes(100 * 1024 * 1024, 50 * 1024 * 1024)
+        with cur, srcp, patch("brig.workspace.workspace.vm_run", return_value=ok) as vm:
+            copy_in("c", "/tmp/src", "/work/dst", quota="500m")
+        vm.assert_called_once()
+
+    def test_unmeasurable_size_fails_closed(self):
+        from brig.workspace.workspace import copy_in
+        with patch("brig.workspace.workspace._get_workspace_size", return_value=None), \
+             patch("brig.workspace.workspace.vm_run") as vm:
+            with self.assertRaises(BrigError) as ctx:
+                copy_in("c", "/tmp/src", "/work/dst", quota="500m")
+        self.assertIn("cannot verify workspace quota", str(ctx.exception).lower())
+        vm.assert_not_called()
+
+    def test_no_quota_skips_size_check(self):
+        from brig.workspace.workspace import copy_in
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with patch("brig.workspace.workspace._get_workspace_size") as sz, \
+             patch("brig.workspace.workspace.vm_run", return_value=ok):
+            copy_in("c", "/tmp/src", "/work/dst", quota=None)
+        sz.assert_not_called()
 
 
 class TestGetPathSize(unittest.TestCase):

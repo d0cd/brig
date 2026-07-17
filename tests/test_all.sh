@@ -69,6 +69,7 @@ SUITES=(
     "test_warden_features:Warden Features"
     "test_invariants_7_8:Invariants 7 & 8"
     "test_stream_passthrough:Stream Passthrough (ingress SSE)"
+    "test_containment_e2e:Containment Red-Team (Tier-1)"
 )
 
 # Run on their own (also wired into CI's e2e.yml), NOT here:

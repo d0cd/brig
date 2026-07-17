@@ -94,7 +94,7 @@ fi
 # T1 — egress to a non-allowlisted host: blocked + logged.
 info "--- T1: egress bypass (non-allowlisted host) ---"
 OUT=$(in_cell attacker wget -q -O- --timeout=5 http://neverssl.com 2>&1 || echo BLOCKED)
-if echo "$OUT" | grep -qiE "blocked|forbidden|refused|timed out|error|403|502|BLOCKED"; then
+if echo "$OUT" | grep -qiE "blocked|forbidden|refused|timed out|403|502|BLOCKED"; then
     pass "T1a prevent: egress to neverssl.com refused"
 else
     fail "T1a prevent: egress NOT blocked (got: $(echo "$OUT" | head -c 120))"
@@ -108,7 +108,7 @@ fi
 # T2 — SSRF / private + cloud-metadata IP: blocked + logged.
 info "--- T2: SSRF to cloud-metadata IP (169.254.169.254) ---"
 OUT=$(in_cell attacker wget -q -O- --timeout=5 http://169.254.169.254/ 2>&1 || echo BLOCKED)
-if echo "$OUT" | grep -qiE "blocked|forbidden|refused|timed out|error|403|502|BLOCKED"; then
+if echo "$OUT" | grep -qiE "blocked|forbidden|refused|timed out|403|502|BLOCKED"; then
     pass "T2a prevent: egress to 169.254.169.254 refused"
 else
     fail "T2a prevent: metadata IP NOT blocked (got: $(echo "$OUT" | head -c 120))"
@@ -126,7 +126,7 @@ BYSTANDER_IP=$(run_in_vm sudo podman inspect brig-bystander \
     --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null | tr -d '\r')
 if [ -n "$BYSTANDER_IP" ]; then
     OUT=$(in_cell attacker wget -q -O- --timeout=5 "http://${BYSTANDER_IP}/" 2>&1 || echo UNREACHABLE)
-    if echo "$OUT" | grep -qiE "unreachable|refused|timed out|no route|error|UNREACHABLE"; then
+    if echo "$OUT" | grep -qiE "unreachable|refused|timed out|no route|UNREACHABLE"; then
         pass "T3 prevent: second cell ($BYSTANDER_IP) is unreachable (no east-west)"
     else
         fail "T3 prevent: reached another cell! (got: $(echo "$OUT" | head -c 120))"
@@ -139,7 +139,7 @@ fi
 info "--- T4: airgapped cell (network: none) ---"
 $BRIG run --name airgap-probe -d --network none alpine sleep 60 >/dev/null 2>&1 || true
 OUT=$(in_cell airgap-probe wget -q -O- --timeout=5 http://github.com 2>&1 || echo NOEGRESS)
-if echo "$OUT" | grep -qiE "bad address|unreachable|refused|timed out|error|NOEGRESS"; then
+if echo "$OUT" | grep -qiE "bad address|unreachable|refused|timed out|NOEGRESS"; then
     pass "T4 prevent: airgapped cell has no egress"
 else
     fail "T4 prevent: airgapped cell reached the network! (got: $(echo "$OUT" | head -c 120))"
@@ -157,4 +157,7 @@ echo
 echo "============================================"
 echo -e "Containment: ${GREEN}${PASSED} passed${NC}, ${RED}${FAILED} failed${NC}"
 echo "============================================"
+# Machine-readable tallies for test_all.sh's aggregator.
+echo "Passed: $PASSED"
+echo "Failed: $FAILED"
 [ "$FAILED" -eq 0 ]

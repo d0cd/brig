@@ -330,6 +330,30 @@ class Policy:
         allow_matches = self._allow_trie.lookup(host)
         return any(r.matches_domain(host) for r in allow_matches)
 
+    def is_host_allowed(self, host: str) -> tuple[bool, str]:
+        """Host-level allow decision for a CONNECT (HTTPS tunnel setup).
+
+        At CONNECT time the path and method live inside the not-yet-established
+        TLS tunnel, so they can't be matched — decide on host alone. An
+        UNSCOPED deny rule (no path/method filter) blocks the tunnel; any allow
+        rule for the host permits it. Path/method-scoped rules are enforced
+        per-request in is_allowed()/request() after MITM decryption. Gating the
+        CONNECT on a path-scoped allow like `{domain: x, paths: [/api]}` would
+        wrongly break ALL HTTPS to that host (the path isn't known yet).
+        """
+        for rule in self._deny_trie.lookup(host):
+            # An unscoped deny (no path/method filter) blocks the tunnel. Treat
+            # an EMPTY paths/methods list the same as None — is_allowed's
+            # matches_path/matches_method also treat empty as "no restriction"
+            # (matches everything), so a `paths: []` deny blocks all HTTP and
+            # must block the CONNECT too, not be mistaken for a scoped rule.
+            if not rule.paths and not rule.methods and rule.matches_domain(host):
+                return False, f"denied by rule: {rule.domain}"
+        for rule in self._allow_trie.lookup(host):
+            if rule.matches_domain(host):
+                return True, f"allowed by rule: {rule.domain}"
+        return False, "not in allowlist"
+
     def is_allowed(self, host: str, path: str, method: str,
                    trace_config: PolicyTraceConfig = None) -> tuple[bool, str, dict]:
         """Check if request is allowed.

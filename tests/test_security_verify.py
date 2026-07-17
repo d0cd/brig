@@ -175,6 +175,16 @@ class TestVerifyNetworkIsolation(unittest.TestCase):
         result = verify_network_isolation()
         self.assertFalse(result.passed)
 
+    def test_capitalized_internal_key_accepted(self):
+        # A podman/netavark shape change to "Internal" (capital) must not turn
+        # a correctly-internal network into a spurious isolation violation.
+        result = verify_network_isolation([{"name": "brig-cell1", "Internal": True}])
+        self.assertTrue(result.passed)
+
+    def test_missing_internal_key_is_violation(self):
+        result = verify_network_isolation([{"name": "brig-cell1"}])
+        self.assertFalse(result.passed)
+
 
 class TestVerifySingleHomed(unittest.TestCase):
     """Invariant 8: Cells must be single-homed."""

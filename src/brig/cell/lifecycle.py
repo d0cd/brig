@@ -61,6 +61,19 @@ def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
     seen_prefixes: set = set()
     for i, entry in enumerate(ingress_spec):
         errors.extend(_v_ingress_entry(i, entry, seen_names, seen_prefixes, ""))
+    # Re-apply the untrusted-profile auth:none gate on replay. The profile is
+    # read from the (untrusted) metadata, but the check is fail-closed: a
+    # tampered file that adds an auth:none route to an untrusted cell is
+    # refused, matching the parse-time gate in _v_ingress.
+    from brig.cell.metadata import read_profile
+    from brig.cell.validators import _profile_is_untrusted
+    if _profile_is_untrusted(read_profile(cell_name)):
+        for i, entry in enumerate(ingress_spec):
+            if isinstance(entry, dict) and entry.get("auth") == "none":
+                errors.append(
+                    f"ingress[{i}].auth: none is not allowed with the untrusted "
+                    f"profile — untrusted cells must keep brig's token gate"
+                )
     if errors:
         raise BrigError(
             f"Refusing to register ingress for '{cell_name}': "
@@ -200,9 +213,11 @@ def list_cell_containers(*, include_stopped: bool = True) -> list[tuple[str, dic
 
 # Exact hex length per algorithm — an open-ended {64,} would accept an
 # over-long sha256 or a wrong-length sha384/sha512 as well-formed.
-_DIGEST_PATTERN = re.compile(
-    r"^sha(?:256:[0-9a-fA-F]{64}|384:[0-9a-fA-F]{96}|512:[0-9a-fA-F]{128})\Z"
-)
+# Only sha256 is accepted: OCI registry manifest digests (what podman matches
+# at pull time and reports as {{.ImageDigest}} for the start-time re-check) are
+# sha256, so a sha384/sha512 pin could never match and the cell would fail to
+# start with a spurious "digest drift".
+_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-fA-F]{64}\Z")
 
 
 def _apply_image_digest_pin(spec: CellSpec) -> None:
@@ -214,7 +229,7 @@ def _apply_image_digest_pin(spec: CellSpec) -> None:
     at pull time.
 
     Raises BrigError if:
-      - image_digest is set but malformed (must be sha{256,384,512}:HEX)
+      - image_digest is set but malformed (must be sha256:<64-hex>)
       - image already contains a digest that disagrees with image_digest
     """
     if not spec.image_digest:
@@ -223,7 +238,7 @@ def _apply_image_digest_pin(spec: CellSpec) -> None:
     if not _DIGEST_PATTERN.match(digest):
         raise BrigError(
             f"Invalid image_digest '{digest}'",
-            suggestion="Format must be sha256:<64-hex> (or sha384/sha512)",
+            suggestion="Format must be sha256:<64-hex>",
         )
     if "@" in spec.image:
         repo, _, existing = spec.image.partition("@")
@@ -525,26 +540,71 @@ def kill_cell(cell_name: str) -> None:
             suggestion="Use 'brig cell list' to see available cells",
         )
 
+    # observe() reports a paused container as running=False; a paused cell can
+    # still be killed (unpause first). Anything else that isn't running has
+    # nothing to kill — reject like stop_cell rather than deregister ingress
+    # and log a false "kill" success for a cell that's already stopped.
+    should_kill = actual.running or actual.status == "paused"
+    if not should_kill:
+        raise BrigError(
+            f"Cell '{cell_name}' is not running",
+            suggestion=f"Use 'brig cell start {cell_name}' to start it",
+        )
+
     # Deregister ingress routes before killing.
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
-
-    # observe() reports a paused container as running=False, so gate on the
-    # actual status too — otherwise killing a paused cell would no-op, log a
-    # false "kill" success, and leave it up with its egress wiring stripped.
     # podman refuses to SIGKILL a paused container, so unpause it first.
-    should_kill = actual.running or actual.status == "paused"
-    if should_kill and actual.status == "paused":
+    if actual.status == "paused":
         from brig.config import container_name
         vm_run(["podman", "unpause", container_name(cell_name)])
 
-    actions = [Action(ActionType.PODMAN_KILL, cell_name)] if should_kill else []
-    result = apply(actions)
-
+    result = apply([Action(ActionType.PODMAN_KILL, cell_name)])
     if result.success:
         log_operation("kill", cell_name=cell_name)
         log_lifecycle("kill", cell_name)
+    else:
+        failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
+        raise BrigError(f"Failed to kill cell '{cell_name}': {failed[1]}")
+
+
+def enforce_workspace_quotas() -> list[tuple[str, int, int]]:
+    """Stop every running cell whose workspace exceeds its `workspace_quota`.
+
+    Reactive (soft) enforcement. The workspace lives on a virtiofs mount where
+    a hard block-quota isn't available, so instead of preventing the write we
+    periodically measure and stop over-quota cells — halting further disk
+    growth on the shared VM disk while preserving the workspace for the
+    operator to inspect or clean up. Intended to be called from a periodic
+    context (see `brig system watchdog`); it is a no-op for cells with no quota.
+
+    Returns `(cell_name, size_bytes, quota_bytes)` for each cell found over
+    quota (whether or not the stop succeeded) so the caller can report it.
+    """
+    from brig.cell.metadata import read_workspace_quota
+    from brig.cell.spec import parse_size
+    from brig.workspace.workspace import _get_workspace_size
+
+    breached: list[tuple[str, int, int]] = []
+    for cell_name, _entry in list_cell_containers(include_stopped=False):
+        quota = read_workspace_quota(cell_name)
+        if not quota:
+            continue
+        try:
+            quota_bytes = parse_size(quota)
+        except (ValueError, TypeError):
+            continue
+        size = _get_workspace_size(cell_name)
+        if size is None:
+            continue  # Best-effort reactive sweep: skip if we can't measure.
+        if size > quota_bytes:
+            breached.append((cell_name, size, quota_bytes))
+            try:
+                stop_cell(cell_name)
+            except BrigError:
+                pass  # Best-effort; the breach is reported regardless.
+    return breached
 
 
 def rm_cell(

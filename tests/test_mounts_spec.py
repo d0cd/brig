@@ -91,6 +91,14 @@ class TestHostPath(_MountsCase):
             errs = self._validate([self._entry(host_path=other)])
             self.assertTrue(any("mount_roots" in e or "root" in e for e in errs), errs)
 
+    def test_colon_in_host_path_rejected(self):
+        # ':' is the podman -v field separator; reject it in host_path so it
+        # can't smuggle extra mount options into the bind arg.
+        colon_dir = self.root / "re:po"
+        colon_dir.mkdir()
+        errs = self._validate([self._entry(host_path=str(colon_dir))])
+        self.assertTrue(any("must not contain ':'" in e for e in errs), errs)
+
     def test_no_roots_configured_rejected(self):
         with patch("brig.config.mount_roots", return_value=[]):
             errs = self._validate([self._entry()])

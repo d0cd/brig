@@ -90,6 +90,32 @@ OS-enforced confinement beyond `mount-scan` + consumer discipline.
 **Effort:** Medium. Per-helper profiles + testing they don't break legitimate
 access; more if it needs re-signing / entitlements.
 
+### Hard workspace quota (block-level enforcement)
+**Status:** Deferred — soft (reactive) enforcement ships today.
+
+`workspace_quota` is currently a **soft** quota: enforced preventively on
+`brig cp` and reactively by `brig system watchdog` (which *stops* a cell whose
+`/work` has outgrown its quota). It is not a hard block-quota — a cell can burst
+over its limit between watchdog sweeps until it's stopped. A hard cap isn't
+possible today because the workspace lives on a **virtiofs** mount (`~/.brig/state`
+→ `/state`), which can't carry an XFS/ext4 project quota, and the workspace is
+read *directly from macOS* (`safe_open` for `brig cell read`, host-side lifecycle
+ops), so it can't simply move inside an ext4 loop image without breaking that
+visibility.
+
+A real hard cap means re-architecting where the workspace lives: put it on the
+VM's own ext4/xfs disk with per-cell project quotas (or a per-cell loopback ext4
+image), and route **all** host access (`cp`, `read`, size) through the VM instead
+of direct virtiofs reads. Overlaps with the substrate items above — the
+Apple-Containerization / VM-per-cell path dissolves the shared-VM-disk problem
+entirely, so evaluate this against that before building it standalone.
+
+**Trigger:** A cell can fill the shared VM disk fast enough that the watchdog's
+sweep interval is too coarse, AND you're not moving to a VM-per-cell substrate.
+
+**Effort:** High. Storage re-layout, host-access rerouting through the VM,
+provisioning changes, and migration of existing cells' workspaces.
+
 ### Dispatcher integration
 **Status:** Deferred — dispatcher's job, not Brig's.
 

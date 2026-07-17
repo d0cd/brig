@@ -25,8 +25,11 @@ Routes file format (JSON, written by reconciler):
         ]
     }
 
-Usage:
-    mitmdump --mode reverse:... -s ingress.py
+Reverse-proxy by path is the SEMANTICS; the addon is loaded into warden's
+single multi-mode mitmproxy (started with `--mode regular@8080 --mode
+regular@8443`), and it claims inbound requests by listen port — request()
+handles only the ingress port (8443) and ignores egress (8080). It is not
+launched as a standalone `--mode reverse` proxy.
 """
 
 import collections
@@ -102,7 +105,12 @@ class IngressRouter:
         self._last_check_time = 0.0
         self._CHECK_INTERVAL = 1.0
         # Per-IP auth failure tracking: ip -> deque of failure timestamps.
-        self._auth_failures: dict[str, collections.deque] = {}
+        # OrderedDict so eviction at capacity is genuinely LRU (see
+        # AUTH_FAIL_MAX_IPS): each access/record moves the IP to the end, so a
+        # flood of fresh IPs can't evict an IP that's actively being throttled.
+        self._auth_failures: collections.OrderedDict[str, collections.deque] = (
+            collections.OrderedDict()
+        )
         self._auth_failures_lock = threading.Lock()
 
     def load(self, loader):
@@ -235,9 +243,17 @@ class IngressRouter:
         if not cell_routes:
             return None, ""
 
+        # Longest-prefix wins. With overlapping prefixes (e.g. "/" and "/api")
+        # the list order is arbitrary, so pick the most specific match rather
+        # than the first — otherwise a broad "/" route shadows "/api".
+        best: IngressRoute | None = None
         for route in cell_routes:
-            if route.matches_path(rest):
-                return route, rest
+            if route.matches_path(rest) and (
+                best is None or len(route.path_prefix) > len(best.path_prefix)
+            ):
+                best = route
+        if best is not None:
+            return best, rest
 
         return None, ""
 
@@ -251,6 +267,8 @@ class IngressRouter:
             # Evict old entries outside the window.
             while failures and failures[0] < now - AUTH_FAIL_WINDOW:
                 failures.popleft()
+            # Touch: this IP is active, so it's the last we want evicted.
+            self._auth_failures.move_to_end(client_ip)
             return len(failures) >= AUTH_FAIL_MAX
 
     def _record_auth_failure(self, client_ip: str) -> None:
@@ -258,15 +276,15 @@ class IngressRouter:
         now = time.monotonic()
         with self._auth_failures_lock:
             if client_ip not in self._auth_failures:
-                # Evict oldest IP if at capacity.
+                # Evict least-recently-used IP if at capacity.
                 if len(self._auth_failures) >= AUTH_FAIL_MAX_IPS:
                     try:
-                        oldest_ip = next(iter(self._auth_failures))
-                        del self._auth_failures[oldest_ip]
-                    except StopIteration:
+                        self._auth_failures.popitem(last=False)
+                    except KeyError:
                         pass
                 self._auth_failures[client_ip] = collections.deque()
             self._auth_failures[client_ip].append(now)
+            self._auth_failures.move_to_end(client_ip)
             # Cap deque size to prevent memory growth.
             while len(self._auth_failures[client_ip]) > AUTH_FAIL_MAX * 2:
                 self._auth_failures[client_ip].popleft()
@@ -329,6 +347,10 @@ class IngressRouter:
         route, remaining_path = self._find_route(path)
 
         if route is None:
+            # Count route misses toward the rate limiter. The 401 path is
+            # throttled but a miss returns 404; without this an attacker could
+            # probe nonexistent cell/route names unbounded from a single IP.
+            self._record_auth_failure(client_ip)
             flow.response = http.Response.make(
                 404, f"No ingress route registered for '{safe_path}'\n",
                 {"Content-Type": "text/plain"},

@@ -81,5 +81,28 @@ class TestCliFlagOnlyRunValidatesMergedSpec(unittest.TestCase):
         run_cell.assert_not_called()
 
 
+class TestYamlProfileAppliesHardening(unittest.TestCase):
+    """A `profile:` declared in the yaml (no --profile flag) must be
+    apply_profile()'d, not merely recorded by name — otherwise the profile's
+    hardening defaults are silently dropped."""
+
+    def test_yaml_profile_applies_defaults(self):
+        from brig.commands import lifecycle_run
+        with tempfile.TemporaryDirectory() as td:
+            yml = _write(Path(td), name="u", image="alpine", profile="untrusted")
+            args = _args(file=str(yml))
+            with patch.object(lifecycle_run, "run_cell") as run_cell, \
+                 patch("brig.ops.logging.Spinner"), \
+                 patch("brig.commands.lifecycle_run.info"):
+                lifecycle_run.cmd_run(args)
+            run_cell.assert_called_once()
+            spec = run_cell.call_args[0][0]
+            self.assertEqual(spec.profile, "untrusted")
+            # Hardening defaults from the untrusted profile (differ from the
+            # CellSpec defaults of 2g / 512), proving apply_profile actually ran.
+            self.assertEqual(spec.memory, "512m")
+            self.assertEqual(spec.pids_limit, 256)
+
+
 if __name__ == "__main__":
     unittest.main()

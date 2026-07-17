@@ -140,8 +140,9 @@ class Cell:
 
     def copy_in(self, src: str, dst: str) -> None:
         """Copy a file from host into the cell workspace."""
+        from brig.cell.metadata import read_workspace_quota
         from brig.workspace.workspace import copy_in
-        copy_in(self.name, src, dst)
+        copy_in(self.name, src, dst, quota=read_workspace_quota(self.name))
 
     def copy_out(self, src: str, dst: str) -> None:
         """Copy a file from cell workspace to host (with sanitization)."""

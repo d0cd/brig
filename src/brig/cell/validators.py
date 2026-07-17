@@ -153,7 +153,9 @@ def _v_cpus(value: Any, context: str) -> list[str]:
 
 
 def _v_pids_limit(value: Any, context: str) -> list[str]:
-    if not isinstance(value, int) or value < 1:
+    # bool is an int subclass; reject it so True/False don't reach podman as
+    # `--pids-limit True` (opaque runtime failure). Mirrors _v_cpus.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         return [f"'pids_limit' must be a positive integer{context}"]
     return []
 
@@ -245,9 +247,13 @@ def _v_workspace_quota(value: Any, context: str) -> list[str]:
     if not isinstance(value, str):
         return [f"'workspace_quota' must be a string like '500m' or '2g'{context}"]
     try:
-        parse_size(value)
+        parsed = parse_size(value)
     except ValueError:
         return [f"Invalid workspace_quota value: {value}{context}"]
+    # parse_size happily returns 0 for "0" and a negative for "-5g"; a quota
+    # must be a positive size (mirrors the memory/timeout validators).
+    if parsed <= 0:
+        return [f"'workspace_quota' must be a positive size like '500m'{context}"]
     return []
 
 
@@ -280,6 +286,10 @@ def _v_workspace_mount(value: Any, context: str) -> list[str]:
         return [f"'workspace_mount' must be an absolute path{context}"]
     if ".." in value.split("/"):
         return [f"'workspace_mount' must not contain '..'{context}"]
+    if ":" in value:
+        # ':' is the podman -v field separator — it would inject dest/options
+        # into the workspace bind. Mirrors _v_cell_mount_point.
+        return [f"'workspace_mount' must not contain ':'{context}"]
     # Reject non-normalized paths (doubled/trailing slashes, '.' segments).
     # The forbidden-prefix check below is lexical, so without this a value
     # like '/run//host' slips past it while the kernel collapses it back to
@@ -391,8 +401,7 @@ def _v_image_digest(value: Any, context: str) -> list[str]:
     from brig.cell.lifecycle import _DIGEST_PATTERN
     if not isinstance(value, str) or not _DIGEST_PATTERN.match(value.strip()):
         return [
-            f"Invalid 'image_digest' value: must be sha256:<64-hex> "
-            f"(or sha384/sha512){context}"
+            f"Invalid 'image_digest' value: must be sha256:<64-hex>{context}"
         ]
     return []
 
@@ -586,6 +595,10 @@ def _v_mount_entry(i: int, entry: Any, seen_names: set, seen_mounts: set,
         errors.append(f"'mounts[{i}].host_path' must be absolute{context}")
     elif ".." in host_path.split("/"):
         errors.append(f"'mounts[{i}].host_path' must not contain '..'{context}")
+    elif ":" in host_path:
+        # ':' is the podman -v field separator; it would inject dest/options
+        # into the mount spec. Mirrors _v_cell_mount_point.
+        errors.append(f"'mounts[{i}].host_path' must not contain ':'{context}")
     elif not roots:
         errors.append(
             f"'mounts' requires mount_roots to be configured first: "

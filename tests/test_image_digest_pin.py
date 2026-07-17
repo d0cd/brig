@@ -1,8 +1,10 @@
-"""image_digest pin format — exact per-algorithm hex length.
+"""image_digest pin format — sha256 only, exact hex length.
 
-An open-ended length match accepts an over-long sha256 or a wrong-length
-sha384/sha512 as well-formed, giving false confidence in the pin. The pin
-must match exactly: sha256:64, sha384:96, sha512:128 hex chars.
+Only sha256 is accepted: OCI registry manifest digests (what podman matches at
+pull time and reports as {{.ImageDigest}} for the start-time re-check) are
+sha256, so a sha384/sha512 pin could never match and would fail on restart with
+a spurious "digest drift". Rejecting them at validation fails fast with a clear
+message. The pin must be exactly sha256:<64 hex>.
 """
 
 from __future__ import annotations
@@ -27,10 +29,15 @@ class TestImageDigestPin(unittest.TestCase):
         _apply_image_digest_pin(spec)
         self.assertEqual(spec.image, "alpine@sha256:" + "a" * 64)
 
-    def test_valid_sha512_pins(self):
-        spec = _spec("sha512:" + "b" * 128)
-        _apply_image_digest_pin(spec)
-        self.assertTrue(spec.image.endswith("@sha512:" + "b" * 128))
+    def test_sha512_pin_rejected(self):
+        # Well-formed sha512, but only sha256 works end-to-end — reject it at
+        # validation rather than let the cell fail to restart on digest drift.
+        with self.assertRaises(BrigError):
+            _apply_image_digest_pin(_spec("sha512:" + "b" * 128))
+
+    def test_sha384_pin_rejected(self):
+        with self.assertRaises(BrigError):
+            _apply_image_digest_pin(_spec("sha384:" + "b" * 96))
 
     def test_over_long_sha256_rejected(self):
         with self.assertRaises(BrigError):

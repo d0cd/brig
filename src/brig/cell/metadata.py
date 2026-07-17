@@ -132,6 +132,8 @@ def build_metadata(
     started_at: datetime | None = None,
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
+    workspace_quota: str | None = None,
+    profile: str | None = None,
 ) -> dict[str, Any]:
     """Compose the cell metadata payload. Pure function for testability.
 
@@ -139,6 +141,10 @@ def build_metadata(
     so `brig cell start` can replay registration without the original
     yaml. No secrets land here — the bearer token lives in the secrets
     dir and is re-read at registration time.
+
+    workspace_quota is persisted here (for EVERY cell, unlike the
+    restart-only cell-spec.json) so the reactive/preventive quota
+    enforcement can find it regardless of restart policy.
     """
     ts = started_at or datetime.now(timezone.utc)
     ingress_published = [
@@ -152,13 +158,14 @@ def build_metadata(
         if isinstance(entry, dict)
         and {"name", "port", "path_prefix", "auth"} <= entry.keys()
     ]
+    workspace: dict[str, Any] = {"mount_point": workspace_mount}
+    if workspace_quota:
+        workspace["quota"] = workspace_quota
     payload: dict[str, Any] = {
         "version": SCHEMA_VERSION,
         "name": cell_name,
         "started_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "workspace": {
-            "mount_point": workspace_mount,
-        },
+        "workspace": workspace,
         "ingress": ingress_published,
         "policy": {
             "host_services": _per_cell_host_services(cell_name),
@@ -166,6 +173,11 @@ def build_metadata(
     }
     if image_digest:
         payload["image_digest"] = image_digest
+    # Persist the profile so the ingress-replay path (brig cell start) can
+    # re-apply the untrusted-profile auth:none gate — cell-metadata.json is
+    # untrusted (invariant 4), but the gate must still be checked on replay.
+    if profile:
+        payload["profile"] = profile
     return payload
 
 
@@ -193,14 +205,18 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     """Rewrite the metadata file for `cell_name` if one already exists,
     preserving the original `workspace_mount` value.
 
-    Called after per-cell policy changes so `policy.host_services` in
-    /run/brig/cell.json reflects the latest ACL. No-op if the cell has
+    Called after per-cell policy changes to keep the HOST-side
+    `policy.host_services` in cell-metadata.json current. No-op if the cell has
     no metadata file (cell was never started, or was removed).
 
-    Bind mounts are fixed at podman-create time, so the cell's running
-    container can't pick up a new workspace_mount — the original is
-    preserved. The policy field is the only one that can drift out of
-    sync, so it is re-synced here.
+    IMPORTANT: this does NOT update a running cell's in-cell view. cell.json is
+    bind-mounted as a single file, and the atomic temp+rename write swaps the
+    inode the mount is pinned to — the running container keeps seeing the old
+    inode. The refreshed value takes effect on the cell's next start (or via
+    `brig cell export`/`inspect`, which read the host copy). Warden enforces the
+    ACL independently of this file, so egress policy is not affected either way.
+    Bind mounts are fixed at create time, so the original workspace_mount is
+    preserved.
     """
     import json as _json
     existing = _host_metadata_path(cell_name)
@@ -208,7 +224,8 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
         prior = _json.loads(existing.read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
-    workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
+    workspace = prior.get("workspace", {})
+    workspace_mount = workspace.get("mount_point", "/work")
     # Preserve ingress across refresh — ingress configuration is fixed at
     # cell-create time, so it can't change without a `brig run`.
     prior_ingress = read_ingress(cell_name)
@@ -216,6 +233,8 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
         cell_name, workspace_mount,
         ingress=prior_ingress,
         image_digest=read_image_digest(cell_name),
+        workspace_quota=workspace.get("quota"),
+        profile=prior.get("profile"),
     )
 
 
@@ -254,11 +273,44 @@ def read_image_digest(cell_name: str) -> str | None:
     return val if isinstance(val, str) and val else None
 
 
+def read_workspace_quota(cell_name: str) -> str | None:
+    """Return the cell's stored workspace_quota from cell-metadata.json.
+
+    Written for EVERY cell (unlike the restart-only cell-spec.json), so this
+    is the source of truth for quota enforcement regardless of restart policy.
+    None when the cell has no quota, predates the field, or is unreadable.
+    """
+    import json as _json
+    try:
+        payload = _json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return None
+    val = payload.get("workspace", {}).get("quota")
+    return val if isinstance(val, str) and val else None
+
+
+def read_profile(cell_name: str) -> str | None:
+    """Return the cell's stored profile name from cell-metadata.json.
+
+    Used by the ingress-replay path to re-apply the untrusted-profile gate.
+    None when the cell had no profile, predates the field, or is unreadable.
+    """
+    import json as _json
+    try:
+        payload = _json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return None
+    val = payload.get("profile")
+    return val if isinstance(val, str) and val else None
+
+
 def write_metadata(
     cell_name: str,
     workspace_mount: str,
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
+    workspace_quota: str | None = None,
+    profile: str | None = None,
 ) -> Path:
     """Write the cell's metadata JSON to the host path. Returns the path.
 
@@ -274,6 +326,8 @@ def write_metadata(
         cell_name, workspace_mount,
         ingress=ingress,
         image_digest=image_digest,
+        workspace_quota=workspace_quota,
+        profile=profile,
     )
     target = _host_metadata_path(cell_name)
     atomic_write_json(target, payload, mode=0o644)

@@ -2,7 +2,10 @@
 Warden watchdog — monitors proxy health and restarts on failure.
 
 Runs in the foreground, checking warden health at a configurable interval.
-If the proxy dies, it restarts it automatically (up to max_restarts).
+If the proxy dies, it restarts it automatically (up to max_restarts). Each
+interval it also enforces per-cell workspace_quota, stopping any cell whose
+workspace has outgrown its quota (reactive soft-quota — see
+enforce_workspace_quotas).
 """
 
 from __future__ import annotations
@@ -50,6 +53,19 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
                 info("Warden restarted successfully")
             else:
                 warn("Warden restart failed, will retry")
+
+        # Reactive workspace-quota enforcement: stop cells that have outgrown
+        # their workspace_quota (soft quota — the workspace is on virtiofs where
+        # a hard block-quota isn't available). Runs regardless of warden health.
+        from brig.cell.lifecycle import enforce_workspace_quotas
+        try:
+            for cell, size, quota in enforce_workspace_quotas():
+                warn(
+                    f"Stopped cell '{cell}': workspace {size} bytes exceeds "
+                    f"workspace_quota ({quota} bytes)"
+                )
+        except Exception as e:
+            warn(f"Workspace-quota sweep failed: {e}")
 
         time.sleep(interval)
 

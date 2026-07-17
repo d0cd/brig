@@ -305,8 +305,14 @@ def cmd_cp(args: argparse.Namespace) -> int:
     elif dst_target:
         if src.startswith("-"):
             raise BrigError(f"Host path must not start with '-': {src}")
+        from brig.cell.metadata import read_workspace_quota
         from brig.workspace.workspace import copy_in
-        copy_in(dst_target[0], src, dst_target[1])
+        # Enforce the cell's workspace_quota on host->cell copies (the one
+        # preventive check available on a virtiofs workspace). Sourced from
+        # cell-metadata.json, which exists for every cell regardless of
+        # restart policy.
+        copy_in(dst_target[0], src, dst_target[1],
+                quota=read_workspace_quota(dst_target[0]))
     else:
         raise BrigError(
             "Could not determine copy direction",

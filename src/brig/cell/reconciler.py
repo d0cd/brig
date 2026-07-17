@@ -287,17 +287,20 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
             "-e", f"HTTP_PROXY=http://{PROXY_NAME}:{PROXY_PORT}",
             "-e", f"HTTPS_PROXY=http://{PROXY_NAME}:{PROXY_PORT}",
             "-e", "no_proxy=localhost,127.0.0.1",
+            "-e", "NO_PROXY=localhost,127.0.0.1",
         ])
 
     cmd.extend(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
 
     # Safe-by-default rootfs. The cell's container-writable layer would
     # otherwise let a hostile cell (a) fill the VM disk (shared across
-    # all cells; workspace_quota only bounds /work), and (b) stash
-    # state outside the workspace where the user wouldn't see it across
-    # stop/start. Read-only rootfs + sized tmpfs for the dirs every
-    # Linux app expects to write to. workspace_quota still applies to
-    # /work; opt-out via writable_rootfs: true in the cell spec.
+    # all cells), and (b) stash state outside the workspace where the
+    # user wouldn't see it across stop/start. Read-only rootfs + sized
+    # tmpfs for the dirs every Linux app expects to write to. Note:
+    # workspace_quota bounds /work growth as a SOFT quota — enforced
+    # preventively on `brig cp` and reactively by `brig system watchdog`
+    # (which stops an over-quota cell) — not a hard block-quota, since the
+    # virtiofs workspace can't carry one. Opt-out via writable_rootfs: true.
     if not spec.writable_rootfs:
         cmd.extend([
             "--read-only",
@@ -326,7 +329,13 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         if timeout_seconds is not None:
             cmd.extend(["--timeout", str(timeout_seconds)])
 
-    for label in spec.labels:
+    # Labels may arrive as a dict ({key: value}, the yaml/profile shape the
+    # validator accepts) or a list of "KEY=value" strings. Normalize the dict
+    # form to "KEY=value" so iterating doesn't silently drop the values.
+    labels = spec.labels
+    if isinstance(labels, dict):
+        labels = [f"{k}={v}" for k, v in labels.items()]
+    for label in labels:
         cmd.extend(["--label", label])
 
     if spec.seccomp_profile:
@@ -455,6 +464,12 @@ def _mount_bind_arg(entry: dict, roots: list[tuple[str, str]]) -> str:
     """
     import os.path as _ospath
     real = _ospath.realpath(entry["host_path"])
+    if ":" in real:
+        # A ':'-named dir under an allowlisted root would inject fields into the
+        # podman -v spec even though the declared host_path had none. Fail closed.
+        raise BrigError(
+            f"mount host_path resolves to a path containing ':' ({real}) — refusing"
+        )
     for root_real, slug in roots:
         if real == root_real or real.startswith(root_real + "/"):
             vm_path = VMPaths.MOUNTS_DIR / slug
@@ -564,7 +579,9 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # podman creates the read-only bind mount at /run/brig/cell.json.
         write_metadata(spec.name, spec.workspace_mount,
                        ingress=spec.ingress,
-                       image_digest=spec.image_digest)
+                       image_digest=spec.image_digest,
+                       workspace_quota=spec.workspace_quota,
+                       profile=spec.profile)
         # Stage the combined CA bundle inside the VM so HTTPS clients in
         # the cell trust Warden's MITM cert. Re-extracted from Warden
         # every start so a CA rotation doesn't leave cells with stale

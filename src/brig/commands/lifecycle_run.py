@@ -42,8 +42,8 @@ def _warn_unverified_image(image: str) -> None:
         return
     info(
         f"WARN: image {image!r} is unpinned and unverified. "
-        f"Pin a digest (image@sha256:...) or verify with: "
-        f"brig image verify {image}\n"
+        f"Pin a digest (image@sha256:...), or verify a signature with: "
+        f"brig image verify {image} --key <cosign.pub>\n"
         f"  (silence with: brig config set suppress_unverified_image_warn true)"
     )
 
@@ -159,6 +159,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         errors = validate_cell_definition(cell_def, args.file)
         if errors:
             raise BrigError("Invalid cell definition:\n  - " + "\n  - ".join(errors))
+        # A profile declared in the yaml (not via --profile) must still be
+        # apply_profile()'d, or its hardening defaults (read-only rootfs,
+        # cap-drop, no-new-privileges) are silently dropped — only the name
+        # gets recorded. The CLI --profile case was already applied above; this
+        # handles the yaml case, before the yaml overrides layer on top.
+        if not args.profile and isinstance(cell_def.get("profile"), str):
+            profile = load_profile(cell_def["profile"])
+            merged = apply_profile(spec_kwargs, profile)
+            spec_kwargs.update(merged)
+            spec_kwargs["profile"] = cell_def["profile"]
         for key in ("image", "name"):
             if key in cell_def and not getattr(args, key, None):
                 spec_kwargs[key] = cell_def[key]

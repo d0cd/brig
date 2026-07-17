@@ -138,9 +138,9 @@ xattr -w com.apple.quarantine "0181;$(printf %x $(date +%s));brig;$(uuidgen)" ~/
 
 **Rules:**
 
-1. **Default runtime is gVisor** — set in containers.conf, not just CLI flag
+1. **Runtime is always gVisor** — the reconciler hardcodes `--runtime runsc`
 2. **`brig cell list` shows runtime** — always visible which runtime a cell uses
-3. **Native runtime requires explicit opt-in** — via `--profile dev` (or another non-gVisor profile)
+3. **Runtime is not profile-selectable** — no profile (including `dev`) can downgrade to a native runtime; `runtime` is intentionally omitted from the profile schema
 4. **Runtime is verified at startup** — don't rely solely on config defaults
 
 #### Understanding gVisor's Role
@@ -246,7 +246,7 @@ done
 verify_cell_single_homed() {
     local exit_code=0
 
-    for cell in $(podman ps --format '{{.Names}}' | grep -v '^proxy$'); do
+    for cell in $(podman ps --format '{{.Names}}' | grep -v '^warden$'); do
         network_count=$(podman inspect "$cell" --format '{{len .NetworkSettings.Networks}}')
         if [ "$network_count" -ne 1 ]; then
             echo "FATAL: Cell '$cell' is attached to $network_count networks (must be exactly 1)"

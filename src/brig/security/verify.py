@@ -184,7 +184,9 @@ def verify_network_isolation(network_infos: list[dict] | None = None) -> CheckRe
     issues: list[str] = []
     for net_info in network_infos:
         net_name = net_info.get("name", "")
-        if not net_info.get("internal", False):
+        # podman/netavark emits lowercase "internal"; accept "Internal" too so a
+        # runtime shape change can't turn this into a spurious false-positive.
+        if not net_info.get("internal", net_info.get("Internal", False)):
             issues.append(f"Network {net_name} should be internal")
 
     if issues:

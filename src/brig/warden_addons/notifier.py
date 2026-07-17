@@ -252,7 +252,10 @@ class Notifier:
             else:
                 ctx.log.info("Notifier: Disabled (no webhook URL)")
                 self._stop_worker()
-        except (json.JSONDecodeError, IOError, OSError) as e:
+        except (json.JSONDecodeError, IOError, OSError, ValueError, TypeError) as e:
+            # ValueError/TypeError: a malformed operator-set field (e.g. a
+            # non-int max_query_len) must not re-raise out of this hook on every
+            # flow — log and keep the last-good config.
             ctx.log.error(f"Notifier: Failed to load config: {e}")
 
     def _start_worker(self) -> None:

@@ -95,7 +95,7 @@ trust_warden_ca: true
 timeout: "30m"                   # Auto-kill after duration (30s, 5m, 2h, 1d)
 
 # Workspace
-workspace_quota: "500m"          # Max workspace size
+workspace_quota: "500m"          # Soft quota: enforced on `brig cp` + reactively by `brig system watchdog` (not a hard block-quota)
 workspace_mount: /work           # Mount point for the cell's writable workspace (default /work)
 
 # Cell rootfs writability. Default false (safe). When false, brig runs the

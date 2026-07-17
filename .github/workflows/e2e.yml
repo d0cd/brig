@@ -248,6 +248,12 @@ jobs:
         continue-on-error: true
         run: tests/test_invariants_7_8.sh
 
+      - name: "Test: Containment red-team (Tier-1 adversarial cell)"
+        id: test_containment_e2e
+        timeout-minutes: 10
+        continue-on-error: true
+        run: tests/test_containment_e2e.sh
+
       - name: "Test: Ingress survives brig system down/up"
         # Regression for the aitelier-reported 502 after
         # `brig system down && brig system up && brig cell start`.
@@ -280,6 +286,7 @@ jobs:
             "${{ steps.test_warden_features.outcome }}" \
             "${{ steps.test_stream_passthrough.outcome }}" \
             "${{ steps.test_invariants_7_8.outcome }}" \
+            "${{ steps.test_containment_e2e.outcome }}" \
             "${{ steps.test_ingress_replay_e2e.outcome }}" \
             "${{ steps.test_overhead.outcome }}"
           do

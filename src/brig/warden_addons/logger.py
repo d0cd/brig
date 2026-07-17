@@ -112,9 +112,15 @@ class RequestLogger:
             filter_config = data.get("log_filter", {})
             self.log_filter = LogFilter(filter_config)
 
-            # Load disk quota configuration.
+            # Load disk quota configuration. Coerce to int: a string value
+            # (e.g. "100") would silently become a repeated string on `* 1024`,
+            # making the rotation size comparison raise TypeError and disabling
+            # rotation (log loss).
             quota_config = data.get("log_quota", {})
-            max_size_mb = quota_config.get("max_size_mb", 100)
+            try:
+                max_size_mb = int(quota_config.get("max_size_mb", 100))
+            except (TypeError, ValueError):
+                max_size_mb = 100
             self.max_log_size = max_size_mb * 1024 * 1024
             self.async_writer.max_log_size = self.max_log_size
 
