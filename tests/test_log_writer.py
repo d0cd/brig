@@ -136,5 +136,41 @@ class TestAsyncLogWriter(unittest.TestCase):
         self.assertEqual(len(lines), 2)
 
 
+class TestLogQuotaCoercion(unittest.TestCase):
+    """max_size_mb from the policy file must be coerced to int — a string value
+    would repeat on `* 1024` and make the rotation size comparison raise, which
+    silently disables rotation (unbounded log growth)."""
+
+    def _reloaded(self, quota):
+        from unittest.mock import MagicMock, patch
+        import mitmproxy.ctx as ctx
+        if not hasattr(ctx, "log"):
+            ctx.log = MagicMock()
+        import logger as logger_mod
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"log_quota": quota}, f)
+            path = Path(f.name)
+        inst = logger_mod.RequestLogger()
+        with patch.object(logger_mod, "POLICY_FILE", path):
+            inst._reload_log_filter()
+        return inst
+
+    def test_string_max_size_coerced_to_int(self):
+        inst = self._reloaded({"max_size_mb": "100"})
+        self.assertEqual(inst.max_log_size, 100 * 1024 * 1024)
+        self.assertIsInstance(inst.max_log_size, int)
+
+    def test_bogus_max_size_falls_back_to_default(self):
+        inst = self._reloaded({"max_size_mb": "not-a-number"})
+        self.assertEqual(inst.max_log_size, 100 * 1024 * 1024)
+
+    def test_non_positive_max_size_falls_back_to_default(self):
+        # 0/negative would make the rotation comparison never fire (unbounded
+        # growth); floor to the 100MB default.
+        for bad in (0, -5):
+            inst = self._reloaded({"max_size_mb": bad})
+            self.assertEqual(inst.max_log_size, 100 * 1024 * 1024, bad)
+
+
 if __name__ == "__main__":
     unittest.main()

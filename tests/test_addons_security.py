@@ -483,5 +483,190 @@ class TestBlockedLogRedaction(unittest.TestCase):
         self.assertNotIn("SUPERSECRETVALUE", logged)
 
 
+class TestRequestEgressEnforcement(unittest.TestCase):
+    """The core egress decision in PolicyEnforcer.request(): default-deny,
+    per-cell allow/deny (deny wins), port + internal/literal-IP guards, and
+    fail-closed when a cell has no policy. Unit-covers the path the
+    nested-virt e2e gates so a regression surfaces without a running VM."""
+
+    def _enforcer(self, cell="sa", policy=None):
+        from enforce import PolicyEnforcer
+        enf = PolicyEnforcer()
+        enf._check_reload = lambda: None
+        enf.subnets = type("S", (), {"get_cell_name": staticmethod(lambda ip: cell)})()
+        if policy is not None:
+            enf.cell_policies[cell] = policy
+        return enf
+
+    def _policy(self, allow=None, deny=None):
+        from _policy import Policy
+        return Policy(allow=allow or [], deny=deny or [])
+
+    def _flow(self, host="api.anthropic.com", port=443, path="/v1/messages",
+              method="POST", listen_port=8080):
+        flow = MagicMock()
+        flow.client_conn.sockname = ("10.60.1.1", listen_port)
+        flow.client_conn.peername = ("10.60.1.5", 1234)
+        flow.request.host = host
+        flow.request.port = port
+        flow.request.path = path
+        flow.request.method = method
+        flow.request.headers = {}
+        flow.metadata = {}
+        flow.response = None
+        return flow
+
+    def test_allowed_host_passes(self):
+        enf = self._enforcer(policy=self._policy(allow=["api.anthropic.com"]))
+        flow = self._flow()
+        enf.request(flow)
+        self.assertIsNone(flow.response)
+        self.assertFalse(flow.metadata.get("blocked", False))
+        self.assertIn("cell:", flow.metadata.get("policy_reason", ""))
+
+    def test_non_allowlisted_host_blocked(self):
+        enf = self._enforcer(policy=self._policy(allow=["api.anthropic.com"]))
+        flow = self._flow(host="evil.example.com")
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertTrue(flow.metadata.get("blocked"))
+        self.assertIn("not in allowlist", flow.metadata.get("block_reason", ""))
+
+    def test_deny_takes_precedence(self):
+        enf = self._enforcer(policy=self._policy(
+            allow=["api.anthropic.com"], deny=["api.anthropic.com"]))
+        flow = self._flow()
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertIn("denied by rule", flow.metadata.get("block_reason", ""))
+
+    def test_disallowed_port_blocked(self):
+        enf = self._enforcer(policy=self._policy(allow=["api.anthropic.com"]))
+        flow = self._flow(port=22)
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertIn("port 22", flow.metadata.get("block_reason", ""))
+
+    def test_literal_ip_blocked(self):
+        # Blocked by the literal-IP guard before the allowlist is even consulted.
+        enf = self._enforcer(policy=self._policy(allow=["93.184.216.34"]))
+        flow = self._flow(host="93.184.216.34")
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertIn("literal IP", flow.metadata.get("block_reason", ""))
+
+    def test_no_cell_policy_fails_closed(self):
+        enf = self._enforcer(policy=None)  # cell resolves but no policy loaded
+        flow = self._flow()
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertIn("no per-cell policy", flow.metadata.get("block_reason", ""))
+
+    def test_host_header_mismatch_blocked_in_request(self):
+        # Exercise the smuggling guard's WIRING into request() (not just the
+        # pure helper): an allowed URL host with a disagreeing Host header must
+        # be blocked, so a dropped call site can't pass the suite silently.
+        enf = self._enforcer(policy=self._policy(allow=["api.anthropic.com"]))
+        flow = self._flow()  # URL host = api.anthropic.com (allowed)
+        flow.request.headers = {"Host": "evil.example.com"}
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertIn("host header mismatch",
+                      flow.metadata.get("block_reason", "").lower())
+
+    def test_ingress_port_unhandled_blocked(self):
+        # A request arriving on the ingress port without the ingress addon's
+        # metadata flag must be blocked (fail closed).
+        enf = self._enforcer(policy=self._policy(allow=["api.anthropic.com"]))
+        flow = self._flow(listen_port=8443)
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+
+
+class TestReloadCellPolicies(unittest.TestCase):
+    """_reload_cell_policies: fail-closed size cap, LRU eviction, deleted drop —
+    the untrusted-state-dir (invariant 4) defenses on the policy loader."""
+
+    def _enforcer(self):
+        import mitmproxy.ctx as ctx
+        from enforce import PolicyEnforcer
+        ctx.log = MagicMock()
+        return PolicyEnforcer()
+
+    def _write_policy(self, d, name, pad=0):
+        import json as _json
+        data = {"allow": ["example.com"], "deny": []}
+        if pad:
+            data["_pad"] = "x" * pad
+        (d / f"{name}.json").write_text(_json.dumps(data))
+
+    def test_oversized_policy_skipped_failing_closed(self):
+        import tempfile as _tf
+        import enforce as enforce_mod
+        with _tf.TemporaryDirectory() as td:
+            d = Path(td)
+            self._write_policy(d, "small")
+            self._write_policy(d, "big", pad=1000)
+            enf = self._enforcer()
+            with patch.object(enforce_mod, "CELL_POLICY_DIR", d), \
+                 patch.object(enforce_mod, "MAX_POLICY_FILE_BYTES", 200):
+                enf._reload_cell_policies()
+            self.assertIn("small", enf.cell_policies)
+            self.assertNotIn("big", enf.cell_policies)  # over cap -> not loaded
+
+    def test_lru_eviction_bounds_cache(self):
+        import tempfile as _tf
+        import enforce as enforce_mod
+        with _tf.TemporaryDirectory() as td:
+            d = Path(td)
+            for n in ("a", "b", "c"):
+                self._write_policy(d, n)
+            enf = self._enforcer()
+            with patch.object(enforce_mod, "CELL_POLICY_DIR", d), \
+                 patch.object(enforce_mod, "MAX_CACHED_CELL_POLICIES", 2):
+                enf._reload_cell_policies()
+            self.assertEqual(len(enf.cell_policies), 2)
+
+    def test_deleted_policy_dropped_from_cache(self):
+        import tempfile as _tf
+        import enforce as enforce_mod
+        with _tf.TemporaryDirectory() as td:
+            d = Path(td)
+            self._write_policy(d, "gone")
+            enf = self._enforcer()
+            with patch.object(enforce_mod, "CELL_POLICY_DIR", d):
+                enf._reload_cell_policies()
+                self.assertIn("gone", enf.cell_policies)
+                (d / "gone.json").unlink()
+                enf._reload_cell_policies()
+                self.assertNotIn("gone", enf.cell_policies)
+
+    def test_non_dict_policy_file_fails_closed_no_escape(self):
+        # A tampered non-dict policy file (invariant 4) must NOT raise out of the
+        # loader (which runs in request()/http_connect() and would fail OPEN).
+        import tempfile as _tf
+        import enforce as enforce_mod
+        with _tf.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "bad.json").write_text("[]")  # valid JSON, not a dict
+            enf = self._enforcer()
+            with patch.object(enforce_mod, "CELL_POLICY_DIR", d):
+                enf._reload_cell_policies()  # must not raise
+            self.assertNotIn("bad", enf.cell_policies)  # not loaded (default-deny)
+
+    def test_malformed_rule_policy_fails_closed_no_escape(self):
+        # A valid-JSON policy with a bad rule (empty domain) makes Policy() raise
+        # ValueError; that must be caught and the file skipped, not escape.
+        import tempfile as _tf
+        import enforce as enforce_mod
+        with _tf.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "bad.json").write_text('{"allow": [{"domain": ""}]}')
+            enf = self._enforcer()
+            with patch.object(enforce_mod, "CELL_POLICY_DIR", d):
+                enf._reload_cell_policies()  # must not raise
+            self.assertNotIn("bad", enf.cell_policies)
+
+
 if __name__ == "__main__":
     unittest.main()

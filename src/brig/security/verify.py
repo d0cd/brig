@@ -89,6 +89,25 @@ def _get_cell_networks() -> list[dict] | None:
         return None
 
 
+def _network_member_names(net_name: str) -> set[str] | None:
+    """Live container members of a network, read from `podman ps`.
+
+    `podman network inspect` does NOT populate a container list under netavark
+    (the `.containers`/`.Containers` field is absent), so enumerating members
+    from the inspect JSON silently sees nothing — a foreign container on a cell
+    network would never be flagged. `podman ps` is the authoritative source.
+    `--all` includes stopped-but-attached containers so a parked container can't
+    hide. Returns None on query failure so callers fail closed.
+    """
+    result = _run([
+        "podman", "ps", "--all", "--filter", f"network={net_name}",
+        "--format", "{{.Names}}",
+    ])
+    if result.returncode != 0:
+        return None
+    return {n.strip() for n in result.stdout.splitlines() if n.strip()}
+
+
 def verify_proxy_running() -> CheckResult:
     """Invariant 9: Proxy must be running before cells start."""
     result = _run(["podman", "inspect", PROXY_NAME, "--format", "{{.State.Status}}"])
@@ -112,22 +131,9 @@ def verify_proxy_network() -> CheckResult:
     # network and defeat the choke point. Enumerate the members and assert
     # only infrastructure containers are attached.
     from brig.config import INFRA_CONTAINER_NAMES
-    inspect = _run(["podman", "network", "inspect", PROXY_EXTERNAL_NETWORK])
-    try:
-        net_infos = json.loads(inspect.stdout)
-    except json.JSONDecodeError:
+    members = _network_member_names(PROXY_EXTERNAL_NETWORK)
+    if members is None:
         return CheckResult(False, "Could not inspect proxy-external network")
-
-    members: set[str] = set()
-    for net_info in net_infos:
-        containers = net_info.get("containers") or {}
-        for cid, m in containers.items():
-            if not isinstance(m, dict):
-                continue
-            # A member with no name still occupies the network and must be
-            # accounted for — fall back to the container ID so it can't slip
-            # past the enumeration (fail closed, not open).
-            members.add(m.get("name") or f"<unnamed:{cid}>")
     unexpected = sorted(n for n in members if n not in INFRA_CONTAINER_NAMES)
     if unexpected:
         return CheckResult(
@@ -178,7 +184,9 @@ def verify_network_isolation(network_infos: list[dict] | None = None) -> CheckRe
     issues: list[str] = []
     for net_info in network_infos:
         net_name = net_info.get("name", "")
-        if not net_info.get("internal", False):
+        # podman/netavark emits lowercase "internal"; accept "Internal" too so a
+        # runtime shape change can't turn this into a spurious false-positive.
+        if not net_info.get("internal", net_info.get("Internal", False)):
             issues.append(f"Network {net_name} should be internal")
 
     if issues:
@@ -223,14 +231,14 @@ def verify_cell_network_members(network_infos: list[dict] | None = None) -> Chec
     issues: list[str] = []
     for net_info in network_infos:
         net_name = net_info.get("name", "")
-        containers = net_info.get("containers") or {}
-        member_names = {
-            (m.get("name") or f"<unnamed:{cid}>")
-            for cid, m in containers.items()
-            if isinstance(m, dict)
-        }
+        if not net_name:
+            continue
+        members = _network_member_names(net_name)
+        if members is None:
+            issues.append(f"Could not enumerate members of {net_name}")
+            continue
         expected = {PROXY_NAME, net_name}
-        unexpected = {n for n in member_names if n not in expected}
+        unexpected = members - expected
         if unexpected:
             issues.append(
                 f"Network {net_name} has non-warden/non-cell containers: "

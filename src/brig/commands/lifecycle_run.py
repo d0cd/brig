@@ -9,13 +9,22 @@ from typing import Any
 
 from brig.cell.lifecycle import run_cell
 from brig.cell.profiles import apply_profile, load_profile
-from brig.cell.spec import CellSpec, load_cell_definition, validate_cell_definition
+from brig.cell.spec import (
+    CellSpec,
+    load_cell_definition,
+    validate_cell_definition,
+    warn_unknown_cell_keys,
+)
 from brig.config import container_name
 from brig.errors import BrigError
 from brig.ops.logging import info, output
 from brig.vm.shell import vm_run
 
-_DIGEST_RE = re.compile(r"@sha(?:256|512):[0-9a-f]{40,}$")
+# Recognize a pinned image ref for warning-suppression. sha256 only, exact 64
+# hex, case-insensitive — consistent with _DIGEST_PATTERN / _v_image_digest (a
+# sha512 or short digest isn't a usable OCI pin, so it should still get the
+# unpinned warning; an accepted uppercase-hex pin should not).
+_DIGEST_RE = re.compile(r"@sha256:[0-9a-fA-F]{64}\Z")
 
 
 def _warn_unverified_image(image: str) -> None:
@@ -37,8 +46,8 @@ def _warn_unverified_image(image: str) -> None:
         return
     info(
         f"WARN: image {image!r} is unpinned and unverified. "
-        f"Pin a digest (image@sha256:...) or verify with: "
-        f"brig image verify {image}\n"
+        f"Pin a digest (image@sha256:...), or verify a signature with: "
+        f"brig image verify {image} --key <cosign.pub>\n"
         f"  (silence with: brig config set suppress_unverified_image_warn true)"
     )
 
@@ -137,22 +146,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         profile = load_profile(args.profile)
         merged = apply_profile(spec_kwargs, profile)
         spec_kwargs.update(merged)
-        # Record the profile name so the untrusted-profile guards (host_sockets,
-        # host_services, tls_passthrough) fire during validation below. Without
-        # this, --profile untrusted on the CLI silently voids those guards.
+        # Record the profile name so the untrusted-profile guards (host_services,
+        # tls_passthrough) fire during validation below. Without this,
+        # --profile untrusted on the CLI silently voids those guards.
         spec_kwargs["profile"] = args.profile
 
     cell_def: dict = {}
     if args.file:
         cell_def = load_cell_definition(args.file)
+        warn_unknown_cell_keys(cell_def, args.file)
         # The CLI --profile flag is authoritative over the yaml (CLI > yaml),
         # so inject it for validation; otherwise an untrusted-profile run could
-        # declare host_sockets / tls_passthrough in the yaml unchecked.
+        # declare host_services / tls_passthrough in the yaml unchecked.
         if args.profile:
             cell_def["profile"] = args.profile
         errors = validate_cell_definition(cell_def, args.file)
         if errors:
             raise BrigError("Invalid cell definition:\n  - " + "\n  - ".join(errors))
+        # A profile declared in the yaml (not via --profile) must still be
+        # apply_profile()'d, or its hardening defaults (read-only rootfs,
+        # cap-drop, no-new-privileges) are silently dropped — only the name
+        # gets recorded. The CLI --profile case was already applied above; this
+        # handles the yaml case, before the yaml overrides layer on top.
+        if not args.profile and isinstance(cell_def.get("profile"), str):
+            profile = load_profile(cell_def["profile"])
+            merged = apply_profile(spec_kwargs, profile)
+            spec_kwargs.update(merged)
+            spec_kwargs["profile"] = cell_def["profile"]
         for key in ("image", "name"):
             if key in cell_def and not getattr(args, key, None):
                 spec_kwargs[key] = cell_def[key]
@@ -179,11 +199,22 @@ def cmd_run(args: argparse.Namespace) -> int:
                 list(spec_kwargs.get("host_services") or [])
                 + list(cell_def["host_services"])
             )
+        # yaml `labels:` EXTEND the profile-merged labels — a generic replace
+        # would drop profile-declared labels (the trust marker is re-stamped
+        # authoritatively in the reconciler regardless, but other labels matter).
+        if "labels" in cell_def:
+            yaml_labels = cell_def["labels"]
+            if isinstance(yaml_labels, dict):
+                yaml_labels = [f"{k}={v}" for k, v in yaml_labels.items()]
+            existing_labels = spec_kwargs.get("labels") or []
+            if isinstance(existing_labels, dict):
+                existing_labels = [f"{k}={v}" for k, v in existing_labels.items()]
+            spec_kwargs["labels"] = list(existing_labels) + list(yaml_labels)
         import dataclasses as _dc
         _spec_field_names = {f.name for f in _dc.fields(CellSpec)}
         _already_handled = {
             "image", "name", "command", "env", "ingress", "policy",
-            "host_services",
+            "host_services", "labels",
         }
         for key, val in cell_def.items():
             if key in _spec_field_names and key not in _already_handled:

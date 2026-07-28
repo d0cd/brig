@@ -13,6 +13,106 @@ from brig.cell.spec import CellSpec
 from brig.errors import BrigError
 
 
+class TestStopMarker(unittest.TestCase):
+    """The desired-state marker set by stop/kill and cleared by start/run."""
+
+    def test_mark_clear_roundtrip(self):
+        import tempfile
+        from pathlib import Path
+
+        from brig.cell import metadata
+
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(metadata.HostPaths, "STATE_DIR", Path(d)):
+                self.assertFalse(metadata.cell_marked_stopped("c"))
+                metadata.mark_cell_stopped("c")
+                self.assertTrue(metadata.cell_marked_stopped("c"))
+                metadata.clear_cell_stopped("c")
+                self.assertFalse(metadata.cell_marked_stopped("c"))
+                metadata.clear_cell_stopped("c")  # idempotent
+
+    def _stop(self, cell, **kwargs):
+        with patch("brig.cell.lifecycle.observe",
+                   return_value=CellState(exists=True, running=True)), \
+             patch("brig.cell.lifecycle.apply",
+                   return_value=ReconcileResult(success=True)), \
+             patch("brig.network.ingress.deregister_ingress"), \
+             patch("brig.cell.lifecycle.log_operation"), \
+             patch("brig.cell.lifecycle.log_lifecycle"):
+            stop_cell(cell, **kwargs)
+
+    def test_operator_stop_marks(self):
+        import tempfile
+        from pathlib import Path
+
+        from brig.cell import metadata
+
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(metadata.HostPaths, "STATE_DIR", Path(d)):
+                self._stop("web")
+                self.assertTrue(metadata.cell_marked_stopped("web"))
+
+    def test_harness_shutdown_does_not_mark(self):
+        # `brig system down` is a harness-level shutdown, not per-cell operator
+        # intent. Marking there would opt every cell out of restart:always
+        # recovery for good — the next `brig system up` / watchdog tick would
+        # leave a VM-dropped cell down until a manual per-cell `brig cell start`.
+        import tempfile
+        from pathlib import Path
+
+        from brig.cell import metadata
+
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(metadata.HostPaths, "STATE_DIR", Path(d)):
+                self._stop("web", mark_stopped=False)
+                self.assertFalse(metadata.cell_marked_stopped("web"))
+
+    def test_system_down_then_up_still_recovers(self):
+        # End-to-end: `brig system down` must not disarm restart:always. After a
+        # down/up cycle the cell is still recoverable, so the next `system up` (or
+        # watchdog tick) relaunches it once the VM drops the container.
+        import argparse
+        import tempfile
+        from pathlib import Path
+
+        from brig.cell import metadata
+        from brig.cell.lifecycle import restore_persisted_cells
+        from brig.commands.convenience_cmd import cmd_down
+
+        raw = {"name": "web", "image": "alpine", "restart": "always"}
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(metadata.HostPaths, "STATE_DIR", Path(d)), \
+                 patch("brig.cell.lifecycle.list_cell_containers",
+                       return_value=[("web", {})]), \
+                 patch("brig.cell.lifecycle.observe",
+                       return_value=CellState(exists=True, running=True)), \
+                 patch("brig.cell.lifecycle.apply",
+                       return_value=ReconcileResult(success=True)), \
+                 patch("brig.network.ingress.deregister_ingress"), \
+                 patch("brig.cell.lifecycle.log_operation"), \
+                 patch("brig.cell.lifecycle.log_lifecycle"), \
+                 patch("brig.network.subnet.reclaim_orphan_subnets", return_value=[]), \
+                 patch("brig.network.subnet.list_all", return_value=[]), \
+                 patch("brig.network.ingress.sweep_orphan_routes", return_value=0), \
+                 patch("warden.proxy.stop"), \
+                 patch("brig.observability.collector.is_running", return_value=False), \
+                 patch("brig.commands.convenience_cmd.info"), \
+                 patch("brig.commands.convenience_cmd.output"):
+                cmd_down(argparse.Namespace(vm=False))
+                self.assertFalse(metadata.cell_marked_stopped("web"))
+
+            # The VM later drops the container; `system up` must bring it back.
+            with patch.object(metadata.HostPaths, "STATE_DIR", Path(d)), \
+                 patch("brig.cell.metadata.restorable_cell_specs",
+                       return_value=[dict(raw)]), \
+                 patch("brig.cell.lifecycle.observe",
+                       return_value=CellState(exists=False, running=False)), \
+                 patch("brig.cell.lifecycle.info"), \
+                 patch("brig.cell.lifecycle.run_cell") as mock_run:
+                restore_persisted_cells()
+            mock_run.assert_called_once()
+
+
 class TestRunCell(unittest.TestCase):
     """Test run_cell() enforces invariants and delegates to reconciler."""
 
@@ -40,6 +140,40 @@ class TestRunCell(unittest.TestCase):
             result = run_cell(spec, proxy_check=fake_proxy)
             self.assertTrue(result.success)
             self.assertFalse(proxy_called)
+
+    @patch("brig.cell.lifecycle.check_rate_limit", return_value=True)
+    def test_failed_run_leaves_stop_marker_intact(self, mock_rate):
+        # A `brig run` that never got the cell up must not re-arm recovery for a
+        # cell the operator had stopped — otherwise the watchdog resurrects it.
+        import tempfile
+        from pathlib import Path
+
+        from brig.cell import metadata
+
+        spec = CellSpec(name="test", image="alpine")
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(metadata.HostPaths, "STATE_DIR", Path(d)):
+                metadata.mark_cell_stopped("test")
+                with self.assertRaises(BrigError):
+                    run_cell(spec, proxy_check=lambda: False)
+                self.assertTrue(metadata.cell_marked_stopped("test"))
+
+    @patch("brig.cell.lifecycle.check_rate_limit", return_value=True)
+    def test_successful_run_clears_stop_marker(self, mock_rate):
+        import tempfile
+        from pathlib import Path
+
+        from brig.cell import metadata
+
+        spec = CellSpec(name="test", image="alpine")
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(metadata.HostPaths, "STATE_DIR", Path(d)), \
+                 patch("brig.cell.lifecycle.observe", return_value=CellState()), \
+                 patch("brig.cell.lifecycle.apply",
+                       return_value=ReconcileResult(success=True, container_id="a")):
+                metadata.mark_cell_stopped("test")
+                run_cell(spec, proxy_check=lambda: True)
+                self.assertFalse(metadata.cell_marked_stopped("test"))
 
     @patch("brig.cell.lifecycle.check_rate_limit", return_value=True)
     def test_run_cell_syncs_per_cell_policy(self, mock_rate):
@@ -267,8 +401,37 @@ class TestRestorePersistedCells(unittest.TestCase):
     @patch("brig.cell.lifecycle.run_cell")
     @patch("brig.cell.lifecycle.observe")
     @patch("brig.cell.metadata.restorable_cell_specs")
-    def test_skips_present_cell(self, mock_specs, mock_observe, mock_run):
-        # A cell still present (running, or user-stopped → exited) is left alone.
+    def test_skips_running_cell(self, mock_specs, mock_observe, mock_run):
+        # A running cell is healthy — left alone.
+        from brig.cell.lifecycle import restore_persisted_cells
+        mock_specs.return_value = [dict(self._RAW)]
+        mock_observe.return_value = CellState(exists=True, running=True)
+        restore_persisted_cells()
+        mock_run.assert_not_called()
+
+    @patch("brig.cell.metadata.cell_marked_stopped", return_value=False)
+    @patch("brig.cell.lifecycle.run_cell")
+    @patch("brig.cell.lifecycle.observe")
+    @patch("brig.cell.metadata.restorable_cell_specs")
+    def test_recovers_crashed_present_cell(
+        self, mock_specs, mock_observe, mock_run, mock_stopped
+    ):
+        # exited-but-present (crashed / SIGKILLed), not intentionally stopped →
+        # recover it (the host-sleep case). Old behavior wrongly skipped this.
+        from brig.cell.lifecycle import restore_persisted_cells
+        mock_specs.return_value = [dict(self._RAW)]
+        mock_observe.return_value = CellState(exists=True, running=False)
+        restore_persisted_cells()
+        mock_run.assert_called_once()
+
+    @patch("brig.cell.metadata.cell_marked_stopped", return_value=True)
+    @patch("brig.cell.lifecycle.run_cell")
+    @patch("brig.cell.lifecycle.observe")
+    @patch("brig.cell.metadata.restorable_cell_specs")
+    def test_respects_intentional_stop(
+        self, mock_specs, mock_observe, mock_run, mock_stopped
+    ):
+        # Operator-stopped (stop marker set) → left down even though not running.
         from brig.cell.lifecycle import restore_persisted_cells
         mock_specs.return_value = [dict(self._RAW)]
         mock_observe.return_value = CellState(exists=True, running=False)

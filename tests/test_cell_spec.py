@@ -67,6 +67,26 @@ class TestValidateCellDefinition(unittest.TestCase):
                 {"name": "test", "image": "alpine", "user": u})
             self.assertTrue(any("user" in e for e in errs), u)
 
+    def test_user_none_is_valid(self):
+        # A cell.yaml that omits `user` persists as user=None; re-validating
+        # that spec (restart:always restore) must accept it. Empty string stays
+        # invalid — only None (unset → image default) is allowed.
+        errs = validate_cell_definition(
+            {"name": "test", "image": "alpine", "user": None})
+        self.assertEqual(errs, [])
+
+    def test_persisted_default_spec_revalidates_clean(self):
+        # `restore_persisted_cells` re-validates dataclasses.asdict(spec) before
+        # relaunching, so EVERY unset optional field arrives as None. A validator
+        # that rejects None makes every restart:always cell unrestorable — the
+        # cell is silently skipped with "invalid persisted spec". Assert the
+        # whole round-trip rather than one field at a time, so the next optional
+        # field to grow a validator can't reintroduce this.
+        import dataclasses
+
+        raw = dataclasses.asdict(CellSpec(name="test", image="alpine"))
+        self.assertEqual(validate_cell_definition(raw), [])
+
     def test_command_string(self):
         errors = validate_cell_definition({"command": "echo hi"})
         self.assertEqual(errors, [])
@@ -129,6 +149,44 @@ class TestValidateCellDefinition(unittest.TestCase):
     def test_pids_limit_negative(self):
         errors = validate_cell_definition({"pids_limit": -1})
         self.assertTrue(any("positive integer" in e for e in errors))
+
+    def test_pids_limit_bool_rejected(self):
+        # bool is an int subclass; True must not slip through as --pids-limit True.
+        for bad in (True, False):
+            errors = validate_cell_definition({"pids_limit": bad})
+            self.assertTrue(any("positive integer" in e for e in errors), bad)
+
+    def test_workspace_mount_colon_rejected(self):
+        # ':' is the podman -v field separator; it must not reach the bind arg.
+        errors = validate_cell_definition({"workspace_mount": "/work:x"})
+        self.assertTrue(any("must not contain ':'" in e for e in errors), errors)
+
+    def test_workspace_quota_non_positive_rejected(self):
+        for bad in ("0", "0m", "-5g"):
+            errors = validate_cell_definition({"workspace_quota": bad})
+            self.assertTrue(any("positive size" in e for e in errors), (bad, errors))
+
+    def test_workspace_quota_positive_ok(self):
+        self.assertEqual(validate_cell_definition({"workspace_quota": "500m"}), [])
+
+    def test_profile_traversal_rejected(self):
+        # profile resolves to a file path under ~/.brig/profiles; a path/traversal
+        # must not escape it.
+        for bad in ("../../etc/passwd", "a/b", "..", "x\x00y"):
+            errors = validate_cell_definition({"image": "alpine", "profile": bad})
+            self.assertTrue(any("profile" in e for e in errors), (bad, errors))
+
+    def test_profile_bare_name_ok(self):
+        self.assertEqual(
+            validate_cell_definition({"image": "alpine", "profile": "untrusted"}), [])
+
+    def test_rm_non_bool_rejected(self):
+        for bad in ("yes", 1, "true"):
+            errors = validate_cell_definition({"image": "alpine", "rm": bad})
+            self.assertTrue(any("'rm' must be a boolean" in e for e in errors), (bad, errors))
+
+    def test_rm_bool_ok(self):
+        self.assertEqual(validate_cell_definition({"image": "alpine", "rm": True}), [])
 
     # --- Security Invariant 1/6: network=proxy-external rejected ---
     def test_network_proxy_external_rejected(self):
@@ -217,8 +275,8 @@ class TestValidateCellDefinition(unittest.TestCase):
     def test_workspace_mount_shadowing_run_secrets_rejected(self):
         # The crown jewel: a cell that sets workspace_mount: /run/secrets
         # would hide its own secrets dir behind the workspace mount. Reject.
-        # /run/host and /run/brig also covered: host_sockets + downward
-        # API + CA bundle mount roots, shadowed = silent breakage.
+        # /run/host and /run/brig also covered: downward-API + CA bundle
+        # mount roots (and /run/host reserved), shadowed = silent breakage.
         for shadow in ("/run/secrets", "/run/secrets/foo",
                        "/run/host", "/run/host/foo.sock",
                        "/run/brig", "/run/brig/cell.json",

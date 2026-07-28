@@ -75,7 +75,7 @@ Common reasons:
 - `host header mismatch` — the cell tried to set a Host header that
   disagrees with the URL it's connecting to (smuggling defense).
 - `internal IP range blocked` — the cell tried to reach an RFC1918 / link-local IP directly.
-- `host service '<name>': cell '<cell>' has no host_services configured` —
+- `host service '<name>': cell '<cell>' has no host_services declared` —
   the cell tried `<name>.host.brig` but its per-cell policy doesn't grant
   access. Add the service name to the cell's `host_services` list (see
   `brig policy set <cell> --help`).
@@ -88,8 +88,8 @@ brig policy test <cell> <domain> --path /api
 
 ## Disk space
 
-`~/.brig/state/system/<cell>/workspace/` accumulates per-cell. The Lima VM
-has its own disk allocation (default 100 GiB) for the container layer. If
+`~/.brig/state/<cell>/workspace/` accumulates per-cell. The Lima VM
+has its own disk allocation (50 GiB, per `lima.yaml.template`) for the container layer. If
 you're running out:
 
 ```bash
@@ -145,7 +145,7 @@ If your in-cell app expects to write to `/workspace/...`, either:
 1. **Change the cell yaml** to align with the app's expectation:
    ```yaml
    workspace_mount: /workspace        # default is /work
-   workspace_quota: "20g"             # bound the writable area
+   workspace_quota: "20g"             # soft cap: enforced on `brig cp` + by `brig system watchdog`
    ```
    Then `brig cell rm <name> -f && brig run --file <yaml>`. Bind
    mounts are fixed at container-create time; restart alone won't
@@ -191,7 +191,7 @@ The cell's PID 1 exited. Common causes:
   `--read-only`. See "Cell can't write to /workspace/..." above.
 
 - **Required env var or secret missing.** `brig cell preflight <yaml>`
-  validates secrets + host_services + host_sockets before starting.
+  validates secrets + host_services + ingress before starting.
 
 ## Warden blocks well-known telemetry endpoints (non-fatal)
 

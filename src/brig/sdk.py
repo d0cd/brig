@@ -140,8 +140,9 @@ class Cell:
 
     def copy_in(self, src: str, dst: str) -> None:
         """Copy a file from host into the cell workspace."""
+        from brig.cell.metadata import read_workspace_quota
         from brig.workspace.workspace import copy_in
-        copy_in(self.name, src, dst)
+        copy_in(self.name, src, dst, quota=read_workspace_quota(self.name))
 
     def copy_out(self, src: str, dst: str) -> None:
         """Copy a file from cell workspace to host (with sanitization)."""
@@ -217,7 +218,6 @@ class Brig:
         detach: bool = True,
         timeout: str | None = None,
         labels: list[str] | None = None,
-        host_sockets: list[dict[str, Any]] | None = None,
         host_services: list[dict[str, Any]] | None = None,
         mounts: list[dict[str, Any]] | None = None,
         ingress: list[dict[str, Any]] | None = None,
@@ -241,7 +241,6 @@ class Brig:
             secrets=secrets, memory=memory, cpus=cpus,
             pids_limit=pids_limit, network=network, profile=profile,
             detach=detach, timeout=timeout, labels=labels,
-            host_sockets=host_sockets,
             host_services=host_services, mounts=mounts, ingress=ingress,
             policy_allow=policy_allow, policy_deny=policy_deny,
             policy_passthrough_tls=policy_passthrough_tls,
@@ -266,7 +265,6 @@ class Brig:
         detach: bool = True,
         timeout: str | None = None,
         labels: list[str] | None = None,
-        host_sockets: list[dict[str, Any]] | None = None,
         host_services: list[dict[str, Any]] | None = None,
         mounts: list[dict[str, Any]] | None = None,
         ingress: list[dict[str, Any]] | None = None,
@@ -284,10 +282,6 @@ class Brig:
         user: str | None = None,
     ) -> Cell:
         """Synchronous version of run().
-
-        host_sockets: list of dicts with keys {name, host_path, mount_point,
-        mode?}. Same validation rules as the cell yaml (see
-        docs/design/cell-definition.md). Bypasses Warden by design.
 
         mounts: list of dicts {name, host_path, mount_point, mode?} —
         bind-mount a host dir (under a configured mount_roots entry) into the
@@ -312,7 +306,6 @@ class Brig:
             "network": network,
             "detach": detach,
             "labels": labels or [],
-            "host_sockets": host_sockets or [],
             "host_services": host_services or [],
             "mounts": mounts or [],
             "ingress": ingress or [],

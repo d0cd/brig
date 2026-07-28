@@ -142,13 +142,83 @@ class TestBuildRunCommand(unittest.TestCase):
         idx = cmd.index("--runtime")
         self.assertEqual(cmd[idx + 1], "runsc")
 
-    def test_proxy_env_set(self):
-        """Proxy env vars are injected for non-airgapped cells."""
+    def _markers(self, cmd):
+        return [
+            cmd[i + 1] for i, a in enumerate(cmd)
+            if a == "--label" and i + 1 < len(cmd)
+            and cmd[i + 1].startswith("brig.profile")
+        ]
+
+    def test_untrusted_cell_emits_trust_label_end_to_end(self):
+        # The REAL create chain: CLI seeds labels=[] -> apply_profile('untrusted')
+        # -> CellSpec -> build_run_command. The container MUST carry
+        # brig.profile=untrusted, or the ingress auth:none replay gate (which
+        # reads that container label) is dead for every untrusted cell.
+        from brig.cell.profiles import apply_profile, load_profile
+        merged = apply_profile(
+            {"name": "u", "image": "alpine", "labels": []},
+            load_profile("untrusted"),
+        )
+        merged["profile"] = "untrusted"  # as lifecycle_run/sdk set spec.profile
+        cmd = build_run_command(CellSpec(**merged), "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+
+    def test_trust_marker_stamped_despite_user_labels(self):
+        # yaml/CLI labels block must NOT drop the marker (the reconciler stamps
+        # it authoritatively from spec.profile, independent of spec.labels).
+        spec = CellSpec(name="u", image="alpine", profile="untrusted",
+                        labels=["team=red"])
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+
+    def test_user_cannot_shadow_trust_marker(self):
+        # A user brig.profile=trusted on an untrusted cell must be overridden by
+        # the authoritative untrusted marker — and appear exactly once.
+        spec = CellSpec(name="u", image="alpine", profile="untrusted",
+                        labels=["brig.profile=trusted"])
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+
+    def test_custom_list_form_untrusted_profile_lands_marker(self):
+        # A custom profile whose OWN labels are a list (['brig.profile=untrusted'])
+        # — apply_profile's dict-only merge dropped it, but the reconciler stamps
+        # authoritatively via _profile_is_untrusted, which honors the list form.
+        from brig.cell.profiles import PROFILES_DIR
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        pf = PROFILES_DIR / "myrole.yaml"
+        pf.write_text("memory: 1g\nlabels:\n  - brig.profile=untrusted\n")
+        try:
+            cmd = build_run_command(
+                CellSpec(name="c", image="alpine", profile="myrole"), "10.60.1.1")
+            self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+        finally:
+            pf.unlink()
+
+    def test_non_untrusted_profile_keeps_its_marker(self):
+        spec = CellSpec(name="s", image="alpine", profile="supervised")
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=supervised"])
+
+    def test_proxy_env_uses_warden_dns_name_not_ip(self):
+        """Proxy env points the cell at warden by DNS NAME (stable across warden
+        restarts), not the literal per-cell IP (which goes stale → silent egress
+        loss). proxy_ip is still passed as proof warden is connected, but must not
+        be baked into the env."""
         spec = CellSpec(name="test", image="alpine")
         cmd = build_run_command(spec, "10.60.1.1")
         cmd_str = " ".join(cmd)
-        self.assertIn("http_proxy=http://10.60.1.1:8080", cmd_str)
-        self.assertIn("https_proxy=http://10.60.1.1:8080", cmd_str)
+        self.assertIn("http_proxy=http://warden:8080", cmd_str)
+        self.assertIn("https_proxy=http://warden:8080", cmd_str)
+        self.assertIn("HTTP_PROXY=http://warden:8080", cmd_str)
+        self.assertNotIn("10.60.1.1", cmd_str)  # the connectivity-proof IP is never baked
+
+    def test_non_airgapped_without_warden_connection_refused(self):
+        """Fail closed: a non-airgapped cell won't start if warden isn't connected
+        to its network (no proxy_ip = no proof of connectivity)."""
+        from brig.errors import BrigError
+        spec = CellSpec(name="test", image="alpine")
+        with self.assertRaises(BrigError):
+            build_run_command(spec, None)
 
     def test_user_emitted_when_set(self):
         spec = CellSpec(name="test", image="alpine", user="0")
@@ -246,16 +316,22 @@ class TestBuildRunCommand(unittest.TestCase):
             f"expected /run tmpfs, got --tmpfs values {tmpfs_pairs}")
 
     def test_readonly_tmpfs_has_security_options(self):
-        """Sized tmpfs is necessary but not sufficient — also need
-        noexec/nosuid/nodev so the cell can't drop a SUID binary in /tmp
-        and exec something privileged from there."""
+        """Tmpfs flags follow "strictest that doesn't break a real workload".
+        Every tmpfs carries nosuid (no setuid escalation) + nodev. noexec is
+        weak, bypassable DiD (not a boundary — that's the VM/gVisor/Warden +
+        cap-drop + read-only rootfs), so it's kept on /tmp (nothing needs to
+        exec there) but dropped on /run, where s6-overlay/init systems exec
+        their supervisor from /run/s6 and noexec breaks every s6-based image."""
         spec = CellSpec(name="test", image="alpine")
         cmd = build_run_command(spec, "10.60.1.1")
-        tmpfs_pairs = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs"]
-        for t in tmpfs_pairs:
-            self.assertIn("noexec", t, f"{t} missing noexec")
-            self.assertIn("nosuid", t, f"{t} missing nosuid")
-            self.assertIn("nodev", t, f"{t} missing nodev")
+        tmpfs = {t.split(":", 1)[0]: t for t in
+                 (cmd[i + 1] for i, a in enumerate(cmd) if a == "--tmpfs")}
+        for path in ("/tmp", "/run"):
+            self.assertIn("nosuid", tmpfs[path], f"{tmpfs[path]} missing nosuid")
+            self.assertIn("nodev", tmpfs[path], f"{tmpfs[path]} missing nodev")
+        self.assertIn("noexec", tmpfs["/tmp"], f"{tmpfs['/tmp']} missing noexec")
+        self.assertNotIn("noexec", tmpfs["/run"],
+            "/run must be exec-capable so s6-overlay/init-system images can run")
 
     def test_writable_rootfs_opt_out_omits_readonly(self):
         """For cells whose images legitimately need a writable rootfs

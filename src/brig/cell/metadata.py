@@ -10,29 +10,38 @@ writes a small JSON file on the host, podman bind-mounts it read-only
 into the cell at `/run/brig/cell.json`. The cell can read but not
 modify it.
 
-Schema (v3):
+Schema (v4):
     {
-      "version": 3,
+      "version": 4,
       "name": "<cell-name>",
       "started_at": "<RFC 3339 UTC>",
       "workspace": {
-        "mount_point": "/work"
+        "mount_point": "/work",
+        "quota": "500m"               // optional; only when set
       },
-      "host_sockets": [{"name": ..., "mount_point": ...}, ...],
       "ingress":      [{"name": ..., "port": int,
                         "path_prefix": ..., "auth": "token"}, ...],
-      "image_digest": "sha256:..."  // optional; only when pinned
+      "image_digest": "sha256:...",  // optional; only when pinned
       "policy": {
         "host_services": ["<svc-name>", ...]   // per-cell ACL
       }
     }
 
-What changed since v2:
+What changed since v3:
+  - `profile` REMOVED. A cell's trust profile must not be read from this file
+    (invariant 4 names it untrusted), so the ingress-replay auth:none gate now
+    reads it from the trusted podman container label (`brig.profile`) instead.
+    A v3 file on disk still carries the key; nothing reads it.
+  - `workspace.quota` documented. The v3 writer already emitted it — quota
+    enforcement (the `brig system watchdog` sweep and the `brig cp` guard) needs
+    the limit for EVERY cell, and the restart-only cell-spec.json is absent for
+    a default cell — but the v3 schema never listed it.
+
+What changed in v3:
   - `ingress` added so `brig cell start` can replay route registration
     without the original yaml. No secrets land here.
   - `image_digest` added so `brig cell start` can re-verify the pinned
     digest before letting the container start.
-  Both fields are optional and additive — v2 readers ignore them.
 
 Why v2 dropped `workspace.host_path`: publishing the absolute host
 path made it trivial for a consumer to do plain `open(host_path)`,
@@ -61,7 +70,7 @@ from brig.config import HostPaths, VMPaths
 from brig.ops.atomic import atomic_write_json
 from brig.policy.policy import load_cell_policy
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 IN_CELL_PATH = "/run/brig/cell.json"
 
 
@@ -127,38 +136,58 @@ def restorable_cell_specs() -> list[dict[str, Any]]:
     return out
 
 
+# --- Desired-state marker -------------------------------------------------
+# brig can't tell a crash (container exited-present) from an operator stop by
+# container state alone, so an explicit `brig cell stop`/`kill` records this
+# sentinel. `restart: always` recovery respects it (leaves the cell down until
+# an explicit start), while an unmarked down cell — crashed or dropped by a VM
+# restart — auto-recovers. This is the systemd `Restart=always` / Docker
+# `unless-stopped` distinction between "I stopped it" and "it failed".
+
+
+def _host_stopped_marker_path(cell_name: str) -> Path:
+    return HostPaths.STATE_DIR / cell_name / "stopped"
+
+
+def mark_cell_stopped(cell_name: str) -> None:
+    """Record that the operator intentionally stopped this cell so recovery
+    leaves it down until an explicit start."""
+    path = _host_stopped_marker_path(cell_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+
+
+def clear_cell_stopped(cell_name: str) -> None:
+    """Clear the intentional-stop marker (on start/run) — desired state is
+    running again, so recovery restores the cell if it later goes down."""
+    _host_stopped_marker_path(cell_name).unlink(missing_ok=True)
+
+
+def cell_marked_stopped(cell_name: str) -> bool:
+    """True when the cell was intentionally stopped and not since started."""
+    return _host_stopped_marker_path(cell_name).exists()
+
+
 def build_metadata(
     cell_name: str,
     workspace_mount: str,
     started_at: datetime | None = None,
-    host_sockets: list[dict[str, Any]] | None = None,
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
+    workspace_quota: str | None = None,
 ) -> dict[str, Any]:
     """Compose the cell metadata payload. Pure function for testability.
-
-    host_sockets entries are projected to {name, mount_point} only —
-    host_path stays out of the downward-API surface for the same
-    reason workspace.host_path was dropped in v2 (no host paths
-    leak through `/run/brig/cell.json`).
-
-    The projection only reads `name` and `mount_point`, so callers may
-    pass either full entries (from CellSpec.host_sockets, with
-    host_path/mode set) or pre-projected ones — both work. Don't add
-    fabricated values (the old `host_path: ""` placeholder was a lie
-    waiting to break if the projection ever extended).
 
     ingress entries are stored in full ({name, port, path_prefix, auth})
     so `brig cell start` can replay registration without the original
     yaml. No secrets land here — the bearer token lives in the secrets
     dir and is re-read at registration time.
+
+    workspace_quota is persisted here (for EVERY cell, unlike the
+    restart-only cell-spec.json) so the reactive/preventive quota
+    enforcement can find it regardless of restart policy.
     """
     ts = started_at or datetime.now(timezone.utc)
-    sockets_published = [
-        {"name": entry["name"], "mount_point": entry["mount_point"]}
-        for entry in (host_sockets or [])
-        if isinstance(entry, dict) and "name" in entry and "mount_point" in entry
-    ]
     ingress_published = [
         {
             "name": entry["name"],
@@ -170,14 +199,14 @@ def build_metadata(
         if isinstance(entry, dict)
         and {"name", "port", "path_prefix", "auth"} <= entry.keys()
     ]
+    workspace: dict[str, Any] = {"mount_point": workspace_mount}
+    if workspace_quota:
+        workspace["quota"] = workspace_quota
     payload: dict[str, Any] = {
         "version": SCHEMA_VERSION,
         "name": cell_name,
         "started_at": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "workspace": {
-            "mount_point": workspace_mount,
-        },
-        "host_sockets": sockets_published,
+        "workspace": workspace,
         "ingress": ingress_published,
         "policy": {
             "host_services": _per_cell_host_services(cell_name),
@@ -212,14 +241,18 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
     """Rewrite the metadata file for `cell_name` if one already exists,
     preserving the original `workspace_mount` value.
 
-    Called after per-cell policy changes so `policy.host_services` in
-    /run/brig/cell.json reflects the latest ACL. No-op if the cell has
+    Called after per-cell policy changes to keep the HOST-side
+    `policy.host_services` in cell-metadata.json current. No-op if the cell has
     no metadata file (cell was never started, or was removed).
 
-    Bind mounts are fixed at podman-create time, so the cell's running
-    container can't pick up a new workspace_mount — the original is
-    preserved. The policy field is the only one that can drift out of
-    sync, so it is re-synced here.
+    IMPORTANT: this does NOT update a running cell's in-cell view. cell.json is
+    bind-mounted as a single file, and the atomic temp+rename write swaps the
+    inode the mount is pinned to — the running container keeps seeing the old
+    inode. The refreshed value takes effect on the cell's next start (or via
+    `brig cell export`/`inspect`, which read the host copy). Warden enforces the
+    ACL independently of this file, so egress policy is not affected either way.
+    Bind mounts are fixed at create time, so the original workspace_mount is
+    preserved.
     """
     import json as _json
     existing = _host_metadata_path(cell_name)
@@ -227,20 +260,20 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
         prior = _json.loads(existing.read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
-    workspace_mount = prior.get("workspace", {}).get("mount_point", "/work")
-    # Preserve host_sockets and ingress across refresh — bind mounts and
-    # ingress configuration are fixed at cell-create time, so these lists
-    # can't change without a `brig run`. build_metadata projects each
-    # entry to its public-facing fields.
-    prior_sockets = [
-        s for s in prior.get("host_sockets", [])
-        if isinstance(s, dict) and "name" in s and "mount_point" in s
-    ]
+    if not isinstance(prior, dict):
+        return None  # Tampered non-dict metadata (invariant 4).
+    workspace = prior.get("workspace", {})
+    if not isinstance(workspace, dict):
+        workspace = {}
+    workspace_mount = workspace.get("mount_point", "/work")
+    # Preserve ingress across refresh — ingress configuration is fixed at
+    # cell-create time, so it can't change without a `brig run`.
     prior_ingress = read_ingress(cell_name)
     return write_metadata(
         cell_name, workspace_mount,
-        host_sockets=prior_sockets, ingress=prior_ingress,
+        ingress=prior_ingress,
         image_digest=read_image_digest(cell_name),
+        workspace_quota=workspace.get("quota"),
     )
 
 
@@ -256,28 +289,14 @@ def read_ingress(cell_name: str) -> list[dict[str, Any]]:
         payload = _json.loads(_host_metadata_path(cell_name).read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return []
+    if not isinstance(payload, dict):
+        return []  # Tampered non-dict metadata (invariant 4).
     entries = payload.get("ingress", []) or []
     return [
         e for e in entries
         if isinstance(e, dict)
         and {"name", "port", "path_prefix", "auth"} <= e.keys()
     ]
-
-
-def read_host_sockets(cell_name: str) -> list[dict[str, Any]]:
-    """Return the cell's stored host_sockets entries from cell-metadata.json.
-
-    Only the cell-visible projection (name, mount_point) is stored — host_path
-    is deliberately omitted (the file is mounted into the untrusted cell), so
-    bridges cannot be reconstructed from this alone. Used to detect that a
-    cell declares host_sockets, not to recreate them.
-    """
-    import json as _json
-    try:
-        payload = _json.loads(_host_metadata_path(cell_name).read_text())
-    except (FileNotFoundError, _json.JSONDecodeError, OSError):
-        return []
-    return [e for e in (payload.get("host_sockets", []) or []) if isinstance(e, dict)]
 
 
 def read_image_digest(cell_name: str) -> str | None:
@@ -291,16 +310,37 @@ def read_image_digest(cell_name: str) -> str | None:
         payload = _json.loads(_host_metadata_path(cell_name).read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
+    if not isinstance(payload, dict):
+        return None  # Tampered non-dict metadata (invariant 4).
     val = payload.get("image_digest")
+    return val if isinstance(val, str) and val else None
+
+
+def read_workspace_quota(cell_name: str) -> str | None:
+    """Return the cell's stored workspace_quota from cell-metadata.json.
+
+    Written for EVERY cell (unlike the restart-only cell-spec.json), so this
+    is the source of truth for quota enforcement regardless of restart policy.
+    None when the cell has no quota, predates the field, or is unreadable.
+    """
+    import json as _json
+    try:
+        payload = _json.loads(_host_metadata_path(cell_name).read_text())
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict):
+        return None  # Tampered non-dict metadata (invariant 4).
+    workspace = payload.get("workspace", {})
+    val = workspace.get("quota") if isinstance(workspace, dict) else None
     return val if isinstance(val, str) and val else None
 
 
 def write_metadata(
     cell_name: str,
     workspace_mount: str,
-    host_sockets: list[dict[str, Any]] | None = None,
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
+    workspace_quota: str | None = None,
 ) -> Path:
     """Write the cell's metadata JSON to the host path. Returns the path.
 
@@ -314,8 +354,9 @@ def write_metadata(
     """
     payload = build_metadata(
         cell_name, workspace_mount,
-        host_sockets=host_sockets, ingress=ingress,
+        ingress=ingress,
         image_digest=image_digest,
+        workspace_quota=workspace_quota,
     )
     target = _host_metadata_path(cell_name)
     atomic_write_json(target, payload, mode=0o644)

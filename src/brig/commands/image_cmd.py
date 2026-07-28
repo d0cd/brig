@@ -423,10 +423,16 @@ def cmd_verify_image(args: argparse.Namespace) -> int:
             f"'{args.image}' must not start with '-' (would be parsed as a "
             f"cosign/podman flag)"
         )
-    ok, msg, details = verify_image_signature(
-        args.image,
-        key=getattr(args, "key", None),
-        keyless=getattr(args, "keyless", False),
-    )
+    key = getattr(args, "key", None)
+    if not key:
+        raise BrigError(
+            "`brig image verify` requires --key <cosign public key>",
+            suggestion=(
+                "Keyless verification was removed: without an identity "
+                "constraint it only proves an image is signed, not by whom. "
+                "For runtime integrity, pin an image digest (image@sha256:...)."
+            ),
+        )
+    ok, msg, details = verify_image_signature(args.image, key=key)
     output(f"{'VERIFIED' if ok else 'FAILED'}: {msg}")
     return 0 if ok else 1

@@ -178,19 +178,5 @@ class TestStop(unittest.TestCase):
         self.assertIn(["podman", "rm"], seen)
 
 
-class TestEndpoints(unittest.TestCase):
-    def test_otlp_endpoint_uses_container_name(self):
-        from brig.observability import collector
-        from brig.config import COLLECTOR_NAME, COLLECTOR_OTLP_GRPC_PORT
-        endpoint = collector.otlp_endpoint_for_warden()
-        self.assertEqual(endpoint, f"{COLLECTOR_NAME}:{COLLECTOR_OTLP_GRPC_PORT}")
-
-    def test_prometheus_url_is_loopback(self):
-        from brig.observability import collector
-        url = collector.prometheus_url_for_host()
-        self.assertIn("127.0.0.1", url)
-        self.assertIn("/metrics", url)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -194,12 +194,6 @@ jobs:
         continue-on-error: true
         run: tests/test_vm_foundation.sh
 
-      - name: "Test: Subnet Allocator"
-        id: test_subnet_allocator
-        timeout-minutes: 10
-        continue-on-error: true
-        run: tests/test_subnet_allocator.sh
-
       - name: "Test: Proxy Policy"
         id: test_proxy_policy
         timeout-minutes: 10
@@ -254,15 +248,11 @@ jobs:
         continue-on-error: true
         run: tests/test_invariants_7_8.sh
 
-      - name: "Test: Host Sockets E2E (invariant 10)"
-        # tests/test_host_sockets_e2e.sh auto-skips when launchd isn't
-        # present, so this step is a no-op on Linux runners — but the
-        # macOS-15 E2E runner exercises the launchd bridge + socat
-        # forwarding path that invariant 10 hangs on.
-        id: test_host_sockets_e2e
+      - name: "Test: Containment red-team (Tier-1 adversarial cell)"
+        id: test_containment_e2e
         timeout-minutes: 10
         continue-on-error: true
-        run: tests/test_host_sockets_e2e.sh
+        run: tests/test_containment_e2e.sh
 
       - name: "Test: Ingress survives brig system down/up"
         # Regression for the aitelier-reported 502 after
@@ -287,7 +277,6 @@ jobs:
           FAILED=0
           for step in \
             "${{ steps.test_vm_foundation.outcome }}" \
-            "${{ steps.test_subnet_allocator.outcome }}" \
             "${{ steps.test_proxy_policy.outcome }}" \
             "${{ steps.test_cell_lifecycle.outcome }}" \
             "${{ steps.test_secrets.outcome }}" \
@@ -297,7 +286,7 @@ jobs:
             "${{ steps.test_warden_features.outcome }}" \
             "${{ steps.test_stream_passthrough.outcome }}" \
             "${{ steps.test_invariants_7_8.outcome }}" \
-            "${{ steps.test_host_sockets_e2e.outcome }}" \
+            "${{ steps.test_containment_e2e.outcome }}" \
             "${{ steps.test_ingress_replay_e2e.outcome }}" \
             "${{ steps.test_overhead.outcome }}"
           do

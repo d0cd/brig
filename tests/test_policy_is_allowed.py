@@ -64,5 +64,89 @@ class TestIsAllowed(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestIsHostAllowed(unittest.TestCase):
+    """Host-level CONNECT gate: path/method are inside the not-yet-established
+    TLS tunnel, so a path/method-scoped allow must NOT block the CONNECT (it's
+    enforced per-request after MITM). An UNSCOPED deny still blocks."""
+
+    def test_plain_allow_permits_connect(self):
+        p = Policy(allow=["example.com"], deny=[])
+        ok, _ = p.is_host_allowed("example.com")
+        self.assertTrue(ok)
+
+    def test_path_scoped_allow_permits_connect(self):
+        # Regression: is_allowed(host, "/", "CONNECT") returned False here and
+        # broke ALL HTTPS to a host whose allow rule was path-scoped.
+        p = Policy(allow=[{"domain": "api.example.com", "paths": ["/v1/*"]}], deny=[])
+        ok, _ = p.is_host_allowed("api.example.com")
+        self.assertTrue(ok)
+
+    def test_method_scoped_allow_permits_connect(self):
+        p = Policy(allow=[{"domain": "api.example.com", "methods": ["GET"]}], deny=[])
+        ok, _ = p.is_host_allowed("api.example.com")
+        self.assertTrue(ok)
+
+    def test_non_allowlisted_host_blocked(self):
+        p = Policy(allow=["example.com"], deny=[])
+        ok, reason = p.is_host_allowed("evil.com")
+        self.assertFalse(ok)
+        self.assertIn("not in allowlist", reason)
+
+    def test_unscoped_deny_blocks_connect(self):
+        p = Policy(allow=["example.com"], deny=["example.com"])
+        ok, reason = p.is_host_allowed("example.com")
+        self.assertFalse(ok)
+        self.assertIn("denied by rule", reason)
+
+    def test_empty_methods_allow_grants_all(self):
+        # matches_method treats [] as no-restriction (this round's change), so a
+        # `methods: []` ALLOW grants every method — consistent with `paths: []`
+        # and with the deny direction. Locks the new semantics.
+        p = Policy(allow=[{"domain": "x.com", "methods": []}], deny=[])
+        for m in ("GET", "POST", "DELETE"):
+            ok, _, _ = p.is_allowed("x.com", "/", m)
+            self.assertTrue(ok, m)
+
+    def test_empty_paths_allow_grants_all(self):
+        p = Policy(allow=[{"domain": "x.com", "paths": []}], deny=[])
+        ok, _, _ = p.is_allowed("x.com", "/anything/deep", "GET")
+        self.assertTrue(ok)
+
+    def test_empty_methods_deny_blocks_http_and_connect(self):
+        # A `methods: []` deny is unscoped (empty = no restriction), so it must
+        # block every method per-request AND block the CONNECT — not be a no-op
+        # on HTTP while blocking HTTPS.
+        p = Policy(allow=["x.com"], deny=[{"domain": "x.com", "methods": []}])
+        for method in ("GET", "POST", "DELETE"):
+            blocked, _, _ = p.is_allowed("x.com", "/", method)
+            self.assertFalse(blocked, method)
+        ok, reason = p.is_host_allowed("x.com")
+        self.assertFalse(ok)
+        self.assertIn("denied by rule", reason)
+
+    def test_empty_paths_deny_blocks_connect(self):
+        # An empty paths list means "all paths" in is_allowed (matches_path
+        # returns True), so a `paths: []` deny blocks all HTTP — is_host_allowed
+        # must block the CONNECT too, matching is_allowed rather than mistaking
+        # the empty list for a scoped rule.
+        p = Policy(allow=["x.com"], deny=[{"domain": "x.com", "paths": []}])
+        # Sanity: is_allowed denies a concrete request under this rule.
+        blocked, _, _ = p.is_allowed("x.com", "/anything", "GET")
+        self.assertFalse(blocked)
+        ok, reason = p.is_host_allowed("x.com")
+        self.assertFalse(ok)
+        self.assertIn("denied by rule", reason)
+
+    def test_path_scoped_deny_does_not_block_connect(self):
+        # A path-scoped deny can't be evaluated at CONNECT (path unknown) — it
+        # is enforced per-request after MITM, so the CONNECT itself proceeds.
+        p = Policy(
+            allow=["api.example.com"],
+            deny=[{"domain": "api.example.com", "paths": ["/admin/*"]}],
+        )
+        ok, _ = p.is_host_allowed("api.example.com")
+        self.assertTrue(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

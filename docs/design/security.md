@@ -138,9 +138,9 @@ xattr -w com.apple.quarantine "0181;$(printf %x $(date +%s));brig;$(uuidgen)" ~/
 
 **Rules:**
 
-1. **Default runtime is gVisor** — set in containers.conf, not just CLI flag
+1. **Runtime is always gVisor** — the reconciler hardcodes `--runtime runsc`
 2. **`brig cell list` shows runtime** — always visible which runtime a cell uses
-3. **Native runtime requires explicit opt-in** — via `--profile dev` (or another non-gVisor profile)
+3. **Runtime is not profile-selectable** — no profile (including `dev`) can downgrade to a native runtime; `runtime` is intentionally omitted from the profile schema
 4. **Runtime is verified at startup** — don't rely solely on config defaults
 
 #### Understanding gVisor's Role
@@ -246,7 +246,7 @@ done
 verify_cell_single_homed() {
     local exit_code=0
 
-    for cell in $(podman ps --format '{{.Names}}' | grep -v '^proxy$'); do
+    for cell in $(podman ps --format '{{.Names}}' | grep -v '^warden$'); do
         network_count=$(podman inspect "$cell" --format '{{len .NetworkSettings.Networks}}')
         if [ "$network_count" -ne 1 ]; then
             echo "FATAL: Cell '$cell' is attached to $network_count networks (must be exactly 1)"
@@ -268,23 +268,18 @@ verify_cell_single_homed() {
 
 ---
 
-### Invariant 10: `host_sockets` Bypass Warden by Design
+### Invariant 10: (retired) `host_sockets`
 
-**Rule:** A cell that declares `host_sockets: [...]` in its yaml bind-mounts a macOS-side unix socket into the cell at a path under `/run/host/`. Bytes flow kernel-direct between the cell and the host service — no proxy interposition possible.
+The unix `host_sockets` feature was **removed** (see CHANGELOG). It mounted a
+macOS host service's unix socket into a cell via a launchd bridge, but it never
+worked under brig's mandatory gVisor runtime (a cell cannot `connect()` to a
+bind-mounted host unix socket), no consumer used it, and it bypassed Warden by
+design.
 
-**Why this matters:** Some upstream services (Postgres / Redis / ssh-agent) don't speak HTTP and can't meaningfully traverse a CONNECT-style proxy. The `host_sockets` primitive trades audit visibility for protocol generality.
-
-**Sub-rules brig enforces** (`docs/INVARIANTS.md` invariant 10):
-
-1. **Opt-in per cell yaml.** No default access; the operator's act of writing the entry IS the security review.
-2. **Untrusted profile cannot declare `host_sockets`** at parse time. Adversarial cells don't get side channels.
-3. **Engine sockets (`docker.sock`, `podman.sock`, …) are denylisted** at parse time AND at bridge-start (defense in depth).
-4. **Bridge sockets are real unix sockets, never symlinks** (lstat check defends against TOCTOU swap of the bridge path).
-5. **Per-cell namespacing** — cell A's bridge can't be reused by cell B.
-6. **Every attach is audited** via `log_lifecycle("host_socket_attach", …)`.
-7. **The cell startup banner** explicitly says Warden does not see the traffic, so operators internalize the trade-off.
-
-For host services that DO speak TCP but aren't worth bypassing Warden entirely, `host_services` with `protocol: tcp` keeps Warden in the path (connection-level audit only — see cell-definition.md).
+Cell→host access is served by **`host_services`** (HTTP, or `protocol: tcp` —
+both keep Warden in the path) and scoped **`mounts:`** (invariant 13). This
+invariant number is retired, not reused, so invariants 11–13 keep stable
+references. Design notes for the removal: GitHub issue #21.
 
 ---
 
@@ -354,7 +349,7 @@ Two lists, not one with attributes, so `grep -l tls_passthrough cells/*.yaml` an
 
 ### Invariant 13: Scoped Host Mounts Are Opt-In, Bounded, and Bypass Warden by Design
 
-**Rule:** A `supervised`/`dev` cell may bind-mount an operator-chosen host directory into itself via `mounts:` (read-only by default, `rw` opt-in), bounded by the VM-level `mount_roots` allowlist. Like `host_sockets`, the bytes flow between the cell and the host files directly — Warden does not mediate them.
+**Rule:** A `supervised`/`dev` cell may bind-mount an operator-chosen host directory into itself via `mounts:` (read-only by default, `rw` opt-in), bounded by the VM-level `mount_roots` allowlist. The bytes flow between the cell and the host files directly — Warden does not mediate them (a deliberate bypass).
 
 **Why this matters:** Agents frequently need a real working tree (a repo to edit, a dataset to read) that's larger or more persistent than `/work`, and copying everything in and out is slow and loses edits. `mounts:` trades audit visibility over those files for direct, persistent access — with the host exposure bounded to roots the operator explicitly allowlisted at the VM level.
 

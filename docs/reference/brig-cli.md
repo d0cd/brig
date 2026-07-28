@@ -16,9 +16,9 @@ output; `--no-color` disables ANSI colors.
 | `brig cell list [--format=table\|wide\|json]` | List cells. `wide` adds CREATED, NETWORK columns. Aliases: `brig cell ls`, top-level `brig ps`. |
 | `brig cell inspect <cell>` | Raw podman inspect JSON. Alias: `brig cell status <cell>`. |
 | `brig cell diagnose <cell>` | Per-cell state summary (status, runtime, networks). |
-| `brig cell stop <cell>` | SIGTERM with 10s grace. |
-| `brig cell kill <cell>` | SIGKILL. |
-| `brig cell start <cell>` | Start a previously stopped cell. |
+| `brig cell stop <cell>` | SIGTERM with 10s grace. Records a stop marker, so a `restart: always` cell stays down (not auto-recovered) until `start`. |
+| `brig cell kill <cell>` | SIGKILL. Also records the stop marker (see `stop`). |
+| `brig cell start <cell>` | Start a previously stopped cell; clears the stop marker so `restart: always` recovery resumes. |
 | `brig cell restart <cell>` | Stop (if running) then start. Applies cell-yaml changes. |
 | `brig cell pause <cell>` / `brig cell unpause <cell>` | Freeze / thaw processes. |
 | `brig cell rm <cell> [-f] [--keep-workspace]` | Remove cell + network + subnet allocation. `-f` required if running. By default the cell's `~/.brig/state/<cell>/` workspace is deleted; pass `--keep-workspace` to retain it. |
@@ -48,7 +48,7 @@ output; `--no-color` disables ANSI colors.
 | `--policy-deny <domain>` | Add to the cell's denylist (repeatable). |
 | `--label`, `-l KEY=VALUE` | Label on the cell (repeatable). |
 | `--timeout <duration>` | Container timeout, e.g. `30s`, `5m`, `2h`. |
-| `--workspace-quota <size>` | Cap on the cell's workspace size (e.g. `500m`). |
+| `--workspace-quota <size>` | Soft cap on the cell's workspace (e.g. `500m`). Enforced preventively on `brig cp` and reactively by `brig system watchdog` (stops an over-quota cell); not a hard block-quota. |
 | `--image-digest sha256:...` | Pin the expected image digest. Reconciler refuses to start the cell on mismatch. |
 | `--workdir <path>` | Working directory inside the cell. |
 | `--file`, `-f <yaml>` | Cell definition file (YAML / JSON). Mutually compatible with flags; flags override fields from the file. |
@@ -95,14 +95,14 @@ output; `--no-color` disables ANSI colors.
 | `brig image build <dir> [--tag TAG] [--file PATH] [--build-arg K=V] [--use-warden]` | Build a container image from a directory inside the VM. Auto-derives tag from the dir basename if `--tag` omitted; auto-detects `Containerfile`/`Dockerfile` if `--file` omitted. `--use-warden` routes the build's HTTP(S) traffic through warden — injects `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` build args and mounts the warden CA at `/etc/ssl/certs/warden-ca.crt`. Same policy applies as runtime. |
 | `brig image pull <image>` | Pull + cache an image. |
 | `brig image warmup` | Pre-pull the pinned warden/mitmproxy base image into the VM cache. |
-| `brig image verify <image> [--key KEY \| --keyless]` | Verify a cosign signature. Cosign is a hard requirement (no `podman trust` fallback). Advisory only — `--keyless` without an identity/issuer constraint confirms the image is signed, not who signed it; run-time integrity comes from digest pinning. |
+| `brig image verify <image> --key KEY` | Verify a cosign signature against a public key (`--key` required). Proves the image was signed by the holder of that key. Cosign is a hard requirement (no `podman trust` fallback). Keyless verification is not offered — without an identity constraint it can't attest who signed; run-time integrity comes from digest pinning. |
 
 ## System / lifecycle
 
 | Command | What it does |
 |---|---|
-| `brig system up` | Initialize `~/.brig` if needed, create Lima VM if missing, start it if stopped, start warden, then re-launch any gone `restart: always` cells. The "make it work" command. |
-| `brig system down [--vm]` | Stop all cells + warden. `--vm` also stops the Lima VM. |
+| `brig system up` | Initialize `~/.brig` if needed, create Lima VM if missing, start it if stopped, start warden, then recover any down `restart: always` cells (crashed or VM-dropped; a deliberately stopped one is left down). The "make it work" command. |
+| `brig system down [--vm]` | Stop all cells + warden. `--vm` also stops the Lima VM. Harness-level, not per-cell intent: no stop marker is recorded, so `restart: always` cells come back on the next `system up`. Use `brig cell stop` to keep one down. |
 | `brig system init` | Bootstrap `~/.brig`, set 0700 perms on `secrets`/`addons`/`state/system`, write default policy. Idempotent. |
 | `brig system profiles` | List trust profiles (`untrusted`, `supervised`, `dev`, `airgapped`, `honeypot`). |
 | `brig system doctor --quick` | Lightweight health check: proxy running + VM reachable. |
@@ -112,7 +112,7 @@ output; `--no-color` disables ANSI colors.
 | `brig system metrics` | Output Prometheus-format counters. |
 | `brig system stats` | Per-cell summary (requests / bytes / blocks) scraped from the OTel collector. Requires the collector to be running. |
 | `brig system prune [--cells\|--logs\|--subnets] [--log-days N] [--dry-run]` | Clean up. **No scope flag → all categories.** `--cells` removes stopped/exited cells + their networks. `--logs` deletes rotated operation logs older than N days (default 7) + invokes `warden logs prune`. `--subnets` frees allocator entries whose podman network is gone. `--dry-run` shows what would be removed. |
-| `brig system watchdog [--interval N] [--max-restarts N]` | Monitor warden, restart it on failure. Foreground long-running command. |
+| `brig system watchdog [--interval N] [--max-restarts N]` | Foreground long-running command. Monitors warden (restarts on failure) and, each interval, recovers down `restart: always` cells (crashed / SIGKILLed / VM-dropped; a deliberately stopped one is left down) and enforces `workspace_quota` by stopping any cell whose workspace has outgrown it (that stop records the marker, so recovery doesn't fight it — free space, then `brig cell start`). Run it persistently (e.g. a launchd agent) so cells self-heal after host sleep/reboot. |
 
 ## Config
 

@@ -85,5 +85,5 @@ the canonical updater, which writes both:
 **Brig's own code:**
 
 1. Security issues should be reported via GitHub security advisories (private disclosure). See `SECURITY.md` at the repo root.
-2. All 12 invariants have tests — run `brig system verify` after any security fix.
+2. All active invariants (numbered 1–13, with #10 retired) have tests — run `brig system verify` after any security fix.
 3. The audit trail is in `docs/INVARIANTS.md`.

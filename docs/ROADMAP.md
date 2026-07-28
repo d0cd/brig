@@ -70,9 +70,9 @@ of the network choke point and the invariant ledger.
 **Status:** Deferred — defense-in-depth for the untrusted-state-dir boundary.
 
 Confine brig's *macOS-side* processes with seatbelt (App Sandbox /
-`sandbox-exec` profiles): the host_socket bridges, `brig cell mount-scan`, and
-any host tooling that touches cell-influenced files (invariant 4 — the state dir
-is untrusted). A profile limiting each helper's filesystem reach and denying
+`sandbox-exec` profiles): `brig cell mount-scan` and any host tooling that
+touches cell-influenced files (invariant 4 — the state dir is untrusted). A
+profile limiting each helper's filesystem reach and denying
 unexpected network/exec shrinks the blast radius if a cell plants content a
 host-side helper later consumes (the confused-deputy boundary `mount-scan`
 already guards). Pairs with — does not replace — the VM boundary.
@@ -89,6 +89,66 @@ OS-enforced confinement beyond `mount-scan` + consumer discipline.
 
 **Effort:** Medium. Per-helper profiles + testing they don't break legitimate
 access; more if it needs re-signing / entitlements.
+
+### Hard workspace quota (block-level enforcement)
+**Status:** Deferred — soft (reactive) enforcement ships today.
+
+`workspace_quota` is currently a **soft** quota: enforced preventively on
+`brig cp` and reactively by `brig system watchdog` (which *stops* a cell whose
+`/work` has outgrown its quota). It is not a hard block-quota — a cell can burst
+over its limit between watchdog sweeps until it's stopped. A hard cap isn't
+possible today because the workspace lives on a **virtiofs** mount (`~/.brig/state`
+→ `/state`), which can't carry an XFS/ext4 project quota, and the workspace is
+read *directly from macOS* (`safe_open` for `brig cell read`, host-side lifecycle
+ops), so it can't simply move inside an ext4 loop image without breaking that
+visibility.
+
+A real hard cap means re-architecting where the workspace lives: put it on the
+VM's own ext4/xfs disk with per-cell project quotas (or a per-cell loopback ext4
+image), and route **all** host access (`cp`, `read`, size) through the VM instead
+of direct virtiofs reads. Overlaps with the substrate items above — the
+Apple-Containerization / VM-per-cell path dissolves the shared-VM-disk problem
+entirely, so evaluate this against that before building it standalone.
+
+**Trigger:** A cell can fill the shared VM disk fast enough that the watchdog's
+sweep interval is too coarse, AND you're not moving to a VM-per-cell substrate.
+
+**Effort:** High. Storage re-layout, host-access rerouting through the VM,
+provisioning changes, and migration of existing cells' workspaces.
+
+### Trusted-source hardening for state-dir-read security decisions
+**Status:** Deferred — defense-in-depth for invariant 4 (untrusted state dir).
+
+Some security decisions are still read from files in the untrusted macOS state
+dir. Where the host-side path already re-derives trust from the podman container
+label (the ingress auth:none gate reads `brig.profile`), the *addon* side and a
+couple of other readers do not:
+
+- **Signed ingress routes.** `ingress-routes.json` carries each route's `auth`.
+  The host gate (`register_ingress_for`, trusted container label) refuses to
+  *write* an `auth: none` route for an untrusted cell, but the warden ingress
+  addon reads the file directly and can't re-validate a route that was tampered
+  on disk after the fact (it has no podman access). Fix: brig HMAC-signs the
+  routes file with a per-session key handed to warden via a trusted channel
+  (podman env at warden create, read via inspect), and the addon rejects an
+  unverified file. Overlaps the deleted audit-log-signing scaffolding.
+- **Digest pin via label.** `_verify_image_digest_on_start` reads the pin from
+  `cell-metadata.json`; dropping the key silently skips the start-time re-check
+  (the image ref is still digest-pinned at pull, so this is only the
+  commit-swap second layer). Fix: stamp `brig.image_digest=` as a reserved
+  container label (same mechanism as `brig.profile`) and read the pin from the
+  label.
+
+- **Pre-existing cells carry no trust marker.** The `brig.profile` label is
+  stamped at container *create*, so a cell created before the label existed has
+  none, and the replay gate can't fire for it. Not a new exposure (the
+  parse-time gate covered its creation) but the second layer is absent until
+  the cell is re-created. Fix: `brig system verify` flags label-less cells, or
+  a one-shot migration recreates them from their persisted spec.
+
+**Trigger:** hardening the invariant-4 surface beyond the host-side gates, or an
+incident involving state-dir tampering. **Effort:** Medium (HMAC key management
+for routes; Low for the digest label and the verify warning).
 
 ### Dispatcher integration
 **Status:** Deferred — dispatcher's job, not Brig's.
@@ -305,16 +365,6 @@ could fail). A brig-provided small per-cell writable HOME tmpfs *outside* `/tmp`
 (e.g. `/home/<cell>`) would let HOME-sensitive CLIs behave without a hand-rolled
 mount. **Trigger:** a cell's CLI hard-fails on a `/tmp` HOME. **Effort:** Low
 (one more tmpfs mount + a default HOME).
-
-### `brig system doctor`: stale cell `HTTP_PROXY` check (consumer feedback: hermes)
-**Status:** Deferred — edge; the `restart: always` recreate path already avoids it.
-
-A cell's `HTTP_PROXY` is baked at creation to warden's then-current per-cell-net
-IP; if that IP churns (a full `system down/up`), an already-created cell keeps
-the stale address and `brig cell start` reuses it (only `rm --keep-workspace` +
-`run` recovers). Have `doctor` flag "cell HTTP_PROXY ≠ current warden IP" with
-the recreate fix. **Trigger:** warden IP churn strands a started cell.
-**Effort:** Low (one doctor check).
 
 ### Cross-source audit query (consumer feedback: hermes)
 **Status:** Deferred — needs a correlation-id contract.

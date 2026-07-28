@@ -178,10 +178,15 @@ class TestBrigCliParsing(unittest.TestCase):
 
     def test_image_verify(self):
         args = self.parser.parse_args([
-            "image", "verify", "myimage:latest", "--keyless",
+            "image", "verify", "myimage:latest", "--key", "cosign.pub",
         ])
         self.assertEqual(args.image_command, "verify")
-        self.assertTrue(args.keyless)
+        self.assertEqual(args.key, "cosign.pub")
+
+    def test_image_verify_requires_key(self):
+        # Keyless verification was removed; --key is now required.
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(["image", "verify", "myimage:latest"])
 
     def test_image_warmup(self):
         args = self.parser.parse_args(["image", "warmup"])

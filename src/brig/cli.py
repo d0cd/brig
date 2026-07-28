@@ -32,7 +32,12 @@ _HOST_ONLY_TOP = frozenset({"config", "policy", "secrets"})
 #   - down: must work even when the VM is broken (idempotent cleanup) — and
 #     `brig system down --vm` definitionally has to work without the VM up.
 #   - history: reads ~/.brig/state/system/operations.jsonl on host only.
-_HOST_ONLY_SYSTEM = frozenset({"init", "profiles", "up", "down", "history"})
+#   - watchdog: the supervisor must run in every state — it brings the VM up
+#     (via `system up`) when the host slept and dropped it, so it can't be
+#     gated on the VM already running.
+_HOST_ONLY_SYSTEM = frozenset(
+    {"init", "profiles", "up", "down", "history", "watchdog"}
+)
 # `image` subcommands that don't touch the VM.
 _HOST_ONLY_IMAGE = frozenset({"verify"})
 
@@ -274,12 +279,11 @@ def _add_image_group(sub: argparse._SubParsersAction) -> None:
 
     p_verify = isub.add_parser("verify", help="Verify image signature (cosign)")
     p_verify.add_argument("image", help="Image to verify")
-    p_verify.add_argument("--key", help="Cosign public key")
     p_verify.add_argument(
-        "--keyless", action="store_true",
-        help="Keyless (Fulcio) verification — advisory only: without an "
-        "identity/issuer constraint it confirms the image is signed, not who "
-        "signed it",
+        "--key", required=True,
+        help="Cosign public key to verify against (required). Proves the image "
+        "was signed by the holder of this key. (Keyless verification was "
+        "removed: without an identity constraint it can't attest WHO signed.)",
     )
 
     isub.add_parser(
@@ -312,7 +316,10 @@ def _add_system_group(sub: argparse._SubParsersAction) -> None:
         help="Only check the two essentials (proxy + VM).",
     )
 
-    p_watchdog = ss.add_parser("watchdog", help="Monitor warden, restart on failure")
+    p_watchdog = ss.add_parser(
+        "watchdog",
+        help="Monitor warden (restart on failure) and enforce workspace quotas",
+    )
     p_watchdog.add_argument("--interval", type=int, default=30,
                             help="Check interval (seconds)")
     p_watchdog.add_argument("--max-restarts", type=int, default=5,

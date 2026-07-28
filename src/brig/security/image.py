@@ -1,8 +1,10 @@
 """
-Image signature verification using cosign or podman trust.
+Image signature verification using cosign.
 
-Cosign and podman run on the host (macOS), not inside the VM,
-so these use subprocess directly (not vm_run).
+Cosign runs on the host (macOS), not inside the VM, so this uses subprocess
+directly (not vm_run). There is no `podman trust` fallback — `podman image
+trust show` returns a global accept/reject policy that can't attest an
+individual image, so cosign is a hard requirement.
 """
 
 from __future__ import annotations
@@ -27,21 +29,18 @@ def _parse_cosign_output(stdout: str) -> dict:
 
 def verify_image_signature(
     image: str,
-    key: str | None = None,
-    keyless: bool = False,
-    certificate_identity: str | None = None,
-    certificate_oidc_issuer: str | None = None,
+    key: str,
 ) -> tuple[bool, str, dict]:
-    """Verify image signature using cosign or podman trust.
+    """Verify an image signature against a cosign public key.
 
     Returns (success, message, details) tuple.
     Note: cosign runs on macOS host, not in the VM.
 
-    Keyless verification is ADVISORY unless both certificate_identity and
-    certificate_oidc_issuer are supplied: with neither, cosign accepts a
-    signature from any Fulcio identity, so a success means "signed by
-    someone", not "signed by who you trust". Image integrity at run time is
-    enforced by digest pinning, not by this command.
+    Key-based only: a success proves the image was signed by the holder of
+    `key`. Keyless (Fulcio) verification is intentionally not offered — without
+    an identity/issuer constraint it only proves an image is signed, not by
+    whom, which is false confidence. Image integrity at run time is enforced by
+    digest pinning (see `_verify_image_digest_on_start`), not by this command.
     """
     result = subprocess.run(
         ["which", "cosign"], check=False, capture_output=True, text=True,
@@ -58,15 +57,7 @@ def verify_image_signature(
             {},
         )
 
-    cmd = ["cosign", "verify"]
-    if key:
-        cmd.extend(["--key", key])
-    elif keyless:
-        if certificate_identity:
-            cmd.extend(["--certificate-identity", certificate_identity])
-        if certificate_oidc_issuer:
-            cmd.extend(["--certificate-oidc-issuer", certificate_oidc_issuer])
-    cmd.append(image)
+    cmd = ["cosign", "verify", "--key", key, image]
 
     debug(f"Verifying image with cosign: {image}")
     result = subprocess.run(cmd, check=False, capture_output=True, text=True)

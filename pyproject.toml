@@ -51,6 +51,11 @@ dev = [
     # security-critical addons against semantics production never runs. Bump
     # this in lockstep with the Dockerfile base.
     "mitmproxy>=10.1.1,<11",
+    # Host-side SSE server in tests/test_stream_passthrough.sh (verifies Warden
+    # streams server-sent events without buffering). Was undeclared, so the e2e
+    # failed at "stream server failed to start" wherever aiohttp wasn't already
+    # present.
+    "aiohttp",
 ]
 
 [project.scripts]

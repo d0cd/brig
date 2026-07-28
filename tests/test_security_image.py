@@ -36,7 +36,7 @@ class TestVerifyImageSignature(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 1)
             return subprocess.CompletedProcess(cmd, 0, stdout="default  accept", stderr="")
         mock_run.side_effect = side_effect
-        ok, msg, _ = verify_image_signature("alpine:latest")
+        ok, msg, _ = verify_image_signature("alpine:latest", key="/path/to/key")
         self.assertFalse(ok)
         self.assertIn("cosign", msg.lower())
 
@@ -59,7 +59,7 @@ class TestVerifyImageSignature(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0)
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no matching signatures")
         mock_run.side_effect = side_effect
-        ok, msg, _ = verify_image_signature("myimage:latest")
+        ok, msg, _ = verify_image_signature("myimage:latest", key="/path/to/key")
         self.assertFalse(ok)
         self.assertIn("no signature", msg)
 
@@ -70,6 +70,6 @@ class TestVerifyImageSignature(unittest.TestCase):
                 return subprocess.CompletedProcess(cmd, 0)
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="connection refused")
         mock_run.side_effect = side_effect
-        ok, msg, _ = verify_image_signature("myimage:latest")
+        ok, msg, _ = verify_image_signature("myimage:latest", key="/path/to/key")
         self.assertFalse(ok)
         self.assertIn("connection refused", msg)

@@ -287,6 +287,12 @@ class OpsAddon:
             # bad edit is retried on the next configure() rather than skipped
             # until the file changes again (matches enforce.py / notifier.py).
             self.policy_mtime = sig
+            # Existing buckets were built with the OLD rate/burst, and _get_bucket
+            # only reads config at creation, so a reloaded (e.g. tightened) limit
+            # would never reach already-active cells. Clear them so the next
+            # request rebuilds each with the new limits.
+            with self.buckets_lock:
+                self.buckets.clear()
         except (json.JSONDecodeError, IOError, OSError, ValueError) as e:
             ctx.log.warn(f"OpsAddon: Failed to load rate config: {e}")
 

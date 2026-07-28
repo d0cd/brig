@@ -155,23 +155,3 @@ def start() -> bool:
 
     debug(f"{COLLECTOR_NAME} did not become healthy in {HEALTH_TIMEOUT_S}s")
     return False
-
-
-def otlp_endpoint_for_warden() -> str:
-    """OTLP gRPC endpoint warden uses to push signals.
-
-    Both warden and collector run as containers on the VM's podman
-    network. From inside warden, the collector is reachable at the
-    container name via podman's built-in DNS.
-    """
-    return f"{COLLECTOR_NAME}:{COLLECTOR_OTLP_GRPC_PORT}"
-
-
-def prometheus_url_for_host() -> str:
-    """Where the host CLI scrapes metrics.
-
-    The collector port is published to the VM's loopback via -p; the
-    host reaches it through Lima's port forwarding. Default Lima
-    forwards 127.0.0.1:N → vm:N.
-    """
-    return f"http://127.0.0.1:{COLLECTOR_PROMETHEUS_PORT}/metrics"

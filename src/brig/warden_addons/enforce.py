@@ -290,6 +290,17 @@ class PolicyEnforcer:
                     try:
                         with open(policy_file, "r") as f:
                             data = json.load(f)
+                        if not isinstance(data, dict):
+                            # Tampered non-dict policy file (invariant 4): fail
+                            # closed. The file is never adopted — an unseen cell
+                            # hits the "no per-cell policy" default-deny, and a
+                            # cell whose good policy is already cached keeps it.
+                            # Either way the tampered content grants nothing.
+                            ctx.log.error(
+                                f"PolicyEnforcer: policy '{cell_name}' is not a "
+                                f"JSON object; skipping (fail closed)"
+                            )
+                            continue
                         self.cell_policies[cell_name] = Policy(
                             allow=data.get("allow", []),
                             deny=data.get("deny", []),
@@ -298,7 +309,15 @@ class PolicyEnforcer:
                         )
                         self.cell_policy_mtimes[cell_name] = sig
                         ctx.log.info(f"PolicyEnforcer: Loaded policy for cell '{cell_name}'")
-                    except (json.JSONDecodeError, IOError) as e:
+                    except Exception as e:
+                        # Broad on purpose (mirrors the global _reload_policy):
+                        # Policy()/PolicyRule() raise ValueError on a malformed
+                        # rule (empty domain, bad IDN). Such a structural error
+                        # MUST NOT escape — _reload_cell_policies runs via
+                        # _check_reload() at the top of request()/http_connect(),
+                        # where an unhandled hook exception fails OPEN (mitmproxy
+                        # lets the flow through with no 403). Skip the bad file;
+                        # the cell falls to default-deny.
                         ctx.log.error(f"PolicyEnforcer: Failed to load cell policy {cell_name}: {e}")
 
             # Evict cached policies whose file was deleted (`brig policy rm`).
@@ -624,7 +643,12 @@ class PolicyEnforcer:
                 f"cell '{cell_name or 'unknown'}' has no per-cell policy",
             )
             return
-        allowed, reason, _ = cell_policy.is_allowed(host, "/", "CONNECT")
+        # CONNECT only sets up the tunnel; path and method are encrypted inside
+        # it. Gate on the host alone here — per-request path/method rules are
+        # enforced in request() after MITM. Using the full is_allowed() with a
+        # placeholder "/"+"CONNECT" would wrongly block HTTPS to any host whose
+        # allow rule is path- or method-scoped.
+        allowed, reason = cell_policy.is_host_allowed(host)
         if not allowed:
             self._block(flow, f"cell policy: {reason}")
 

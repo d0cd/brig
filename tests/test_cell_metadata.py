@@ -26,13 +26,27 @@ class TestBuildMetadata(unittest.TestCase):
             m = build_metadata("test-cell", "/work")
 
         self.assertEqual(m["version"], SCHEMA_VERSION)
-        self.assertEqual(m["version"], 3,
-            "v3 schema (added image_digest + ingress) — bump this when you "
+        self.assertEqual(m["version"], 4,
+            "v4 schema (dropped `profile` — trust reads the container label) — "
+            "bump this when you "
             "intentionally change the wire shape, not when you change "
             "internals")
         self.assertEqual(m["name"], "test-cell")
         self.assertEqual(m["workspace"]["mount_point"], "/work")
         self.assertEqual(m["policy"]["host_services"], [])
+
+    def test_v4_does_not_publish_profile(self):
+        """Load-bearing security test: the trust profile is REMOVED in v4.
+        This file is untrusted (invariant 4), so re-publishing `profile` here
+        invites a reader to make a trust decision on a tamperable value — the
+        exact fail-open the ingress auth:none gate moved to the podman
+        container label to close."""
+        from brig.cell.metadata import build_metadata
+        with patch("brig.cell.metadata.load_cell_policy", return_value=None):
+            m = build_metadata("test-cell", "/work")
+        self.assertNotIn("profile", m,
+            "the trust profile must not be published in cell-metadata.json — "
+            "read it from the brig.profile container label")
 
     def test_v2_does_not_publish_host_path(self):
         """Load-bearing security test: workspace.host_path is REMOVED in v2.
@@ -95,7 +109,7 @@ class TestWriteMetadata(unittest.TestCase):
         self.assertEqual(payload["name"], "test-cell")
         self.assertEqual(payload["workspace"]["mount_point"], "/work")
         self.assertIn("started_at", payload)
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 4)
         self.assertNotIn("host_path", payload["workspace"])
 
     def test_metadata_file_is_world_readable_inside_cell(self):
@@ -166,6 +180,36 @@ class TestRefreshMetadataIfPresent(unittest.TestCase):
                 # No prior write_metadata call.
                 result = metadata.refresh_metadata_if_present("ghost")
                 self.assertIsNone(result)
+
+    def test_readers_tolerate_tampered_non_dict_metadata(self):
+        # A tampered non-dict cell-metadata.json (invariant 4) must not crash the
+        # host-side readers with AttributeError — they return their empty default.
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths:
+                host_paths.STATE_DIR = Path(td)
+                p = metadata._host_metadata_path("c1")
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("[]")  # valid JSON, not an object
+                self.assertEqual(metadata.read_ingress("c1"), [])
+                self.assertIsNone(metadata.read_image_digest("c1"))
+                self.assertIsNone(metadata.read_workspace_quota("c1"))
+                self.assertIsNone(metadata.refresh_metadata_if_present("c1"))
+
+    def test_preserves_workspace_quota_across_refresh(self):
+        # v4 field: a dropped kwarg in refresh would silently disable quota
+        # enforcement for the cell — lock the round-trip so it fails loudly.
+        from brig.cell import metadata
+        with tempfile.TemporaryDirectory() as td:
+            with patch("brig.cell.metadata.HostPaths") as host_paths, \
+                 patch("brig.cell.metadata.load_cell_policy", return_value=None):
+                host_paths.STATE_DIR = Path(td)
+                metadata.write_metadata("c1", "/work", workspace_quota="500m")
+                metadata.refresh_metadata_if_present("c1")
+                payload = json.loads(
+                    metadata._host_metadata_path("c1").read_text()
+                )
+                self.assertEqual(payload["workspace"].get("quota"), "500m")
 
 
 class TestIngressInMetadata(unittest.TestCase):

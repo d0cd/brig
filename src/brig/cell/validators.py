@@ -17,15 +17,10 @@ from brig.config import (
     CELL_NAME_PATTERN,
     DOMAIN_PATTERN,
     HOST_SERVICE_NAME_PATTERN,
-    HOST_SOCKET_ENGINE_DENYLIST,
-    HOST_SOCKET_MODES,
-    HOST_SOCKET_MOUNT_PREFIX,
-    HOST_SOCKET_NAME_PATTERN,
     INGRESS_AUTH_METHODS,
     INGRESS_NAME_PATTERN,
     INGRESS_PATH_PREFIX_PATTERN,
     MAX_HOST_SERVICES_PER_CELL,
-    MAX_HOST_SOCKETS_PER_CELL,
     MAX_INGRESS_PER_CELL,
     MAX_MOUNTS_PER_CELL,
     MEMORY_PATTERN,
@@ -158,7 +153,9 @@ def _v_cpus(value: Any, context: str) -> list[str]:
 
 
 def _v_pids_limit(value: Any, context: str) -> list[str]:
-    if not isinstance(value, int) or value < 1:
+    # bool is an int subclass; reject it so True/False don't reach podman as
+    # `--pids-limit True` (opaque runtime failure). Mirrors _v_cpus.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         return [f"'pids_limit' must be a positive integer{context}"]
     return []
 
@@ -239,6 +236,11 @@ _USER_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(:[A-Za-z0-9_][A-Z
 
 def _v_user(value: Any, context: str) -> list[str]:
     """Cell process user (podman --user) — uid[:gid] or name[:group]."""
+    if value is None:
+        # Unset → no --user override (image default). A persisted spec always
+        # carries user=None when the cell.yaml omits it, so rejecting None here
+        # made restart:always cells unrestorable (re-validation failed).
+        return []
     if not isinstance(value, str) or not _USER_PATTERN.match(value):
         return [f"'user' must be uid[:gid] or name[:group] (e.g. '0' or "
                 f"'1000:1000'){context}"]
@@ -247,12 +249,22 @@ def _v_user(value: Any, context: str) -> list[str]:
 
 def _v_workspace_quota(value: Any, context: str) -> list[str]:
     from brig.cell.spec import parse_size
+    if value is None:
+        # Unset → no quota. A persisted spec always carries workspace_quota=None
+        # when the cell.yaml omits it, so rejecting None here made every such
+        # restart:always cell unrestorable (re-validation failed). Same shape as
+        # _v_user; see test_persisted_default_spec_revalidates_clean.
+        return []
     if not isinstance(value, str):
         return [f"'workspace_quota' must be a string like '500m' or '2g'{context}"]
     try:
-        parse_size(value)
+        parsed = parse_size(value)
     except ValueError:
         return [f"Invalid workspace_quota value: {value}{context}"]
+    # parse_size happily returns 0 for "0" and a negative for "-5g"; a quota
+    # must be a positive size (mirrors the memory/timeout validators).
+    if parsed <= 0:
+        return [f"'workspace_quota' must be a positive size like '500m'{context}"]
     return []
 
 
@@ -285,6 +297,10 @@ def _v_workspace_mount(value: Any, context: str) -> list[str]:
         return [f"'workspace_mount' must be an absolute path{context}"]
     if ".." in value.split("/"):
         return [f"'workspace_mount' must not contain '..'{context}"]
+    if ":" in value:
+        # ':' is the podman -v field separator — it would inject dest/options
+        # into the workspace bind. Mirrors _v_cell_mount_point.
+        return [f"'workspace_mount' must not contain ':'{context}"]
     # Reject non-normalized paths (doubled/trailing slashes, '.' segments).
     # The forbidden-prefix check below is lexical, so without this a value
     # like '/run//host' slips past it while the kernel collapses it back to
@@ -302,8 +318,8 @@ def _v_workspace_mount(value: Any, context: str) -> list[str]:
         return [f"'workspace_mount' must not be '/' (shadows rootfs){context}"]
     forbidden_prefixes = (
         "/proc", "/sys", "/dev", "/run/secrets", "/etc",
-        # /run/host and /run/brig are the bind-mount roots for
-        # host_sockets and the downward-API metadata / CA bundle.
+        # /run/brig is the bind-mount root for the downward-API metadata
+        # and CA bundle; /run/host stays reserved (off-limits to cell mounts).
         "/run/host", "/run/brig",
     )
     for p in forbidden_prefixes:
@@ -323,6 +339,14 @@ def _v_workspace_mount(value: Any, context: str) -> list[str]:
 def _v_detach(value: Any, context: str) -> list[str]:
     if not isinstance(value, bool):
         return [f"'detach' must be a boolean{context}"]
+    return []
+
+
+def _v_rm(value: Any, context: str) -> list[str]:
+    # bool only — a truthy non-bool (e.g. a string) would silently enable
+    # `podman run --rm` (auto-delete the cell on exit) on a mistyped value.
+    if not isinstance(value, bool):
+        return [f"'rm' must be a boolean{context}"]
     return []
 
 
@@ -375,6 +399,19 @@ def _v_seccomp_profile(value: Any, context: str) -> list[str]:
     return []
 
 
+def _v_profile(value: Any, context: str) -> list[str]:
+    # The profile name resolves to ~/.brig/profiles/<name>.{yaml,yml,json} (or a
+    # builtin); a path / traversal / null byte would escape that directory when
+    # load_profile builds the file path.
+    if value is None:
+        return []
+    if not isinstance(value, str) or not value:
+        return [f"'profile' must be a non-empty string{context}"]
+    if "/" in value or ".." in value or "\x00" in value:
+        return [f"'profile' must be a bare name, not a path{context}"]
+    return []
+
+
 def _v_workdir(value: Any, context: str) -> list[str]:
     if value is None:
         return []
@@ -396,139 +433,9 @@ def _v_image_digest(value: Any, context: str) -> list[str]:
     from brig.cell.lifecycle import _DIGEST_PATTERN
     if not isinstance(value, str) or not _DIGEST_PATTERN.match(value.strip()):
         return [
-            f"Invalid 'image_digest' value: must be sha256:<64-hex> "
-            f"(or sha384/sha512){context}"
+            f"Invalid 'image_digest' value: must be sha256:<64-hex>{context}"
         ]
     return []
-
-
-def _v_host_socket_entry(
-    i: int, entry: Any, seen_names: set, seen_mounts: set, context: str,
-) -> list[str]:
-    """Validate one host_socket entry. Mutates seen_* to track duplicates.
-
-    Static checks only — the runtime check happens in the reconciler at
-    cell start, where TOCTOU is unavoidable anyway.
-    """
-    if not isinstance(entry, dict):
-        return [f"'host_sockets[{i}]' must be a dict{context}"]
-
-    errors: list[str] = []
-
-    name = entry.get("name")
-    if not name or not isinstance(name, str):
-        errors.append(
-            f"'host_sockets[{i}].name' is required and must be a string{context}"
-        )
-    elif not HOST_SOCKET_NAME_PATTERN.match(name):
-        errors.append(
-            f"'host_sockets[{i}].name' must be lowercase alphanumeric "
-            f"with hyphens, max 31 chars{context}"
-        )
-    elif name in seen_names:
-        errors.append(f"Duplicate host_sockets name '{name}'{context}")
-    else:
-        seen_names.add(name)
-
-    host_path = entry.get("host_path")
-    if not host_path or not isinstance(host_path, str):
-        errors.append(
-            f"'host_sockets[{i}].host_path' is required and must be a string{context}"
-        )
-    elif not host_path.startswith("/"):
-        errors.append(
-            f"'host_sockets[{i}].host_path' must be absolute{context}"
-        )
-    elif ".." in host_path.split("/"):
-        errors.append(
-            f"'host_sockets[{i}].host_path' must not contain '..' (path traversal){context}"
-        )
-    else:
-        # Engine-socket denylist: granting these is root-equivalent on
-        # the host.
-        basename = host_path.rsplit("/", 1)[-1]
-        if basename in HOST_SOCKET_ENGINE_DENYLIST:
-            errors.append(
-                f"'host_sockets[{i}].host_path' points at engine socket "
-                f"'{basename}' — granting this is root-equivalent on the "
-                f"host and is denied{context}"
-            )
-
-    mount_point = entry.get("mount_point")
-    if not mount_point or not isinstance(mount_point, str):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' is required and must be a string{context}"
-        )
-    elif ".." in mount_point.split("/"):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' must not contain '..' (path traversal){context}"
-        )
-    elif not mount_point.startswith(HOST_SOCKET_MOUNT_PREFIX):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' must start with "
-            f"'{HOST_SOCKET_MOUNT_PREFIX}'{context}"
-        )
-    elif mount_point.rstrip("/") == HOST_SOCKET_MOUNT_PREFIX.rstrip("/"):
-        errors.append(
-            f"'host_sockets[{i}].mount_point' must be a file path under "
-            f"'{HOST_SOCKET_MOUNT_PREFIX}', not the directory itself{context}"
-        )
-    else:
-        import os.path as _ospath
-        normalized = _ospath.normpath(mount_point)
-        if normalized in seen_mounts:
-            errors.append(
-                f"Duplicate host_sockets mount_point '{mount_point}' "
-                f"(normalizes to '{normalized}'){context}"
-            )
-        else:
-            seen_mounts.add(normalized)
-
-    mode = entry.get("mode", "ro")
-    if not isinstance(mode, str) or mode not in HOST_SOCKET_MODES:
-        errors.append(
-            f"'host_sockets[{i}].mode' must be one of: "
-            f"{', '.join(sorted(HOST_SOCKET_MODES))}{context}"
-        )
-
-    return errors
-
-
-def _v_host_sockets(value: Any, cell_def: dict, context: str) -> list[str]:
-    """Validate the cell's host_sockets list as a whole."""
-    if not isinstance(value, list):
-        return [f"'host_sockets' must be a list{context}"]
-
-    errors: list[str] = []
-    if len(value) > MAX_HOST_SOCKETS_PER_CELL:
-        errors.append(
-            f"Too many host_sockets entries ({len(value)}), "
-            f"max {MAX_HOST_SOCKETS_PER_CELL}{context}"
-        )
-
-    if value and _profile_is_untrusted(cell_def.get("profile")):
-        errors.append(
-            f"'host_sockets' is not allowed with the untrusted profile — "
-            f"untrusted cells must not have side channels to host services"
-            f"{context}"
-        )
-
-    # Cell name with dots breaks launchd label parsing.
-    cell_name = cell_def.get("name", "")
-    if value and isinstance(cell_name, str) and "." in cell_name:
-        errors.append(
-            f"cell names with '.' may not declare host_sockets "
-            f"(launchd label ambiguity){context}"
-        )
-
-    seen_names: set = set()
-    seen_mounts: set = set()
-    for i, entry in enumerate(value):
-        errors.extend(
-            _v_host_socket_entry(i, entry, seen_names, seen_mounts, context)
-        )
-
-    return errors
 
 
 def _profile_is_untrusted(profile_name: Any) -> bool:
@@ -689,7 +596,7 @@ def _v_cell_mount_point(value: Any, field: str, workspace_mount: str,
 def _v_mount_entry(i: int, entry: Any, seen_names: set, seen_mounts: set,
                    roots: list[str], workspace_mount: str,
                    context: str) -> list[str]:
-    """Validate one `mounts:` entry. Mirrors `_v_host_socket_entry`.
+    """Validate one `mounts:` entry.
 
     `roots` are the realpath-canonicalized, configured mount_roots; a
     host_path whose realpath isn't under one of them is refused (the
@@ -720,6 +627,10 @@ def _v_mount_entry(i: int, entry: Any, seen_names: set, seen_mounts: set,
         errors.append(f"'mounts[{i}].host_path' must be absolute{context}")
     elif ".." in host_path.split("/"):
         errors.append(f"'mounts[{i}].host_path' must not contain '..'{context}")
+    elif ":" in host_path:
+        # ':' is the podman -v field separator; it would inject dest/options
+        # into the mount spec. Mirrors _v_cell_mount_point.
+        errors.append(f"'mounts[{i}].host_path' must not contain ':'{context}")
     elif not roots:
         errors.append(
             f"'mounts' requires mount_roots to be configured first: "
@@ -864,7 +775,7 @@ def _v_ingress(value: Any, cell_def: dict, context: str) -> list[str]:
         errors.append(f"'ingress' cannot be used with network='none' (airgapped){context}")
 
     # auth: none removes brig's perimeter gate — an untrusted cell must not be
-    # openly reachable without it (consistent with host_sockets / tls_passthrough).
+    # openly reachable without it (consistent with tls_passthrough).
     if _profile_is_untrusted(cell_def.get("profile")):
         for i, entry in enumerate(value):
             if isinstance(entry, dict) and entry.get("auth") == "none":
@@ -890,14 +801,47 @@ _SIMPLE_VALIDATORS = {
     "writable_rootfs": _v_writable_rootfs,
     "trust_warden_ca": _v_trust_warden_ca,
     "detach": _v_detach,
+    "rm": _v_rm,
     "labels": _v_labels,
     "timeout": _v_timeout,
     "seccomp_profile": _v_seccomp_profile,
+    "profile": _v_profile,
     "workdir": _v_workdir,
     "image_digest": _v_image_digest,
     "restart": _v_restart,
     "user": _v_user,
 }
+
+
+def unknown_cell_keys(cell_def: dict[str, Any]) -> list[str]:
+    """Return the cell-yaml top-level keys brig doesn't recognize, sorted.
+
+    Known keys are the `CellSpec` fields (derived dynamically, so the set can't
+    drift as fields are added/removed) plus the nested `policy:` yaml alias,
+    which folds into `policy_allow`/`policy_deny`/`policy_passthrough_tls`.
+
+    brig builds the spec by filtering cell_def to known fields, so an unknown
+    key (a typo, or a stale/removed field like `host_sockets:`) is otherwise
+    silently dropped. This powers a warning so the operator finds out.
+    """
+    import dataclasses
+
+    from brig.cell.spec import CellSpec  # lazy: spec imports this module.
+    known = {f.name for f in dataclasses.fields(CellSpec)} | {"policy"}
+    return sorted(k for k in cell_def if k not in known)
+
+
+def warn_unknown_cell_keys(cell_def: dict[str, Any], file_path: str = "") -> None:
+    """Warn (don't fail) about unrecognized cell-yaml keys — they're ignored
+    at build time, so an unflagged typo silently does nothing."""
+    unknown = unknown_cell_keys(cell_def)
+    if unknown:
+        from brig.ops.logging import warn
+        where = f" in {file_path}" if file_path else ""
+        warn(
+            f"ignoring unknown cell key(s){where}: {', '.join(unknown)} "
+            f"(typo, or a removed field — see docs/design/cell-definition.md)"
+        )
 
 
 def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> list[str]:
@@ -929,9 +873,6 @@ def validate_cell_definition(cell_def: dict[str, Any], file_path: str = "") -> l
 
     if "ingress" in cell_def:
         errors.extend(_v_ingress(cell_def["ingress"], cell_def, context))
-
-    if "host_sockets" in cell_def:
-        errors.extend(_v_host_sockets(cell_def["host_sockets"], cell_def, context))
 
     if "host_services" in cell_def:
         errors.extend(_v_host_services(cell_def["host_services"], cell_def, context))

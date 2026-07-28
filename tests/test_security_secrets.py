@@ -12,6 +12,34 @@ from unittest.mock import patch
 from brig.security.secrets import validate_secret_path
 
 
+class TestSecretsAddSymlinkGuard(unittest.TestCase):
+    """`brig secrets add` must refuse a pre-planted symlink at the target path
+    (invariant 4: the secrets dir is untrusted) — else a symlink like
+    `name -> ~/.ssh/authorized_keys` would let a write overwrite it. The lstat
+    check + O_NOFOLLOW open both defend this."""
+
+    def test_refuses_preplanted_symlink_and_leaves_target(self):
+        from brig.commands.secrets_cmd import cmd_secrets_add
+        from brig.config import HostPaths
+        from brig.errors import BrigError
+        HostPaths.SECRETS_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as td:
+            victim = Path(td) / "victim"
+            victim.write_text("original")
+            link = HostPaths.SECRETS_DIR / "evil"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(victim)
+            # force=True proves the symlink check fires even on an overwrite.
+            args = types.SimpleNamespace(
+                name="evil", value="pwned", force=True, from_file=None)
+            with self.assertRaises(BrigError) as ctx:
+                cmd_secrets_add(args)
+            self.assertIn("symlink", str(ctx.exception).lower())
+            self.assertEqual(victim.read_text(), "original")  # not overwritten
+            link.unlink()
+
+
 class TestSecretsRmValidatesName(unittest.TestCase):
     """`brig secrets rm` must reject traversal/charset like `add` does, so it
     can't unlink a file outside the secrets dir."""

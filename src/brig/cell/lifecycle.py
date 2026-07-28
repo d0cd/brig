@@ -100,6 +100,27 @@ def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
             suggestion=f"brig cell logs {cell_name}",
         )
 
+    # Re-apply the untrusted-profile auth:none gate. Derive untrusted-ness from
+    # the TRUSTED podman container label (set as `--label brig.profile=...` at
+    # create, immutable, read from podman's store) — NOT cell-metadata.json,
+    # which invariant 4 names as untrusted and which this gate exists to police.
+    # Reading the trust decision from that file would let a tampered copy bypass
+    # the gate by dropping the profile.
+    labels = (container_info.get("Config", {}) or {}).get("Labels", {}) or {}
+    if labels.get("brig.profile") == "untrusted":
+        for i, entry in enumerate(ingress_spec):
+            if isinstance(entry, dict) and entry.get("auth") == "none":
+                raise BrigError(
+                    f"Refusing ingress for '{cell_name}': ingress[{i}].auth: "
+                    f"none is not allowed with the untrusted profile — untrusted "
+                    f"cells must keep brig's token gate",
+                    suggestion=(
+                        f"~/.brig/state/{cell_name}/cell-metadata.json may have "
+                        f"been hand-edited. Re-create from yaml: brig cell rm "
+                        f"{cell_name} && brig run --file <yaml>"
+                    ),
+                )
+
     # A token is needed only if at least one route is auth: token. An
     # all-`auth: none` cell (transparent pass-through) requires no secret.
     needs_token = any(e.get("auth") == "token" for e in ingress_spec)
@@ -198,11 +219,12 @@ def list_cell_containers(*, include_stopped: bool = True) -> list[tuple[str, dic
     return out
 
 
-# Exact hex length per algorithm — an open-ended {64,} would accept an
-# over-long sha256 or a wrong-length sha384/sha512 as well-formed.
-_DIGEST_PATTERN = re.compile(
-    r"^sha(?:256:[0-9a-fA-F]{64}|384:[0-9a-fA-F]{96}|512:[0-9a-fA-F]{128})\Z"
-)
+# Only sha256 is accepted: OCI registry manifest digests — what podman matches
+# at pull time and reports as {{.ImageDigest}} for the start-time re-check — are
+# sha256, so a sha384/sha512 pin could never match and the cell would fail to
+# start with a spurious "digest drift". Exact 64 hex chars (not an open {64,})
+# so an over-long value can't slip through as well-formed.
+_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-fA-F]{64}\Z")
 
 
 def _apply_image_digest_pin(spec: CellSpec) -> None:
@@ -214,7 +236,7 @@ def _apply_image_digest_pin(spec: CellSpec) -> None:
     at pull time.
 
     Raises BrigError if:
-      - image_digest is set but malformed (must be sha{256,384,512}:HEX)
+      - image_digest is set but malformed (must be sha256:<64-hex>)
       - image already contains a digest that disagrees with image_digest
     """
     if not spec.image_digest:
@@ -223,7 +245,7 @@ def _apply_image_digest_pin(spec: CellSpec) -> None:
     if not _DIGEST_PATTERN.match(digest):
         raise BrigError(
             f"Invalid image_digest '{digest}'",
-            suggestion="Format must be sha256:<64-hex> (or sha384/sha512)",
+            suggestion="Format must be sha256:<64-hex>",
         )
     if "@" in spec.image:
         repo, _, existing = spec.image.partition("@")
@@ -351,19 +373,9 @@ def run_cell(
             ),
         )
 
-    # Bring up host_socket bridges BEFORE reconcile — the reconciler's
-    # runtime check needs the bridge sockets to exist. start_cell_bridges
-    # is idempotent and a no-op if spec.host_sockets is empty.
-    if spec.host_sockets:
-        from brig.cell.host_sockets_bridge import start_cell_bridges
-        start_cell_bridges(spec.name, spec.host_sockets)
-
     def _rollback_reconcile_side_effects() -> None:
-        # apply() rolls back its own network/subnet/podman actions, but bridges
-        # and the pre-written policy file are ours to clean up.
-        if spec.host_sockets:
-            from brig.cell.host_sockets_bridge import stop_cell_bridges
-            stop_cell_bridges(spec.name)
+        # apply() rolls back its own network/subnet/podman actions, but the
+        # pre-written policy file is ours to clean up.
         if not policy_preexisted:
             from brig.policy.policy import delete_cell_policy
             delete_cell_policy(spec.name)
@@ -398,7 +410,7 @@ def run_cell(
             register_ingress_for(spec.name, spec.ingress)
             # An auth: none route removes brig's perimeter gate — the cell's
             # app is the authenticator. Surface it loudly (audit + operator
-            # NOTE), the way mounts/host_sockets announce their bypasses.
+            # NOTE), the way mounts announce their bypass.
             open_routes = [e for e in spec.ingress if e.get("auth") == "none"]
             for e in open_routes:
                 log_lifecycle(
@@ -411,21 +423,6 @@ def run_cell(
                     f"route(s) with auth: none — brig does NOT authenticate "
                     f"these; the cell's app must be the gate."
                 )
-        # Audit any host_sockets that were mounted. The bytes flowing
-        # over these sockets bypass Warden, so the attach event is the
-        # only thing we can record — make sure it's loud.
-        if spec.host_sockets:
-            for entry in spec.host_sockets:
-                log_lifecycle(
-                    "host_socket_attach", spec.name,
-                    details={"socket": entry["name"],
-                             "mount_point": entry["mount_point"],
-                             "mode": entry.get("mode", "ro")},
-                )
-            info(
-                f"NOTE: cell '{spec.name}' has {len(spec.host_sockets)} "
-                f"host_sockets — Warden does not see traffic over these."
-            )
         # Audit host-directory mounts. The cell reads/writes these host files
         # directly (Warden not in the path); a rw mount lets it modify files a
         # host process later consumes — surface it loudly.
@@ -460,6 +457,12 @@ def run_cell(
             debug(f"rollback rm_cell failed: {cleanup_err}")
         raise
 
+    # The cell is up: desired state is "running", so clear any intentional-stop
+    # marker and a later crash/reboot auto-recovers it. Only on success — a
+    # rolled-back run must not re-arm recovery for a cell the operator stopped.
+    from brig.cell.metadata import clear_cell_stopped
+    clear_cell_stopped(spec.name)
+
     # Persist the spec for restart:always cells so `brig system up` can
     # re-launch them after a VM restart. Best-effort — a persistence failure
     # must not fail an otherwise-healthy cell.
@@ -478,32 +481,39 @@ def run_cell(
 
 
 def restore_persisted_cells() -> None:
-    """Re-launch `restart: always` cells whose container is gone, on
-    `brig system up` (once warden is up).
+    """Re-launch `restart: always` cells that are down but whose desired state
+    is running — they crashed, were SIGKILLed, or the VM dropped them. Called
+    by `brig system up` (once warden is up) and by the watchdog loop.
 
-    A cell is restored only when its container no longer exists. An *exited*
-    cell (still present — e.g. an explicit `brig cell stop`) is left alone.
-    Note a VM restart drops every container, so a stopped restart:always cell
-    DOES relaunch on the next up; use `brig cell rm` to keep one down for good.
+    A cell the operator intentionally stopped (`brig cell stop`/`kill`, which
+    sets the stop marker) is left down until an explicit `brig cell start` —
+    the systemd `Restart=always` / Docker `unless-stopped` distinction:
+    unexpected exits recover, a deliberate stop is respected.
 
     The persisted spec is re-validated before launch (the state dir is
     untrusted, invariant 4) and replayed without counting against the creation
     rate limit (these cells were already authorized).
     """
     import dataclasses
-    from brig.cell.metadata import restorable_cell_specs
+    from brig.cell.metadata import cell_marked_stopped, restorable_cell_specs
     from brig.cell.spec import validate_cell_definition
 
     valid = {f.name for f in dataclasses.fields(CellSpec)}
     for raw in restorable_cell_specs():
         name = raw.get("name")
-        if not name or observe(name).exists:
+        if not name:
+            continue
+        state = observe(name)
+        # Running → healthy. Intentionally stopped → respect it. Otherwise the
+        # cell is down unexpectedly (crashed / VM-dropped) → recover it.
+        if state.running or cell_marked_stopped(name):
             continue
         errs = validate_cell_definition(raw)
         if errs:
             info(f"  (warn) skipping restore of '{name}': invalid persisted spec: {errs[0]}")
             continue
-        info(f"Restoring cell '{name}' (restart: always)...")
+        verb = "Recovering" if state.exists else "Restoring"
+        info(f"{verb} cell '{name}' (restart: always)...")
         try:
             spec = CellSpec(**{k: v for k, v in raw.items() if k in valid})
             run_cell(spec, count_against_rate_limit=False)
@@ -511,8 +521,16 @@ def restore_persisted_cells() -> None:
             info(f"  (warn) could not restore cell '{name}': {e}")
 
 
-def stop_cell(cell_name: str) -> None:
-    """Gracefully stop a running cell."""
+def stop_cell(cell_name: str, mark_stopped: bool = True) -> None:
+    """Gracefully stop a running cell.
+
+    `mark_stopped=False` stops the cell WITHOUT recording the intentional-stop
+    marker — for `brig system down`, which takes the whole harness down rather
+    than expressing intent about any one cell. Marking there would opt every
+    cell out of `restart: always` recovery permanently, so the next `brig
+    system up` (or watchdog tick) would leave a VM-dropped cell down until a
+    manual per-cell `brig cell start`.
+    """
     actual = observe(cell_name)
     if not actual.exists:
         raise BrigError(
@@ -530,16 +548,16 @@ def stop_cell(cell_name: str) -> None:
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
-    # Tear down any host_socket bridges (idempotent — no-op if there
-    # are none). Done before the podman stop so launchd doesn't keep
-    # trying to forward to a dead cell.
-    from brig.cell.host_sockets_bridge import stop_cell_bridges
-    stop_cell_bridges(cell_name)
-
     actions = plan_stop(cell_name, actual)
     result = apply(actions)
 
     if result.success:
+        if mark_stopped:
+            # Desired state is now "stopped": recovery (brig system up +
+            # watchdog) leaves a restart:always cell down until an explicit
+            # start.
+            from brig.cell.metadata import mark_cell_stopped
+            mark_cell_stopped(cell_name)
         log_operation("stop", cell_name=cell_name)
         log_lifecycle("stop", cell_name)
     else:
@@ -556,29 +574,74 @@ def kill_cell(cell_name: str) -> None:
             suggestion="Use 'brig cell list' to see available cells",
         )
 
+    # observe() reports a paused container as running=False; a paused cell can
+    # still be killed (unpause first). Anything else that isn't running has
+    # nothing to kill — reject like stop_cell rather than deregister ingress
+    # and log a false "kill" success for a cell that's already stopped.
+    should_kill = actual.running or actual.status == "paused"
+    if not should_kill:
+        raise BrigError(
+            f"Cell '{cell_name}' is not running",
+            suggestion=f"Use 'brig cell start {cell_name}' to start it",
+        )
+
     # Deregister ingress routes before killing.
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
-    # Tear down host_socket bridges (idempotent).
-    from brig.cell.host_sockets_bridge import stop_cell_bridges
-    stop_cell_bridges(cell_name)
-
-    # observe() reports a paused container as running=False, so gate on the
-    # actual status too — otherwise killing a paused cell would no-op, log a
-    # false "kill" success, and leave it up with its egress wiring stripped.
     # podman refuses to SIGKILL a paused container, so unpause it first.
-    should_kill = actual.running or actual.status == "paused"
-    if should_kill and actual.status == "paused":
+    if actual.status == "paused":
         from brig.config import container_name
         vm_run(["podman", "unpause", container_name(cell_name)])
 
-    actions = [Action(ActionType.PODMAN_KILL, cell_name)] if should_kill else []
-    result = apply(actions)
-
+    result = apply([Action(ActionType.PODMAN_KILL, cell_name)])
     if result.success:
+        # Operator take-down → desired state "stopped" (see stop_cell).
+        from brig.cell.metadata import mark_cell_stopped
+        mark_cell_stopped(cell_name)
         log_operation("kill", cell_name=cell_name)
         log_lifecycle("kill", cell_name)
+    else:
+        failed = result.actions_failed[0] if result.actions_failed else (None, "unknown")
+        raise BrigError(f"Failed to kill cell '{cell_name}': {failed[1]}")
+
+
+def enforce_workspace_quotas() -> list[tuple[str, int, int]]:
+    """Stop every running cell whose workspace exceeds its `workspace_quota`.
+
+    Reactive (soft) enforcement. The workspace lives on a virtiofs mount where
+    a hard block-quota isn't available, so instead of preventing the write we
+    periodically measure and stop over-quota cells — halting further disk
+    growth on the shared VM disk while preserving the workspace for the
+    operator to inspect or clean up. Intended to be called from a periodic
+    context (see `brig system watchdog`); it is a no-op for cells with no quota.
+
+    Returns `(cell_name, size_bytes, quota_bytes)` for each cell found over
+    quota (whether or not the stop succeeded) so the caller can report it.
+    """
+    from brig.cell.metadata import read_workspace_quota
+    from brig.cell.spec import parse_size
+    from brig.workspace.workspace import _get_workspace_size
+
+    breached: list[tuple[str, int, int]] = []
+    for cell_name, _entry in list_cell_containers(include_stopped=False):
+        quota = read_workspace_quota(cell_name)
+        if not quota:
+            continue
+        try:
+            quota_bytes = parse_size(quota)
+        except (ValueError, TypeError):
+            continue
+        size = _get_workspace_size(cell_name)
+        if size is None:
+            continue  # Best-effort reactive sweep: skip if we can't measure.
+        if size > quota_bytes:
+            breached.append((cell_name, size, quota_bytes))
+            try:
+                stop_cell(cell_name)
+            except BrigError:
+                pass  # Best-effort; the breach is reported regardless.
+    return breached
 
 
 def rm_cell(
@@ -622,9 +685,6 @@ def rm_cell(
     from brig.network.ingress import deregister_ingress
     deregister_ingress(cell_name)
 
-    # Tear down host_socket bridges (idempotent).
-    from brig.cell.host_sockets_bridge import stop_cell_bridges
-    stop_cell_bridges(cell_name)
 
     actions = plan_destroy(cell_name, actual)
     result = apply(actions)

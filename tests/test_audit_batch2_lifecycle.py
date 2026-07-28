@@ -2,76 +2,12 @@
 
 H2 — ingress-token failure rolls the cell back instead of leaving it
      running with no ingress
-H3 — bridge rolled back if apply() fails or rolls back its actions
-H4 — brig down enumerates and bootouts all loaded host_socket bridges
 """
 
 from __future__ import annotations
 
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-
-class TestH3BridgeRollbackOnApplyFailure(unittest.TestCase):
-    """When apply() returns success=False or raises, any bridges we
-    started must be torn down so we don't leak a socat process for a
-    cell that never finished starting."""
-
-    def _spec(self):
-        from brig.cell.spec import CellSpec
-        return CellSpec(
-            name="alice", image="alpine",
-            host_sockets=[{"name": "pg", "host_path": "/tmp/x.sock",
-                           "mount_point": "/run/host/pg.sock"}],
-        )
-
-    def _common_patches(self, apply_result):
-        observed = MagicMock(exists=False, running=False, network_exists=False)
-        return [
-            patch("brig.cell.lifecycle.observe", return_value=observed),
-            patch("brig.cell.lifecycle.check_rate_limit", return_value=True),
-            patch("brig.cell.lifecycle.plan_run",
-                  return_value=[MagicMock()]),  # nonempty so we don't bail
-            patch("brig.cell.lifecycle.apply", return_value=apply_result),
-        ]
-
-    def test_apply_failure_tears_down_bridges(self):
-        from brig.cell.lifecycle import run_cell
-        from brig.errors import BrigError
-        bad_apply = MagicMock(
-            success=False,
-            actions_failed=[(MagicMock(), "podman run failed")],
-        )
-        with patch("brig.cell.host_sockets_bridge.start_cell_bridges") as start_b, \
-             patch("brig.cell.host_sockets_bridge.stop_cell_bridges") as stop_b:
-            patches = self._common_patches(bad_apply)
-            for p in patches:
-                p.start()
-            try:
-                with self.assertRaises(BrigError):
-                    run_cell(self._spec(), proxy_check=lambda: True)
-            finally:
-                for p in patches:
-                    p.stop()
-        start_b.assert_called_once_with("alice", unittest.mock.ANY)
-        stop_b.assert_called_once_with("alice")
-
-    def test_apply_exception_tears_down_bridges(self):
-        from brig.cell.lifecycle import run_cell
-        with patch("brig.cell.host_sockets_bridge.start_cell_bridges") as start_b, \
-             patch("brig.cell.host_sockets_bridge.stop_cell_bridges") as stop_b:
-            observed = MagicMock(exists=False, running=False, network_exists=False)
-            with patch("brig.cell.lifecycle.observe", return_value=observed), \
-                 patch("brig.cell.lifecycle.check_rate_limit", return_value=True), \
-                 patch("brig.cell.lifecycle.plan_run", return_value=[MagicMock()]), \
-                 patch("brig.cell.lifecycle.apply",
-                       side_effect=RuntimeError("boom")):
-                with self.assertRaises(RuntimeError):
-                    run_cell(self._spec(), proxy_check=lambda: True)
-        start_b.assert_called_once()
-        stop_b.assert_called_once_with("alice")
 
 
 class TestH2IngressTokenFailureRollsBackCell(unittest.TestCase):
@@ -104,29 +40,163 @@ class TestH2IngressTokenFailureRollsBackCell(unittest.TestCase):
         mock_rm.assert_called_once_with("alice", force=True, keep_workspace=True)
 
 
-class TestH4BrigDownTearsDownAllBridges(unittest.TestCase):
-    def test_enumerates_loaded_bridges_and_stops_each_cell(self):
-        from brig.commands.convenience_cmd import _bootout_all_host_socket_bridges
-        from brig.cell.host_sockets_bridge import LABEL_PREFIX
-        with tempfile.TemporaryDirectory() as td:
-            plist_dir = Path(td)
-            (plist_dir / f"{LABEL_PREFIX}alice.pg.plist").write_text("x")
-            (plist_dir / f"{LABEL_PREFIX}alice.redis.plist").write_text("x")
-            (plist_dir / f"{LABEL_PREFIX}bob.pg.plist").write_text("x")
-            (plist_dir / "com.other.label.plist").write_text("x")  # unrelated
-            with patch("brig.cell.host_sockets_bridge.PLIST_DIR", plist_dir), \
-                 patch("brig.cell.host_sockets_bridge.stop_cell_bridges") as stop_b:
-                _bootout_all_host_socket_bridges()
-        called_for = {call.args[0] for call in stop_b.call_args_list}
-        self.assertEqual(called_for, {"alice", "bob"})
+class TestKillCellStoppedCell(unittest.TestCase):
+    """kill_cell on an existing-but-stopped cell must raise (like stop_cell)
+    rather than deregister ingress and log a false 'kill' success when no
+    PODMAN_KILL action actually runs."""
 
-    def test_no_plists_no_op(self):
-        from brig.commands.convenience_cmd import _bootout_all_host_socket_bridges
-        with tempfile.TemporaryDirectory() as td:
-            with patch("brig.cell.host_sockets_bridge.PLIST_DIR", Path(td)), \
-                 patch("brig.cell.host_sockets_bridge.stop_cell_bridges") as stop_b:
-                _bootout_all_host_socket_bridges()
-        stop_b.assert_not_called()
+    def test_kill_stopped_cell_raises_and_leaves_ingress(self):
+        from brig.cell.lifecycle import kill_cell
+        from brig.errors import BrigError
+        stopped = MagicMock(exists=True, running=False, status="exited")
+        with patch("brig.cell.lifecycle.observe", return_value=stopped), \
+             patch("brig.cell.lifecycle.apply") as mock_apply, \
+             patch("brig.network.ingress.deregister_ingress") as mock_dereg:
+            with self.assertRaises(BrigError):
+                kill_cell("ghost")
+        mock_apply.assert_not_called()
+        mock_dereg.assert_not_called()
+
+    def test_kill_running_cell_kills_and_deregisters(self):
+        from brig.cell.lifecycle import kill_cell
+        running = MagicMock(exists=True, running=True, status="running")
+        good = MagicMock(success=True, actions_failed=[])
+        with patch("brig.cell.lifecycle.observe", return_value=running), \
+             patch("brig.cell.lifecycle.apply", return_value=good) as mock_apply, \
+             patch("brig.network.ingress.deregister_ingress") as mock_dereg, \
+             patch("brig.cell.lifecycle.log_operation"), \
+             patch("brig.cell.lifecycle.log_lifecycle"):
+            kill_cell("live")
+        mock_apply.assert_called_once()
+        mock_dereg.assert_called_once_with("live")
+
+
+class TestEnforceWorkspaceQuotas(unittest.TestCase):
+    """Reactive soft-quota: a running cell whose workspace exceeds its
+    workspace_quota is stopped (halting further disk growth); under-quota and
+    quota-less cells are left alone."""
+
+    def _persist_quota(self, cell, quota):
+        # Write REAL cell-metadata.json (as create does) rather than mocking a
+        # reader — this is what catches the restart:always-only regression: the
+        # metadata file is written for every cell, cell-spec.json is not.
+        from brig.cell.metadata import write_metadata, _host_metadata_path
+        _host_metadata_path(cell).parent.mkdir(parents=True, exist_ok=True)
+        write_metadata(cell, "/work", workspace_quota=quota)
+
+    def _enforce(self, quotas, sizes):
+        from brig.cell.lifecycle import enforce_workspace_quotas
+        for cell, quota in quotas.items():
+            self._persist_quota(cell, quota)
+        with patch("brig.cell.lifecycle.list_cell_containers",
+                   return_value=[(c, {}) for c in quotas]), \
+             patch("brig.workspace.workspace._get_workspace_size",
+                   side_effect=lambda c: sizes.get(c, 0)), \
+             patch("brig.cell.lifecycle.stop_cell") as stop:
+            result = enforce_workspace_quotas()
+        return result, stop
+
+    def test_over_quota_default_restart_cell_stopped(self):
+        # Regression for the audit finding: a default (restart:"no") cell has no
+        # cell-spec.json, only cell-metadata.json. Quota MUST still be enforced.
+        result, stop = self._enforce({"big": "1m"}, {"big": 5 * 1024 * 1024})
+        stop.assert_called_once_with("big")
+        self.assertEqual([r[0] for r in result], ["big"])
+
+    def test_under_quota_not_stopped(self):
+        result, stop = self._enforce({"small": "10m"}, {"small": 1 * 1024 * 1024})
+        stop.assert_not_called()
+        self.assertEqual(result, [])
+
+    def test_no_quota_skipped(self):
+        result, stop = self._enforce({"unbounded": None}, {"unbounded": 999 * 1024 * 1024})
+        stop.assert_not_called()
+
+    def test_unmeasurable_size_skipped(self):
+        # du failure -> _get_workspace_size returns None -> best-effort skip
+        # (don't stop a cell we can't measure).
+        from brig.cell.lifecycle import enforce_workspace_quotas
+        self._persist_quota("blip", "1m")
+        with patch("brig.cell.lifecycle.list_cell_containers",
+                   return_value=[("blip", {})]), \
+             patch("brig.workspace.workspace._get_workspace_size",
+                   return_value=None), \
+             patch("brig.cell.lifecycle.stop_cell") as stop:
+            result = enforce_workspace_quotas()
+        stop.assert_not_called()
+        self.assertEqual(result, [])
+
+    def test_no_metadata_skipped(self):
+        # Cell with no metadata file at all (predates the field / never written).
+        from brig.cell.lifecycle import enforce_workspace_quotas
+        with patch("brig.cell.lifecycle.list_cell_containers",
+                   return_value=[("ghost", {})]), \
+             patch("brig.workspace.workspace._get_workspace_size",
+                   return_value=999 * 1024 * 1024), \
+             patch("brig.cell.lifecycle.stop_cell") as stop:
+            enforce_workspace_quotas()
+        stop.assert_not_called()
+
+    def test_stop_failure_still_reported(self):
+        from brig.errors import BrigError
+        from brig.cell.lifecycle import enforce_workspace_quotas
+        self._persist_quota("big", "1m")
+        with patch("brig.cell.lifecycle.list_cell_containers",
+                   return_value=[("big", {})]), \
+             patch("brig.workspace.workspace._get_workspace_size",
+                   return_value=5 * 1024 * 1024), \
+             patch("brig.cell.lifecycle.stop_cell",
+                   side_effect=BrigError("already gone")):
+            result = enforce_workspace_quotas()
+        # Best-effort stop: a failure is swallowed but the breach is reported.
+        self.assertEqual([r[0] for r in result], ["big"])
+
+
+class TestIngressReplayUntrustedAuthNoneGate(unittest.TestCase):
+    """The ingress-replay path (brig cell start) re-applies the untrusted-profile
+    auth:none gate using the TRUSTED podman container label (brig.profile) — NOT
+    the untrusted cell-metadata.json — so a tampered/absent metadata profile
+    can't hand an untrusted cell an unauthenticated route."""
+
+    def _inspect(self, profile_label, cell):
+        labels = {"brig.profile": profile_label} if profile_label else {}
+        return {
+            "Config": {"Labels": labels},
+            "NetworkSettings": {"Networks": {f"brig-{cell}": {"IPAddress": "10.60.1.2"}}},
+        }
+
+    def test_untrusted_auth_none_refused_on_replay(self):
+        from brig.cell.lifecycle import register_ingress_for
+        from brig.errors import BrigError
+        entry = {"name": "api", "port": 8642, "path_prefix": "/api", "auth": "none"}
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value=self._inspect("untrusted", "adv")):
+            with self.assertRaises(BrigError) as ctx:
+                register_ingress_for("adv", [entry])
+        self.assertIn("auth: none", str(ctx.exception))
+
+    def test_trusted_auth_none_registers(self):
+        # A non-untrusted cell may use auth:none; the gate must NOT fire.
+        from brig.cell.lifecycle import register_ingress_for
+        entry = {"name": "api", "port": 8642, "path_prefix": "/api", "auth": "none"}
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value=self._inspect("supervised", "sup")), \
+             patch("brig.network.ingress.register_ingress") as reg:
+            register_ingress_for("sup", [entry])
+        reg.assert_called_once()
+
+    def test_gate_keys_on_trusted_label_not_metadata(self):
+        # Regression: the gate previously read profile from the untrusted
+        # metadata file, so dropping it bypassed the gate. The label is the
+        # trusted source — an untrusted container is gated regardless of what
+        # cell-metadata.json says (here: no metadata written at all).
+        from brig.cell.lifecycle import register_ingress_for
+        from brig.errors import BrigError
+        entry = {"name": "api", "port": 8642, "path_prefix": "/api", "auth": "none"}
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value=self._inspect("untrusted", "adv")):
+            with self.assertRaises(BrigError):
+                register_ingress_for("adv", [entry])
 
 
 if __name__ == "__main__":

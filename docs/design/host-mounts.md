@@ -27,7 +27,7 @@ everything outside the mounted subtree.
 This feature changes brig's job, for the affected cell, from *"isolate untrusted
 code"* to *"let a semi-trusted agent edit a shared folder in place."* That is why
 it is a `supervised`/`dev` capability and the `untrusted` profile rejects it — the
-same rule already applied to `host_sockets`, `host_services`, and TLS passthrough.
+same rule already applied to `host_services` and TLS passthrough.
 
 Two distinct risks, with different owners:
 
@@ -56,7 +56,7 @@ shared mount to cells that are allowed to see each other's data.
 
 ### Cell yaml — `mounts:` (per-cell)
 
-Shape and `mode` values are identical to `host_sockets`, on purpose:
+Shape — `{name, host_path, mount_point, mode?}`, with `mode` ∈ {`ro`, `rw`}:
 
 ```yaml
 # user: "0" — a rw mount the cell must own needs a root cell (gVisor presents
@@ -132,13 +132,12 @@ reference mounts need none of this.
 
 ### Validation — `_v_mounts` / `_v_mount_entry` (`validators.py`)
 
-Mirrors `_v_host_socket_entry`; deltas:
+Per-entry checks:
 
 - `name`: required, `MOUNT_NAME_PATTERN`, unique per cell.
 - `host_path`: required, absolute, normalized, no `..`. `realpath(host_path)` must
   (a) exist, (b) be a directory, (c) live under `realpath(R)` for some `R` in
-  `mount_roots` (`startswith(R + "/")`, same idiom as the host_socket realpath
-  guard). Rejected if `mount_roots` is empty.
+  `mount_roots` (`startswith(R + "/")`). Rejected if `mount_roots` is empty.
 - `mount_point`: required, absolute, normalized — validated by
   `_v_cell_mount_point` (mirrors, kept separate from, `_v_workspace_mount`):
   forbidden prefixes (`/proc`, `/sys`, `/dev`, `/etc`, `/run/secrets`,
@@ -153,21 +152,21 @@ Mirrors `_v_host_socket_entry`; deltas:
 
 ### Reconciler — `_attach_mounts(spec, cmd)` (`reconciler.py`)
 
-Mirrors `_attach_host_sockets`. Per entry, in `build_run_command`:
+Per entry, in `build_run_command`:
 
 1. Re-resolve `realpath(host_path)`, re-confirm it is under one of the `mount_roots`
-   (runtime check is the real boundary; TOCTOU note as in the socket path).
+   (runtime check is the real boundary; unavoidable TOCTOU between check and bind).
 2. Translate to the VM path: `/mnt/host/<slug(R)>/<relpath(realpath, R)>`.
 3. Emit `-v {vm_path}:{mount_point}:{mode}`.
 4. `log_lifecycle("mount_attach", spec.name, {name, mount_point, mode})` and a loud
-   `info()` banner — the same "Warden does not see this" disclaimer host_sockets
-   prints, adapted: *"cell '<name>' has a <mode> host mount at <mount_point> →
-   <host_path>; the cell reads/writes these host files directly."*
+   `info()` banner with a "Warden does not see this" disclaimer: *"cell '<name>'
+   has a <mode> host mount at <mount_point> → <host_path>; the cell reads/writes
+   these host files directly."*
 
 ### Profile gating
 
-`untrusted` rejects `mounts:` at parse time (identical to `host_sockets` /
-`host_services` / passthrough). `supervised` / `dev` allow it. Per-entry `mode` is
+`untrusted` rejects `mounts:` at parse time (identical to `host_services` /
+passthrough). `supervised` / `dev` allow it. Per-entry `mode` is
 the rw opt-in; no separate global kill-switch.
 
 ## Symlink reality (empirically verified)

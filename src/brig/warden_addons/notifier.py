@@ -229,14 +229,18 @@ class Notifier:
                 webhook_url=webhook_url,
                 block_reasons=filters.get("block_reasons"),
                 cells=filters.get("cells"),
-                min_interval_seconds=filters.get("min_interval_seconds", DEFAULT_MIN_INTERVAL),
+                # Coerce numeric fields (like max_query_len above): a string
+                # value would otherwise flow into response()/circuit-breaker
+                # arithmetic and raise TypeError on every flow. A bad value is
+                # caught by the except below, keeping the last-good config.
+                min_interval_seconds=float(filters.get("min_interval_seconds", DEFAULT_MIN_INTERVAL)),
                 enabled=bool(webhook_url),
                 circuit_breaker=CircuitBreakerConfig(
-                    failure_threshold=cb_config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD),
-                    recovery_timeout=cb_config.get("recovery_timeout", DEFAULT_RECOVERY_TIMEOUT),
-                    max_retries=cb_config.get("max_retries", DEFAULT_MAX_RETRIES),
-                    base_backoff=cb_config.get("base_backoff", DEFAULT_BASE_BACKOFF),
-                    max_backoff=cb_config.get("max_backoff", DEFAULT_MAX_BACKOFF),
+                    failure_threshold=int(cb_config.get("failure_threshold", DEFAULT_FAILURE_THRESHOLD)),
+                    recovery_timeout=float(cb_config.get("recovery_timeout", DEFAULT_RECOVERY_TIMEOUT)),
+                    max_retries=int(cb_config.get("max_retries", DEFAULT_MAX_RETRIES)),
+                    base_backoff=float(cb_config.get("base_backoff", DEFAULT_BASE_BACKOFF)),
+                    max_backoff=float(cb_config.get("max_backoff", DEFAULT_MAX_BACKOFF)),
                 ),
                 resolved_ip=resolved_ip,
                 resolved_hostname=resolved_hostname,
@@ -252,7 +256,10 @@ class Notifier:
             else:
                 ctx.log.info("Notifier: Disabled (no webhook URL)")
                 self._stop_worker()
-        except (json.JSONDecodeError, IOError, OSError) as e:
+        except (json.JSONDecodeError, IOError, OSError, ValueError, TypeError) as e:
+            # ValueError/TypeError: a malformed operator-set field (e.g. a
+            # non-int max_query_len) must not re-raise out of this hook on every
+            # flow — log and keep the last-good config.
             ctx.log.error(f"Notifier: Failed to load config: {e}")
 
     def _start_worker(self) -> None:
@@ -539,6 +546,12 @@ class Notifier:
         restart doesn't replay every known (host, path) as novel. The log is
         the persistence layer — re-seeding from it on each load is idempotent."""
         if cell in self._novel_seeded:
+            return
+        # `cell` comes from the untrusted subnet map (invariant 4) via flow
+        # metadata and is interpolated into a log-file path below, so reject
+        # anything that isn't a plain cell name to prevent path traversal
+        # (mirrors the logger's guard).
+        if not re.match(r'^[a-z0-9][a-z0-9._-]{0,62}$', cell):
             return
         self._novel_seeded.add(cell)
         seen = self._novel_seen.setdefault(cell, set())

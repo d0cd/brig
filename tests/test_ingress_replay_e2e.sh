@@ -60,10 +60,13 @@ fi
 echo "$TOKEN_VALUE" | brig secrets add "${CELL_NAME}-ingress-token" --force >/dev/null
 
 # --- Cell yaml: a tiny python http.server publishing one ingress route ---
+# Serve a dir that has content at BOTH / and /api/ so the assertion is 200
+# whether warden forwards the /api prefix to the cell or strips it. The rootfs
+# is read-only except /tmp, so build the docroot there.
 cat > "$YAML" <<'EOF'
 name: brigtest-ingress-replay
 image: python:3.12-alpine
-command: ["python", "-m", "http.server", "8000"]
+command: ["sh", "-c", "mkdir -p /tmp/srv/api && echo ok > /tmp/srv/api/index.html && echo root > /tmp/srv/index.html && cd /tmp/srv && exec python -m http.server 8000"]
 memory: 256m
 ingress:
   - name: api

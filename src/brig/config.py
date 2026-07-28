@@ -93,7 +93,7 @@ SUSPICIOUS_DOMAIN_PATTERNS = [
 # src/brig/warden_addons/enforce.py — addons can't import from brig.* so the suffix
 # lives in both places. Keep them in sync.
 #
-# Single-tenant flattened model (see also host_sockets): cell yaml
+# Single-tenant flattened model: cell yaml
 # declares both the name AND the host port. There is no separate
 # global registry — declaring in yaml IS the authorization. The
 # operator who wrote the yaml is the trust principal.
@@ -119,31 +119,15 @@ INGRESS_AUTH_METHODS = {"token", "none"}
 INGRESS_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}\Z')
 INGRESS_PATH_PREFIX_PATTERN = re.compile(r'^/[a-zA-Z0-9/_-]+\Z')
 
-# Host sockets — kernel-side channel between a cell and a macOS host
-# service via a bind-mounted unix socket. Bypasses Warden by design
-# (the bytes never reach the proxy), so the validators here are the
-# only thing standing between a cell yaml and a host file.
-HOST_SOCKET_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}\Z')
-MAX_HOST_SOCKETS_PER_CELL = 8
-HOST_SOCKET_MOUNT_PREFIX = "/run/host/"
-HOST_SOCKET_MODES = {"ro", "rw"}
-
 # Scoped host-directory mounts — bind-mount an operator-chosen host directory
 # into a non-untrusted cell (ro default / rw opt-in). Bytes bypass Warden, so
 # the boundary is the validators + the mount_roots() allowlist + runtime
 # realpath re-containment. A cell-side symlink can't escape the subtree
 # (mount-namespace isolation); the residual host-side symlink risk is mitigated
 # by `brig cell mount-scan`. See docs/design/host-mounts.md.
-MOUNT_NAME_PATTERN = HOST_SOCKET_NAME_PATTERN
+MOUNT_NAME_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]{0,30}\Z')
 MAX_MOUNTS_PER_CELL = 8
-MOUNT_MODES = HOST_SOCKET_MODES  # {"ro", "rw"}
-# Container-engine sockets — granting these to a cell is root-equivalent
-# on the host. Denied at parse time unless the operator passes the
-# (future) --allow-engine-socket override.
-HOST_SOCKET_ENGINE_DENYLIST = (
-    "docker.sock", "podman.sock", "containerd.sock",
-    "crio.sock", "firecracker.sock", "limactl.sock",
-)
+MOUNT_MODES = {"ro", "rw"}
 
 # Secret name pattern — restricts allowable filenames in ~/.brig/secrets/
 # to a safe character set. Empty names, null bytes, leading dashes, and
@@ -192,12 +176,6 @@ class HostPaths:
     POLICY_DIR = SYSTEM_DIR / "policies"
     INGRESS_ROUTES_FILE = SYSTEM_DIR / "ingress-routes.json"
 
-    # host_sockets bridge dir — macOS-side launchd unit creates a socket
-    # here that proxies to the operator's host_path; Lima exposes
-    # ~/.brig under /state in the VM, so the same path is reachable
-    # from inside the VM without a separate forward.
-    HOST_SOCKETS_DIR = STATE_DIR / "system" / "host-sockets"
-
     # Rate limit state (host-side, used before entering VM).
     RATE_LIMIT_FILE = STATE_DIR / "system" / "rate_limit.json"
 
@@ -235,10 +213,6 @@ class VMPaths:
 
     # Logs (inside VM).
     LOG_DIR = Path("/var/log/brig/network")
-
-    # host_sockets bridge dir — same files as HostPaths.HOST_SOCKETS_DIR,
-    # reached via the /state virtiofs mount.
-    HOST_SOCKETS_DIR = SYSTEM_DIR / "host-sockets"
 
     # Root under which each declared mount_root is Lima-mounted, at
     # /mnt/host/<slug>. See mount_roots() / mount_root_slug().

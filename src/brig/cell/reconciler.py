@@ -262,37 +262,59 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.is_airgapped:
         cmd.extend(["--network", "none"])
     else:
+        # `proxy_ip` (warden's IP on this cell's network) is required not to bake
+        # into the env — we point the cell at warden by NAME below — but as proof
+        # that warden is actually connected to this network. A cell with no warden
+        # on its net can't egress regardless, so refuse to start it (fail closed).
         if not proxy_ip:
             raise BrigError(
-                "proxy_ip is required for non-airgapped cells",
-                suggestion=(
-                    "Warden's per-cell IP could not be determined. "
-                    "Try: brig system doctor"
-                ),
+                "Warden is not connected to this cell's network",
+                suggestion="Try: brig system up (ensures warden is running and connected)",
             )
         cmd.extend([
             "--network", name,
-            "-e", f"http_proxy=http://{proxy_ip}:{PROXY_PORT}",
-            "-e", f"https_proxy=http://{proxy_ip}:{PROXY_PORT}",
-            "-e", f"HTTP_PROXY=http://{proxy_ip}:{PROXY_PORT}",
-            "-e", f"HTTPS_PROXY=http://{proxy_ip}:{PROXY_PORT}",
+            # Point the cell at warden by its DNS NAME, not its literal IP. Warden's
+            # per-cell-network IP is NOT stable across warden restarts (VM reboot,
+            # resume-from-sleep, addon reload, `system down/up`); a baked IP goes
+            # stale and the cell silently loses all egress (HTTP 000, no error). The
+            # name re-resolves warden's current IP on every connection via the cell
+            # network's DNS (aardvark — enabled by default; CREATE_NETWORK does not
+            # pass --disable-dns), so egress survives every warden restart with no
+            # cell recreate. PROXY_NAME is the same constant the warden container is
+            # named with, so the name and the resolver target can't drift.
+            "-e", f"http_proxy=http://{PROXY_NAME}:{PROXY_PORT}",
+            "-e", f"https_proxy=http://{PROXY_NAME}:{PROXY_PORT}",
+            "-e", f"HTTP_PROXY=http://{PROXY_NAME}:{PROXY_PORT}",
+            "-e", f"HTTPS_PROXY=http://{PROXY_NAME}:{PROXY_PORT}",
             "-e", "no_proxy=localhost,127.0.0.1",
+            "-e", "NO_PROXY=localhost,127.0.0.1",
         ])
 
     cmd.extend(["--cap-drop", "ALL", "--security-opt", "no-new-privileges"])
 
     # Safe-by-default rootfs. The cell's container-writable layer would
     # otherwise let a hostile cell (a) fill the VM disk (shared across
-    # all cells; workspace_quota only bounds /work), and (b) stash
-    # state outside the workspace where the user wouldn't see it across
-    # stop/start. Read-only rootfs + sized tmpfs for the dirs every
-    # Linux app expects to write to. workspace_quota still applies to
-    # /work; opt-out via writable_rootfs: true in the cell spec.
+    # all cells), and (b) stash state outside the workspace where the
+    # user wouldn't see it across stop/start. Read-only rootfs + sized
+    # tmpfs for the dirs every Linux app expects to write to. Note:
+    # workspace_quota bounds /work growth as a SOFT quota — enforced
+    # preventively on `brig cp` and reactively by `brig system watchdog`
+    # (which stops an over-quota cell) — not a hard block-quota, since the
+    # virtiofs workspace can't carry one. Opt-out via writable_rootfs: true.
     if not spec.writable_rootfs:
         cmd.extend([
             "--read-only",
+            # tmpfs flags follow "strictest that doesn't break a real workload":
+            # nosuid (no setuid escalation) + nodev on every tmpfs. noexec is
+            # weak, bypassable defense-in-depth (memfd; /work is exec-capable
+            # anyway) — NOT a brig boundary, which is the VM/gVisor/Warden choke
+            # point plus cap-drop ALL + read-only rootfs. So noexec is kept on
+            # /tmp, where no known workload needs to exec (zero cost), but
+            # dropped on /run because s6-overlay and other init systems exec
+            # their supervisor from /run/s6 — keeping it there breaks every
+            # s6-based image for no real security gain.
             "--tmpfs", "/tmp:rw,size=64m,noexec,nosuid,nodev",
-            "--tmpfs", "/run:rw,size=16m,noexec,nosuid,nodev",
+            "--tmpfs", "/run:rw,size=16m,nosuid,nodev",
         ])
 
     cmd.extend([
@@ -307,8 +329,29 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
         if timeout_seconds is not None:
             cmd.extend(["--timeout", str(timeout_seconds)])
 
-    for label in spec.labels:
+    # Labels may arrive as a dict ({key: value}, the yaml/profile shape the
+    # validator accepts) or a list of "KEY=value" strings. Normalize the dict
+    # form to "KEY=value" so iterating doesn't silently drop the values.
+    labels = spec.labels
+    if isinstance(labels, dict):
+        labels = [f"{k}={v}" for k, v in labels.items()]
+    for label in labels:
+        # brig.profile is brig-RESERVED: it's the trust marker the ingress
+        # auth:none replay gate reads off the container label (invariant 4:
+        # the metadata file can't be trusted for this). It must not be
+        # droppable or shadowable by user/yaml/profile-merged labels, so skip
+        # any such value here and stamp it authoritatively from the resolved
+        # profile below. This is the single choke point that closes EVERY
+        # upstream path that could drop it (yaml `labels:` clobber, list-form
+        # profile labels, a user `--label brig.profile=...` override).
+        if isinstance(label, str) and label.split("=", 1)[0] == "brig.profile":
+            continue
         cmd.extend(["--label", label])
+    from brig.cell.validators import _profile_is_untrusted
+    if _profile_is_untrusted(spec.profile):
+        cmd.extend(["--label", "brig.profile=untrusted"])
+    elif spec.profile:
+        cmd.extend(["--label", f"brig.profile={spec.profile}"])
 
     if spec.seccomp_profile:
         if spec.seccomp_profile.lower() == "unconfined":
@@ -377,7 +420,6 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if spec.workdir:
         cmd.extend(["--workdir", spec.workdir])
 
-    _attach_host_sockets(spec, cmd)
     _attach_mounts(spec, cmd)
 
     # End-of-options marker so an image reference (or command token) that
@@ -387,85 +429,6 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     cmd.extend(spec.command)
 
     return cmd
-
-
-def _attach_host_sockets(spec: CellSpec, cmd: list[str]) -> None:
-    """Append `--volume` args for each declared host_socket, after
-    re-checking that the bridge socket is actually present and is a
-    real unix socket file (not a symlink, not a regular file).
-
-    This is the runtime TOCTOU defense — the static checks at yaml
-    parse time can't see the bridge directory, and the bridge is
-    populated by the macOS-side launchd unit (Phase 4). If the bridge
-    is missing, refuse cell start with a clear error rather than
-    letting podman create an empty dir at the source path.
-    """
-    if not spec.host_sockets:
-        return
-
-    from brig.config import VMPaths
-    # Per-cell bridge dir so two cells declaring the same physical host
-    # service (e.g. both want /tmp/postgres.sock) each get their own
-    # bridge socket. No reference counting; bridges live with the cell.
-    #
-    # CRITICAL: this code runs in the HOST (macOS) process, but the `-v`
-    # mount source must be the VM-namespace path (podman runs inside the VM
-    # and sees the bridge dir at /state/..., not ~/.brig/...). So validate the
-    # HOST path (the same inode, shared into the VM via virtio-fs) and emit the
-    # VM path as the mount source. Validating the VM path here would lstat a
-    # nonexistent /state on macOS — breaking the feature and leaving the real
-    # bridge socket unchecked.
-    host_bridge_dir = HostPaths.HOST_SOCKETS_DIR / spec.name
-    vm_bridge_dir = Path(str(VMPaths.HOST_SOCKETS_DIR)) / spec.name
-    for entry in spec.host_sockets:
-        name = entry["name"]
-        mount_point = entry["mount_point"]
-        mode = entry.get("mode", "ro")
-        source = host_bridge_dir / f"{name}.sock"
-
-        # lstat (NOT stat) so symlinks don't get followed silently.
-        # Symlinks AT the bridge path OR anywhere in its ancestor
-        # chain could redirect the bind-mount to attacker-controlled
-        # storage. We require:
-        #   - source exists, is a real socket, not a symlink
-        #   - every ancestor directory is also not a symlink
-        #   - realpath of source still lives under bridge_dir
-        import os as _os
-        import stat as _stat
-        try:
-            st = source.lstat()
-        except FileNotFoundError:
-            raise BrigError(
-                f"host_socket '{name}': bridge socket not found at {source}",
-                suggestion="Is the launchd bridge running? Try: brig system up",
-            )
-        if _stat.S_ISLNK(st.st_mode):
-            raise BrigError(
-                f"host_socket '{name}': bridge path {source} is a symlink. "
-                f"Refusing to mount — bridge sockets must be real files."
-            )
-        if not _stat.S_ISSOCK(st.st_mode):
-            raise BrigError(
-                f"host_socket '{name}': bridge path {source} is not a "
-                f"unix socket (mode={oct(st.st_mode)})."
-            )
-        # Realpath canonicalizes the entire ancestor chain in one
-        # call — any symlinked parent dir (e.g. someone replaced the
-        # per-cell bridge dir with a link elsewhere) gets resolved
-        # here, defeating a post-lstat parent-dir swap. Then require
-        # the canonical path to live under the canonical bridge_dir
-        # (resolve both sides; macOS /tmp → /private/tmp makes a raw
-        # comparison falsely flag every real path as escaping).
-        real_source = _os.path.realpath(str(source))
-        real_root = _os.path.realpath(str(host_bridge_dir))
-        if not real_source.startswith(real_root + "/"):
-            raise BrigError(
-                f"host_socket '{name}': bridge socket realpath {real_source} "
-                f"escapes bridge dir {real_root}"
-            )
-
-        # Validation passed against the host path; mount the VM-namespace path.
-        cmd.extend(["-v", f"{vm_bridge_dir / f'{name}.sock'}:{mount_point}:{mode}"])
 
 
 def _resolved_mount_roots() -> list[tuple[str, str]]:
@@ -489,8 +452,7 @@ def _verify_mount_sources_for_run(spec: CellSpec) -> None:
 
     mount_roots changed without a VM recreate => /mnt/host/<slug> is absent;
     podman -v would auto-create an empty dir and the cell would silently mount
-    VM-local storage instead of the host files. Fail closed (mirrors the
-    host_socket bridge guard).
+    VM-local storage instead of the host files. Fail closed.
     """
     if not spec.mounts:
         return
@@ -517,6 +479,12 @@ def _mount_bind_arg(entry: dict, roots: list[tuple[str, str]]) -> str:
     """
     import os.path as _ospath
     real = _ospath.realpath(entry["host_path"])
+    if ":" in real:
+        # A ':'-named dir under an allowlisted root would inject fields into the
+        # podman -v spec even though the declared host_path had none. Fail closed.
+        raise BrigError(
+            f"mount host_path resolves to a path containing ':' ({real}) — refusing"
+        )
     for root_real, slug in roots:
         if real == root_real or real.startswith(root_real + "/"):
             vm_path = VMPaths.MOUNTS_DIR / slug
@@ -625,9 +593,9 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         # Write the cell metadata file (downward API) so it's in place when
         # podman creates the read-only bind mount at /run/brig/cell.json.
         write_metadata(spec.name, spec.workspace_mount,
-                       host_sockets=spec.host_sockets,
                        ingress=spec.ingress,
-                       image_digest=spec.image_digest)
+                       image_digest=spec.image_digest,
+                       workspace_quota=spec.workspace_quota)
         # Stage the combined CA bundle inside the VM so HTTPS clients in
         # the cell trust Warden's MITM cert. Re-extracted from Warden
         # every start so a CA rotation doesn't leave cells with stale

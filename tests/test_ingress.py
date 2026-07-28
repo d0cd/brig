@@ -921,3 +921,114 @@ class TestIngressSseStreaming(unittest.TestCase):
         flow.response.headers = {"Content-Type": "Text/Event-Stream"}
         router.responseheaders(flow)
         self.assertTrue(flow.response.stream)
+
+
+def _ingress_addon_classes():
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
+    try:
+        from ingress import IngressRoute, IngressRouter
+    finally:
+        sys.path.pop(0)
+    return IngressRoute, IngressRouter
+
+
+class TestIngressLongestPrefixMatch(unittest.TestCase):
+    """_find_route must pick the most specific (longest) matching prefix, not
+    the first in list order — otherwise a broad '/' route shadows '/api'."""
+
+    def _route(self, IngressRoute, **kw):
+        d = {
+            "cell": "c", "cell_ip": "10.60.1.2", "name": "n",
+            "port": 8642, "path_prefix": "/api", "auth_secret_hash": "h",
+        }
+        d.update(kw)
+        return IngressRoute(d)
+
+    def test_specific_prefix_wins_over_broad_regardless_of_order(self):
+        IngressRoute, IngressRouter = _ingress_addon_classes()
+        broad = self._route(IngressRoute, name="broad", path_prefix="/api")
+        specific = self._route(IngressRoute, name="specific", path_prefix="/api/v1")
+        router = IngressRouter()
+        # Broad first: the old first-match logic would return it and shadow /api/v1.
+        router.routes = {"c": [broad, specific]}
+        route, _ = router._find_route("/c/api/v1/data")
+        self.assertEqual(route.name, "specific")
+        # And with the list order reversed, still the specific one.
+        router.routes = {"c": [specific, broad]}
+        route, _ = router._find_route("/c/api/v1/data")
+        self.assertEqual(route.name, "specific")
+
+    def test_broad_still_matches_when_specific_does_not(self):
+        IngressRoute, IngressRouter = _ingress_addon_classes()
+        broad = self._route(IngressRoute, name="broad", path_prefix="/api")
+        specific = self._route(IngressRoute, name="specific", path_prefix="/api/v1")
+        router = IngressRouter()
+        router.routes = {"c": [broad, specific]}
+        route, _ = router._find_route("/c/api/other")
+        self.assertEqual(route.name, "broad")
+
+
+class TestIngressRateLimitEviction(unittest.TestCase):
+    """Fix: LRU (not FIFO) eviction, and 404 route-misses count toward the
+    per-IP rate limiter so probing is bounded."""
+
+    def _router(self):
+        _, IngressRouter = _ingress_addon_classes()
+        r = IngressRouter()
+        r._check_reload = lambda: None
+        return r
+
+    def test_active_ip_survives_flood_of_fresh_ips(self):
+        import ingress as ingress_mod
+        router = self._router()
+        with patch.object(ingress_mod, "AUTH_FAIL_MAX_IPS", 2):
+            router._record_auth_failure("A")
+            router._record_auth_failure("B")
+            # Touch A so it's most-recently-used; a fresh IP must evict B, not A.
+            router._is_rate_limited("A")
+            router._record_auth_failure("C")
+            self.assertIn("A", router._auth_failures)
+            self.assertIn("C", router._auth_failures)
+            self.assertNotIn("B", router._auth_failures)
+
+    def test_route_miss_records_failure(self):
+        IngressRoute, _ = _ingress_addon_classes()
+        router = self._router()
+        router.routes = {}  # no routes → every request is a 404 miss
+        flow = MagicMock()
+        flow.client_conn.sockname = ("0.0.0.0", 8443)
+        flow.client_conn.peername = ("198.51.100.7", 5555)
+        flow.request.path = "/ghost/probe"
+        flow.request.headers = {}
+        flow.metadata = {}
+        flow.response = None
+        router.request(flow)
+        self.assertIn("198.51.100.7", router._auth_failures)
+
+
+class TestIngressRoutePortValidation(unittest.TestCase):
+    """A route with an out-of-range port from the untrusted routes file must be
+    skipped (invariant 4), not forwarded to cell_ip:<bad-port>."""
+
+    def test_route_with_invalid_port_is_skipped(self):
+        import json as _json
+        import tempfile as _tf
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
+        try:
+            import ingress as ingress_mod
+        finally:
+            _sys.path.pop(0)
+        good = {"cell": "c1", "cell_ip": "10.60.1.2", "name": "api",
+                "port": 8642, "path_prefix": "/api", "auth_secret_hash": "h"}
+        bad = {"cell": "c2", "cell_ip": "10.60.2.2", "name": "api",
+               "port": 99999, "path_prefix": "/api", "auth_secret_hash": "h"}
+        with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"routes": [good, bad]}, f)
+            path = Path(f.name)
+        router = ingress_mod.IngressRouter()
+        with patch.object(ingress_mod, "ROUTES_FILE", path):
+            router._reload_routes(strict=True)
+        self.assertIn("c1", router.routes)       # valid port kept
+        self.assertNotIn("c2", router.routes)    # port 99999 skipped
