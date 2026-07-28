@@ -32,7 +32,12 @@ _HOST_ONLY_TOP = frozenset({"config", "policy", "secrets"})
 #   - down: must work even when the VM is broken (idempotent cleanup) — and
 #     `brig system down --vm` definitionally has to work without the VM up.
 #   - history: reads ~/.brig/state/system/operations.jsonl on host only.
-_HOST_ONLY_SYSTEM = frozenset({"init", "profiles", "up", "down", "history"})
+#   - watchdog: the supervisor must run in every state — it brings the VM up
+#     (via `system up`) when the host slept and dropped it, so it can't be
+#     gated on the VM already running.
+_HOST_ONLY_SYSTEM = frozenset(
+    {"init", "profiles", "up", "down", "history", "watchdog"}
+)
 # `image` subcommands that don't touch the VM.
 _HOST_ONLY_IMAGE = frozenset({"verify"})
 

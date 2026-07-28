@@ -32,9 +32,16 @@ class TestImageWarn(unittest.TestCase):
         self.assertEqual(_capture(f"alpine{digest}"), "")
         self.assertEqual(_capture(f"docker.io/library/alpine{digest}"), "")
 
-    def test_sha512_digest_silent(self):
-        digest = "@sha512:" + "b" * 128
-        self.assertEqual(_capture(f"alpine{digest}"), "")
+    def test_uppercase_hex_digest_silent(self):
+        # _v_image_digest / _DIGEST_PATTERN accept uppercase hex, so a ref brig
+        # considers validly pinned must not also draw the "unpinned" warning.
+        self.assertEqual(_capture("alpine@sha256:" + "A" * 64), "")
+
+    def test_sha512_ref_warns_not_a_valid_pin(self):
+        # OCI manifest digests are sha256; a sha512 ref isn't a usable pin, so
+        # brig no longer treats it as pinned — it gets the unpinned warning.
+        out = _capture("alpine@sha512:" + "b" * 128)
+        self.assertIn("unpinned and unverified", out)
 
     def test_implicit_dockerhub_warns(self):
         out = _capture("alpine")

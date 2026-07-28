@@ -142,7 +142,9 @@ def cmd_down(args: argparse.Namespace) -> int:
 
     Steps:
       1. Stop all running cells (via stop_cell so ingress is torn down
-         consistently per-cell).
+         consistently per-cell). Taking the harness down is not per-cell
+         operator intent, so no intentional-stop marker is recorded — a
+         `restart: always` cell still comes back on the next `system up`.
       2. Sweep orphan ingress routes whose cell already exited (subnet reuse
          would otherwise let a future cell inherit the prior cell's hashed
          auth token).
@@ -161,7 +163,7 @@ def cmd_down(args: argparse.Namespace) -> int:
     for cell_name, _entry in list_cell_containers(include_stopped=False):
         info(f"Stopping {cell_name}...")
         try:
-            stop_cell(cell_name)
+            stop_cell(cell_name, mark_stopped=False)
         except BrigError as e:
             output(f"  ERROR: {e}")
             failures += 1

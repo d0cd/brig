@@ -562,6 +562,18 @@ class TestRequestEgressEnforcement(unittest.TestCase):
         self.assertIsNotNone(flow.response)
         self.assertIn("no per-cell policy", flow.metadata.get("block_reason", ""))
 
+    def test_host_header_mismatch_blocked_in_request(self):
+        # Exercise the smuggling guard's WIRING into request() (not just the
+        # pure helper): an allowed URL host with a disagreeing Host header must
+        # be blocked, so a dropped call site can't pass the suite silently.
+        enf = self._enforcer(policy=self._policy(allow=["api.anthropic.com"]))
+        flow = self._flow()  # URL host = api.anthropic.com (allowed)
+        flow.request.headers = {"Host": "evil.example.com"}
+        enf.request(flow)
+        self.assertIsNotNone(flow.response)
+        self.assertIn("host header mismatch",
+                      flow.metadata.get("block_reason", "").lower())
+
     def test_ingress_port_unhandled_blocked(self):
         # A request arriving on the ingress port without the ingress addon's
         # metadata flag must be blocked (fail closed).
@@ -628,6 +640,32 @@ class TestReloadCellPolicies(unittest.TestCase):
                 (d / "gone.json").unlink()
                 enf._reload_cell_policies()
                 self.assertNotIn("gone", enf.cell_policies)
+
+    def test_non_dict_policy_file_fails_closed_no_escape(self):
+        # A tampered non-dict policy file (invariant 4) must NOT raise out of the
+        # loader (which runs in request()/http_connect() and would fail OPEN).
+        import tempfile as _tf
+        import enforce as enforce_mod
+        with _tf.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "bad.json").write_text("[]")  # valid JSON, not a dict
+            enf = self._enforcer()
+            with patch.object(enforce_mod, "CELL_POLICY_DIR", d):
+                enf._reload_cell_policies()  # must not raise
+            self.assertNotIn("bad", enf.cell_policies)  # not loaded (default-deny)
+
+    def test_malformed_rule_policy_fails_closed_no_escape(self):
+        # A valid-JSON policy with a bad rule (empty domain) makes Policy() raise
+        # ValueError; that must be caught and the file skipped, not escape.
+        import tempfile as _tf
+        import enforce as enforce_mod
+        with _tf.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "bad.json").write_text('{"allow": [{"domain": ""}]}')
+            enf = self._enforcer()
+            with patch.object(enforce_mod, "CELL_POLICY_DIR", d):
+                enf._reload_cell_policies()  # must not raise
+            self.assertNotIn("bad", enf.cell_policies)
 
 
 if __name__ == "__main__":

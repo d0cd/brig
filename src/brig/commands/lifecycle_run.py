@@ -20,7 +20,11 @@ from brig.errors import BrigError
 from brig.ops.logging import info, output
 from brig.vm.shell import vm_run
 
-_DIGEST_RE = re.compile(r"@sha(?:256|512):[0-9a-f]{40,}$")
+# Recognize a pinned image ref for warning-suppression. sha256 only, exact 64
+# hex, case-insensitive — consistent with _DIGEST_PATTERN / _v_image_digest (a
+# sha512 or short digest isn't a usable OCI pin, so it should still get the
+# unpinned warning; an accepted uppercase-hex pin should not).
+_DIGEST_RE = re.compile(r"@sha256:[0-9a-fA-F]{64}\Z")
 
 
 def _warn_unverified_image(image: str) -> None:
@@ -195,11 +199,22 @@ def cmd_run(args: argparse.Namespace) -> int:
                 list(spec_kwargs.get("host_services") or [])
                 + list(cell_def["host_services"])
             )
+        # yaml `labels:` EXTEND the profile-merged labels — a generic replace
+        # would drop profile-declared labels (the trust marker is re-stamped
+        # authoritatively in the reconciler regardless, but other labels matter).
+        if "labels" in cell_def:
+            yaml_labels = cell_def["labels"]
+            if isinstance(yaml_labels, dict):
+                yaml_labels = [f"{k}={v}" for k, v in yaml_labels.items()]
+            existing_labels = spec_kwargs.get("labels") or []
+            if isinstance(existing_labels, dict):
+                existing_labels = [f"{k}={v}" for k, v in existing_labels.items()]
+            spec_kwargs["labels"] = list(existing_labels) + list(yaml_labels)
         import dataclasses as _dc
         _spec_field_names = {f.name for f in _dc.fields(CellSpec)}
         _already_handled = {
             "image", "name", "command", "env", "ingress", "policy",
-            "host_services",
+            "host_services", "labels",
         }
         for key, val in cell_def.items():
             if key in _spec_field_names and key not in _already_handled:

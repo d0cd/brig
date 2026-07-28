@@ -98,6 +98,32 @@ class TestIsHostAllowed(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("denied by rule", reason)
 
+    def test_empty_methods_allow_grants_all(self):
+        # matches_method treats [] as no-restriction (this round's change), so a
+        # `methods: []` ALLOW grants every method — consistent with `paths: []`
+        # and with the deny direction. Locks the new semantics.
+        p = Policy(allow=[{"domain": "x.com", "methods": []}], deny=[])
+        for m in ("GET", "POST", "DELETE"):
+            ok, _, _ = p.is_allowed("x.com", "/", m)
+            self.assertTrue(ok, m)
+
+    def test_empty_paths_allow_grants_all(self):
+        p = Policy(allow=[{"domain": "x.com", "paths": []}], deny=[])
+        ok, _, _ = p.is_allowed("x.com", "/anything/deep", "GET")
+        self.assertTrue(ok)
+
+    def test_empty_methods_deny_blocks_http_and_connect(self):
+        # A `methods: []` deny is unscoped (empty = no restriction), so it must
+        # block every method per-request AND block the CONNECT — not be a no-op
+        # on HTTP while blocking HTTPS.
+        p = Policy(allow=["x.com"], deny=[{"domain": "x.com", "methods": []}])
+        for method in ("GET", "POST", "DELETE"):
+            blocked, _, _ = p.is_allowed("x.com", "/", method)
+            self.assertFalse(blocked, method)
+        ok, reason = p.is_host_allowed("x.com")
+        self.assertFalse(ok)
+        self.assertIn("denied by rule", reason)
+
     def test_empty_paths_deny_blocks_connect(self):
         # An empty paths list means "all paths" in is_allowed (matches_path
         # returns True), so a `paths: []` deny blocks all HTTP — is_host_allowed

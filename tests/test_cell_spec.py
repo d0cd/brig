@@ -67,6 +67,26 @@ class TestValidateCellDefinition(unittest.TestCase):
                 {"name": "test", "image": "alpine", "user": u})
             self.assertTrue(any("user" in e for e in errs), u)
 
+    def test_user_none_is_valid(self):
+        # A cell.yaml that omits `user` persists as user=None; re-validating
+        # that spec (restart:always restore) must accept it. Empty string stays
+        # invalid — only None (unset → image default) is allowed.
+        errs = validate_cell_definition(
+            {"name": "test", "image": "alpine", "user": None})
+        self.assertEqual(errs, [])
+
+    def test_persisted_default_spec_revalidates_clean(self):
+        # `restore_persisted_cells` re-validates dataclasses.asdict(spec) before
+        # relaunching, so EVERY unset optional field arrives as None. A validator
+        # that rejects None makes every restart:always cell unrestorable — the
+        # cell is silently skipped with "invalid persisted spec". Assert the
+        # whole round-trip rather than one field at a time, so the next optional
+        # field to grow a validator can't reintroduce this.
+        import dataclasses
+
+        raw = dataclasses.asdict(CellSpec(name="test", image="alpine"))
+        self.assertEqual(validate_cell_definition(raw), [])
+
     def test_command_string(self):
         errors = validate_cell_definition({"command": "echo hi"})
         self.assertEqual(errors, [])
@@ -148,6 +168,25 @@ class TestValidateCellDefinition(unittest.TestCase):
 
     def test_workspace_quota_positive_ok(self):
         self.assertEqual(validate_cell_definition({"workspace_quota": "500m"}), [])
+
+    def test_profile_traversal_rejected(self):
+        # profile resolves to a file path under ~/.brig/profiles; a path/traversal
+        # must not escape it.
+        for bad in ("../../etc/passwd", "a/b", "..", "x\x00y"):
+            errors = validate_cell_definition({"image": "alpine", "profile": bad})
+            self.assertTrue(any("profile" in e for e in errors), (bad, errors))
+
+    def test_profile_bare_name_ok(self):
+        self.assertEqual(
+            validate_cell_definition({"image": "alpine", "profile": "untrusted"}), [])
+
+    def test_rm_non_bool_rejected(self):
+        for bad in ("yes", 1, "true"):
+            errors = validate_cell_definition({"image": "alpine", "rm": bad})
+            self.assertTrue(any("'rm' must be a boolean" in e for e in errors), (bad, errors))
+
+    def test_rm_bool_ok(self):
+        self.assertEqual(validate_cell_definition({"image": "alpine", "rm": True}), [])
 
     # --- Security Invariant 1/6: network=proxy-external rejected ---
     def test_network_proxy_external_rejected(self):

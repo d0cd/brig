@@ -336,7 +336,22 @@ def build_run_command(spec: CellSpec, proxy_ip: str | None) -> list[str]:
     if isinstance(labels, dict):
         labels = [f"{k}={v}" for k, v in labels.items()]
     for label in labels:
+        # brig.profile is brig-RESERVED: it's the trust marker the ingress
+        # auth:none replay gate reads off the container label (invariant 4:
+        # the metadata file can't be trusted for this). It must not be
+        # droppable or shadowable by user/yaml/profile-merged labels, so skip
+        # any such value here and stamp it authoritatively from the resolved
+        # profile below. This is the single choke point that closes EVERY
+        # upstream path that could drop it (yaml `labels:` clobber, list-form
+        # profile labels, a user `--label brig.profile=...` override).
+        if isinstance(label, str) and label.split("=", 1)[0] == "brig.profile":
+            continue
         cmd.extend(["--label", label])
+    from brig.cell.validators import _profile_is_untrusted
+    if _profile_is_untrusted(spec.profile):
+        cmd.extend(["--label", "brig.profile=untrusted"])
+    elif spec.profile:
+        cmd.extend(["--label", f"brig.profile={spec.profile}"])
 
     if spec.seccomp_profile:
         if spec.seccomp_profile.lower() == "unconfined":
@@ -580,8 +595,7 @@ def _execute_action(action: Action, result: ReconcileResult) -> None:
         write_metadata(spec.name, spec.workspace_mount,
                        ingress=spec.ingress,
                        image_digest=spec.image_digest,
-                       workspace_quota=spec.workspace_quota,
-                       profile=spec.profile)
+                       workspace_quota=spec.workspace_quota)
         # Stage the combined CA bundle inside the VM so HTTPS clients in
         # the cell trust Warden's MITM cert. Re-extracted from Warden
         # every start so a CA rotation doesn't leave cells with stale

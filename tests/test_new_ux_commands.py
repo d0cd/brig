@@ -283,11 +283,27 @@ class TestPolicyRm(unittest.TestCase):
             with self.assertRaises(BrigError):
                 policy_cmd.cmd_policy_rm(SimpleNamespace(name="does-not-exist"))
 
-    def test_rm_global_refused(self):
+    def test_rm_nonexistent_policy_errors(self):
+        # Policies are strictly per-cell — there is no "global" policy — so
+        # removing one that doesn't exist errors clearly. (Formerly named
+        # test_rm_global_refused, which implied a reserved-name guard that does
+        # not exist; the real error is "no policy", not "reserved name".)
         from brig.commands.policy_cmd import cmd_policy_rm
         with self.assertRaises(BrigError) as ctx:
             cmd_policy_rm(SimpleNamespace(name="global"))
-        self.assertIn("global", str(ctx.exception).lower())
+        self.assertIn("no policy", str(ctx.exception).lower())
+
+    def test_policy_commands_reject_traversal_cell_name(self):
+        # args.name flows into per-cell policy file paths; a '/'/'..' name must
+        # be rejected before touching the filesystem (invariant 4 boundary).
+        from brig.commands import policy_cmd
+        for handler in (policy_cmd.cmd_policy_show, policy_cmd.cmd_policy_rm,
+                        policy_cmd.cmd_policy_set):
+            with self.assertRaises(BrigError) as ctx:
+                handler(SimpleNamespace(name="../../etc/passwd",
+                                        allow=None, deny=None,
+                                        remove_allow=None, remove_deny=None))
+            self.assertIn("invalid cell name", str(ctx.exception).lower())
 
 
 class TestDeprecatedCommandsRemoved(unittest.TestCase):

@@ -142,6 +142,63 @@ class TestBuildRunCommand(unittest.TestCase):
         idx = cmd.index("--runtime")
         self.assertEqual(cmd[idx + 1], "runsc")
 
+    def _markers(self, cmd):
+        return [
+            cmd[i + 1] for i, a in enumerate(cmd)
+            if a == "--label" and i + 1 < len(cmd)
+            and cmd[i + 1].startswith("brig.profile")
+        ]
+
+    def test_untrusted_cell_emits_trust_label_end_to_end(self):
+        # The REAL create chain: CLI seeds labels=[] -> apply_profile('untrusted')
+        # -> CellSpec -> build_run_command. The container MUST carry
+        # brig.profile=untrusted, or the ingress auth:none replay gate (which
+        # reads that container label) is dead for every untrusted cell.
+        from brig.cell.profiles import apply_profile, load_profile
+        merged = apply_profile(
+            {"name": "u", "image": "alpine", "labels": []},
+            load_profile("untrusted"),
+        )
+        merged["profile"] = "untrusted"  # as lifecycle_run/sdk set spec.profile
+        cmd = build_run_command(CellSpec(**merged), "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+
+    def test_trust_marker_stamped_despite_user_labels(self):
+        # yaml/CLI labels block must NOT drop the marker (the reconciler stamps
+        # it authoritatively from spec.profile, independent of spec.labels).
+        spec = CellSpec(name="u", image="alpine", profile="untrusted",
+                        labels=["team=red"])
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+
+    def test_user_cannot_shadow_trust_marker(self):
+        # A user brig.profile=trusted on an untrusted cell must be overridden by
+        # the authoritative untrusted marker — and appear exactly once.
+        spec = CellSpec(name="u", image="alpine", profile="untrusted",
+                        labels=["brig.profile=trusted"])
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+
+    def test_custom_list_form_untrusted_profile_lands_marker(self):
+        # A custom profile whose OWN labels are a list (['brig.profile=untrusted'])
+        # — apply_profile's dict-only merge dropped it, but the reconciler stamps
+        # authoritatively via _profile_is_untrusted, which honors the list form.
+        from brig.cell.profiles import PROFILES_DIR
+        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+        pf = PROFILES_DIR / "myrole.yaml"
+        pf.write_text("memory: 1g\nlabels:\n  - brig.profile=untrusted\n")
+        try:
+            cmd = build_run_command(
+                CellSpec(name="c", image="alpine", profile="myrole"), "10.60.1.1")
+            self.assertEqual(self._markers(cmd), ["brig.profile=untrusted"])
+        finally:
+            pf.unlink()
+
+    def test_non_untrusted_profile_keeps_its_marker(self):
+        spec = CellSpec(name="s", image="alpine", profile="supervised")
+        cmd = build_run_command(spec, "10.60.1.1")
+        self.assertEqual(self._markers(cmd), ["brig.profile=supervised"])
+
     def test_proxy_env_uses_warden_dns_name_not_ip(self):
         """Proxy env points the cell at warden by DNS NAME (stable across warden
         restarts), not the literal per-cell IP (which goes stale → silent egress

@@ -11,10 +11,23 @@ from __future__ import annotations
 import argparse
 import json
 
+from brig.config import CELL_NAME_PATTERN
 from brig.errors import BrigError
 from brig.ops.history import log_policy_change
 from brig.ops.logging import info, output
 from brig.policy.policy import delete_cell_policy, load_cell_policy, mutate_cell_policy
+
+
+def _require_valid_cell_name(name: str) -> None:
+    # args.name is a plain CLI positional that flows into per-cell policy file
+    # paths (load/mutate/delete_cell_policy). Validate against CELL_NAME_PATTERN
+    # (which forbids '/' and can't express '..') so a crafted name can't
+    # traverse into or out of the policy dir.
+    if not isinstance(name, str) or not CELL_NAME_PATTERN.match(name):
+        raise BrigError(
+            f"Invalid cell name '{name}': must start with a lowercase letter or "
+            f"digit, then up to 62 of [a-z0-9._-] — no uppercase, no '/'."
+        )
 
 
 def register_parser(sub) -> None:
@@ -42,6 +55,7 @@ def register_parser(sub) -> None:
 
 
 def cmd_policy_show(args: argparse.Namespace) -> int:
+    _require_valid_cell_name(args.name)
     policy = load_cell_policy(args.name)
     if policy is None:
         # No per-cell policy file = default deny. Don't error — show
@@ -57,6 +71,7 @@ def cmd_policy_show(args: argparse.Namespace) -> int:
 
 def cmd_policy_test(args: argparse.Namespace) -> int:
     """Simulate a request against a cell's policy."""
+    _require_valid_cell_name(args.name)
     policy = load_cell_policy(args.name)
     if policy is None:
         output(f"BLOCKED: cell '{args.name}' has no policy (default deny)")
@@ -99,6 +114,7 @@ def cmd_policy_test(args: argparse.Namespace) -> int:
 
 
 def cmd_policy_set(args: argparse.Namespace) -> int:
+    _require_valid_cell_name(args.name)
     # Read-modify-write under one exclusive lock so a concurrent `brig run`
     # re-sync or parallel `brig policy set` can't drop this update.
     captured: dict = {}
@@ -167,6 +183,7 @@ def _apply_policy_changes(args: argparse.Namespace, policy: dict) -> dict:
 
 
 def cmd_policy_rm(args: argparse.Namespace) -> int:
+    _require_valid_cell_name(args.name)
     if delete_cell_policy(args.name):
         log_policy_change(args.name, "delete", changes={})
         from brig.cell.metadata import refresh_metadata_if_present

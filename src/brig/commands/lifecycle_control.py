@@ -103,6 +103,10 @@ def cmd_start(args: argparse.Namespace) -> int:
             f"Failed to start cell '{args.name}': {result.stderr.strip()}",
             suggestion="Check if cell exists with: brig cell list",
         )
+    # Operator started it → desired state running: clear any intentional-stop
+    # marker so recovery restores the cell if it later crashes.
+    from brig.cell.metadata import clear_cell_stopped
+    clear_cell_stopped(args.name)
     # Post-start configuration must be all-or-nothing: a cell that comes up
     # but can't be fully wired (ingress unrouteable, etc.) is worse than one
     # that didn't start. Roll back (stop) on any failure so the operator isn't
@@ -208,11 +212,13 @@ def _verify_proxy_connected_after_start(cell_name: str) -> None:
 def _refresh_metadata_for_start(cell_name: str) -> None:
     """Rewrite /run/brig/cell.json on restart with a fresh `started_at`.
 
-    Preserves the original workspace_mount and ingress — these are fixed at
-    create time, so they come from the prior metadata write rather than
-    being re-derived.
-    If the file is missing or unreadable (cell predates cell.json), write
-    a default-mount fallback.
+    Preserves the original workspace_mount, workspace.quota, ingress, and
+    image_digest — these are fixed at create time, so refresh_metadata_if_present
+    carries them from the prior metadata write rather than re-deriving them.
+    If the file is missing or unreadable (cell predates cell.json, or it was
+    corrupted), write a bare default-mount fallback: the v4 fields are already
+    unrecoverable at that point, and the empty-ingress fallback means no route
+    is registered, so nothing is gated on the lost profile/quota.
     """
     from brig.cell.metadata import refresh_metadata_if_present, write_metadata
     if refresh_metadata_if_present(cell_name) is None:

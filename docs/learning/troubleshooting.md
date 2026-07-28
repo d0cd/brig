@@ -75,7 +75,7 @@ Common reasons:
 - `host header mismatch` — the cell tried to set a Host header that
   disagrees with the URL it's connecting to (smuggling defense).
 - `internal IP range blocked` — the cell tried to reach an RFC1918 / link-local IP directly.
-- `host service '<name>': cell '<cell>' has no host_services configured` —
+- `host service '<name>': cell '<cell>' has no host_services declared` —
   the cell tried `<name>.host.brig` but its per-cell policy doesn't grant
   access. Add the service name to the cell's `host_services` list (see
   `brig policy set <cell> --help`).
@@ -89,7 +89,7 @@ brig policy test <cell> <domain> --path /api
 ## Disk space
 
 `~/.brig/state/<cell>/workspace/` accumulates per-cell. The Lima VM
-has its own disk allocation (default 100 GiB) for the container layer. If
+has its own disk allocation (50 GiB, per `lima.yaml.template`) for the container layer. If
 you're running out:
 
 ```bash

@@ -116,6 +116,40 @@ sweep interval is too coarse, AND you're not moving to a VM-per-cell substrate.
 **Effort:** High. Storage re-layout, host-access rerouting through the VM,
 provisioning changes, and migration of existing cells' workspaces.
 
+### Trusted-source hardening for state-dir-read security decisions
+**Status:** Deferred — defense-in-depth for invariant 4 (untrusted state dir).
+
+Some security decisions are still read from files in the untrusted macOS state
+dir. Where the host-side path already re-derives trust from the podman container
+label (the ingress auth:none gate reads `brig.profile`), the *addon* side and a
+couple of other readers do not:
+
+- **Signed ingress routes.** `ingress-routes.json` carries each route's `auth`.
+  The host gate (`register_ingress_for`, trusted container label) refuses to
+  *write* an `auth: none` route for an untrusted cell, but the warden ingress
+  addon reads the file directly and can't re-validate a route that was tampered
+  on disk after the fact (it has no podman access). Fix: brig HMAC-signs the
+  routes file with a per-session key handed to warden via a trusted channel
+  (podman env at warden create, read via inspect), and the addon rejects an
+  unverified file. Overlaps the deleted audit-log-signing scaffolding.
+- **Digest pin via label.** `_verify_image_digest_on_start` reads the pin from
+  `cell-metadata.json`; dropping the key silently skips the start-time re-check
+  (the image ref is still digest-pinned at pull, so this is only the
+  commit-swap second layer). Fix: stamp `brig.image_digest=` as a reserved
+  container label (same mechanism as `brig.profile`) and read the pin from the
+  label.
+
+- **Pre-existing cells carry no trust marker.** The `brig.profile` label is
+  stamped at container *create*, so a cell created before the label existed has
+  none, and the replay gate can't fire for it. Not a new exposure (the
+  parse-time gate covered its creation) but the second layer is absent until
+  the cell is re-created. Fix: `brig system verify` flags label-less cells, or
+  a one-shot migration recreates them from their persisted spec.
+
+**Trigger:** hardening the invariant-4 surface beyond the host-side gates, or an
+incident involving state-dir tampering. **Effort:** Medium (HMAC key management
+for routes; Low for the digest label and the verify warning).
+
 ### Dispatcher integration
 **Status:** Deferred — dispatcher's job, not Brig's.
 

@@ -103,6 +103,30 @@ class TestYamlProfileAppliesHardening(unittest.TestCase):
             self.assertEqual(spec.memory, "512m")
             self.assertEqual(spec.pids_limit, 256)
 
+    def test_yaml_labels_block_does_not_disarm_trust_marker(self):
+        # Regression: a --file run with profile: untrusted AND its own labels:
+        # block used to clobber the profile-merged labels, dropping the trust
+        # marker. Drive the real chain and assert the emitted podman command
+        # still carries brig.profile=untrusted (the ingress replay gate needs it).
+        from brig.commands import lifecycle_run
+        from brig.cell.reconciler import build_run_command
+        with tempfile.TemporaryDirectory() as td:
+            yml = _write(Path(td), name="u", image="alpine",
+                         profile="untrusted", labels={"team": "red"})
+            args = _args(file=str(yml))
+            with patch.object(lifecycle_run, "run_cell") as run_cell, \
+                 patch("brig.ops.logging.Spinner"), \
+                 patch("brig.commands.lifecycle_run.info"):
+                lifecycle_run.cmd_run(args)
+            spec = run_cell.call_args[0][0]
+            cmd = build_run_command(spec, "10.60.1.1")
+            markers = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--label"
+                       and cmd[i + 1].startswith("brig.profile")]
+            self.assertEqual(markers, ["brig.profile=untrusted"])
+            # The user's own label survived the merge too.
+            self.assertIn("team=red", [cmd[i + 1] for i, a in enumerate(cmd)
+                                       if a == "--label"])
+
 
 if __name__ == "__main__":
     unittest.main()

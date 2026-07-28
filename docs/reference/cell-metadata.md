@@ -10,15 +10,16 @@ The pattern mirrors Kubernetes' downward API and cloud instance
 metadata: brig writes a small JSON file on the host, podman bind-mounts
 it read-only into the cell. The cell can read but cannot modify it.
 
-## Schema (v3)
+## Schema (v4)
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "name": "my-cell",
   "started_at": "2026-05-18T17:30:00Z",
   "workspace": {
-    "mount_point": "/work"
+    "mount_point": "/work",
+    "quota": "500m"
   },
   "ingress": [
     {"name": "api", "port": 8000, "path_prefix": "/api", "auth": "token"}
@@ -32,13 +33,30 @@ it read-only into the cell. The cell can read but cannot modify it.
 
 | Field | Type | Notes |
 |---|---|---|
-| `version` | int | Schema version. Currently `3`. Bumps on shape changes. |
+| `version` | int | Schema version. Currently `4`. Bumps on shape changes. |
 | `name` | string | Cell name, matches `--name` / yaml `name:`. |
 | `started_at` | string | RFC 3339 UTC timestamp of cell creation. |
 | `workspace.mount_point` | string | Path inside the cell, default `/work`, overridable via `workspace_mount` in the cell spec. |
+| `workspace.quota` | string? | Optional. The cell's `workspace_quota` (e.g. `500m`). Persisted here — not only in the restart-only `cell-spec.json` — so quota enforcement (the `brig system watchdog` sweep and the `brig cp` guard) can find it for every cell. Soft quota; see `--workspace-quota`. |
 | `policy.host_services` | string[] | Per-cell host-service ACL — the names of host services this cell may reach. Ports live in the per-cell policy file on disk; metadata exposes names only. |
 | `ingress[]` | `[{name, port, path_prefix, auth}]` | Ingress endpoints the cell publishes through warden's `:8443` reverse proxy. `auth` is `token` (default; the bearer token is never stored here — it lives in `~/.brig/secrets/<cell>-ingress-token`) or `none` (transparent pass-through, no token). `brig cell start` uses this list to replay route registration with a freshly-inspected cell IP after a `brig system down` / `up` cycle. |
-| `image_digest` | string? | Optional. Set when the cell was created with a pinned digest. `brig cell start` re-verifies the container's current image digest against this value before letting the cell start. |
+| `image_digest` | string? | Optional. Set when the cell was created with a pinned digest (`sha256:<64-hex>`). `brig cell start` re-verifies the container's current image digest against this value before letting the cell start. |
+
+The cell's trust **profile** is deliberately NOT stored here: the ingress-replay `auth: none` gate on `brig cell start` reads it from the trusted podman container label (`brig.profile`), because this metadata file is untrusted (invariant 4) and a tampered copy must not be able to relax a security control.
+
+### What changed in v4
+
+v3 → v4 **removed** the top-level `profile` field. Trust decisions must not be
+read from this file (invariant 4), so the ingress-replay `auth: none` gate now
+reads the profile off the trusted podman container label instead — see the note
+above. A v3 file left on disk still carries `profile`; v4 readers ignore it, and
+nothing is gated on it.
+
+v4 also documents `workspace.quota`, which the v3 *writer* already emitted but
+the v3 schema never listed.
+
+Not purely additive — a consumer that read `profile` from this file was reading
+an untrusted value and must switch to the container label.
 
 ### What changed in v3
 

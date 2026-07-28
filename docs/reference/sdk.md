@@ -104,7 +104,7 @@ def run_sync(
     workspace_mount: str = "/work",
     writable_rootfs: bool = False,
     seccomp_profile: str | None = None,
-    restart: str = "no",          # "always" re-launches on `brig system up`
+    restart: str = "no",          # "always": recover on crash/reboot (up + watchdog); an explicit stop is respected
     user: str | None = None,      # podman --user; "0" to own a rw mounts: dir
 ) -> Cell
 ```

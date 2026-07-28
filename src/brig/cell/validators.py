@@ -236,6 +236,11 @@ _USER_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(:[A-Za-z0-9_][A-Z
 
 def _v_user(value: Any, context: str) -> list[str]:
     """Cell process user (podman --user) — uid[:gid] or name[:group]."""
+    if value is None:
+        # Unset → no --user override (image default). A persisted spec always
+        # carries user=None when the cell.yaml omits it, so rejecting None here
+        # made restart:always cells unrestorable (re-validation failed).
+        return []
     if not isinstance(value, str) or not _USER_PATTERN.match(value):
         return [f"'user' must be uid[:gid] or name[:group] (e.g. '0' or "
                 f"'1000:1000'){context}"]
@@ -244,6 +249,12 @@ def _v_user(value: Any, context: str) -> list[str]:
 
 def _v_workspace_quota(value: Any, context: str) -> list[str]:
     from brig.cell.spec import parse_size
+    if value is None:
+        # Unset → no quota. A persisted spec always carries workspace_quota=None
+        # when the cell.yaml omits it, so rejecting None here made every such
+        # restart:always cell unrestorable (re-validation failed). Same shape as
+        # _v_user; see test_persisted_default_spec_revalidates_clean.
+        return []
     if not isinstance(value, str):
         return [f"'workspace_quota' must be a string like '500m' or '2g'{context}"]
     try:
@@ -331,6 +342,14 @@ def _v_detach(value: Any, context: str) -> list[str]:
     return []
 
 
+def _v_rm(value: Any, context: str) -> list[str]:
+    # bool only — a truthy non-bool (e.g. a string) would silently enable
+    # `podman run --rm` (auto-delete the cell on exit) on a mistyped value.
+    if not isinstance(value, bool):
+        return [f"'rm' must be a boolean{context}"]
+    return []
+
+
 def _v_labels(value: Any, context: str) -> list[str]:
     if value is None:
         return []
@@ -377,6 +396,19 @@ def _v_seccomp_profile(value: Any, context: str) -> list[str]:
         return [f"'seccomp_profile' must not be 'unconfined' (disables seccomp){context}"]
     if "/" in value or ".." in value:
         return [f"'seccomp_profile' must be a filename, not a path{context}"]
+    return []
+
+
+def _v_profile(value: Any, context: str) -> list[str]:
+    # The profile name resolves to ~/.brig/profiles/<name>.{yaml,yml,json} (or a
+    # builtin); a path / traversal / null byte would escape that directory when
+    # load_profile builds the file path.
+    if value is None:
+        return []
+    if not isinstance(value, str) or not value:
+        return [f"'profile' must be a non-empty string{context}"]
+    if "/" in value or ".." in value or "\x00" in value:
+        return [f"'profile' must be a bare name, not a path{context}"]
     return []
 
 
@@ -769,9 +801,11 @@ _SIMPLE_VALIDATORS = {
     "writable_rootfs": _v_writable_rootfs,
     "trust_warden_ca": _v_trust_warden_ca,
     "detach": _v_detach,
+    "rm": _v_rm,
     "labels": _v_labels,
     "timeout": _v_timeout,
     "seccomp_profile": _v_seccomp_profile,
+    "profile": _v_profile,
     "workdir": _v_workdir,
     "image_digest": _v_image_digest,
     "restart": _v_restart,

@@ -120,12 +120,20 @@ seccomp_profile: default.json
 # Execution mode
 detach: false                    # Run in background
 
-# Restart policy (default: no). "always" re-launches the cell on
-# `brig system up` whenever its container is gone — e.g. a VM restart drops
-# every container. brig persists the full spec at run time to replay it.
-# An *exited* cell (still present, e.g. `brig cell stop`) is left alone, but a
-# VM restart drops the container, so a stopped restart:always cell DOES
-# relaunch on the next up; use `brig cell rm` to keep one down for good.
+# Restart policy (default: no). "always" recovers the cell whenever it goes
+# down *unexpectedly* — it crashed, was SIGKILLed, or a VM restart dropped its
+# container — on `brig system up` and continuously from `brig system watchdog`.
+# brig persists the full spec at run time to replay it.
+#
+# An explicit `brig cell stop` / `kill` is respected: brig records a stop
+# marker (desired state = stopped) and leaves the cell down until you run
+# `brig cell start`. This is the systemd `Restart=always` / Docker
+# `unless-stopped` distinction between "it failed" (recover) and "I stopped it"
+# (leave alone). `brig cell rm` removes it entirely.
+#
+# `brig system down` takes the whole harness down rather than expressing intent
+# about any one cell, so it records no marker — these cells come back on the
+# next `brig system up`.
 restart: always
 
 # Process user (podman --user; uid[:gid] or name[:group]). Default: the image's

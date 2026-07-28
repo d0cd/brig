@@ -74,6 +74,12 @@ def load_profile(name: str, profiles_dir: Path = PROFILES_DIR) -> dict[str, Any]
 
     Raises ValueError if not found or if a user file shadows a builtin.
     """
+    # Defense in depth: this runs at cell-run time, potentially before/around
+    # validate_cell_definition, so guard traversal here too — a name with '/',
+    # '..', or a null byte would resolve `profiles_dir / f"{name}{ext}"` outside
+    # the profiles directory.
+    if not isinstance(name, str) or "/" in name or ".." in name or "\x00" in name:
+        raise ValueError(f"Invalid profile name '{name}'")
     for ext in (".yaml", ".yml", ".json"):
         user_profile = profiles_dir / f"{name}{ext}"
         if user_profile.exists():
@@ -139,8 +145,24 @@ def apply_profile(spec: dict[str, Any], profile: dict[str, Any]) -> dict[str, An
     if "labels" in profile:
         profile_labels = profile["labels"]
         if isinstance(profile_labels, dict):
-            existing = merged.get("labels", {})
-            if isinstance(existing, dict):
-                merged["labels"] = {**profile_labels, **existing}
+            existing = merged.get("labels")
+            if isinstance(existing, list):
+                # CLI/SDK seed labels as a LIST of "KEY=value" strings; the
+                # dict-only merge below would silently drop the profile's
+                # labels for them. Append the profile's labels (as KEY=value)
+                # for keys the list doesn't already set. Load-bearing:
+                # brig.profile=untrusted is the trust marker the ingress
+                # auth:none replay gate reads off the container label, so it
+                # MUST land on every untrusted cell (create seeds labels=[]).
+                existing_keys = {
+                    e.split("=", 1)[0] for e in existing if isinstance(e, str)
+                }
+                merged["labels"] = existing + [
+                    f"{k}={v}" for k, v in profile_labels.items()
+                    if k not in existing_keys
+                ]
+            else:
+                existing_dict = existing if isinstance(existing, dict) else {}
+                merged["labels"] = {**profile_labels, **existing_dict}
 
     return merged

@@ -121,6 +121,14 @@ class RequestLogger:
                 max_size_mb = int(quota_config.get("max_size_mb", 100))
             except (TypeError, ValueError):
                 max_size_mb = 100
+            if max_size_mb < 1:
+                # A zero/negative size makes the rotation comparison never fire,
+                # disabling rotation (unbounded log growth). Fall back to default.
+                ctx.log.warn(
+                    f"RequestLogger: log_quota.max_size_mb={max_size_mb} is not "
+                    f"positive; using 100MB"
+                )
+                max_size_mb = 100
             self.max_log_size = max_size_mb * 1024 * 1024
             self.async_writer.max_log_size = self.max_log_size
 

@@ -76,7 +76,13 @@ class IngressRoute:
         self.port = route["port"]
         self.path_prefix = route["path_prefix"]
         # Default to "token" (fail-secure): a route missing `auth` is gated,
-        # never silently treated as open.
+        # never silently treated as open. NOTE (invariant 4): the routes file
+        # lives in the untrusted state dir. The PRIMARY defense against an
+        # auth:none route on an untrusted cell is the host-side gate in
+        # lifecycle.register_ingress_for (keyed on the TRUSTED container label),
+        # which refuses to write such a route. This addon does not independently
+        # re-validate a directly-tampered routes file — signed routes are the
+        # deferred hardening (docs/ROADMAP.md, "Trusted-source hardening").
         self.auth = route.get("auth", "token")
         self.auth_secret_hash = route.get("auth_secret_hash", "")
         self.auth_salt = route.get("auth_salt", "")
@@ -202,6 +208,17 @@ class IngressRouter:
                     ctx.log.warn(
                         f"IngressRouter: Skipping route with invalid cell_ip: "
                         f"{route.cell_ip} ({e})"
+                    )
+                    continue
+                # Validate port from the untrusted routes file (invariant 4) —
+                # it's used to forward to cell_ip:port, so reject anything that
+                # isn't a real TCP port. bool is an int subclass; reject it too.
+                if (isinstance(route.port, bool)
+                        or not isinstance(route.port, int)
+                        or not 1 <= route.port <= 65535):
+                    ctx.log.warn(
+                        f"IngressRouter: Skipping route '{route.name}' with "
+                        f"invalid port: {route.port!r}"
                     )
                     continue
                 if route.cell not in new_routes:

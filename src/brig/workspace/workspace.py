@@ -44,15 +44,16 @@ def copy_out(cell_name: str, src: str, dst: str, sanitize: bool = False) -> None
 
     if sanitize:
         try:
-            if dst_path.is_dir():
-                _sanitize_tree(dst_path)
-            elif dst_path.is_symlink():
-                # A single-file copy-out that landed as a symlink is a
-                # confused-deputy risk (it can point at a host file outside the
-                # destination, e.g. ~/.ssh/id_rsa). The tree path already prunes
-                # escaping symlinks; refuse the single-file case too.
+            # is_symlink() MUST be tested before is_dir()/is_file(), which
+            # follow the link: a symlink-to-directory would otherwise slip into
+            # the tree arm and drive _sanitize_tree / xattr -r against the link
+            # TARGET — a confused deputy chmod/unlink/xattr on an arbitrary host
+            # directory. Refuse any copied-out symlink (file or dir).
+            if dst_path.is_symlink():
                 dst_path.unlink()
                 raise BrigError(f"Refusing copied-out symlink: {dst}")
+            elif dst_path.is_dir():
+                _sanitize_tree(dst_path)
             else:
                 _sanitize_file(dst_path)
         except BrigError:
@@ -78,9 +79,14 @@ def copy_out(cell_name: str, src: str, dst: str, sanitize: bool = False) -> None
         # entry (dst/<basename>) instead.
         quarantine_target = dst_path
         if dst_preexisted and dst_path.is_dir():
-            copied = dst_path / Path(src).name
-            if copied.exists():
-                quarantine_target = copied
+            # Guard the basename: a src ending in '.'/'..'/'' would resolve the
+            # copied entry to dst itself or its PARENT, retargeting the recursive
+            # xattr outside the destination.
+            name = Path(src).name
+            if name and name not in (".", ".."):
+                copied = dst_path / name
+                if copied.exists():
+                    quarantine_target = copied
         _apply_quarantine(quarantine_target)
 
 
@@ -173,12 +179,19 @@ def _apply_quarantine(path: Path) -> None:
     tree with only its root marked would leave the payloads unquarantined.
     """
     cmd = ["xattr", "-w", "com.apple.quarantine", "0083;00000000;Brig;", str(path)]
-    if path.is_dir():
+    # Recurse only into a REAL directory — os.path.isdir follows symlinks, so
+    # exclude a symlinked dir to avoid marking the link target's tree.
+    if os.path.isdir(path) and not os.path.islink(path):
         cmd.insert(1, "-r")
     try:
-        subprocess.run(cmd, check=False, capture_output=True)
+        result = subprocess.run(cmd, check=False, capture_output=True)
     except OSError:
-        pass  # Not on macOS or xattr unavailable.
+        return  # Not on macOS or xattr unavailable — quarantine is a no-op.
+    if result.returncode != 0:
+        # xattr exists (macOS) but the mark failed — surface it, since the
+        # copied-out file is then NOT Gatekeeper-quarantined as intended.
+        warn(f"Quarantine xattr not applied to {path} "
+             f"(exit {result.returncode}); the file is not Gatekeeper-marked")
 
 
 def _get_workspace_size(cell_name: str) -> int | None:

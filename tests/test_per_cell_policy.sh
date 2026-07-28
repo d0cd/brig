@@ -49,29 +49,29 @@ fi
 
 # Test 2: a different cell with its own allow reaches its domain.
 echo
-echo "--- Test 2: Custom allow permits httpbin.org ---"
-$BRIG run -d --name policy-cell-2 --policy-allow httpbin.org alpine sleep 600 >/dev/null 2>&1 || true
+echo "--- Test 2: Custom allow permits example.org ---"
+$BRIG run -d --name policy-cell-2 --policy-allow example.org alpine sleep 600 >/dev/null 2>&1 || true
 sleep 2
-if in_cell policy-cell-2 wget -q -O /dev/null --timeout=10 http://httpbin.org/get 2>/dev/null; then
-    log_pass "Cell with custom allow can reach httpbin.org"
+if in_cell policy-cell-2 wget -q -O /dev/null --timeout=10 http://example.org/ 2>/dev/null; then
+    log_pass "Cell with custom allow can reach example.org"
 else
-    log_fail "Cell with custom allow cannot reach httpbin.org"
+    log_fail "Cell with custom allow cannot reach example.org"
 fi
 
 # Test 3: a domain not in the cell's allowlist is blocked (default-deny).
 echo
 echo "--- Test 3: Default-deny blocks non-allowed domain ---"
-if in_cell policy-cell-1 wget -q -O /dev/null --timeout=5 http://httpbin.org/get 2>/dev/null; then
-    log_fail "Cell reached httpbin.org despite not allowing it"
+if in_cell policy-cell-1 wget -q -O /dev/null --timeout=5 http://example.org/ 2>/dev/null; then
+    log_fail "Cell reached example.org despite not allowing it"
 else
-    log_pass "Default-deny correctly blocks httpbin.org"
+    log_pass "Default-deny correctly blocks example.org"
 fi
 
 # Test 4: policy show reflects the cell's allowlist.
 echo
 echo "--- Test 4: brig policy show displays the allowlist ---"
 POLICY_OUTPUT=$($BRIG policy show policy-cell-2 2>/dev/null || echo "")
-if echo "$POLICY_OUTPUT" | grep -q "httpbin.org"; then
+if echo "$POLICY_OUTPUT" | grep -q "example.org"; then
     log_pass "brig policy show displays custom allowlist"
 else
     log_fail "brig policy show missing custom domain"
@@ -80,9 +80,9 @@ fi
 # Test 5: a runtime policy update takes effect.
 echo
 echo "--- Test 5: brig policy set updates policy at runtime ---"
-$BRIG policy set policy-cell-1 --allow httpbin.org >/dev/null 2>&1 || true
+$BRIG policy set policy-cell-1 --allow example.org >/dev/null 2>&1 || true
 sleep 2
-if in_cell policy-cell-1 wget -q -O /dev/null --timeout=10 http://httpbin.org/get 2>/dev/null; then
+if in_cell policy-cell-1 wget -q -O /dev/null --timeout=10 http://example.org/ 2>/dev/null; then
     log_pass "Runtime policy update allows the new domain"
 else
     log_fail "Runtime policy update not working"

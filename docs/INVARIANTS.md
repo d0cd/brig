@@ -70,9 +70,18 @@ proxy logs, not prevention.
 | Surface | Location |
 |---|---|
 | Path validation | `src/brig/security/secrets.py:validate_secret_path` — resolve + relative_to |
+| Trust marker (pattern) | A runtime security decision must not read its input from the state dir. `src/brig/cell/reconciler.py:build_run_command` stamps the reserved `brig.profile` container label from `spec.profile` — skipping any user/yaml/profile-merged `brig.profile` so it can't be dropped or shadowed — and the consumer reads it back via `podman inspect`. |
+| Trust marker (consumer) | `src/brig/cell/lifecycle.py:register_ingress_for` re-applies the untrusted-profile `auth: none` gate on the `brig cell start` replay path, keyed on `Config.Labels["brig.profile"]`. Reading it from `cell-metadata.json` would let a tampered copy relax the gate by dropping the key — the schema therefore does NOT publish `profile` (v4). |
+| Tampered-input readers | `cell/metadata.py` readers (`read_ingress`, `read_image_digest`, `read_workspace_quota`, `refresh_metadata_if_present`) return their empty default on a non-dict payload; `warden_addons/enforce.py:_reload_cell_policies` skips a non-dict or structurally-invalid per-cell policy (broad `except` — the loader runs inside `request()`/`http_connect()`, where an escaping exception fails OPEN); `warden_addons/ingress.py` skips routes with an out-of-range port. |
 | Unit test | `tests/test_security_secrets.py::TestValidateSecretPath` — legit file, symlink escape, double-hop symlink, nonexistent secret |
+| Unit test | `tests/test_cell_reconciler.py::TestBuildRunCommand` — trust marker emitted end-to-end through the real `apply_profile` → `CellSpec` → `build_run_command` chain; not droppable by yaml/CLI labels; not shadowable by a user `--label brig.profile=`; list-form custom profile still lands it |
+| Unit test | `tests/test_audit_batch2_lifecycle.py::TestIngressReplayUntrustedAuthNoneGate` — gate keys on the container label, not metadata |
+| Unit test | `tests/test_run_profile_enforcement.py::test_yaml_labels_block_does_not_disarm_trust_marker` |
+| Unit test | `tests/test_cell_metadata.py::TestBuildMetadata::test_v4_does_not_publish_profile`; `::test_readers_tolerate_tampered_non_dict_metadata` |
+| Unit test | `tests/test_addons_security.py::TestReloadCellPolicies` — non-dict and malformed-rule policy files must not escape the loader |
 | E2E test | `tests/test_hardening.sh` |
 | CI | Unit (the E2E `.sh` lane is gated on nested-virt and does NOT run on GitHub-hosted CI — manual/dispatch only) |
+| Known gap | Cells **created before** the trust-marker change carry no `brig.profile` label, so the replay gate can't fire for them; re-create such cells (`brig cell rm` + `brig run --file`) to get the label. Remaining state-dir-read gaps (signed ingress routes, digest pin via label) are tracked in `docs/ROADMAP.md` → "Trusted-source hardening". |
 
 ### 5. gVisor Must Be Active (no silent downgrade)
 

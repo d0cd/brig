@@ -61,19 +61,6 @@ def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
     seen_prefixes: set = set()
     for i, entry in enumerate(ingress_spec):
         errors.extend(_v_ingress_entry(i, entry, seen_names, seen_prefixes, ""))
-    # Re-apply the untrusted-profile auth:none gate on replay. The profile is
-    # read from the (untrusted) metadata, but the check is fail-closed: a
-    # tampered file that adds an auth:none route to an untrusted cell is
-    # refused, matching the parse-time gate in _v_ingress.
-    from brig.cell.metadata import read_profile
-    from brig.cell.validators import _profile_is_untrusted
-    if _profile_is_untrusted(read_profile(cell_name)):
-        for i, entry in enumerate(ingress_spec):
-            if isinstance(entry, dict) and entry.get("auth") == "none":
-                errors.append(
-                    f"ingress[{i}].auth: none is not allowed with the untrusted "
-                    f"profile — untrusted cells must keep brig's token gate"
-                )
     if errors:
         raise BrigError(
             f"Refusing to register ingress for '{cell_name}': "
@@ -112,6 +99,27 @@ def register_ingress_for(cell_name: str, ingress_spec: list[dict]) -> None:
             f"unregistered.",
             suggestion=f"brig cell logs {cell_name}",
         )
+
+    # Re-apply the untrusted-profile auth:none gate. Derive untrusted-ness from
+    # the TRUSTED podman container label (set as `--label brig.profile=...` at
+    # create, immutable, read from podman's store) — NOT cell-metadata.json,
+    # which invariant 4 names as untrusted and which this gate exists to police.
+    # Reading the trust decision from that file would let a tampered copy bypass
+    # the gate by dropping the profile.
+    labels = (container_info.get("Config", {}) or {}).get("Labels", {}) or {}
+    if labels.get("brig.profile") == "untrusted":
+        for i, entry in enumerate(ingress_spec):
+            if isinstance(entry, dict) and entry.get("auth") == "none":
+                raise BrigError(
+                    f"Refusing ingress for '{cell_name}': ingress[{i}].auth: "
+                    f"none is not allowed with the untrusted profile — untrusted "
+                    f"cells must keep brig's token gate",
+                    suggestion=(
+                        f"~/.brig/state/{cell_name}/cell-metadata.json may have "
+                        f"been hand-edited. Re-create from yaml: brig cell rm "
+                        f"{cell_name} && brig run --file <yaml>"
+                    ),
+                )
 
     # A token is needed only if at least one route is auth: token. An
     # all-`auth: none` cell (transparent pass-through) requires no secret.
@@ -211,12 +219,11 @@ def list_cell_containers(*, include_stopped: bool = True) -> list[tuple[str, dic
     return out
 
 
-# Exact hex length per algorithm — an open-ended {64,} would accept an
-# over-long sha256 or a wrong-length sha384/sha512 as well-formed.
-# Only sha256 is accepted: OCI registry manifest digests (what podman matches
-# at pull time and reports as {{.ImageDigest}} for the start-time re-check) are
+# Only sha256 is accepted: OCI registry manifest digests — what podman matches
+# at pull time and reports as {{.ImageDigest}} for the start-time re-check — are
 # sha256, so a sha384/sha512 pin could never match and the cell would fail to
-# start with a spurious "digest drift".
+# start with a spurious "digest drift". Exact 64 hex chars (not an open {64,})
+# so an over-long value can't slip through as well-formed.
 _DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-fA-F]{64}\Z")
 
 
@@ -450,6 +457,12 @@ def run_cell(
             debug(f"rollback rm_cell failed: {cleanup_err}")
         raise
 
+    # The cell is up: desired state is "running", so clear any intentional-stop
+    # marker and a later crash/reboot auto-recovers it. Only on success — a
+    # rolled-back run must not re-arm recovery for a cell the operator stopped.
+    from brig.cell.metadata import clear_cell_stopped
+    clear_cell_stopped(spec.name)
+
     # Persist the spec for restart:always cells so `brig system up` can
     # re-launch them after a VM restart. Best-effort — a persistence failure
     # must not fail an otherwise-healthy cell.
@@ -468,32 +481,39 @@ def run_cell(
 
 
 def restore_persisted_cells() -> None:
-    """Re-launch `restart: always` cells whose container is gone, on
-    `brig system up` (once warden is up).
+    """Re-launch `restart: always` cells that are down but whose desired state
+    is running — they crashed, were SIGKILLed, or the VM dropped them. Called
+    by `brig system up` (once warden is up) and by the watchdog loop.
 
-    A cell is restored only when its container no longer exists. An *exited*
-    cell (still present — e.g. an explicit `brig cell stop`) is left alone.
-    Note a VM restart drops every container, so a stopped restart:always cell
-    DOES relaunch on the next up; use `brig cell rm` to keep one down for good.
+    A cell the operator intentionally stopped (`brig cell stop`/`kill`, which
+    sets the stop marker) is left down until an explicit `brig cell start` —
+    the systemd `Restart=always` / Docker `unless-stopped` distinction:
+    unexpected exits recover, a deliberate stop is respected.
 
     The persisted spec is re-validated before launch (the state dir is
     untrusted, invariant 4) and replayed without counting against the creation
     rate limit (these cells were already authorized).
     """
     import dataclasses
-    from brig.cell.metadata import restorable_cell_specs
+    from brig.cell.metadata import cell_marked_stopped, restorable_cell_specs
     from brig.cell.spec import validate_cell_definition
 
     valid = {f.name for f in dataclasses.fields(CellSpec)}
     for raw in restorable_cell_specs():
         name = raw.get("name")
-        if not name or observe(name).exists:
+        if not name:
+            continue
+        state = observe(name)
+        # Running → healthy. Intentionally stopped → respect it. Otherwise the
+        # cell is down unexpectedly (crashed / VM-dropped) → recover it.
+        if state.running or cell_marked_stopped(name):
             continue
         errs = validate_cell_definition(raw)
         if errs:
             info(f"  (warn) skipping restore of '{name}': invalid persisted spec: {errs[0]}")
             continue
-        info(f"Restoring cell '{name}' (restart: always)...")
+        verb = "Recovering" if state.exists else "Restoring"
+        info(f"{verb} cell '{name}' (restart: always)...")
         try:
             spec = CellSpec(**{k: v for k, v in raw.items() if k in valid})
             run_cell(spec, count_against_rate_limit=False)
@@ -501,8 +521,16 @@ def restore_persisted_cells() -> None:
             info(f"  (warn) could not restore cell '{name}': {e}")
 
 
-def stop_cell(cell_name: str) -> None:
-    """Gracefully stop a running cell."""
+def stop_cell(cell_name: str, mark_stopped: bool = True) -> None:
+    """Gracefully stop a running cell.
+
+    `mark_stopped=False` stops the cell WITHOUT recording the intentional-stop
+    marker — for `brig system down`, which takes the whole harness down rather
+    than expressing intent about any one cell. Marking there would opt every
+    cell out of `restart: always` recovery permanently, so the next `brig
+    system up` (or watchdog tick) would leave a VM-dropped cell down until a
+    manual per-cell `brig cell start`.
+    """
     actual = observe(cell_name)
     if not actual.exists:
         raise BrigError(
@@ -524,6 +552,12 @@ def stop_cell(cell_name: str) -> None:
     result = apply(actions)
 
     if result.success:
+        if mark_stopped:
+            # Desired state is now "stopped": recovery (brig system up +
+            # watchdog) leaves a restart:always cell down until an explicit
+            # start.
+            from brig.cell.metadata import mark_cell_stopped
+            mark_cell_stopped(cell_name)
         log_operation("stop", cell_name=cell_name)
         log_lifecycle("stop", cell_name)
     else:
@@ -562,6 +596,9 @@ def kill_cell(cell_name: str) -> None:
 
     result = apply([Action(ActionType.PODMAN_KILL, cell_name)])
     if result.success:
+        # Operator take-down → desired state "stopped" (see stop_cell).
+        from brig.cell.metadata import mark_cell_stopped
+        mark_cell_stopped(cell_name)
         log_operation("kill", cell_name=cell_name)
         log_lifecycle("kill", cell_name)
     else:

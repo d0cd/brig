@@ -1005,3 +1005,30 @@ class TestIngressRateLimitEviction(unittest.TestCase):
         flow.response = None
         router.request(flow)
         self.assertIn("198.51.100.7", router._auth_failures)
+
+
+class TestIngressRoutePortValidation(unittest.TestCase):
+    """A route with an out-of-range port from the untrusted routes file must be
+    skipped (invariant 4), not forwarded to cell_ip:<bad-port>."""
+
+    def test_route_with_invalid_port_is_skipped(self):
+        import json as _json
+        import tempfile as _tf
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "brig" / "warden_addons"))
+        try:
+            import ingress as ingress_mod
+        finally:
+            _sys.path.pop(0)
+        good = {"cell": "c1", "cell_ip": "10.60.1.2", "name": "api",
+                "port": 8642, "path_prefix": "/api", "auth_secret_hash": "h"}
+        bad = {"cell": "c2", "cell_ip": "10.60.2.2", "name": "api",
+               "port": 99999, "path_prefix": "/api", "auth_secret_hash": "h"}
+        with _tf.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"routes": [good, bad]}, f)
+            path = Path(f.name)
+        router = ingress_mod.IngressRouter()
+        with patch.object(ingress_mod, "ROUTES_FILE", path):
+            router._reload_routes(strict=True)
+        self.assertIn("c1", router.routes)       # valid port kept
+        self.assertNotIn("c2", router.routes)    # port 99999 skipped

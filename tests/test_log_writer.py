@@ -164,6 +164,13 @@ class TestLogQuotaCoercion(unittest.TestCase):
         inst = self._reloaded({"max_size_mb": "not-a-number"})
         self.assertEqual(inst.max_log_size, 100 * 1024 * 1024)
 
+    def test_non_positive_max_size_falls_back_to_default(self):
+        # 0/negative would make the rotation comparison never fire (unbounded
+        # growth); floor to the 100MB default.
+        for bad in (0, -5):
+            inst = self._reloaded({"max_size_mb": bad})
+            self.assertEqual(inst.max_log_size, 100 * 1024 * 1024, bad)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -153,35 +153,50 @@ class TestEnforceWorkspaceQuotas(unittest.TestCase):
 
 
 class TestIngressReplayUntrustedAuthNoneGate(unittest.TestCase):
-    """The ingress-replay path (brig cell start) must re-apply the
-    untrusted-profile auth:none gate using the persisted profile — a tampered
-    cell-metadata.json can't hand an untrusted cell an unauthenticated route."""
+    """The ingress-replay path (brig cell start) re-applies the untrusted-profile
+    auth:none gate using the TRUSTED podman container label (brig.profile) — NOT
+    the untrusted cell-metadata.json — so a tampered/absent metadata profile
+    can't hand an untrusted cell an unauthenticated route."""
 
-    def _persist_profile(self, cell, profile):
-        from brig.cell.metadata import write_metadata, _host_metadata_path
-        _host_metadata_path(cell).parent.mkdir(parents=True, exist_ok=True)
-        write_metadata(cell, "/work", profile=profile)
+    def _inspect(self, profile_label, cell):
+        labels = {"brig.profile": profile_label} if profile_label else {}
+        return {
+            "Config": {"Labels": labels},
+            "NetworkSettings": {"Networks": {f"brig-{cell}": {"IPAddress": "10.60.1.2"}}},
+        }
 
     def test_untrusted_auth_none_refused_on_replay(self):
         from brig.cell.lifecycle import register_ingress_for
         from brig.errors import BrigError
-        self._persist_profile("adv", "untrusted")
         entry = {"name": "api", "port": 8642, "path_prefix": "/api", "auth": "none"}
-        with self.assertRaises(BrigError) as ctx:
-            register_ingress_for("adv", [entry])
-        self.assertIn("auth: none is not allowed", str(ctx.exception))
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value=self._inspect("untrusted", "adv")):
+            with self.assertRaises(BrigError) as ctx:
+                register_ingress_for("adv", [entry])
+        self.assertIn("auth: none", str(ctx.exception))
 
-    def test_trusted_auth_none_passes_the_gate(self):
-        # A non-untrusted cell may use auth:none; the gate must NOT fire (it
-        # proceeds and fails later on container inspect, a different error).
+    def test_trusted_auth_none_registers(self):
+        # A non-untrusted cell may use auth:none; the gate must NOT fire.
+        from brig.cell.lifecycle import register_ingress_for
+        entry = {"name": "api", "port": 8642, "path_prefix": "/api", "auth": "none"}
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value=self._inspect("supervised", "sup")), \
+             patch("brig.network.ingress.register_ingress") as reg:
+            register_ingress_for("sup", [entry])
+        reg.assert_called_once()
+
+    def test_gate_keys_on_trusted_label_not_metadata(self):
+        # Regression: the gate previously read profile from the untrusted
+        # metadata file, so dropping it bypassed the gate. The label is the
+        # trusted source — an untrusted container is gated regardless of what
+        # cell-metadata.json says (here: no metadata written at all).
         from brig.cell.lifecycle import register_ingress_for
         from brig.errors import BrigError
-        self._persist_profile("sup", "supervised")
         entry = {"name": "api", "port": 8642, "path_prefix": "/api", "auth": "none"}
-        with patch("brig.cell.reconciler._podman_inspect_json", return_value=None):
-            with self.assertRaises(BrigError) as ctx:
-                register_ingress_for("sup", [entry])
-        self.assertNotIn("auth: none is not allowed", str(ctx.exception))
+        with patch("brig.cell.reconciler._podman_inspect_json",
+                   return_value=self._inspect("untrusted", "adv")):
+            with self.assertRaises(BrigError):
+                register_ingress_for("adv", [entry])
 
 
 if __name__ == "__main__":

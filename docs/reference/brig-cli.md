@@ -16,9 +16,9 @@ output; `--no-color` disables ANSI colors.
 | `brig cell list [--format=table\|wide\|json]` | List cells. `wide` adds CREATED, NETWORK columns. Aliases: `brig cell ls`, top-level `brig ps`. |
 | `brig cell inspect <cell>` | Raw podman inspect JSON. Alias: `brig cell status <cell>`. |
 | `brig cell diagnose <cell>` | Per-cell state summary (status, runtime, networks). |
-| `brig cell stop <cell>` | SIGTERM with 10s grace. |
-| `brig cell kill <cell>` | SIGKILL. |
-| `brig cell start <cell>` | Start a previously stopped cell. |
+| `brig cell stop <cell>` | SIGTERM with 10s grace. Records a stop marker, so a `restart: always` cell stays down (not auto-recovered) until `start`. |
+| `brig cell kill <cell>` | SIGKILL. Also records the stop marker (see `stop`). |
+| `brig cell start <cell>` | Start a previously stopped cell; clears the stop marker so `restart: always` recovery resumes. |
 | `brig cell restart <cell>` | Stop (if running) then start. Applies cell-yaml changes. |
 | `brig cell pause <cell>` / `brig cell unpause <cell>` | Freeze / thaw processes. |
 | `brig cell rm <cell> [-f] [--keep-workspace]` | Remove cell + network + subnet allocation. `-f` required if running. By default the cell's `~/.brig/state/<cell>/` workspace is deleted; pass `--keep-workspace` to retain it. |
@@ -101,8 +101,8 @@ output; `--no-color` disables ANSI colors.
 
 | Command | What it does |
 |---|---|
-| `brig system up` | Initialize `~/.brig` if needed, create Lima VM if missing, start it if stopped, start warden, then re-launch any gone `restart: always` cells. The "make it work" command. |
-| `brig system down [--vm]` | Stop all cells + warden. `--vm` also stops the Lima VM. |
+| `brig system up` | Initialize `~/.brig` if needed, create Lima VM if missing, start it if stopped, start warden, then recover any down `restart: always` cells (crashed or VM-dropped; a deliberately stopped one is left down). The "make it work" command. |
+| `brig system down [--vm]` | Stop all cells + warden. `--vm` also stops the Lima VM. Harness-level, not per-cell intent: no stop marker is recorded, so `restart: always` cells come back on the next `system up`. Use `brig cell stop` to keep one down. |
 | `brig system init` | Bootstrap `~/.brig`, set 0700 perms on `secrets`/`addons`/`state/system`, write default policy. Idempotent. |
 | `brig system profiles` | List trust profiles (`untrusted`, `supervised`, `dev`, `airgapped`, `honeypot`). |
 | `brig system doctor --quick` | Lightweight health check: proxy running + VM reachable. |
@@ -112,7 +112,7 @@ output; `--no-color` disables ANSI colors.
 | `brig system metrics` | Output Prometheus-format counters. |
 | `brig system stats` | Per-cell summary (requests / bytes / blocks) scraped from the OTel collector. Requires the collector to be running. |
 | `brig system prune [--cells\|--logs\|--subnets] [--log-days N] [--dry-run]` | Clean up. **No scope flag → all categories.** `--cells` removes stopped/exited cells + their networks. `--logs` deletes rotated operation logs older than N days (default 7) + invokes `warden logs prune`. `--subnets` frees allocator entries whose podman network is gone. `--dry-run` shows what would be removed. |
-| `brig system watchdog [--interval N] [--max-restarts N]` | Foreground long-running command. Monitors warden (restarts on failure) and, each interval, enforces `workspace_quota` by stopping any cell whose workspace has outgrown it. |
+| `brig system watchdog [--interval N] [--max-restarts N]` | Foreground long-running command. Monitors warden (restarts on failure) and, each interval, recovers down `restart: always` cells (crashed / SIGKILLed / VM-dropped; a deliberately stopped one is left down) and enforces `workspace_quota` by stopping any cell whose workspace has outgrown it (that stop records the marker, so recovery doesn't fight it — free space, then `brig cell start`). Run it persistently (e.g. a launchd agent) so cells self-heal after host sleep/reboot. |
 
 ## Config
 

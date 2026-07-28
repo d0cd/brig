@@ -194,8 +194,6 @@ Other configurations may work but are not tested:
 ```yaml
 vmType: vz
 mountType: virtiofs
-rosetta:
-  enabled: true
 
 cpus: 4
 memory: 8GiB

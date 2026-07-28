@@ -10,28 +10,38 @@ writes a small JSON file on the host, podman bind-mounts it read-only
 into the cell at `/run/brig/cell.json`. The cell can read but not
 modify it.
 
-Schema (v3):
+Schema (v4):
     {
-      "version": 3,
+      "version": 4,
       "name": "<cell-name>",
       "started_at": "<RFC 3339 UTC>",
       "workspace": {
-        "mount_point": "/work"
+        "mount_point": "/work",
+        "quota": "500m"               // optional; only when set
       },
       "ingress":      [{"name": ..., "port": int,
                         "path_prefix": ..., "auth": "token"}, ...],
-      "image_digest": "sha256:..."  // optional; only when pinned
+      "image_digest": "sha256:...",  // optional; only when pinned
       "policy": {
         "host_services": ["<svc-name>", ...]   // per-cell ACL
       }
     }
 
-What changed since v2:
+What changed since v3:
+  - `profile` REMOVED. A cell's trust profile must not be read from this file
+    (invariant 4 names it untrusted), so the ingress-replay auth:none gate now
+    reads it from the trusted podman container label (`brig.profile`) instead.
+    A v3 file on disk still carries the key; nothing reads it.
+  - `workspace.quota` documented. The v3 writer already emitted it — quota
+    enforcement (the `brig system watchdog` sweep and the `brig cp` guard) needs
+    the limit for EVERY cell, and the restart-only cell-spec.json is absent for
+    a default cell — but the v3 schema never listed it.
+
+What changed in v3:
   - `ingress` added so `brig cell start` can replay route registration
     without the original yaml. No secrets land here.
   - `image_digest` added so `brig cell start` can re-verify the pinned
     digest before letting the container start.
-  Both fields are optional and additive — v2 readers ignore them.
 
 Why v2 dropped `workspace.host_path`: publishing the absolute host
 path made it trivial for a consumer to do plain `open(host_path)`,
@@ -60,7 +70,7 @@ from brig.config import HostPaths, VMPaths
 from brig.ops.atomic import atomic_write_json
 from brig.policy.policy import load_cell_policy
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 IN_CELL_PATH = "/run/brig/cell.json"
 
 
@@ -126,6 +136,38 @@ def restorable_cell_specs() -> list[dict[str, Any]]:
     return out
 
 
+# --- Desired-state marker -------------------------------------------------
+# brig can't tell a crash (container exited-present) from an operator stop by
+# container state alone, so an explicit `brig cell stop`/`kill` records this
+# sentinel. `restart: always` recovery respects it (leaves the cell down until
+# an explicit start), while an unmarked down cell — crashed or dropped by a VM
+# restart — auto-recovers. This is the systemd `Restart=always` / Docker
+# `unless-stopped` distinction between "I stopped it" and "it failed".
+
+
+def _host_stopped_marker_path(cell_name: str) -> Path:
+    return HostPaths.STATE_DIR / cell_name / "stopped"
+
+
+def mark_cell_stopped(cell_name: str) -> None:
+    """Record that the operator intentionally stopped this cell so recovery
+    leaves it down until an explicit start."""
+    path = _host_stopped_marker_path(cell_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")
+
+
+def clear_cell_stopped(cell_name: str) -> None:
+    """Clear the intentional-stop marker (on start/run) — desired state is
+    running again, so recovery restores the cell if it later goes down."""
+    _host_stopped_marker_path(cell_name).unlink(missing_ok=True)
+
+
+def cell_marked_stopped(cell_name: str) -> bool:
+    """True when the cell was intentionally stopped and not since started."""
+    return _host_stopped_marker_path(cell_name).exists()
+
+
 def build_metadata(
     cell_name: str,
     workspace_mount: str,
@@ -133,7 +175,6 @@ def build_metadata(
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
     workspace_quota: str | None = None,
-    profile: str | None = None,
 ) -> dict[str, Any]:
     """Compose the cell metadata payload. Pure function for testability.
 
@@ -173,11 +214,6 @@ def build_metadata(
     }
     if image_digest:
         payload["image_digest"] = image_digest
-    # Persist the profile so the ingress-replay path (brig cell start) can
-    # re-apply the untrusted-profile auth:none gate — cell-metadata.json is
-    # untrusted (invariant 4), but the gate must still be checked on replay.
-    if profile:
-        payload["profile"] = profile
     return payload
 
 
@@ -224,7 +260,11 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
         prior = _json.loads(existing.read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
+    if not isinstance(prior, dict):
+        return None  # Tampered non-dict metadata (invariant 4).
     workspace = prior.get("workspace", {})
+    if not isinstance(workspace, dict):
+        workspace = {}
     workspace_mount = workspace.get("mount_point", "/work")
     # Preserve ingress across refresh — ingress configuration is fixed at
     # cell-create time, so it can't change without a `brig run`.
@@ -234,7 +274,6 @@ def refresh_metadata_if_present(cell_name: str) -> Path | None:
         ingress=prior_ingress,
         image_digest=read_image_digest(cell_name),
         workspace_quota=workspace.get("quota"),
-        profile=prior.get("profile"),
     )
 
 
@@ -250,6 +289,8 @@ def read_ingress(cell_name: str) -> list[dict[str, Any]]:
         payload = _json.loads(_host_metadata_path(cell_name).read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return []
+    if not isinstance(payload, dict):
+        return []  # Tampered non-dict metadata (invariant 4).
     entries = payload.get("ingress", []) or []
     return [
         e for e in entries
@@ -269,6 +310,8 @@ def read_image_digest(cell_name: str) -> str | None:
         payload = _json.loads(_host_metadata_path(cell_name).read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
+    if not isinstance(payload, dict):
+        return None  # Tampered non-dict metadata (invariant 4).
     val = payload.get("image_digest")
     return val if isinstance(val, str) and val else None
 
@@ -285,22 +328,10 @@ def read_workspace_quota(cell_name: str) -> str | None:
         payload = _json.loads(_host_metadata_path(cell_name).read_text())
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
         return None
-    val = payload.get("workspace", {}).get("quota")
-    return val if isinstance(val, str) and val else None
-
-
-def read_profile(cell_name: str) -> str | None:
-    """Return the cell's stored profile name from cell-metadata.json.
-
-    Used by the ingress-replay path to re-apply the untrusted-profile gate.
-    None when the cell had no profile, predates the field, or is unreadable.
-    """
-    import json as _json
-    try:
-        payload = _json.loads(_host_metadata_path(cell_name).read_text())
-    except (FileNotFoundError, _json.JSONDecodeError, OSError):
-        return None
-    val = payload.get("profile")
+    if not isinstance(payload, dict):
+        return None  # Tampered non-dict metadata (invariant 4).
+    workspace = payload.get("workspace", {})
+    val = workspace.get("quota") if isinstance(workspace, dict) else None
     return val if isinstance(val, str) and val else None
 
 
@@ -310,7 +341,6 @@ def write_metadata(
     ingress: list[dict[str, Any]] | None = None,
     image_digest: str | None = None,
     workspace_quota: str | None = None,
-    profile: str | None = None,
 ) -> Path:
     """Write the cell's metadata JSON to the host path. Returns the path.
 
@@ -327,7 +357,6 @@ def write_metadata(
         ingress=ingress,
         image_digest=image_digest,
         workspace_quota=workspace_quota,
-        profile=profile,
     )
     target = _host_metadata_path(cell_name)
     atomic_write_json(target, payload, mode=0o644)

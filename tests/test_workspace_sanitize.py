@@ -147,6 +147,45 @@ class TestCopyOutSanitizeFailure(unittest.TestCase):
                 copy_out("cell", "src", str(dst), sanitize=True)
         self.assertFalse(dst.exists())  # we created it, so we clean it up
 
+    def test_refuses_symlink_to_file(self):
+        base = Path(tempfile.mkdtemp())
+        victim = base / "victim"
+        victim.write_text("secret")
+        dst = base / "out"
+
+        def fake_cp(cmd, *a, **k):
+            dst.symlink_to(victim)  # podman "copied out" a symlink
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with patch("brig.workspace.workspace.vm_run", side_effect=fake_cp):
+            with self.assertRaises(BrigError) as ctx:
+                copy_out("cell", "src", str(dst), sanitize=True)
+        self.assertIn("symlink", str(ctx.exception).lower())
+        self.assertFalse(dst.is_symlink())            # link removed
+        self.assertEqual(victim.read_text(), "secret")  # target untouched
+
+    def test_refuses_symlink_to_directory(self):
+        # Regression: is_dir() follows the link, so before the branch-order fix
+        # a symlink-to-dir slipped into the tree arm and _sanitize_tree / xattr
+        # -r ran against the link target (a confused deputy on a host dir).
+        base = Path(tempfile.mkdtemp())
+        target_dir = base / "targetdir"
+        target_dir.mkdir()
+        (target_dir / "keep.txt").write_text("host data")
+        dst = base / "out"
+
+        def fake_cp(cmd, *a, **k):
+            dst.symlink_to(target_dir)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with patch("brig.workspace.workspace.vm_run", side_effect=fake_cp):
+            with self.assertRaises(BrigError) as ctx:
+                copy_out("cell", "src", str(dst), sanitize=True)
+        self.assertIn("symlink", str(ctx.exception).lower())
+        self.assertFalse(dst.is_symlink())                 # link removed
+        self.assertTrue(target_dir.exists())               # target untouched
+        self.assertEqual((target_dir / "keep.txt").read_text(), "host data")
+
 
 class TestCopyInQuota(unittest.TestCase):
     """Preventive host->cell quota gate in copy_in()."""

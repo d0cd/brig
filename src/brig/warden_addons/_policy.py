@@ -135,8 +135,12 @@ class PolicyRule:
 
     def matches_method(self, method: str) -> bool:
         """Check if method matches this rule's method restrictions."""
-        if self.methods is None:
-            return True  # No method restriction.
+        if not self.methods:
+            # None OR empty = no restriction, matching matches_path's handling
+            # of empty `paths` and is_host_allowed's "unscoped" premise. Without
+            # this, a `methods: []` deny was a no-op on HTTP yet blocked the
+            # HTTPS CONNECT — asymmetric enforcement.
+            return True
         return method.upper() in self.methods
 
     def matches(self, host: str, path: str, method: str) -> bool:
@@ -341,17 +345,20 @@ class Policy:
         CONNECT on a path-scoped allow like `{domain: x, paths: [/api]}` would
         wrongly break ALL HTTPS to that host (the path isn't known yet).
         """
+        # The trie returns only rules whose domain matches `host` (exact +
+        # applicable wildcards), so — like is_allowed — we don't re-check
+        # matches_domain here.
         for rule in self._deny_trie.lookup(host):
             # An unscoped deny (no path/method filter) blocks the tunnel. Treat
-            # an EMPTY paths/methods list the same as None — is_allowed's
-            # matches_path/matches_method also treat empty as "no restriction"
-            # (matches everything), so a `paths: []` deny blocks all HTTP and
-            # must block the CONNECT too, not be mistaken for a scoped rule.
-            if not rule.paths and not rule.methods and rule.matches_domain(host):
+            # an EMPTY paths/methods list the same as None — matches_path /
+            # matches_method also treat empty as "no restriction", so a
+            # `paths: []` / `methods: []` deny blocks all HTTP and must block the
+            # CONNECT too, not be mistaken for a scoped rule.
+            if not rule.paths and not rule.methods:
                 return False, f"denied by rule: {rule.domain}"
-        for rule in self._allow_trie.lookup(host):
-            if rule.matches_domain(host):
-                return True, f"allowed by rule: {rule.domain}"
+        allow_matches = self._allow_trie.lookup(host)
+        if allow_matches:
+            return True, f"allowed by rule: {allow_matches[0].domain}"
         return False, "not in allowlist"
 
     def is_allowed(self, host: str, path: str, method: str,
